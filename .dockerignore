@@ -1,0 +1,14 @@
+.git/
+.claude/
+target/
+**/target/
+**/*.json
+testing/
+graph_data/
+dst/
+docs/
+.vscode/
+.github/
+**/node_modules/
+queries/
+.tmp/

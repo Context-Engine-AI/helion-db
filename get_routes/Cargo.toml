@@ -1,0 +1,17 @@
+[package]
+name = "get_routes"
+version = "0.1.0"
+edition = "2021"
+description = "Route registration proc macro for Helion."
+license = "GPL-3.0-only"
+authors = ["Context Engine AI"]
+repository = "https://github.com/Context-Engine-AI/helion-db"
+
+[lib]
+proc-macro = true
+
+
+[dependencies]
+syn = { version = "2.0.91", features = ["full"] }
+quote = "1.0.38"
+proc-macro2 = "1.0"

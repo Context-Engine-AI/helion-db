@@ -1,0 +1,36 @@
+[package]
+name = "helix-container"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP server for the Helion graph-vector database engine."
+license = "GPL-3.0-only"
+authors = ["Context Engine AI"]
+repository = "https://github.com/Context-Engine-AI/helion-db"
+
+[dependencies]
+helixdb = { path = "../helixdb" }
+get_routes = { path = "../get_routes" }
+inventory = "0.3.16"
+rand = "0.9.1"
+dirs = "5.0.1"
+libc = "0.2"
+chrono = "0.4.19"
+serde = { version = "1.0", features = ["derive"] }
+sonic-rs = "0.5.0"
+tokio = { version = "1.44.2", features = ["full"] }
+serde_json = "1.0.140"
+uuid = { version = "1.12.1", features = ["std", "v4", "v6", "fast-rng"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+
+# jemalloc: replaces glibc malloc on non-MSVC targets. Built from source by
+# `jemalloc-sys`, statically linked into the binary. Symbols are namespaced
+# (`_rjem_` prefix) so they cannot clash with a system libjemalloc, and so
+# MALLOC_CONF must be passed via `_RJEM_MALLOC_CONF` to take effect.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+reqwest = { version = "0.12.15", features = ["blocking", "json"] }
+serde_json = "1.0.140"
+tempfile = "3.2"

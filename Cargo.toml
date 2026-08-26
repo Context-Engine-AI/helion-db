@@ -1,0 +1,27 @@
+[workspace]
+members = ["helixdb", "helix-container", "get_routes", "helix-cli", "hbuild"]
+# vendor/slatedb is its own nested workspace (the vendored SlateDB fork);
+# exclude it so its crates resolve `workspace = true` inheritance against
+# vendor/slatedb/Cargo.toml, not this root.
+exclude = ["vendor"]
+resolver = "2"
+
+# SlateDB is replaced by the vendored HelixDB fork (same 0.14.1 version line,
+# format-compatible; adds DbReader snapshot isolation, batched checkpoint
+# leases, multi_get, and commutative transaction merges). See
+# vendor/slatedb/PROVENANCE.md for the pinned rev and update procedure.
+[patch.crates-io]
+slatedb = { path = "vendor/slatedb/slatedb" }
+slatedb-common = { path = "vendor/slatedb/slatedb-common" }
+slatedb-txn-obj = { path = "vendor/slatedb/slatedb-txn-obj" }
+
+[profile.release]
+opt-level = 3
+# Thin LTO + 16 codegen units: near-identical runtime perf to fat LTO for this
+# I/O-bound workload, but parallel codegen + far faster linking (CI builds were
+# link-bound at ~16-21 min with lto=true / codegen-units=1). For a max-perf
+# build, override at build time:
+#   CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 cargo build --release
+lto = "thin"
+strip = "debuginfo"
+codegen-units = 16

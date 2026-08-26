@@ -1,0 +1,77 @@
+# Helix wedge-repro harness.
+#
+# Goal: reproduce the production wedge where write_queue_depth stops decrementing
+# while blocking_admission_available stays low. Triggers the bug fast by:
+#   - low max-open (4) forces constant LRU eviction → close/reopen races
+#   - low blocking cap (2) makes a single stuck handler obvious
+#   - small initial map (8 MB) forces grow_map() pressure
+#   - small per-collection cap forces in-flight rejects under burst
+#
+# Build context is the parent repo so the binary reflects local source.
+
+services:
+  helix:
+    build:
+      context: ..
+      # Use repro Dockerfile that overrides target-cpu=neoverse-v1 with
+      # target-cpu=generic so the binary runs on Apple Silicon dev hosts.
+      dockerfile: repro/Dockerfile.repro
+    image: helix-db:repro
+    container_name: helix-repro
+    ports:
+      - "6970:6969"
+    environment:
+      HELIX_PORT: "6969"
+      HELIX_DATA_DIR: "/data"
+      HELIX_LOG: "info"
+      HELIX_POOL_SIZE: "32"
+      HELIX_GATEWAY_IMPL: "axum"
+      HELIX_MAX_BODY_MB: "16"
+
+      # Knobs tightened to surface the bug in seconds, not hours.
+      HELIX_MAX_OPEN_COLLECTIONS: "4"
+      HELIX_INITIAL_MAP_MB: "8"
+      HELIX_MAX_MAP_SIZE_GB: "1"
+      HELIX_MAP_GROW_MB: "16"
+
+      # Admission caps. Small enough that one stuck handler shows up.
+      HELIX_WRITE_BLOCKING_CAP: "2"
+      HELIX_READ_BLOCKING_CAP: "4"
+      HELIX_SEARCH_BLOCKING_CAP: "4"
+      HELIX_SCAN_BLOCKING_CAP: "4"
+      HELIX_INDEX_BLOCKING_CAP: "1"
+      HELIX_MAINTENANCE_BLOCKING_CAP: "1"
+      HELIX_WRITE_INFLIGHT_CAP: "8"
+      HELIX_INFLIGHT_CAP_WRITES: "2"
+
+      # Make queue waits short so failures are visible fast.
+      HELIX_SEARCH_BLOCKING_QUEUE_WAIT_MS: "1000"
+      HELIX_SCAN_BLOCKING_QUEUE_WAIT_MS: "1000"
+      HELIX_READ_BLOCKING_QUEUE_WAIT_MS: "0"
+
+      # Durable write queue — same as prod.
+      HELIX_WRITE_QUEUE_DIR: "/data/write-queue"
+      HELIX_WRITE_QUEUE_WORKERS: "2"
+      HELIX_WRITE_QUEUE_PER_COLLECTION_CAP: "32"
+      HELIX_WRITE_QUEUE_QUANTUM: "4"
+      HELIX_WRITE_QUEUE_UPSERT_CHUNK_MAX_BYTES: "1048576"
+      HELIX_WRITE_QUEUE_UPSERT_CHUNK_MIN_BYTES: "262144"
+      HELIX_WRITE_QUEUE_UPSERT_CHUNK_TARGET_MS: "200"
+
+      HELIX_REQUEST_TIMEOUT_SECS: "30"
+      HELIX_KEEP_ALIVE_SECS: "10"
+
+      # Tokio sized small to keep diagnostics readable.
+      HELIX_TOKIO_WORKER_THREADS: "4"
+      HELIX_TOKIO_MAX_BLOCKING_THREADS: "32"
+    # tmpfs avoids the named-volume root-ownership permission fight on first
+    # boot. We don't need persistence between runs — every harness run starts
+    # from a clean state anyway.
+    tmpfs:
+      - /data:uid=1000,gid=1000,mode=0755,size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:6969/health | grep -q ok"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+      start_period: 5s

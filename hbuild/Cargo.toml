@@ -1,0 +1,19 @@
+[package]
+name = "hbuild"
+version = "0.1.0"
+edition = "2021"
+description = "Build helper for Helion query projects."
+license = "GPL-3.0-only"
+authors = ["Context Engine AI"]
+repository = "https://github.com/Context-Engine-AI/helion-db"
+
+[dependencies]
+socket2 = "0.5"
+helixdb = { path = "../helixdb", features = ["build"] }
+aws-config = "1.1.1"
+aws-sdk-s3 = "1.11.0"
+tokio = { version = "1.44.2", features = ["full"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+sonic-rs = "0.5.0"
+futures = "0.3"

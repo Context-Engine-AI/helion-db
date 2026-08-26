@@ -1,0 +1,104 @@
+name: Build and Release CLI
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*.*.*"]
+  pull_request: {}
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-13, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: helix-cli-linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary_name: helix-cli-linux-arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            binary_name: helix-cli-macos-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            binary_name: helix-cli-macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: helix-cli-windows-amd64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL and pkg-config (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config gcc
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: |
+          cd helix-cli
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary_name }}
+          path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'helix.exe' || 'helix' }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/*/; do
+            name=$(basename "$dir")
+            if [[ "$name" == *.exe ]]; then
+              cp "$dir"/*.exe "release/$name"
+            else
+              cp "$dir"/helix "release/$name"
+              chmod +x "release/$name"
+            fi
+          done
+          ls -la release/
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true
+          files: release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

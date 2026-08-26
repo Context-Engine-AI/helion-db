@@ -1,0 +1,130 @@
+# Helix LSM nodes: one fenced writer + two disposable read replicas, all over
+# the same MinIO object-store prefix, each with its own SSD cache (emptyDir).
+#
+# Image: helix-db:lsm-local (build locally, then `minikube image load helix-db:lsm-local`).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: helix-lsm-env
+  namespace: helion-lsm
+  labels: { app: helion, component: helix }
+data:
+  HELIX_STORAGE_BACKEND: "lsm"
+  HELIX_LSM_BUCKET: "helion"
+  HELIX_LSM_PREFIX: "helion"
+  HELIX_LSM_ENDPOINT: "http://minio:9000"
+  HELIX_LSM_ALLOW_HTTP: "1"
+  HELIX_LSM_REGION: "us-east-1"
+  HELIX_LSM_CACHE_DIR: "/cache"          # local SSD object-store cache
+  HELIX_LSM_CACHE_MAX_BYTES: "1073741824"
+  AWS_ACCESS_KEY_ID: "test"
+  AWS_SECRET_ACCESS_KEY: "testtest123"
+  AWS_REGION: "us-east-1"
+  AWS_DEFAULT_REGION: "us-east-1"
+  HELIX_PORT: "6969"
+  HELIX_DATA_DIR: "/data"
+  HELIX_LOG: "info"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helix-writer
+  namespace: helion-lsm
+  labels: { app: helion, component: helix, role: writer }
+spec:
+  replicas: 1                            # single fenced writer per collection prefix
+  selector:
+    matchLabels: { app: helion, component: helix, role: writer }
+  template:
+    metadata:
+      labels: { app: helion, component: helix, role: writer }
+    spec:
+      # fsGroup makes the emptyDir volumes writable by the image's non-root
+      # `helix` user (uid 1000) — the production-correct alternative to the
+      # compose stack's `user: root`.
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: helix
+          image: helix-db:lsm-local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: helix-lsm-env }
+          env:
+            - { name: HELIX_LSM_ROLE, value: "writer" }
+          ports:
+            - { name: http, containerPort: 6969 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          volumeMounts:
+            - { name: cache, mountPath: /cache }
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: cache, emptyDir: {} }
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: helix-writer
+  namespace: helion-lsm
+  labels: { app: helion, component: helix, role: writer }
+spec:
+  selector: { app: helion, component: helix, role: writer }
+  ports:
+    - { name: http, port: 6969, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helix-reader
+  namespace: helion-lsm
+  labels: { app: helion, component: helix, role: reader }
+spec:
+  replicas: 2                            # horizontal read scale; add/remove freely
+  selector:
+    matchLabels: { app: helion, component: helix, role: reader }
+  template:
+    metadata:
+      labels: { app: helion, component: helix, role: reader }
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: helix
+          image: helix-db:lsm-local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: helix-lsm-env }
+          env:
+            - { name: HELIX_LSM_ROLE, value: "reader" }   # writes rejected at the gateway
+          ports:
+            - { name: http, containerPort: 6969 }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          volumeMounts:
+            - { name: cache, mountPath: /cache }
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: cache, emptyDir: {} }   # SSD cache is disposable — wiped on pod restart
+        - { name: data, emptyDir: {} }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: helix-reader
+  namespace: helion-lsm
+  labels: { app: helion, component: helix, role: reader }
+spec:
+  # Load-balances reads across all reader pods (ClusterIP round-robins endpoints).
+  selector: { app: helion, component: helix, role: reader }
+  ports:
+    - { name: http, port: 6969, targetPort: http }

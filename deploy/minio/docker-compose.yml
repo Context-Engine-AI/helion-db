@@ -1,0 +1,43 @@
+# Local object storage for Helion's SlateDB (`LsmBackend`) — MinIO, the same way
+# Helix Cloud runs on S3. No LocalStack; object_store speaks MinIO's S3 natively.
+#
+#   docker compose -f deploy/minio/docker-compose.yml up -d
+#   cargo test -p helixdb lsm_backend_on_minio_s3 \
+#     lsm_single_writer_fencing_on_minio_s3 -- --ignored --nocapture
+#   docker compose -f deploy/minio/docker-compose.yml down -v
+#
+# The tests connect to http://localhost:9000 (bucket `helion-test`, key id
+# `test`, secret `testtest123`, region us-east-1, path-style http) — backend_lsm.rs.
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: helion-minio
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # S3 API  (LsmBackend -> SlateDB -> object_store)
+      - "9001:9001"   # web console (http://localhost:9001  user/pass: test / testtest123)
+    environment:
+      MINIO_ROOT_USER: test
+      MINIO_ROOT_PASSWORD: testtest123
+    volumes:
+      - minio-data:/data
+
+  # One-shot: wait for MinIO, then create the bucket the SlateDB tests write to.
+  create-bucket:
+    image: minio/mc:latest
+    container_name: helion-minio-init
+    restart: "no"
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set h http://minio:9000 test testtest123; do sleep 1; done
+        mc mb --ignore-existing h/helion-test
+        mc ls h
+        echo bucket-ready
+
+volumes:
+  minio-data:

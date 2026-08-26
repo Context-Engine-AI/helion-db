@@ -1,0 +1,2 @@
+include "compactor.fbs";
+include "manifest.fbs";

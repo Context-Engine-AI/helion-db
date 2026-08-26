@@ -1,0 +1,72 @@
+# MinIO = object storage (durable system of record; prod = S3).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: helion-lsm
+  labels: { app: helion, component: minio }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: helion, component: minio }
+  template:
+    metadata:
+      labels: { app: helion, component: minio }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - { name: MINIO_ROOT_USER, value: "test" }
+            - { name: MINIO_ROOT_PASSWORD, value: "testtest123" }
+          ports:
+            - { name: s3, containerPort: 9000 }
+            - { name: console, containerPort: 9001 }
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: helion-lsm
+  labels: { app: helion, component: minio }
+spec:
+  selector: { app: helion, component: minio }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+---
+# One-shot bucket creation; retries until MinIO is reachable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: create-bucket
+  namespace: helion-lsm
+  labels: { app: helion, component: minio-init }
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels: { app: helion, component: minio-init }
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until mc alias set h http://minio:9000 test testtest123; do sleep 2; done
+              mc mb --ignore-existing h/helion
+              mc ls h
+              echo bucket-ready

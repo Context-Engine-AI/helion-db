@@ -1,0 +1,83 @@
+# Repro-only Dockerfile.
+#
+# Same shape as ../Dockerfile, but overrides .cargo/config.toml's
+# `target-cpu=neoverse-v1` (AWS Graviton 3) with `target-cpu=generic` so the
+# resulting binary runs on Apple Silicon and other arm64 hosts. Production
+# images keep the neoverse-v1 codegen for performance; this file exists only
+# so the local repro/test harness produces a runnable container on dev hardware.
+#
+# CARGO_TARGET_<TRIPLE>_RUSTFLAGS env vars REPLACE (not extend) the matching
+# `[target.<triple>] rustflags` entry in `.cargo/config.toml`, which is the
+# only knob that lets us drop the neoverse-v1 flags without editing checked-in
+# source.
+
+FROM --platform=$TARGETPLATFORM rust:1.94-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    clang \
+    llvm-dev \
+    protobuf-compiler \
+    pkg-config \
+    libssl-dev \
+    make \
+    autoconf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Override .cargo/config.toml. These env names match the cargo convention:
+# CARGO_TARGET_<TRIPLE_UPPERCASE_UNDERSCORED>_RUSTFLAGS.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=generic"
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=generic"
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY helixdb/Cargo.toml helixdb/Cargo.toml
+COPY helix-container/Cargo.toml helix-container/Cargo.toml
+COPY get_routes/Cargo.toml get_routes/Cargo.toml
+COPY helix-cli/Cargo.toml helix-cli/Cargo.toml
+COPY hbuild/Cargo.toml hbuild/Cargo.toml
+
+RUN mkdir -p helixdb/src helix-container/src get_routes/src \
+             helix-cli/src hbuild/src && \
+    echo "fn main(){}" > helix-container/src/main.rs && \
+    echo "fn main(){}" > helix-cli/src/main.rs && \
+    echo "fn main(){}" > hbuild/src/main.rs && \
+    touch helixdb/src/lib.rs get_routes/src/lib.rs && \
+    cargo build --release -p helix-container 2>/dev/null || true
+
+COPY . .
+RUN touch helixdb/src/lib.rs helix-container/src/main.rs
+
+RUN cargo build --release -p helix-container && \
+    strip target/release/helix-container && \
+    cp target/release/helix-container /tmp/helix-container
+
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /bin/false helix && \
+    echo "helix soft nofile 65536" >> /etc/security/limits.conf && \
+    echo "helix hard nofile 65536" >> /etc/security/limits.conf
+USER helix
+
+COPY --from=builder /tmp/helix-container /usr/local/bin/helix-container
+
+VOLUME /data
+
+ENV HELIX_PORT=6969 \
+    HELIX_DATA_DIR=/data \
+    HELIX_KEEP_ALIVE_SECS=30 \
+    HELIX_LOG=info \
+    HELIX_MAX_OPEN_COLLECTIONS=256
+
+EXPOSE 6969
+
+HEALTHCHECK --interval=2s --timeout=2s --start-period=3s --retries=15 \
+    CMD curl -sf http://localhost:${HELIX_PORT}/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/helix-container"]

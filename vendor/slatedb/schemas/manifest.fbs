@@ -1,0 +1,202 @@
+include "sst.fbs";
+include "common.fbs";
+
+// Reference to an external database.
+table ExternalDb {
+    // Path to root of the external database
+    path: string (required);
+
+    // Externally owned Checkpoint ID we've used to create an initial state of cloned database.
+    source_checkpoint_id: Uuid (required);
+
+    // Checkpoint ID this database has placed on the external database that prevents referenced
+    // data files from being GC'd. Both final_checkpoint_id and source_checkpoint_id should resolve
+    // to the same manifest_id as long as they both still exist.
+    final_checkpoint_id: Uuid;
+
+    // Compacted SST IDs belonging to external DB that are currently being referenced.
+    sst_ids: [Ulid] (required);
+}
+
+// Manifest to persist state of DB.
+table ManifestV1 {
+    // Id of manifest. Manifest file name will be derived from this id.
+    manifest_id: ulong;
+
+    // List of external databases referenced by this manifest.
+    external_dbs: [ExternalDb];
+
+    // Flag to indicate whether initialization has finished. When creating the initial manifest for
+    // a root db (one that is not a clone), this flag will be set to true. When creating the initial
+    // manifest for a clone db, this flag will be set to false and then updated to true once clone
+    // initialization has completed.
+    initialized: bool;
+
+    // The current writer's epoch.
+    writer_epoch: ulong;
+
+    // The current compactor's epoch.
+    compactor_epoch: ulong;
+
+    // Tracks the most recent SST in the WAL that has been flushed on the last L0 is compacted. When an Immutable
+    // Memtable (IMM) is flushed to L0, we record the recent flushed WAL ID as `replay_after_wal_id`. During recovery,
+    // we use `replay_after_wal_id + 1` as the starting point for WAL replay, and skip the WAL entries with
+    // smaller `seq` than `last_l0_seq`.
+    replay_after_wal_id: ulong;
+
+    // The most recent SST in the WAL at the time manifest was updated.
+    wal_id_last_seen: ulong;
+
+    // The last compacted l0
+    l0_last_compacted: Ulid;
+
+    // A list of the L0 SSTs that are valid to read in the `compacted` folder.
+    l0: [CompactedSsTable] (required);
+
+    // A list of the sorted runs that are valid to read in the `compacted` folder.
+    compacted: [SortedRun] (required);
+
+    // The last L0 clock tick (the database should restore the latest
+    // tick when recovering from WAL if there are any WAL entries)
+    last_l0_clock_tick: long;
+
+    // A list of checkpoints that are currently open.
+    checkpoints: [Checkpoint] (required);
+
+    // The last seq number
+    last_l0_seq: ulong;
+
+    // The URI of the object store dedicated specifically for WAL, if any.
+    wal_object_store_uri: string;
+
+    // Minimum sequence number across all recent in-memory (write) snapshots. The compactor
+    // needs this to determine whether it's safe to drop duplicate key writes. If a recent snapshot
+    // still references an older version of a key, it should not be dropped.
+    recent_snapshot_min_seq: ulong;
+
+    // Serialized sequence tracker data as defined in RFC-0012.
+    sequence_tracker: [ubyte];
+}
+
+// Manifest to persist state of DB, version 2 (CompactedSsTableV2 changed to CompactedSsTableView).
+table ManifestV2 {
+    // Id of manifest. Manifest file name will be derived from this id.
+    manifest_id: ulong;
+
+    // List of external databases referenced by this manifest.
+    external_dbs: [ExternalDb];
+
+    // Flag to indicate whether initialization has finished. When creating the initial manifest for
+    // a root db (one that is not a clone), this flag will be set to true. When creating the initial
+    // manifest for a clone db, this flag will be set to false and then updated to true once clone
+    // initialization has completed.
+    initialized: bool;
+
+    // The current writer's epoch.
+    writer_epoch: ulong;
+
+    // The current compactor's epoch.
+    compactor_epoch: ulong;
+
+    // Tracks the most recent SST in the WAL that has been flushed on the last L0 is compacted. When an Immutable
+    // Memtable (IMM) is flushed to L0, we record the recent flushed WAL ID as `replay_after_wal_id`. During recovery,
+    // we use `replay_after_wal_id + 1` as the starting point for WAL replay, and skip the WAL entries with
+    // smaller `seq` than `last_l0_seq`.
+    replay_after_wal_id: ulong;
+
+    // The most recent SST in the WAL at the time manifest was updated.
+    wal_id_last_seen: ulong;
+
+    // The last compacted l0
+    last_compacted_l0_sst_view_id: Ulid;
+
+    // All compacted SSTs referenced by l0 and compacted (sorted runs) views,
+    // including those referenced by `segments` (RFC-0024) when set.
+    ssts: [CompactedSsTableV2] (required);
+
+    // A list of the L0 SSTs that are valid to read in the `compacted` folder.
+    l0: [CompactedSsTableView] (required);
+
+    // A list of the sorted runs that are valid to read in the `compacted` folder.
+    compacted: [SortedRunV2] (required);
+
+    // The last L0 clock tick (the database should restore the latest
+    // tick when recovering from WAL if there are any WAL entries)
+    last_l0_clock_tick: long;
+
+    // A list of checkpoints that are currently open.
+    checkpoints: [Checkpoint] (required);
+
+    // The last seq number
+    last_l0_seq: ulong;
+
+    // Minimum sequence number across all recent in-memory (write) snapshots. The compactor
+    // needs this to determine whether it's safe to drop duplicate key writes. If a recent snapshot
+    // still references an older version of a key, it should not be dropped.
+    recent_snapshot_min_seq: ulong;
+
+    // Serialized sequence tracker data as defined in RFC-0012.
+    sequence_tracker: [ubyte];
+
+    // Per-segment LSM state, one entry per named segment (RFC-0024). Each segment
+    // owns the contiguous key interval [prefix, prefix++) and is compacted as an
+    // independent logical LSM tree. Segment views reference into the top-level
+    // `ssts` table by SST id, exactly like `l0` and `compacted`.
+    segments: [Segment];
+
+    // Name of the prefix extractor used to derive segment membership from keys
+    // (RFC-0024). Persisted so the writer can detect accidental reconfiguration
+    // on startup. Absent when no extractor is configured.
+    segment_extractor_name: string;
+}
+
+// Per-segment LSM state. Structurally mirrors the top-level `l0` / `compacted` /
+// `last_compacted_l0_sst_view_id` fields, but scoped to a single segment whose
+// key interval is identified by `prefix`. Views reference into the manifest's
+// shared top-level `ssts` table by SST id.
+table Segment {
+    // The segment's key prefix. Owns the interval [prefix, prefix++).
+    prefix: [ubyte] (required);
+
+    // The last compacted L0 view id within this segment.
+    last_compacted_l0_sst_view_id: Ulid;
+
+    // L0 SST views for this segment.
+    l0: [CompactedSsTableView] (required);
+
+    // Sorted runs for this segment, ordered by descending id (list position
+    // encodes read precedence within the segment).
+    compacted: [SortedRunV2] (required);
+}
+
+table WriterCheckpoint {
+    epoch: uint64;
+}
+
+union CheckpointMetadata { WriterCheckpoint }
+
+// Checkpoint reference to be included in manifest to record active checkpoints.
+table Checkpoint {
+    // Id that must be unique across all open checkpoints.
+    id: Uuid (required);
+
+    // The manifest ID that this checkpoint is using as its `DbState`.
+    manifest_id: ulong;
+
+    // The UTC unix timestamp seconds that a checkpoint expires at. Clients may update this value.
+    // If `checkpoint_expire_time_s` is older than now(), the checkpoint is considered expired.
+    // If `checkpoint_expire_time_s` is 0, the checkpoint will never expire.
+    checkpoint_expire_time_s: uint;
+
+    // The unix timestamp seconds that the checkpoint was created
+    checkpoint_create_time_s: uint;
+
+    // Optional metadata associated with the checkpoint. For example, the writer can use this to
+    // clean up checkpoints from older writers.
+    metadata: CheckpointMetadata;
+
+    // Optional name associated with the checkpoint. The name can be used to list the checkpoints.
+    // Note that name may not be unique and the list operation can return multiple checkpoints with
+    // the same name.
+    name: string;
+}

@@ -1,0 +1,138 @@
+include "common.fbs";
+
+enum CompressionFormat: byte {
+    None,
+    Snappy,
+    Zlib,
+    Lz4,
+    Zstd
+}
+
+// Type of SST. The default value (Compacted = 0) is not serialized by
+// FlatBuffers, so existing SSTs without this field are treated as Compacted.
+enum SstType: byte {
+    Compacted,
+    Wal
+}
+
+// Filter block format. The default value (Legacy = 0) is not serialized by
+// FlatBuffers, so existing SSTs without this field are treated as Legacy.
+enum FilterFormat: byte {
+    // Single raw bloom filter bytes (pre-composite format).
+    Legacy,
+    // Block containing one or more named filters, each prefixed with its name
+    // and length.
+    Composite
+}
+
+// Has metadata about a SST file.
+table SsTableInfo {
+    // First entry in the SST file.
+    // The first entry is a key in an SST for compacted data
+    // and it is a sequence number in a WAL SST.
+    first_entry: [ubyte];
+
+    // Offset of the index block.
+    index_offset: ulong;
+
+    // Length of the index block.
+    index_len: ulong;
+
+    // Offset of the bloom filter.
+    filter_offset: ulong;
+
+    // Length of bloom filter. Length will be zero if filter is not present.
+    filter_len: ulong;
+
+    // Type of compression algorithm used.
+    compression_format: CompressionFormat;
+
+    // Type of SST. Defaults to Compacted for backwards compatibility.
+    sst_type: SstType;
+
+    // Last entry in the SST file.
+    // The last entry is a key in an SST for compacted data.
+    last_entry: [ubyte];
+
+    // Offset of the stats block.
+    stats_offset: ulong;
+
+    // Length of the stats block. Length will be zero if stats are not present.
+    stats_len: ulong;
+
+    // Filter block format. Defaults to Legacy for backwards compatibility.
+    filter_format: FilterFormat;
+}
+
+// Per-block statistics.
+table BlockStats {
+    // Number of put entries in the block.
+    num_puts: ushort;
+    // Number of delete entries in the block.
+    num_deletes: ushort;
+    // Number of merge entries in the block.
+    num_merges: ushort;
+}
+
+// Per-SST statistics collected during SST building.
+table SstStats {
+    // Number of put entries in the SST.
+    num_puts: ulong;
+    // Number of delete entries in the SST.
+    num_deletes: ulong;
+    // Number of merge entries in the SST.
+    num_merges: ulong;
+    // Total uncompressed size of all keys in bytes.
+    raw_key_size: ulong;
+    // Total uncompressed size of all values in bytes.
+    raw_val_size: ulong;
+    // Per-block statistics.
+    block_stats: [BlockStats];
+}
+
+table BlockMeta {
+    // Offset of the block within the SST file.
+    offset: ulong;
+
+    // First key contained in the block.
+    first_key: [ubyte] (required);
+}
+
+table SsTableIndex {
+    block_meta: [BlockMeta] (required);
+}
+
+// deprecated: use CompactedSsTableV2
+table CompactedSsTable {
+    id: Ulid (required);
+    info: SsTableInfo (required);
+    visible_range: BytesRange;
+    format_version: uint16 = null;
+}
+
+table CompactedSsTableV2 {
+    id: Ulid (required);
+    info: SsTableInfo (required);
+    format_version: uint16 = null;
+}
+
+// A view over an SST specifying the key range that is visible for reads and compactions
+table CompactedSsTableView {
+    // Unique identifier for this view. Used to track individual views in compaction specs.
+    id: Ulid (required);
+    // Reference to a CompactedSsTable by its id (stored at the top level of ManifestV2).
+    sst_id: Ulid (required);
+    // The key range that this view is restricted to over
+    visible_range: BytesRange;
+}
+
+// deprecated: use SortedRunV2
+table SortedRun {
+    id: uint32;
+    ssts: [CompactedSsTable] (required);
+}
+
+table SortedRunV2 {
+    id: uint32;
+    ssts: [CompactedSsTableView] (required);
+}

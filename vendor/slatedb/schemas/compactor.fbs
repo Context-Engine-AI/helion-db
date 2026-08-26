@@ -1,0 +1,141 @@
+include "common.fbs";
+include "sst.fbs";
+
+union CompactionSpec {
+    TieredCompactionSpec,
+    DrainSegmentSpec,
+}
+
+enum CompactionStatus : byte {
+    /// The compaction has been submitted but not yet started.
+    Submitted = 0,
+    /// The compaction is currently running.
+    Running,
+    /// The compaction finished successfully and was committed to the manifest.
+    Completed,
+    /// The compaction failed. It might or might not have started before failure.
+    Failed,
+    /// The worker finished execution and wrote its final output SSTs; the
+    /// compaction coordinator has not yet committed the result to the manifest.
+    Compacted,
+    /// The coordinator has validated the spec against the current manifest and
+    /// promoted the entry; the job is ready to be claimed by a worker. Only the
+    /// coordinator writes this state.
+    Scheduled,
+}
+
+table TieredCompactionSpec {
+    // deprecated: use l0_view_ids
+    ssts: [Ulid];
+
+    // input Sorted Run IDs
+    sorted_runs: [uint32];
+
+    // input L0 SSTable View IDs
+    l0_view_ids: [Ulid];
+
+    // Target segment prefix. Empty bytes (or absent for legacy specs)
+    // target the compatibility-encoded `prefix=""` segment (i.e. the root
+    // tree). Optional in the schema for backward compatibility with specs
+    // serialized before this field existed; readers default missing values
+    // to empty bytes.
+    segment: [ubyte];
+
+    // Destination Sorted Run ID for the compaction output. Appended after
+    // pre-existing fields so vtable offsets for earlier fields remain stable
+    // across schema evolution. Absent in v1 wire files; readers infer the
+    // destination from SR inputs for v1 and trust this field for v2+.
+    destination: uint32;
+}
+
+// Drains a named segment as part of segment retention (RFC-0024). The
+// executor performs no merge; on commit the segment's
+// `last_compacted_l0_sst_view_id` watermark advances to cover the listed
+// L0 views and the listed sorted runs are removed from `compacted`. The
+// segment entry remains in the manifest as a "drain marker" until the
+// writer's merge protocol observes it and prunes the segment. The
+// compatibility-encoded `prefix=""` segment cannot be drained by this
+// operation.
+table DrainSegmentSpec {
+    // Target segment prefix. Must be non-empty.
+    segment: [ubyte] (required);
+
+    // L0 SSTable View IDs the compactor has observed in the segment and is
+    // draining. `last_compacted_l0_sst_view_id` advances to the newest L0
+    // named here.
+    l0_view_ids: [Ulid];
+
+    // Sorted Run IDs the compactor has observed in the segment and is
+    // draining. These runs are removed from the segment's compacted list.
+    sorted_runs: [uint32];
+}
+
+table WorkerSpec {
+    // worker_id of worker that owns compaction
+    worker_id: string;
+    // wall-clock ms of last progress write
+    last_heartbeat_ms: uint64;
+}
+
+// Holds information required to resume a running job or inspect the result of
+// a complete compaction job. This includes the outputs of planning (e.g.
+// subcompactions, retention_min_seq) along with the job's outputs. Different
+// compaction types may need to hold different types of context. For now,
+// we only define context for tiered compactions as those are the only kind
+// that track and resume from intermediate state.
+union CompactionContext {
+    TieredCompactionContext,
+}
+
+table TieredCompactionContext {
+    // Subcompactions partitioning this compaction into non-overlapping key
+    // ranges (RFC-0028).
+    subcompactions: [Subcompaction];
+
+    // The min retention seq num to use when executing the compaction
+    retention_min_seq: ulong;
+}
+
+table Compaction {
+    // ID of compaction
+    id: Ulid (required);
+
+    // Specification defining the work to be done for this compaction
+    spec: CompactionSpec (required);
+
+    // Current lifecycle status for this compaction
+    status: CompactionStatus;
+
+    // Output SSTs of the compaction (set in Compacted state)
+    output_ssts: [CompactedSsTable];
+
+    // Spec of the worker that has claimed this compaction. null = unclaimed
+    worker: WorkerSpec;
+
+    // Information required to resume a compaction job on a worker
+    ctx: CompactionContext;
+}
+
+// A compaction over a sub-range of the parent compaction's key space
+// (RFC-0028). Subcompactions are only valid within the context of a parent
+// `Compaction` and let a single logical compaction execute its disjoint
+// ranges in parallel while resuming at range granularity after a failure.
+table Subcompaction {
+    // Key range covered by this subcompaction. Ranges of the subcompactions
+    // within a parent compaction are non-overlapping and together cover the
+    // full key space.
+    range: BytesRange (required);
+
+    // Output SSTs already produced by this subcompaction. A subcompaction with
+    // output SSTs that cover its full range has completed; on resume, ranges
+    // with no recorded output are re-run from scratch.
+    output_ssts: [CompactedSsTable];
+}
+
+table CompactionsV1 {
+    // Fencing token to ensure single active compactor
+    compactor_epoch: uint64;
+
+    // In-flight compactions as of the last update
+    recent_compactions: [Compaction] (required);
+}

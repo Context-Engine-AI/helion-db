@@ -1,0 +1,130 @@
+# Helix Cloud LSM topology — local emulation (docker compose)
+#
+# Emulates the production architecture as faithfully as a single host allows:
+#   - MinIO            = object storage (durable system of record; prod = S3)
+#   - helix-writer     = single fenced writer (HELIX_LSM_ROLE=writer)
+#   - helix-reader-1/2 = disposable read replicas (HELIX_LSM_ROLE=reader)
+#   - per-node /cache  = local SSD object-store cache (HELIX_LSM_CACHE_DIR)
+#
+# Every node reads/writes the SAME object-store prefix; readers serve committed
+# state off object storage + their own SSD cache and reject writes at the
+# gateway. This is the diagram, shrunk to one box.
+#
+#   docker build -t helix-db:lsm-local .                       # current LSM code
+#   docker compose -f deploy/lsm-cloud/compose/docker-compose.yml up -d
+#   deploy/lsm-cloud/compose/verify.sh                         # live HA proof
+#   docker compose -f deploy/lsm-cloud/compose/docker-compose.yml down -v
+#
+# Container names are left to compose (helion-lsm-<service>-N) so this stack
+# never collides with other local MinIO/helix containers.
+name: helion-lsm
+
+x-helix-env: &helix-env
+  HELIX_STORAGE_BACKEND: "lsm"
+  HELIX_LSM_BUCKET: "helion"
+  HELIX_LSM_PREFIX: "helion"
+  HELIX_LSM_ENDPOINT: "http://minio:9000"
+  HELIX_LSM_ALLOW_HTTP: "1"
+  HELIX_LSM_REGION: "us-east-1"
+  # SSD cache: reads served from this local mount, object storage only on miss.
+  HELIX_LSM_CACHE_DIR: "/cache"
+  HELIX_LSM_CACHE_MAX_BYTES: "1073741824"   # 1 GiB
+  # object_store AmazonS3Builder::from_env() credentials (MinIO).
+  AWS_ACCESS_KEY_ID: "test"
+  AWS_SECRET_ACCESS_KEY: "testtest123"
+  AWS_REGION: "us-east-1"
+  AWS_DEFAULT_REGION: "us-east-1"
+  HELIX_PORT: "6969"
+  HELIX_DATA_DIR: "/data"
+  HELIX_LOG: "info"
+
+x-helix-node: &helix-node
+  image: helix-db:lsm-local
+  restart: unless-stopped
+  # Local emulation: docker named volumes are root-owned, and the image runs as
+  # the non-root `helix` user, so HelixGraphEngine can't create /data or /cache.
+  # Run as root here (the minikube manifests use securityContext.fsGroup instead,
+  # matching production).
+  user: "0:0"
+  depends_on:
+    create-bucket:
+      condition: service_completed_successfully
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console (test / testtest123)
+    environment:
+      MINIO_ROOT_USER: test
+      MINIO_ROOT_PASSWORD: testtest123
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - minio-data:/data
+
+  # One-shot: create the bucket the writer/readers use, then exit.
+  create-bucket:
+    image: minio/mc:latest
+    restart: "no"
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set h http://minio:9000 test testtest123; do sleep 1; done
+        mc mb --ignore-existing h/helion
+        mc ls h
+        echo bucket-ready
+
+  # Single fenced writer. Owns all mutations; persists durably to object storage.
+  helix-writer:
+    <<: *helix-node
+    environment:
+      <<: *helix-env
+      HELIX_LSM_ROLE: "writer"
+    ports:
+      - "6969:6969"
+    volumes:
+      - writer-cache:/cache
+      - writer-data:/data
+
+  # Read replica #1 — disposable, cache-backed, writes rejected at the gateway.
+  helix-reader-1:
+    <<: *helix-node
+    environment:
+      <<: *helix-env
+      HELIX_LSM_ROLE: "reader"
+    ports:
+      - "6970:6969"
+    volumes:
+      - reader1-cache:/cache
+      - reader1-data:/data
+
+  # Read replica #2 — proves horizontal read scale (N readers, same prefix).
+  helix-reader-2:
+    <<: *helix-node
+    environment:
+      <<: *helix-env
+      HELIX_LSM_ROLE: "reader"
+    ports:
+      - "6971:6969"
+    volumes:
+      - reader2-cache:/cache
+      - reader2-data:/data
+
+volumes:
+  minio-data:
+  writer-cache:
+  writer-data:
+  reader1-cache:
+  reader1-data:
+  reader2-cache:
+  reader2-data:
