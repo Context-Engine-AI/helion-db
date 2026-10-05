@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
-use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::block_iterator::DataBlockIterator;
 use crate::bytes_range::BytesRange;
@@ -25,7 +25,7 @@ use crate::{
 };
 
 enum FetchTask {
-    InFlight(JoinHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
+    InFlight(AbortOnDropHandle<Result<VecDeque<Arc<Block>>, SlateDBError>>),
     Finished(VecDeque<Arc<Block>>),
 }
 
@@ -389,17 +389,17 @@ impl<'a> InternalSstIterator<'a> {
                     let blocks_end = self.next_block_idx_to_fetch + blocks_to_fetch;
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks_start..blocks_end,
-                                    cache_blocks,
-                                )
-                                .await
-                        })));
+                    let fetch_task = AbortOnDropHandle::new(tokio::spawn(async move {
+                        table_store
+                            .read_blocks_using_index(
+                                &table,
+                                index,
+                                blocks_start..blocks_end,
+                                cache_blocks,
+                            )
+                            .await
+                    }));
+                    self.fetch_tasks.push_back(FetchTask::InFlight(fetch_task));
                     self.next_block_idx_to_fetch = blocks_end;
                 }
             }
@@ -418,17 +418,17 @@ impl<'a> InternalSstIterator<'a> {
                     let blocks_start = blocks_end - blocks_to_fetch;
                     let index = index.clone();
                     let cache_blocks = self.options.cache_blocks;
-                    self.fetch_tasks
-                        .push_back(FetchTask::InFlight(tokio::spawn(async move {
-                            table_store
-                                .read_blocks_using_index(
-                                    &table,
-                                    index,
-                                    blocks_start..blocks_end,
-                                    cache_blocks,
-                                )
-                                .await
-                        })));
+                    let fetch_task = AbortOnDropHandle::new(tokio::spawn(async move {
+                        table_store
+                            .read_blocks_using_index(
+                                &table,
+                                index,
+                                blocks_start..blocks_end,
+                                cache_blocks,
+                            )
+                            .await
+                    }));
+                    self.fetch_tasks.push_back(FetchTask::InFlight(fetch_task));
                     self.next_block_idx_to_fetch = blocks_start;
                 }
             }

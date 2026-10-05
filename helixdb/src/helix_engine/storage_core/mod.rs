@@ -17,6 +17,7 @@ pub mod metadata;
 pub mod migrate;
 pub mod properties;
 pub mod raft;
+pub mod reader_warm;
 pub mod replication;
 pub mod storage_core;
 pub mod storage_methods;

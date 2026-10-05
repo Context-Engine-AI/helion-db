@@ -107,8 +107,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use fail_parallel::FailPointRegistry;
-use log::info;
-use log::warn;
+use log::{debug, info, warn};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use rand::RngCore;
@@ -1691,6 +1690,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
 
     /// Builds and returns a DbReader instance.
     pub async fn build(self) -> Result<DbReader, crate::Error> {
+        let build_started = std::time::Instant::now();
         let path = self.path.into();
         let recorder = MetricsRecorderHelper::new(
             self.metrics_recorder,
@@ -1720,6 +1720,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             });
 
         // Setup object store with optional caching
+        let cache_started = std::time::Instant::now();
         let maybe_cached = CachedObjectStore::from_config(
             retrying_object_store.clone(),
             &self.options.object_store_cache_options,
@@ -1728,6 +1729,10 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             self.rand.clone(),
         )
         .await?;
+        debug!(
+            "reader_open_phase phase=cache_setup elapsed_ms={}",
+            cache_started.elapsed().as_secs_f64() * 1000.0
+        );
 
         let object_store: Arc<dyn ObjectStore> = match &maybe_cached {
             Some(cached) => Arc::clone(cached) as Arc<dyn ObjectStore>,
@@ -1736,9 +1741,14 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
 
         // Validate WAL object store configuration.
         let manifest_store = Arc::new(ManifestStore::new(&path, retrying_object_store));
+        let manifest_started = std::time::Instant::now();
         let latest_manifest =
             StoredManifest::try_load(Arc::clone(&manifest_store), self.system_clock.clone())
                 .await?;
+        debug!(
+            "reader_open_phase phase=builder_manifest elapsed_ms={}",
+            manifest_started.elapsed().as_secs_f64() * 1000.0
+        );
         if let Some(latest_manifest) = &latest_manifest {
             latest_manifest
                 .db_state()
@@ -1789,6 +1799,7 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
             TableStoreKind::Reader,
         ));
 
+        let reader_started = std::time::Instant::now();
         let mut reader = DbReader::open_internal(
             manifest_store,
             table_store,
@@ -1802,11 +1813,24 @@ impl<P: Into<Path>> DbReaderBuilder<P> {
         )
         .await
         .map_err(crate::Error::from)?;
+        debug!(
+            "reader_open_phase phase=open_internal elapsed_ms={}",
+            reader_started.elapsed().as_secs_f64() * 1000.0
+        );
 
+        let preload_started = std::time::Instant::now();
         if let Some(cached) = &maybe_cached {
             reader.preload_cache(cached, path).await?;
         }
+        debug!(
+            "reader_open_phase phase=cache_preload elapsed_ms={}",
+            preload_started.elapsed().as_secs_f64() * 1000.0
+        );
         reader.object_store_cache = maybe_cached;
+        debug!(
+            "reader_open_phase phase=builder_total elapsed_ms={}",
+            build_started.elapsed().as_secs_f64() * 1000.0
+        );
 
         Ok(reader)
     }

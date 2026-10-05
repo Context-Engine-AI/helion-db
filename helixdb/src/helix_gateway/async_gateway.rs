@@ -1,9 +1,9 @@
 use crate::helix_engine::{
     graph_core::graph_core::HelixGraphEngine,
     storage_core::{
-        backend::BackendKind,
         backend_lsm::{allow_lsm_blocking, allow_lsm_blocking_cancellable, LsmReadCancellation},
         collection_manager::CollectionManager,
+        reader_warm,
         replication::{self, ReplicationManager},
     },
     types::GraphError,
@@ -645,11 +645,17 @@ pub fn spawn_segment_breaker_reeval_task(state: AsyncGatewayState) {
 /// Maps a handler `GraphError` to an HTTP status code: not-found variants → 404,
 /// resource-exhaustion (map full / resize backpressure) → 503, everything else
 /// → 500. The body remains the error string at the call site.
+/// Purge retries back off from seconds up to minutes; 10s keeps clients from
+/// hammering a create that cannot succeed until the purge completes.
+const PURGE_PENDING_RETRY_AFTER_SECS: u64 = 10;
+
 fn graph_error_status(error: &GraphError) -> u16 {
     match error {
         GraphError::EdgeNotFound | GraphError::NodeNotFound | GraphError::LabelNotFound => 404,
         GraphError::FatalCollectionStorage { .. } => 500,
         GraphError::MapFull | GraphError::ResizeBackpressure(_) => 503,
+        // Transient: the dropped incarnation's object-store purge is retrying.
+        GraphError::PurgePending(_) => 503,
         // `VectorError(_)` can wrap a "Vector not found" message that has no
         // dedicated variant; fall back to the string for that not-found case.
         GraphError::VectorError(_) if error.to_string().contains("not found") => 404,
@@ -1182,6 +1188,10 @@ impl WriteSubmitter {
         // If the HTTP future is canceled, the blocking worker's clone keeps
         // admission closed until the abandoned storage mutation finishes.
         let _point_mutation_guard = point_mutation_guard;
+        // Same cancellation contract for the writer permit: each blocking
+        // attempt holds a clone, so an abandoned HTTP future cannot release
+        // capacity while its storage mutation is still running.
+        let permit = Arc::new(permit);
         let response = loop {
             let request = next_request.take().unwrap_or_else(|| {
                 let (method, headers, path, body) = retry_snapshot
@@ -1194,9 +1204,14 @@ impl WriteSubmitter {
                     body: body.clone(),
                 }
             });
-            let response =
-                run_router_with_guard(state.clone(), request, None, _point_mutation_guard.clone())
-                    .await;
+            let response = run_router_with_guard(
+                state.clone(),
+                request,
+                None,
+                _point_mutation_guard.clone(),
+                Some(Arc::clone(&permit)),
+            )
+            .await;
             if retry_snapshot.is_none()
                 && retryable_background_status(response.status)
                 && attempt < max_attempts
@@ -1307,6 +1322,47 @@ async fn handle(
             .body(Body::from(b"{\"status\":\"ok\"}".to_vec()))
             .unwrap();
     }
+    // Peer hot-list for reader warm (storage_core::reader_warm): an in-memory
+    // snapshot, answered inline before admission. 404 unless this is a reader
+    // whose warm task published a list.
+    if method == "GET" && path == reader_warm::HOT_COLLECTIONS_PATH {
+        drop(body);
+        let (status, payload) = match reader_warm::hot_collections_response_body() {
+            Some(payload) => (StatusCode::OK, payload),
+            None => (
+                StatusCode::NOT_FOUND,
+                b"{\"status\":\"not_found\"}".to_vec(),
+            ),
+        };
+        observe_http_request(&method, &path, status.as_u16(), request_started);
+        return HttpResponse::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .header("X-Helix-Route-Class", RouteClass::Probe.as_label())
+            .body(Body::from(payload))
+            .unwrap();
+    }
+    // Reader warm-before-ready gate (storage_core::reader_warm). `/readyz/warm`
+    // is an atomic load only — no admission, no storage access — so the reader
+    // readiness probe never queues behind or adds to S3-backed work.
+    if method == "GET" && matches!(path.as_str(), "/ready" | "/readyz" | "/readyz/warm") {
+        let warm_ready = reader_warm::startup_warm_ready();
+        if !warm_ready || path == "/readyz/warm" {
+            drop(body);
+            let (status, payload): (StatusCode, &[u8]) = if warm_ready {
+                (StatusCode::OK, b"{\"status\":\"ready\"}")
+            } else {
+                (StatusCode::SERVICE_UNAVAILABLE, b"{\"status\":\"warming\"}")
+            };
+            observe_http_request(&method, &path, status.as_u16(), request_started);
+            return HttpResponse::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .header("X-Helix-Route-Class", RouteClass::Probe.as_label())
+                .body(Body::from(payload.to_vec()))
+                .unwrap();
+        }
+    }
     if method == "GET" && matches!(path.as_str(), "/ready" | "/readyz") {
         if let Some(response) =
             unhealthy_lsm_writer_probe_response(&state, StatusCode::SERVICE_UNAVAILABLE)
@@ -1393,7 +1449,9 @@ async fn handle(
             .unwrap();
     }
 
-    if let Some(response) = lsm_reader_write_rejection(class) {
+    if let Some(response) =
+        lsm_reader_write_rejection(class, state.collections.config().storage_backend)
+    {
         drop(body);
         observe_http_request(&method, &path, response.status, request_started);
         return http_response(response);
@@ -1536,9 +1594,10 @@ async fn handle(
     // per-collection key preserves full parallelism across different
     // collections.
     let point_mutation_guard = match point_mutation_collection.as_deref() {
-        Some(coll) => {
-            Some(point_mutation_admission::acquire_for_backend(BackendKind::from_env(), coll).await)
-        }
+        Some(coll) => Some(
+            point_mutation_admission::acquire_for_backend(state.collections.backend_kind(), coll)
+                .await,
+        ),
         None => None,
     };
 
@@ -1548,7 +1607,14 @@ async fn handle(
             .submit(state.clone(), class, request, point_mutation_guard)
             .await
     } else {
-        run_router_with_guard(state, request, route_guard.take(), point_mutation_guard).await
+        run_router_with_guard(
+            state,
+            request,
+            route_guard.take(),
+            point_mutation_guard,
+            None,
+        )
+        .await
     };
 
     observe_http_request(&method, &path, response.status, request_started);
@@ -1560,6 +1626,7 @@ async fn run_router_with_guard(
     request: HelixRequest,
     route_guard: Option<AdmissionGuard>,
     point_mutation_guard: Option<PointMutationGuard>,
+    submit_permit: Option<Arc<OwnedSemaphorePermit>>,
 ) -> HelixResponse {
     let class = route_class(&request.method, &request.path);
     crate::diag::log(
@@ -1580,7 +1647,14 @@ async fn run_router_with_guard(
     };
     let _route_guard = route_guard;
     let resp_path = request.path.clone();
-    let response = run_router(state, request, blocking_guard, point_mutation_guard).await;
+    let response = run_router(
+        state,
+        request,
+        blocking_guard,
+        point_mutation_guard,
+        submit_permit,
+    )
+    .await;
     crate::diag::log(
         "exit",
         "run_router_with_guard",
@@ -1599,6 +1673,7 @@ async fn run_router(
     request: HelixRequest,
     blocking_guard: Option<BlockingAdmissionGuard>,
     point_mutation_guard: Option<PointMutationGuard>,
+    submit_permit: Option<Arc<OwnedSemaphorePermit>>,
 ) -> HelixResponse {
     let method = request.method.clone();
     let path = request.path.clone();
@@ -1620,6 +1695,9 @@ async fn run_router(
             // clone across retries; this worker clone also survives HTTP
             // cancellation until the abandoned blocking mutation completes.
             let _point_mutation_guard = point_mutation_guard;
+            // WriteSubmitter capacity is released only when the blocking
+            // mutation finishes, not when the HTTP future is dropped.
+            let _submit_permit = submit_permit;
             let mut response = HelixResponse::new();
             if let Err(e) = state.router.handle(
                 Arc::clone(&state.graph),
@@ -1632,6 +1710,12 @@ async fn run_router(
                 log_handler_error(&method, &path, status, &e);
                 quarantine_collection_from_handler_error(&state.collections, &path, &e);
                 response.status = status;
+                if matches!(e, GraphError::PurgePending(_)) {
+                    response.headers.insert(
+                        "Retry-After".to_string(),
+                        PURGE_PENDING_RETRY_AFTER_SECS.to_string(),
+                    );
+                }
                 if let Some(body) = e.fatal_collection_response_body() {
                     response.body = body;
                     response
@@ -2030,12 +2114,31 @@ mod segment_circuit_breaker_tests {
             503
         );
         assert_eq!(
+            graph_error_status(&GraphError::PurgePending("purge pending".into())),
+            503
+        );
+        assert_eq!(
             graph_error_status(&GraphError::VectorError("Vector not found: x".into())),
             404
         );
         assert_eq!(
             graph_error_status(&GraphError::New("Collection 'x' not found".into())),
             404
+        );
+        // LSM reader replica: a collection with no manifest surfaces from
+        // `get_collection` as the same not-found the writer raises → 404, while
+        // other storage failures on the same path stay 500.
+        assert_eq!(
+            graph_error_status(&GraphError::New(
+                "Collection 'codebase' not found (no manifest in object store)".into()
+            )),
+            404
+        );
+        assert_eq!(
+            graph_error_status(&GraphError::StorageError(
+                "io error: Generic S3 error: request failed: 503 Slow Down".into()
+            )),
+            500
         );
         assert_eq!(
             graph_error_status(&GraphError::New("Lock poisoned: x".into())),
@@ -2103,5 +2206,180 @@ mod segment_circuit_breaker_tests {
                 "server/storage failures must remain ERROR: {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod write_submitter_permit_tests {
+    use super::{run_router_with_guard, AsyncGatewayState, WriteSubmitter};
+    use crate::helix_engine::graph_core::config::Config;
+    use crate::helix_engine::graph_core::graph_core::{HelixGraphEngine, HelixGraphEngineOpts};
+    use crate::helix_engine::storage_core::{
+        collection_manager::CollectionManager, replication::ReplicationManager,
+    };
+    use crate::helix_engine::types::GraphError;
+    use crate::helix_gateway::router::router::{HandlerInput, HelixRouter};
+    use crate::helix_gateway::thread_pool::thread_pool::RouteClass;
+    use crate::protocol::{request::Request as HelixRequest, response::Response as HelixResponse};
+    use std::collections::HashMap;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::sync::Semaphore;
+
+    static HANDLER_STARTED: AtomicBool = AtomicBool::new(false);
+    static HANDLER_RELEASE: AtomicBool = AtomicBool::new(false);
+    static HANDLER_DONE: AtomicBool = AtomicBool::new(false);
+
+    fn slow_write(_input: &HandlerInput, response: &mut HelixResponse) -> Result<(), GraphError> {
+        HANDLER_STARTED.store(true, Ordering::Release);
+        while !HANDLER_RELEASE.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        HANDLER_DONE.store(true, Ordering::Release);
+        response.status = 200;
+        Ok(())
+    }
+
+    /// Unblocks the handler even when an assertion panics; otherwise runtime
+    /// shutdown would wait forever on the parked blocking task.
+    struct ReleaseHandlerOnDrop;
+
+    impl Drop for ReleaseHandlerOnDrop {
+        fn drop(&mut self) {
+            HANDLER_RELEASE.store(true, Ordering::Release);
+        }
+    }
+
+    fn purge_pending_create(
+        _input: &HandlerInput,
+        _response: &mut HelixResponse,
+    ) -> Result<(), GraphError> {
+        Err(GraphError::PurgePending(
+            "Collection 'c' cannot be created yet: object-store purge of the previously \
+             dropped collection is still pending (s3 down); retry later"
+                .into(),
+        ))
+    }
+
+    fn test_state(
+        tmp: &TempDir,
+        router: HelixRouter,
+        write_submitter: Arc<WriteSubmitter>,
+    ) -> AsyncGatewayState {
+        let config = Config::default();
+        let graph = Arc::new(
+            HelixGraphEngine::new(HelixGraphEngineOpts {
+                path: tmp.path().join("graph").display().to_string(),
+                config: config.clone(),
+            })
+            .unwrap(),
+        );
+        let collections =
+            Arc::new(CollectionManager::new(tmp.path().join("data"), config.clone()).unwrap());
+        let replication =
+            Arc::new(ReplicationManager::new(Arc::clone(&collections), config).unwrap());
+        AsyncGatewayState {
+            graph,
+            collections,
+            replication,
+            router: Arc::new(router),
+            write_submitter,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hot_collections_route_is_inline_and_404_unless_published() {
+        use crate::helix_engine::storage_core::reader_warm;
+        use axum::{body::to_bytes, extract::State, http::Request, response::IntoResponse};
+        let _gate_lock = reader_warm::warm_gate_test_lock();
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp, HelixRouter::new(None), WriteSubmitter::new());
+        let get = || {
+            Request::builder()
+                .method("GET")
+                .uri(reader_warm::HOT_COLLECTIONS_PATH)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        reader_warm::publish_hot_list_for_test(None);
+        let response = super::handle(State(state.clone()), get())
+            .await
+            .into_response();
+        assert_eq!(response.status().as_u16(), 404);
+
+        reader_warm::publish_hot_list_for_test(Some(vec!["a".into(), "b".into()]));
+        let response = super::handle(State(state), get()).await.into_response();
+        reader_warm::publish_hot_list_for_test(None);
+        assert_eq!(response.status().as_u16(), 200);
+        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["collections"], serde_json::json!(["a", "b"]));
+        assert_eq!(json["version"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purge_pending_create_maps_to_retryable_503() {
+        let tmp = TempDir::new().unwrap();
+        let mut router = HelixRouter::new(None);
+        router.add_route("PUT", "/collections/c", purge_pending_create);
+        let state = test_state(&tmp, router, WriteSubmitter::new());
+        let request = HelixRequest {
+            method: "PUT".into(),
+            headers: HashMap::new(),
+            path: "/collections/c".into(),
+            body: Vec::new(),
+        };
+        let response = run_router_with_guard(state, request, None, None, None).await;
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response.headers.get("Retry-After").map(String::as_str),
+            Some("10")
+        );
+        assert!(String::from_utf8_lossy(&response.body).contains("retry later"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_submit_keeps_writer_permit_until_blocking_work_finishes() {
+        let _release = ReleaseHandlerOnDrop;
+        let tmp = TempDir::new().unwrap();
+        let mut router = HelixRouter::new(None);
+        router.add_route("POST", "/test/slow-write", slow_write);
+        let submitter = Arc::new(WriteSubmitter {
+            writer_semaphore: Arc::new(Semaphore::new(1)),
+        });
+        let state = test_state(&tmp, router, Arc::clone(&submitter));
+        let request = HelixRequest {
+            method: "POST".into(),
+            headers: HashMap::new(),
+            path: "/test/slow-write".into(),
+            body: Vec::new(),
+        };
+
+        // Client gives up while the blocking mutation is still running.
+        let submit = submitter.submit(state, RouteClass::Write, request, None);
+        let outcome = tokio::time::timeout(Duration::from_millis(200), submit).await;
+        assert!(outcome.is_err(), "submit should still be blocked");
+        assert!(HANDLER_STARTED.load(Ordering::Acquire));
+        assert!(!HANDLER_DONE.load(Ordering::Acquire));
+        assert_eq!(
+            submitter.writer_semaphore.available_permits(),
+            0,
+            "abandoned blocking write must keep its submit permit"
+        );
+
+        HANDLER_RELEASE.store(true, Ordering::Release);
+        for _ in 0..400 {
+            if submitter.writer_semaphore.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(HANDLER_DONE.load(Ordering::Acquire));
+        assert_eq!(submitter.writer_semaphore.available_permits(), 1);
     }
 }

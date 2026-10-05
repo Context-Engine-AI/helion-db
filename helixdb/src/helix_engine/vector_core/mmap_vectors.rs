@@ -2150,6 +2150,14 @@ impl MmapBackend {
         }
     }
 
+    #[inline]
+    pub fn hvtq_encoded_matches(&self, ordinal: u64, expected: &[u8]) -> bool {
+        match self {
+            Self::Hvtq(store) => store.get_encoded(ordinal) == Some(expected),
+            Self::Hvec(_) | Self::Hvs8(_) | Self::Hspn(_) => false,
+        }
+    }
+
     /// Score an encoded sidecar row without first copying it out of the mmap.
     #[inline]
     pub fn score_encoded_to(

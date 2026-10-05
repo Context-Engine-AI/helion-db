@@ -29,7 +29,7 @@ use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use log::{info, warn};
+use log::{debug, info, warn};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use parking_lot::RwLock;
@@ -310,9 +310,14 @@ impl DbReaderInner {
         recorder: slatedb_common::metrics::MetricsRecorderHelper,
         mut manifest: StoredManifest,
     ) -> Result<Self, SlateDBError> {
+        let checkpoint_started = std::time::Instant::now();
         let checkpoint =
             Self::get_or_create_checkpoint(&mut manifest, checkpoint_id, &options, rand.clone())
                 .await?;
+        debug!(
+            "reader_open_phase phase=checkpoint elapsed_ms={}",
+            checkpoint_started.elapsed().as_secs_f64() * 1000.0
+        );
 
         let db_stats = DbStats::new(&recorder);
         let replay_new_wals = checkpoint_id.is_none() && !options.skip_wal_replay;
@@ -628,7 +633,12 @@ impl DbReaderInner {
         replay_new_wals: bool,
         db_stats: &DbStats,
     ) -> Result<CheckpointState, SlateDBError> {
+        let manifest_started = std::time::Instant::now();
         let manifest = manifest_store.read_manifest(checkpoint.manifest_id).await?;
+        debug!(
+            "reader_open_phase phase=checkpoint_manifest elapsed_ms={}",
+            manifest_started.elapsed().as_secs_f64() * 1000.0
+        );
         let imm_memtable = ReplayMemtables::default();
         Self::build_checkpoint_state(
             checkpoint,
@@ -840,11 +850,19 @@ impl DbReaderInner {
                     (core.replay_after_wal_id, core.last_l0_seq)
                 }
             });
+        let initial_replay = replay_cursor.is_none();
+        let discovery_started = std::time::Instant::now();
         let wal_id_end = if replay_new_wals {
             table_store.last_seen_wal_id(replay_after_wal_id).await? + 1
         } else {
             core.next_wal_sst_id
         };
+        debug!(
+            "reader_open_phase phase=wal_discovery elapsed_ms={} initial={} replay_new_wals={}",
+            discovery_started.elapsed().as_secs_f64() * 1000.0,
+            initial_replay,
+            replay_new_wals
+        );
 
         let replay_options = WalReplayOptions {
             sst_batch_size: 4,
@@ -854,6 +872,8 @@ impl DbReaderInner {
             min_seq: Some(last_committed_seq),
         };
 
+        let replay_started = std::time::Instant::now();
+        let initial_replay_after_wal_id = replay_after_wal_id;
         let mut replay_iter = WalReplayIterator::range(
             (replay_after_wal_id + 1)..wal_id_end,
             core,
@@ -904,6 +924,12 @@ impl DbReaderInner {
             }
         }
 
+        debug!(
+            "reader_open_phase phase=wal_replay elapsed_ms={} initial={} wal_id_advance={}",
+            replay_started.elapsed().as_secs_f64() * 1000.0,
+            initial_replay,
+            replay_after_wal_id.saturating_sub(initial_replay_after_wal_id)
+        );
         Ok((replay_after_wal_id, last_committed_seq))
     }
 
@@ -1302,6 +1328,7 @@ impl DbReader {
     ) -> Result<Self, SlateDBError> {
         Self::validate_options(&options)?;
 
+        let manifest_started = std::time::Instant::now();
         let manifest =
             match StoredManifest::load(Arc::clone(&manifest_store), system_clock.clone()).await {
                 Ok(manifest) => manifest,
@@ -1310,6 +1337,10 @@ impl DbReader {
                 }
                 Err(error) => return Err(error),
             };
+        debug!(
+            "reader_open_phase phase=initial_manifest elapsed_ms={}",
+            manifest_started.elapsed().as_secs_f64() * 1000.0
+        );
         if !manifest.db_state().initialized {
             return Err(SlateDBError::InvalidDBState);
         }

@@ -75,16 +75,15 @@ impl CatalogSync {
         drop(guard);
     }
 
-    fn await_work(&self) {
+    fn await_work(&self, alive: &AtomicBool) {
         let state = self.lock();
-        if state.served < state.requests {
+        if state.served < state.requests || !alive.load(Ordering::Acquire) {
             return;
         }
         let interval = Duration::from_millis(CATALOG_REFRESH_INTERVAL_MS);
-        let (guard, _timeout) = match self
-            .wake
-            .wait_timeout_while(state, interval, |s| s.served >= s.requests)
-        {
+        let (guard, _timeout) = match self.wake.wait_timeout_while(state, interval, |s| {
+            s.served >= s.requests && alive.load(Ordering::Acquire)
+        }) {
             Ok(pair) => pair,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -172,11 +171,18 @@ pub struct LmdbBackend {
     dbs: Arc<RwLock<HashMap<String, Database<Bytes, Bytes>>>>,
     refresher_alive: Arc<AtomicBool>,
     catalog_sync: Arc<CatalogSync>,
+    refresher_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for LmdbBackend {
     fn drop(&mut self) {
         self.refresher_alive.store(false, Ordering::Release);
+        self.catalog_sync.wake.notify_all();
+        if let Some(thread) = self.refresher_thread.take() {
+            if thread.join().is_err() {
+                tracing::warn!("catalog refresh thread panicked during shutdown");
+            }
+        }
     }
 }
 
@@ -252,7 +258,7 @@ impl LmdbBackend {
             Arc::new(RwLock::new(HashMap::new()));
         let refresher_alive = Arc::new(AtomicBool::new(true));
         let catalog_sync = Arc::new(CatalogSync::new());
-        {
+        let refresher_thread = {
             let env = env.clone();
             let dbs = Arc::clone(&dbs);
             let alive = Arc::clone(&refresher_alive);
@@ -281,15 +287,16 @@ impl LmdbBackend {
                         }
                     }
                     sync.publish_pass(snapshot);
-                    sync.await_work();
+                    sync.await_work(&alive);
                 }
-            });
-        }
+            })
+        };
         Self {
             env,
             dbs,
             refresher_alive,
             catalog_sync,
+            refresher_thread: Some(refresher_thread),
         }
     }
 
@@ -331,7 +338,7 @@ impl LmdbBackend {
     fn open_catalog(
         env: &Env<WithTls>,
     ) -> Result<Vec<(String, Database<Bytes, Bytes>)>, BackendError> {
-        let mut wtxn = env.write_txn().map_err(io_at("catalog_txn"))?;
+        let wtxn = env.write_txn().map_err(io_at("catalog_txn"))?;
         let names: Vec<String> = match env
             .open_database::<Bytes, Bytes>(&wtxn, None)
             .map_err(io_at("catalog_main"))?
@@ -749,6 +756,22 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let be = LmdbBackend::open(dir.path(), 64, 10 * 1024 * 1024).unwrap();
         (dir, be)
+    }
+
+    #[test]
+    fn drop_releases_catalog_thread_before_returning() {
+        let dir = TempDir::new().unwrap();
+        let be = LmdbBackend::open(dir.path(), 64, 10 * 1024 * 1024).unwrap();
+        be.catalog_sync.request_and_wait();
+        {
+            let state = be.catalog_sync.lock();
+            assert_eq!(state.served, state.requests);
+        }
+
+        drop(be);
+
+        LmdbBackend::open(dir.path(), 64, 10 * 1024 * 1024)
+            .expect("dropping a backend must release its LMDB environment");
     }
 
     fn get_owned(

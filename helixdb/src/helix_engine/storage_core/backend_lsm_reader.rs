@@ -33,12 +33,13 @@ use tokio::runtime::Handle;
 
 use super::backend::{is_dup, next_prefix, BackendError, KeyRange, Namespace};
 use super::backend_lsm::{
-    block_on_lsm, block_on_lsm_read, block_on_lsm_read_mapped, collections_root_prefix,
-    decode_dup_full_key, dup_composite, dup_key_prefix, ensure_lsm_read_not_cancelled,
-    list_child_collection_names, logical_key_in_range, lsm_multi_get_enabled, lsm_scan_options,
-    lsm_streaming_scan_options, ns_prefix, prefix_filter_policies_from_env, prefixed,
-    range_covers_all_logical_keys, reader_options_from_env, scan_prefix_for_namespace_range,
-    shared_db_cache, shared_lsm_handle, shared_merge_operator, LsmBackend,
+    block_on_lsm, block_on_lsm_mapped, block_on_lsm_read, block_on_lsm_read_mapped,
+    collections_root_prefix, decode_dup_full_key, dup_composite, dup_key_prefix,
+    ensure_lsm_read_not_cancelled, list_child_collection_names, logical_key_in_range,
+    lsm_multi_get_enabled, lsm_scan_options, lsm_streaming_scan_options, ns_prefix,
+    prefix_filter_policies_from_env, prefixed, range_covers_all_logical_keys,
+    reader_options_from_env, scan_prefix_for_namespace_range, shared_db_cache, shared_lsm_handle,
+    shared_merge_operator, LsmBackend,
 };
 
 fn reader_io<E: std::fmt::Display>(e: E) -> BackendError {
@@ -52,6 +53,21 @@ fn reader_io<E: std::fmt::Display>(e: E) -> BackendError {
         metrics::counter!("helix_lsm_reader_snapshot_lease_lost_total").increment(1);
     }
     BackendError::Io(msg)
+}
+
+/// Stable marker carried by the reader-open error when SlateDB reports
+/// [`slatedb::ErrorCode::DatabaseMissing`] (no manifest at the collection
+/// prefix). The error is stringified on its way through `GraphError`, so the
+/// collection manager matches this marker — set only by the typed check in
+/// [`reader_open_err`] — to surface a collection-not-found (404). Must stay
+/// clear of `lsm_object_reference_is_missing` phrasing so it never quarantines.
+pub const LSM_READER_DATABASE_MISSING: &str = "LSM reader: database missing";
+
+fn reader_open_err(e: slatedb::Error) -> BackendError {
+    if e.code() == Some(slatedb::ErrorCode::DatabaseMissing) {
+        return BackendError::Io(format!("{LSM_READER_DATABASE_MISSING}: {e}"));
+    }
+    BackendError::Io(e.to_string())
 }
 
 const LSM_READER_BATCH_POINT_READ_CONCURRENCY: usize = 96;
@@ -80,6 +96,12 @@ pub struct LsmReader {
     /// `DbReader` (fresh checkpoint + new `manifest_poll_interval` tier) in
     /// place while in-flight reads keep the previous instance alive via `Arc`.
     reader: std::sync::RwLock<Arc<DbReader>>,
+    /// Bumped under the `reader` write lock on every swap. A single
+    /// `DbReader`'s view only moves forward, but a swapped-in reader may sit
+    /// at an OLDER state than the one it replaces, so callers that validate
+    /// a sequence of latest-state reads (e.g. the sparse cache epoch check)
+    /// must also see an unchanged generation.
+    generation: std::sync::atomic::AtomicU64,
     /// `Handle` to the process-shared LSM runtime (see
     /// [`super::backend_lsm::shared_lsm_runtime`]), NOT an owned runtime — so N
     /// reader replicas / collections share one worker pool.
@@ -110,6 +132,7 @@ impl LsmReader {
         let reader = Self::build_reader(&rt, path, store.clone(), options)?;
         Ok(Self {
             reader: std::sync::RwLock::new(Arc::new(reader)),
+            generation: std::sync::atomic::AtomicU64::new(0),
             rt,
             store,
             path: path.to_string(),
@@ -136,7 +159,7 @@ impl LsmReader {
             builder = builder.with_filter_policies(policies);
         }
         ensure_lsm_read_not_cancelled()?;
-        let reader = block_on_lsm(rt, builder.build())?;
+        let reader = block_on_lsm_mapped(rt, builder.build(), reader_open_err)?;
         if let Err(cancelled) = ensure_lsm_read_not_cancelled() {
             // The side-effecting build completed; explicitly tear down its
             // checkpoint/poller before surfacing request cancellation.
@@ -153,6 +176,11 @@ impl LsmReader {
             .read()
             .map(|guard| Arc::clone(&guard))
             .unwrap_or_else(|poisoned| Arc::clone(&poisoned.into_inner()))
+    }
+
+    /// Reader-swap generation; see the `generation` field.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Reopen the underlying `DbReader` against the CURRENT manifest with the
@@ -196,6 +224,8 @@ impl LsmReader {
                 .reader
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             std::mem::replace(&mut *slot, Arc::new(fresh))
         };
         self.rt.spawn(async move {
@@ -853,6 +883,25 @@ mod tests {
     ///
     /// Needs MinIO up with the `helion-test` bucket; run with
     /// `cargo test -p helixdb lsm_reader_sees_writer_dup_on_minio_s3 -- --ignored --nocapture`.
+    /// A reader opened on a prefix no writer ever created (collection missing
+    /// in object storage) must carry the typed `DatabaseMissing` marker so the
+    /// collection manager maps it to not-found (404) instead of a 500.
+    #[test]
+    fn lsm_reader_open_missing_database_is_tagged() {
+        use object_store::memory::InMemory;
+        use object_store::ObjectStore;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let err = match LsmReader::open_with_store("never-created", store) {
+            Ok(_) => panic!("reader open on an empty prefix must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(&err, BackendError::Io(msg) if msg.starts_with(LSM_READER_DATABASE_MISSING)),
+            "missing database must be tagged, got: {err}"
+        );
+    }
+
     /// HA / disposable-reader proof: object storage is the durable record; a
     /// reader's local state (DbReader snapshot + cache) is throwaway. A writer
     /// commits and is dropped; reader A reads then is dropped (simulating a reader

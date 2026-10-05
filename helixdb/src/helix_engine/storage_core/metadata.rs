@@ -246,6 +246,7 @@ mod tests {
                 snapshot_keep_last: Some(3),
                 raft: Default::default(),
             },
+            storage_backend: Default::default(),
         };
 
         let (storage, _temp_dir) = setup_storage(config);

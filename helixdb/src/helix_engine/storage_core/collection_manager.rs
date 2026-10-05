@@ -12,9 +12,10 @@ use heed3::CompactionOption;
 use slatedb::CloseReason;
 
 use crate::helix_engine::graph_core::config::Config;
-use crate::helix_engine::storage_core::backend::BackendKind;
+use crate::helix_engine::storage_core::backend::{BackendKind, StorageBackendConfig};
 use crate::helix_engine::storage_core::backend_any;
-use crate::helix_engine::storage_core::backend_lsm::mask_lsm_read_cancellation_for_writer_open;
+use crate::helix_engine::storage_core::backend_lsm::mask_lsm_read_cancellation_for_cold_open;
+use crate::helix_engine::storage_core::backend_lsm_reader::LSM_READER_DATABASE_MISSING;
 use crate::helix_engine::storage_core::metadata::StorageMetadataSidecar;
 use crate::helix_engine::storage_core::storage_core::{
     HelixGraphStorage, PayloadIndexGcFieldResult, RecountCounters,
@@ -66,25 +67,25 @@ fn cache_drop_hint_enabled() -> bool {
         .unwrap_or(true)
 }
 
-fn lsm_reader_cold_open_enabled() -> bool {
-    BackendKind::from_env() == BackendKind::Lsm
-        && std::env::var("HELIX_LSM_ROLE")
-            .map(|value| value.trim().eq_ignore_ascii_case("reader"))
-            .unwrap_or(false)
+fn lsm_reader_cold_open_enabled(storage_backend: StorageBackendConfig) -> bool {
+    storage_backend.is_reader()
 }
 
-fn lsm_writer_cold_open_needs_cancellation_mask() -> bool {
-    BackendKind::from_env() == BackendKind::Lsm && !lsm_reader_cold_open_enabled()
+fn lsm_cold_open_needs_cancellation_mask(storage_backend: StorageBackendConfig) -> bool {
+    storage_backend.is_lsm()
 }
 
-fn lsm_collection_cache_unbounded() -> bool {
-    BackendKind::from_env() == BackendKind::Lsm
-        && std::env::var("HELIX_LSM_COLLECTION_CACHE_UNBOUNDED")
-            .map(|value| {
-                let value = value.trim().to_ascii_lowercase();
-                !matches!(value.as_str(), "0" | "false" | "off" | "no")
-            })
-            .unwrap_or(false)
+fn lsm_collection_cache_unbounded(storage_backend: StorageBackendConfig) -> bool {
+    storage_backend.is_lsm() && lsm_collection_cache_unbounded_enabled()
+}
+
+fn lsm_collection_cache_unbounded_enabled() -> bool {
+    std::env::var("HELIX_LSM_COLLECTION_CACHE_UNBOUNDED")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
 }
 
 fn skip_periodic_snapshot_for_backend(kind: BackendKind) -> bool {
@@ -410,19 +411,27 @@ fn open_failure_backoff_error(name: &str) -> Option<GraphError> {
 /// maps to 404 rather than a replica-health 500. The phrasing must keep
 /// clear of `lsm_object_reference_is_missing` so a not-found can never
 /// quarantine the name.
+///
+/// The vendored SlateDB fork's `DbReader` instead reports a missing manifest
+/// as the typed `ErrorCode::DatabaseMissing`; `LsmReader` tags that case with
+/// [`LSM_READER_DATABASE_MISSING`] before the error is stringified, so the
+/// reader replica matches that marker rather than SlateDB's display text.
 fn missing_manifest_open_error(name: &str, error: GraphError) -> GraphError {
-    if error
-        .to_string()
+    let message = error.to_string();
+    if message
         .to_ascii_lowercase()
         .contains("latest transactional object")
+        || message.contains(LSM_READER_DATABASE_MISSING)
     {
         GraphError::New(format!(
-            "Collection '{name}' not found (no manifest in object store)"
+            "Collection '{name}' not found {MISSING_MANIFEST_NOT_FOUND_SUFFIX}"
         ))
     } else {
         error
     }
 }
+
+const MISSING_MANIFEST_NOT_FOUND_SUFFIX: &str = "(no manifest in object store)";
 
 fn open_failure_record(name: &str, error: &GraphError) {
     open_failure_record_inner(name, error, false);
@@ -430,6 +439,19 @@ fn open_failure_record(name: &str, error: &GraphError) {
 
 fn open_failure_record_quarantine(name: &str, error: &GraphError) {
     open_failure_record_inner(name, error, true);
+}
+
+fn fenced_writer_quarantine_error(name: &str, reason: CloseReason) -> GraphError {
+    GraphError::New(format!(
+        "Collection '{name}' LSM writer is fenced ({reason:?}); collection is quarantined until process replacement"
+    ))
+}
+
+fn record_fenced_writer_quarantine(name: &str, reason: CloseReason) -> GraphError {
+    let error = fenced_writer_quarantine_error(name, reason);
+    open_failure_record_quarantine(name, &error);
+    metrics::counter!("helix_collection_quarantine_total").increment(1);
+    error
 }
 
 fn open_failure_record_inner(name: &str, error: &GraphError, sticky_quarantine: bool) {
@@ -440,9 +462,17 @@ fn open_failure_record_inner(name: &str, error: &GraphError, sticky_quarantine: 
             last_error: String::new(),
             sticky_quarantine,
         });
-        entry.failures = entry.failures.saturating_add(1);
+        let last_error = error.to_string();
+        // A missing manifest is a cheap LIST, not an S3-hammering corrupt open:
+        // keep the base cooldown so a collection the writer creates right after
+        // is not hidden behind an escalated (up to 60s) not-found.
+        entry.failures = if last_error.contains(MISSING_MANIFEST_NOT_FOUND_SUFFIX) {
+            1
+        } else {
+            entry.failures.saturating_add(1)
+        };
         entry.last_attempt = Instant::now();
-        entry.last_error = error.to_string();
+        entry.last_error = last_error;
         entry.sticky_quarantine |= sticky_quarantine;
     }
 }
@@ -660,8 +690,9 @@ fn sweep_lsm_orphan_object_cache_dirs(
     collections: &Arc<RwLock<HashMap<String, CachedCollection>>>,
     collections_dir: &Path,
     reason: &'static str,
+    storage_backend: StorageBackendConfig,
 ) {
-    if BackendKind::from_env() != BackendKind::Lsm {
+    if !storage_backend.is_lsm() {
         return;
     }
     let Some(cache_root) = backend_any::lsm_cache_root_from_env() else {
@@ -855,15 +886,126 @@ fn schedule_cache_drop_after_close(
     }
 }
 
-/// Worker body for deferred collection cleanup. Spins until the moved-in
-/// `Arc<HelixGraphStorage>` is unique, drops it to close the LMDB env
-/// (releases the path from heed's process-wide `OPENED_ENV` registry), then
-/// removes the on-disk directory. If the Arc never becomes unique within
-/// `HELIX_DROP_DEFERRED_CLEANUP_MS`, logs and exits; the Arc drops at scope
-/// end so the env eventually closes but directory removal is skipped (the
-/// dir is orphaned — `list_collections` will still report it; the operator
-/// can reclaim it, or the next restart will clean up).
-fn spawn_lsm_purge_retry(path: PathBuf, name: String) {
+/// Object-store prefixes whose purge failed during `drop_collection` and has
+/// not yet been confirmed, keyed by collection path (the S3 prefix is derived
+/// from it, so a recreate of the same name reuses the same prefix). The value
+/// is the token of the retry worker that owns the purge. While an entry exists
+/// the name must not be (re)opened: the old manifest would resurrect dropped
+/// data, and a later retry would delete the live writer's new objects.
+static LSM_PURGE_PENDING: std::sync::LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static LSM_PURGE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn lsm_purge_pending_register(path: &Path) -> u64 {
+    let token = LSM_PURGE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut pending) = LSM_PURGE_PENDING.lock() {
+        pending.insert(path.to_path_buf(), token);
+    }
+    token
+}
+
+fn lsm_purge_pending(path: &Path) -> bool {
+    LSM_PURGE_PENDING
+        .lock()
+        .map(|pending| pending.contains_key(path))
+        // A poisoned registry cannot prove the prefix is clean; fail closed.
+        .unwrap_or(true)
+}
+
+fn lsm_purge_pending_clear(path: &Path) {
+    if let Ok(mut pending) = LSM_PURGE_PENDING.lock() {
+        pending.remove(path);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LsmPurgeRetryStep {
+    Purged,
+    Failed,
+    /// The pending entry is gone or owned by a newer drop: the prefix was
+    /// purged synchronously (e.g. by a recreate) and may now hold a live
+    /// collection. Purging it would destroy that collection's objects.
+    Superseded,
+}
+
+/// One retry attempt. Runs under the collection's open gate so it cannot
+/// interleave with a create/open of the same name, and only purges while
+/// this worker's token still owns the pending entry.
+fn lsm_purge_retry_attempt(
+    path: &Path,
+    token: u64,
+    open_gate: &Mutex<()>,
+    tombstone_exists: impl FnOnce() -> Result<bool, super::backend::BackendError>,
+    purge: impl FnOnce() -> Result<(), super::backend::BackendError>,
+    clear_tombstone: impl FnOnce() -> Result<(), super::backend::BackendError>,
+    name: &str,
+    attempt: u32,
+) -> LsmPurgeRetryStep {
+    let _guard = match open_gate.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let owns_entry = LSM_PURGE_PENDING
+        .lock()
+        .map(|pending| pending.get(path) == Some(&token))
+        .unwrap_or(false);
+    if !owns_entry {
+        return LsmPurgeRetryStep::Superseded;
+    }
+    match tombstone_exists() {
+        Ok(true) => {}
+        Ok(false) => return LsmPurgeRetryStep::Superseded,
+        Err(error) => {
+            warn!(
+                collection = %name,
+                attempt,
+                error = %error,
+                "LSM object-store drop tombstone lookup failed before purge retry"
+            );
+            return LsmPurgeRetryStep::Failed;
+        }
+    }
+    match purge() {
+        Ok(()) => {
+            if let Err(error) = clear_tombstone() {
+                warn!(
+                    collection = %name,
+                    attempt,
+                    error = %error,
+                    "LSM object-store drop tombstone cleanup failed after purge retry"
+                );
+                return LsmPurgeRetryStep::Failed;
+            }
+            if let Ok(mut pending) = LSM_PURGE_PENDING.lock() {
+                if pending.get(path) == Some(&token) {
+                    pending.remove(path);
+                }
+            }
+            LsmPurgeRetryStep::Purged
+        }
+        Err(error) => {
+            warn!(
+                collection = %name,
+                attempt,
+                error = %error,
+                "LSM object-store purge retry failed"
+            );
+            LsmPurgeRetryStep::Failed
+        }
+    }
+}
+
+/// Retry a failed drop-time prefix purge in the background. The caller must
+/// have registered `token` in `LSM_PURGE_PENDING` for `path`. On exhaustion the
+/// entry is left in place so the name stays unopenable until a later
+/// create/drop purges the prefix synchronously.
+fn spawn_lsm_purge_retry(
+    path: PathBuf,
+    name: String,
+    storage_backend: StorageBackendConfig,
+    token: u64,
+    open_gate: Arc<Mutex<()>>,
+) {
     metrics::counter!(
         "helix_collection_drop_purge_retry_scheduled_total",
         "collection" => name.clone()
@@ -874,43 +1016,54 @@ fn spawn_lsm_purge_retry(path: PathBuf, name: String) {
         .spawn({
             let name = name.clone();
             move || {
-            let mut backoff = Duration::from_secs(10);
-            for attempt in 1..=6u32 {
-                thread::sleep(backoff);
-                match backend_any::purge_lsm_prefix_from_env(&path) {
-                    Ok(()) => {
-                        info!(
-                            collection = %name,
-                            attempt,
-                            "LSM object-store purge retry succeeded"
-                        );
-                        metrics::counter!(
-                            "helix_collection_drop_purge_retry_success_total",
-                            "collection" => name.clone()
-                        )
-                        .increment(1);
-                        return;
+                let mut backoff = Duration::from_secs(10);
+                for attempt in 1..=6u32 {
+                    thread::sleep(backoff);
+                    let step = lsm_purge_retry_attempt(
+                        &path,
+                        token,
+                        &open_gate,
+                        || backend_any::lsm_drop_tombstone_exists_from_env(&path, storage_backend),
+                        || backend_any::purge_lsm_prefix_from_env(&path, storage_backend),
+                        || backend_any::clear_lsm_drop_tombstone_from_env(&path, storage_backend),
+                        &name,
+                        attempt,
+                    );
+                    match step {
+                        LsmPurgeRetryStep::Purged => {
+                            info!(
+                                collection = %name,
+                                attempt,
+                                "LSM object-store purge retry succeeded"
+                            );
+                            metrics::counter!(
+                                "helix_collection_drop_purge_retry_success_total",
+                                "collection" => name.clone()
+                            )
+                            .increment(1);
+                            return;
+                        }
+                        LsmPurgeRetryStep::Superseded => {
+                            info!(
+                                collection = %name,
+                                attempt,
+                                "LSM object-store purge retry superseded (prefix already purged or recreated); not purging"
+                            );
+                            return;
+                        }
+                        LsmPurgeRetryStep::Failed => {}
                     }
-                    Err(error) => {
-                        warn!(
-                            collection = %name,
-                            attempt,
-                            error = %error,
-                            "LSM object-store purge retry failed"
-                        );
-                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(300));
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(300));
-            }
-            warn!(
-                collection = %name,
-                "LSM object-store purge retries exhausted; prefix is orphaned and needs manual cleanup"
-            );
-            metrics::counter!(
-                "helix_collection_drop_purge_retry_exhausted_total",
-                "collection" => name.clone()
-            )
-            .increment(1);
+                warn!(
+                    collection = %name,
+                    "LSM object-store purge retries exhausted; prefix is orphaned and the name stays blocked until a create/drop purges it"
+                );
+                metrics::counter!(
+                    "helix_collection_drop_purge_retry_exhausted_total",
+                    "collection" => name.clone()
+                )
+                .increment(1);
             }
         });
     if let Err(error) = spawned {
@@ -922,6 +1075,14 @@ fn spawn_lsm_purge_retry(path: PathBuf, name: String) {
     }
 }
 
+/// Worker body for deferred collection cleanup. Spins until the moved-in
+/// `Arc<HelixGraphStorage>` is unique, drops it to close the LMDB env
+/// (releases the path from heed's process-wide `OPENED_ENV` registry), then
+/// removes the on-disk directory. If the Arc never becomes unique within
+/// `HELIX_DROP_DEFERRED_CLEANUP_MS`, logs and exits; the Arc drops at scope
+/// end so the env eventually closes but directory removal is skipped (the
+/// dir is orphaned — `list_collections` will still report it; the operator
+/// can reclaim it, or the next restart will clean up).
 fn deferred_drop_cleanup(storage: Arc<HelixGraphStorage>, path: PathBuf, name: String) {
     let mut arc = Some(storage);
     let started = Instant::now();
@@ -2096,13 +2257,16 @@ fn fetch_feed_changes(
 /// manifest/WAL polling floor with S3 traffic proportional to write activity.
 /// Enabled only on LSM reader replicas with `HELIX_LSM_WRITER_FEED_URL` set;
 /// unset keeps the previous per-collection S3 polling behavior.
-fn spawn_reader_change_feed_poller(collections: &Arc<RwLock<HashMap<String, CachedCollection>>>) {
+fn spawn_reader_change_feed_poller(
+    collections: &Arc<RwLock<HashMap<String, CachedCollection>>>,
+    storage_backend: StorageBackendConfig,
+) {
     use crate::helix_engine::storage_core::backend_lsm::{
         reader_active_poll_interval_from_env, reader_active_ttl_from_env,
         reader_feed_poll_interval_from_env, reader_idle_poll_interval_from_env,
         writer_feed_url_from_env,
     };
-    if !lsm_reader_cold_open_enabled() {
+    if !lsm_reader_cold_open_enabled(storage_backend) {
         return;
     }
     let Some(feed_url) = writer_feed_url_from_env() else {
@@ -2292,12 +2456,15 @@ fn reader_poll_tier_sweeper_should_demote(
 /// write-driven active set — it has no notion of "was this promoted for a
 /// read that stopped happening". Per-collection coordination with the feed
 /// poller is via `write_promoted_recently`, not by disabling the sweep.
-fn spawn_reader_poll_tier_sweeper(collections: &Arc<RwLock<HashMap<String, CachedCollection>>>) {
+fn spawn_reader_poll_tier_sweeper(
+    collections: &Arc<RwLock<HashMap<String, CachedCollection>>>,
+    storage_backend: StorageBackendConfig,
+) {
     use crate::helix_engine::storage_core::backend_lsm::{
         reader_idle_after_from_env, reader_idle_poll_interval_from_env,
         reader_poll_tier_sweeper_enabled,
     };
-    if !lsm_reader_cold_open_enabled() {
+    if !lsm_reader_cold_open_enabled(storage_backend) {
         return;
     }
     let idle_after = reader_idle_after_from_env();
@@ -2683,6 +2850,7 @@ impl CollectionManager {
     pub fn new(data_dir: PathBuf, config: Config) -> Result<Self, GraphError> {
         let collections_dir = data_dir.join("collections");
         fs::create_dir_all(&collections_dir)?;
+        let storage_backend = config.storage_backend;
 
         // LSM catalog rediscovery: a writer that starts with an empty /data
         // (fresh node, PVC loss, or a reader replica) only knows about
@@ -2691,8 +2859,8 @@ impl CollectionManager {
         // re-registered (lazily — just a marker dir) and become visible to
         // describe / list / cold-open. Best-effort: a listing failure is logged
         // and never blocks startup.
-        if BackendKind::from_env() == BackendKind::Lsm {
-            Self::reconcile_lsm_catalog(&collections_dir);
+        if storage_backend.is_lsm() {
+            Self::reconcile_lsm_catalog(&collections_dir, storage_backend);
         }
 
         // Load persisted aliases
@@ -2704,7 +2872,7 @@ impl CollectionManager {
             HashMap::new()
         };
 
-        let lsm_cache_unbounded = lsm_collection_cache_unbounded();
+        let lsm_cache_unbounded = lsm_collection_cache_unbounded(storage_backend);
         let max = max_open_collections();
         let on_disk = count_collections_on_disk(&collections_dir);
         if !lsm_cache_unbounded {
@@ -2719,7 +2887,12 @@ impl CollectionManager {
         );
 
         let collections = Arc::new(RwLock::new(HashMap::new()));
-        sweep_lsm_orphan_object_cache_dirs(&collections, &collections_dir, "startup_orphan");
+        sweep_lsm_orphan_object_cache_dirs(
+            &collections,
+            &collections_dir,
+            "startup_orphan",
+            storage_backend,
+        );
         // The idle collection sweeper reclaims cold/idle collections — closing the
         // SlateDB handle and freeing the in-memory HNSW/segment state (eviction
         // also removes the object-store cache subtree). It must run even when
@@ -2733,8 +2906,8 @@ impl CollectionManager {
         // mmap pages and has nothing to reclaim on the SlateDB object-store path,
         // so it stays off under LSM.
         spawn_idle_collection_sweeper(&collections);
-        spawn_reader_change_feed_poller(&collections);
-        spawn_reader_poll_tier_sweeper(&collections);
+        spawn_reader_change_feed_poller(&collections, storage_backend);
+        spawn_reader_poll_tier_sweeper(&collections, storage_backend);
         if lsm_cache_unbounded {
             metrics::counter!(
                 "helix_page_cache_sweeper_total",
@@ -2768,8 +2941,8 @@ impl CollectionManager {
     /// `collection_exists`, and `get_collection` cold-open to find it; the Db is
     /// not opened here. Never fails: listing or `mkdir` errors are logged and the
     /// node continues (collections are still found lazily on first touch).
-    fn reconcile_lsm_catalog(collections_dir: &Path) {
-        match backend_any::list_collection_prefixes_from_env() {
+    fn reconcile_lsm_catalog(collections_dir: &Path, storage_backend: StorageBackendConfig) {
+        match backend_any::list_collection_prefixes_from_env(storage_backend) {
             Ok(names) => {
                 let mut registered = 0usize;
                 for name in names {
@@ -2809,11 +2982,23 @@ impl CollectionManager {
     /// serve it (a describe/get of an un-loaded-but-in-S3 collection returns its
     /// config instead of 404). Returns `false` on LMDB, when the collection is
     /// absent in S3, or when the listing fails (treated as not found).
-    fn rediscover_lsm_collection(name: &str, path: &Path) -> bool {
-        if BackendKind::from_env() != BackendKind::Lsm {
+    fn rediscover_lsm_collection(&self, name: &str, path: &Path) -> bool {
+        if !self.config.storage_backend.is_lsm() {
             return false;
         }
-        match backend_any::list_collection_prefixes_from_env() {
+        match backend_any::lsm_drop_tombstone_exists_from_env(path, self.config.storage_backend) {
+            Ok(false) => {}
+            Ok(true) => return false,
+            Err(e) => {
+                warn!(
+                    collection = %name,
+                    error = %e,
+                    "LSM rediscovery: drop tombstone lookup failed; treating as not found"
+                );
+                return false;
+            }
+        }
+        match backend_any::list_collection_prefixes_from_env(self.config.storage_backend) {
             Ok(names) => {
                 if !names.iter().any(|n| n == name) {
                     return false;
@@ -2901,6 +3086,61 @@ impl CollectionManager {
         storage.set_write_txn_gate(self.write_gate(name));
         storage.seed_lsm_counter_keys()?;
         Ok(storage)
+    }
+
+    /// Called under the open gate before (re)creating `name`. If a previous
+    /// drop left its object-store prefix un-purged, purge it synchronously now
+    /// (the prefix is name-derived, so the new incarnation would otherwise open
+    /// the old manifest and a later background retry would delete its objects).
+    /// Refuses with a retryable error while the prefix cannot be purged.
+    fn resolve_pending_lsm_purge(&self, name: &str, path: &Path) -> Result<(), GraphError> {
+        let process_pending = lsm_purge_pending(path);
+        let durable_pending = match backend_any::lsm_drop_tombstone_exists_from_env(
+            path,
+            self.config.storage_backend,
+        ) {
+            Ok(pending) => pending,
+            Err(e) => {
+                return Err(GraphError::PurgePending(format!(
+                    "Collection '{}' cannot be created yet: object-store drop tombstone \
+                         status is unavailable ({}); retry later",
+                    name, e
+                )));
+            }
+        };
+        if !process_pending && !durable_pending {
+            return Ok(());
+        }
+        match backend_any::purge_lsm_prefix_from_env(path, self.config.storage_backend) {
+            Ok(()) => {
+                backend_any::clear_lsm_drop_tombstone_from_env(path, self.config.storage_backend)
+                    .map_err(|e| {
+                    GraphError::PurgePending(format!(
+                        "Collection '{}' cannot be created yet: object-store purge completed \
+                             but drop tombstone cleanup failed ({}); retry later",
+                        name, e
+                    ))
+                })?;
+                lsm_purge_pending_clear(path);
+                info!(
+                    collection = %name,
+                    "Purged pending LSM object-store prefix before recreate"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                metrics::counter!(
+                    "helix_collection_create_refused_purge_pending_total",
+                    "collection" => name.to_string()
+                )
+                .increment(1);
+                Err(GraphError::PurgePending(format!(
+                    "Collection '{}' cannot be created yet: object-store purge of the \
+                     previously dropped collection is still pending ({}); retry later",
+                    name, e
+                )))
+            }
+        }
     }
 
     fn mark_dropping(&self, name: &str) {
@@ -3062,6 +3302,12 @@ impl CollectionManager {
             .read()
             .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
         if let Some(entry) = collections.get(name) {
+            if matches!(
+                entry.storage.unhealthy_lsm_writer_close_reason(),
+                Some(CloseReason::Fenced)
+            ) {
+                return Err(record_fenced_writer_quarantine(name, CloseReason::Fenced));
+            }
             touch_cached_collection(entry);
             return Ok(Some(Arc::clone(&entry.storage)));
         }
@@ -3137,6 +3383,23 @@ impl CollectionManager {
         Ok(collections.keys().cloned().collect())
     }
 
+    /// Names of currently-loaded collections, most-recently-accessed first.
+    /// Like [`loaded_collection_names`] this clones no storage `Arc`s and does
+    /// not touch LRU state; used to persist the reader warm hot-list.
+    pub fn loaded_collection_names_by_recency(&self) -> Result<Vec<String>, GraphError> {
+        let collections = self
+            .collections
+            .read()
+            .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
+        let mut names: Vec<(u64, String)> = collections
+            .iter()
+            .map(|(name, entry)| (entry.last_access.load(Ordering::Relaxed), name.clone()))
+            .collect();
+        drop(collections);
+        names.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(names.into_iter().map(|(_, name)| name).collect())
+    }
+
     /// Admission for automatic maintenance that would open a cold collection.
     ///
     /// Foreground traffic still uses `get_collection` and can wait/retry through
@@ -3146,7 +3409,7 @@ impl CollectionManager {
     pub fn maintenance_cold_open_admission(&self, name: &str) -> MaintenanceAdmission {
         let resolved = self.resolve_alias(name);
         let name = resolved.as_str();
-        if lsm_collection_cache_unbounded() {
+        if lsm_collection_cache_unbounded(self.config.storage_backend) {
             metrics::counter!(
                 "helix_maintenance_cold_open_admission_total",
                 "outcome" => "admitted",
@@ -3230,7 +3493,10 @@ impl CollectionManager {
     ) -> Result<Option<StorageMetadataSidecar>, GraphError> {
         let resolved = self.resolve_alias(name);
         let path = self.collection_path(&resolved);
-        HelixGraphStorage::read_metadata_sidecar_from_path_or_lsm(&path)
+        HelixGraphStorage::read_metadata_sidecar_from_path_or_lsm(
+            &path,
+            self.config.storage_backend,
+        )
     }
 
     pub fn collection_storage_bytes(
@@ -3496,13 +3762,11 @@ impl CollectionManager {
         )
     }
 
-    /// Evict cached collections whose LSM writer backend is permanently dead
-    /// (epoch-fenced by a newer writer during a rollout, or closed by an
-    /// internal panic). Such a handle can never commit again — SlateDB's
-    /// background tasks (`l0_manifest_writer`, compactor) just error-loop
-    /// against object storage forever, burning S3 requests. Dropping the
-    /// entry lets the next access reopen the collection under a fresh writer
-    /// epoch, so the node heals itself without a pod restart.
+    /// Evict cached collections whose LSM writer backend was closed by an
+    /// internal panic. A genuinely fenced writer is different: reopening in the
+    /// same process would claim a new writer epoch and could fence the active
+    /// writer, so fenced entries stay resident, unhealthy, and quarantined until
+    /// process replacement.
     fn evict_unhealthy_writers(collections: &mut HashMap<String, CachedCollection>) -> u64 {
         let unhealthy: Vec<(String, CloseReason)> = collections
             .iter()
@@ -3516,6 +3780,16 @@ impl CollectionManager {
 
         let mut evicted = 0u64;
         for (name, reason) in unhealthy {
+            if matches!(reason, CloseReason::Fenced) {
+                let error = record_fenced_writer_quarantine(&name, reason);
+                warn!(
+                    collection = %name,
+                    close_reason = ?reason,
+                    error = %error,
+                    "Quarantined fenced LSM writer without reopening in this process"
+                );
+                continue;
+            }
             if let Some(entry) = collections.remove(&name) {
                 let weak = Arc::downgrade(&entry.storage);
                 let path = entry.path.clone();
@@ -3546,7 +3820,7 @@ impl CollectionManager {
         storage: Arc<HelixGraphStorage>,
         opening: usize,
     ) {
-        if !lsm_collection_cache_unbounded() {
+        if storage.backend.kind() != BackendKind::Lsm || !lsm_collection_cache_unbounded_enabled() {
             Self::evict_idle_for_capacity(collections, opening);
         }
         let tick = LRU_CLOCK.fetch_add(1, Ordering::Relaxed);
@@ -3567,7 +3841,7 @@ impl CollectionManager {
     }
 
     fn reserve_open_slot(&self, name: &str) -> Result<OpenSlotReservation<'_>, GraphError> {
-        if lsm_collection_cache_unbounded() {
+        if lsm_collection_cache_unbounded(self.config.storage_backend) {
             metrics::counter!(
                 "helix_collection_open_admission_total",
                 "outcome" => "admitted",
@@ -3894,6 +4168,7 @@ impl CollectionManager {
                 name
             )));
         }
+        self.resolve_pending_lsm_purge(name, &path)?;
 
         let open_slot = self.reserve_open_slot(name)?;
         let storage = self.open_collection_storage(&path, name)?;
@@ -3941,6 +4216,13 @@ impl CollectionManager {
                 .read()
                 .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
             if let Some(entry) = collections.get(name) {
+                if matches!(
+                    entry.storage.unhealthy_lsm_writer_close_reason(),
+                    Some(CloseReason::Fenced)
+                ) {
+                    metrics::counter!("helix_collection_cache_hits_total").increment(1);
+                    return Err(record_fenced_writer_quarantine(name, CloseReason::Fenced));
+                }
                 touch_cached_collection(entry);
                 entry
                     .storage
@@ -3986,6 +4268,13 @@ impl CollectionManager {
                 .read()
                 .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
             if let Some(existing) = collections.get(name) {
+                if matches!(
+                    existing.storage.unhealthy_lsm_writer_close_reason(),
+                    Some(CloseReason::Fenced)
+                ) {
+                    metrics::counter!("helix_collection_cache_hits_total").increment(1);
+                    return Err(record_fenced_writer_quarantine(name, CloseReason::Fenced));
+                }
                 touch_cached_collection(existing);
                 metrics::counter!("helix_collection_cache_hits_total").increment(1);
                 record_cold_open_duration(cold_open_started, "race_hit_after_gate");
@@ -4004,9 +4293,32 @@ impl CollectionManager {
         }
 
         let path = self.collection_path(name);
+        // A dropped collection whose prefix purge is still pending is
+        // logically gone; rediscovery would reopen its old manifest.
+        let durable_purge_pending = match backend_any::lsm_drop_tombstone_exists_from_env(
+            &path,
+            self.config.storage_backend,
+        ) {
+            Ok(pending) => pending,
+            Err(e) => {
+                record_cold_open_duration(cold_open_started, "purge_pending_read_error");
+                return Err(GraphError::PurgePending(format!(
+                    "Collection '{}' cannot be opened yet: object-store drop tombstone \
+                         status is unavailable ({}); retry later",
+                    name, e
+                )));
+            }
+        };
+        if lsm_purge_pending(&path) || durable_purge_pending {
+            record_cold_open_duration(cold_open_started, "purge_pending");
+            return Err(GraphError::New(format!(
+                "Collection '{}' not found (object-store purge pending)",
+                name
+            )));
+        }
         if !path.exists()
-            && !lsm_reader_cold_open_enabled()
-            && !Self::rediscover_lsm_collection(name, &path)
+            && !lsm_reader_cold_open_enabled(self.config.storage_backend)
+            && !self.rediscover_lsm_collection(name, &path)
         {
             record_cold_open_duration(cold_open_started, "not_found");
             return Err(GraphError::New(format!("Collection '{}' not found", name)));
@@ -4025,6 +4337,13 @@ impl CollectionManager {
                 .read()
                 .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
             if let Some(existing) = collections.get(name) {
+                if matches!(
+                    existing.storage.unhealthy_lsm_writer_close_reason(),
+                    Some(CloseReason::Fenced)
+                ) {
+                    metrics::counter!("helix_collection_cache_hits_total").increment(1);
+                    return Err(record_fenced_writer_quarantine(name, CloseReason::Fenced));
+                }
                 touch_cached_collection(existing);
                 metrics::counter!("helix_collection_cache_hits_total").increment(1);
                 record_cold_open_duration(cold_open_started, "race_hit_after_admission");
@@ -4035,24 +4354,25 @@ impl CollectionManager {
         metrics::counter!("helix_collection_cache_load_misses_total").increment(1);
         debug!(collection = name, "Lazy-opening collection from disk");
 
-        // SlateDB writer build can fence an earlier handle before it resolves.
-        // Once that side-effecting build starts, defer request cancellation
-        // through storage initialization and cache publication so the new
-        // writer is never discarded before it becomes the resident handle.
+        // SlateDB writer and reader builds have side effects and cannot be
+        // aborted safely. Once a build starts, defer request cancellation
+        // through storage initialization and cache publication so the completed
+        // handle is not discarded before it becomes resident.
         // The mask constructor atomically rejects requests already cancelled
         // while queued behind `open_gate`; dropping it after `cache_insert`
         // restores the token for the handler's first ordinary read.
-        let writer_open_cancellation_mask = if lsm_writer_cold_open_needs_cancellation_mask() {
-            match mask_lsm_read_cancellation_for_writer_open() {
-                Ok(mask) => Some(mask),
-                Err(error) => {
-                    record_cold_open_duration(cold_open_started, "cancelled_before_open");
-                    return Err(graph_error_from_backend_error(error));
+        let cold_open_cancellation_mask =
+            if lsm_cold_open_needs_cancellation_mask(self.config.storage_backend) {
+                match mask_lsm_read_cancellation_for_cold_open() {
+                    Ok(mask) => Some(mask),
+                    Err(error) => {
+                        record_cold_open_duration(cold_open_started, "cancelled_before_open");
+                        return Err(graph_error_from_backend_error(error));
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let storage = match self.open_collection_storage(&path, name) {
             Ok(storage) => storage,
             Err(err) => {
@@ -4093,7 +4413,7 @@ impl CollectionManager {
             Arc::clone(&storage),
             self.open_reservations.load(Ordering::Acquire),
         );
-        drop(writer_open_cancellation_mask);
+        drop(cold_open_cancellation_mask);
         drop(open_slot);
         record_cold_open_duration(cold_open_started, "loaded");
 
@@ -4154,6 +4474,12 @@ impl CollectionManager {
                 .read()
                 .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
             if let Some(entry) = collections.get(name) {
+                if matches!(
+                    entry.storage.unhealthy_lsm_writer_close_reason(),
+                    Some(CloseReason::Fenced)
+                ) {
+                    return Err(record_fenced_writer_quarantine(name, CloseReason::Fenced));
+                }
                 touch_cached_collection(entry);
                 return Ok(Arc::clone(&entry.storage));
             }
@@ -4178,6 +4504,12 @@ impl CollectionManager {
                 .read()
                 .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
             if let Some(entry) = collections.get(name) {
+                if matches!(
+                    entry.storage.unhealthy_lsm_writer_close_reason(),
+                    Some(CloseReason::Fenced)
+                ) {
+                    return Err(record_fenced_writer_quarantine(name, CloseReason::Fenced));
+                }
                 touch_cached_collection(entry);
                 return Ok(Arc::clone(&entry.storage));
             }
@@ -4188,6 +4520,7 @@ impl CollectionManager {
         }
 
         let path = self.collection_path(name);
+        self.resolve_pending_lsm_purge(name, &path)?;
         let open_slot = self.reserve_open_slot(name)?;
         let storage = self.open_collection_storage(&path, name)?;
         open_failure_clear_after_successful_open(name);
@@ -4235,6 +4568,39 @@ impl CollectionManager {
             .lock()
             .map_err(|e| GraphError::New(format!("Open gate poisoned: {}", e)))?;
 
+        let path = self.collection_path(name);
+        let is_object_store_writer = self.config.storage_backend.is_lsm()
+            && !self.config.storage_backend.is_lsm_in_memory()
+            && !self.config.storage_backend.is_reader();
+        let should_persist_lsm_tombstone = is_object_store_writer
+            && (path.exists()
+                || self
+                    .collections
+                    .read()
+                    .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?
+                    .contains_key(name)
+                || backend_any::lsm_collection_prefix_exists_from_env(
+                    &path,
+                    self.config.storage_backend,
+                )
+                .map_err(|e| {
+                    GraphError::PurgePending(format!(
+                        "Collection '{}' cannot be dropped: object-store prefix status \
+                         is unavailable before teardown ({})",
+                        name, e
+                    ))
+                })?);
+        if should_persist_lsm_tombstone {
+            backend_any::persist_lsm_drop_tombstone_from_env(&path, self.config.storage_backend)
+                .map_err(|e| {
+                    GraphError::PurgePending(format!(
+                        "Collection '{}' cannot be dropped: failed to persist object-store \
+                         drop tombstone before teardown ({})",
+                        name, e
+                    ))
+                })?;
+        }
+
         self.mark_dropping(name);
 
         // Take the Arc out of the cache while holding the write lock.
@@ -4251,8 +4617,6 @@ impl CollectionManager {
         if let Ok(mut gates) = self.snapshot_gates.write() {
             gates.remove(name);
         }
-        let path = self.collection_path(name);
-
         // Publish the Weak into `closing` BEFORE removing the on-disk
         // directory. Otherwise a concurrent get_collection that passed the
         // cache-miss check sees no `closing` entry AND no path, and returns
@@ -4279,24 +4643,60 @@ impl CollectionManager {
         //
         // LMDB / LsmReader arms are no-ops; the existing `remove_dir_all`
         // below handles the local LMDB env directory on all backends.
-        if let Some(ref entry) = removed {
-            if let Err(e) = entry.storage.backend.destroy_lsm() {
+        //
+        // A failed purge registers the prefix as pending (see
+        // `LSM_PURGE_PENDING`) so the name cannot be reopened/recreated on the
+        // old manifest, and so the retry worker aborts once a later
+        // create/drop has purged the prefix itself.
+        let purge_result = if let Some(ref entry) = removed {
+            entry.storage.backend.destroy_lsm().map(|()| true)
+        } else if self.config.storage_backend.is_lsm()
+            && (!is_object_store_writer || should_persist_lsm_tombstone)
+        {
+            backend_any::purge_lsm_prefix_from_env(&path, self.config.storage_backend)
+                .map(|()| true)
+        } else {
+            Ok(false)
+        };
+        match purge_result {
+            Ok(true) => {
+                if let Err(e) = backend_any::clear_lsm_drop_tombstone_from_env(
+                    &path,
+                    self.config.storage_backend,
+                ) {
+                    warn!(
+                        collection = %name,
+                        error = %e,
+                        "LSM object-store drop tombstone cleanup failed after purge"
+                    );
+                    let token = lsm_purge_pending_register(&path);
+                    spawn_lsm_purge_retry(
+                        path.clone(),
+                        name.to_string(),
+                        self.config.storage_backend,
+                        token,
+                        Arc::clone(&open_gate),
+                    );
+                } else {
+                    lsm_purge_pending_clear(&path);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
                 warn!(
                     collection = %name,
                     error = %e,
+                    loaded = removed.is_some(),
                     "LSM object-store purge failed during drop; retrying in background"
                 );
-                spawn_lsm_purge_retry(path.clone(), name.to_string());
-            }
-        }
-        if removed.is_none() && BackendKind::from_env() == BackendKind::Lsm {
-            if let Err(e) = backend_any::purge_lsm_prefix_from_env(&path) {
-                warn!(
-                    collection = %name,
-                    error = %e,
-                    "LSM object-store purge failed for closed collection drop; retrying in background"
+                let token = lsm_purge_pending_register(&path);
+                spawn_lsm_purge_retry(
+                    path.clone(),
+                    name.to_string(),
+                    self.config.storage_backend,
+                    token,
+                    Arc::clone(&open_gate),
                 );
-                spawn_lsm_purge_retry(path.clone(), name.to_string());
             }
         }
 
@@ -4403,8 +4803,8 @@ impl CollectionManager {
         // yet in the local registry (e.g. created before a PVC loss, or not yet
         // touched since a fresh start). Best-effort: a listing failure falls back
         // to the local-only view rather than erroring the request.
-        if BackendKind::from_env() == BackendKind::Lsm {
-            match backend_any::list_collection_prefixes_from_env() {
+        if self.config.storage_backend.is_lsm() {
+            match backend_any::list_collection_prefixes_from_env(self.config.storage_backend) {
                 Ok(s3_names) => {
                     for name in s3_names {
                         if !name.is_empty() {
@@ -4417,6 +4817,27 @@ impl CollectionManager {
                     "list_collections: object-store listing failed; returning local view only"
                 ),
             }
+            let mut visible = HashSet::with_capacity(names.len());
+            for name in names {
+                let path = self.collection_path(&name);
+                match backend_any::lsm_drop_tombstone_exists_from_env(
+                    &path,
+                    self.config.storage_backend,
+                ) {
+                    Ok(false) => {
+                        visible.insert(name);
+                    }
+                    Ok(true) => {}
+                    Err(e) => {
+                        return Err(GraphError::PurgePending(format!(
+                            "Collection '{}' cannot be listed: object-store drop tombstone \
+                             status is unavailable ({}); retry later",
+                            name, e
+                        )));
+                    }
+                }
+            }
+            names = visible;
         }
         let mut names: Vec<String> = names.into_iter().collect();
         names.sort();
@@ -4488,7 +4909,10 @@ impl CollectionManager {
         }
 
         let path = self.collection_path(&resolved);
-        let sidecar = HelixGraphStorage::read_metadata_sidecar_from_path_or_lsm(&path)?;
+        let sidecar = HelixGraphStorage::read_metadata_sidecar_from_path_or_lsm(
+            &path,
+            self.config.storage_backend,
+        )?;
         let (metadata, disk_bytes) = match sidecar {
             Some(sidecar) => (sidecar.metadata, sidecar.data_mdb_bytes),
             None => {
@@ -4582,6 +5006,10 @@ impl CollectionManager {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn backend_kind(&self) -> BackendKind {
+        self.config.storage_backend.kind()
     }
 
     pub fn snapshot_interval_secs(&self) -> u64 {
@@ -5751,6 +6179,7 @@ fn prune_snapshots(path: &Path, keep_last: usize) -> Result<(), GraphError> {
 mod tests {
     use super::*;
     use crate::helix_engine::graph_core::config::{GraphConfig, VectorConfig};
+    use crate::helix_engine::storage_core::backend::{LsmRole, LsmStorage};
     use crate::helix_engine::storage_core::backend_lsm::{
         allow_lsm_blocking_cancellable, LsmReadCancellation,
     };
@@ -5788,6 +6217,42 @@ mod tests {
             other.to_string().contains("connection reset"),
             "unrelated open errors must pass through unchanged"
         );
+    }
+
+    #[test]
+    fn lsm_reader_database_missing_open_error_maps_to_not_found() {
+        // Exact shape `new_lsm` produces from `LsmReader::open_with_store` when
+        // SlateDB reports `ErrorCode::DatabaseMissing`.
+        let err = missing_manifest_open_error(
+            "codebase",
+            GraphError::StorageError(format!(
+                "io error: {LSM_READER_DATABASE_MISSING}: Data error: database does not exist"
+            )),
+        );
+        assert!(
+            matches!(&err, GraphError::New(m)
+                if m == "Collection 'codebase' not found (no manifest in object store)"),
+            "missing reader database must surface as not-found (404), got: {err}"
+        );
+        assert!(
+            !err.should_quarantine_collection(),
+            "not-found must never quarantine the collection name"
+        );
+
+        // Other reader-open storage failures (S3, corruption, other SlateDB
+        // data errors) must stay unchanged so they still surface as 500.
+        for message in [
+            "io error: Generic S3 error: request failed: 503 Slow Down",
+            "io error: Data error: invalid DB state error",
+            "io error: Data error: database does not exist",
+        ] {
+            let other =
+                missing_manifest_open_error("codebase", GraphError::StorageError(message.into()));
+            assert!(
+                matches!(&other, GraphError::StorageError(m) if m == message),
+                "unrelated reader-open errors must pass through unchanged, got: {other}"
+            );
+        }
     }
 
     struct EnvRestore {
@@ -5861,35 +6326,44 @@ mod tests {
 
     #[test]
     fn lsm_reader_cold_open_is_enabled_only_for_reader_role() {
-        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let reader = StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Reader,
+        };
+        let writer = StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        };
 
-        {
-            let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
-            let _role = EnvRestore::set("HELIX_LSM_ROLE", "reader");
-            assert!(lsm_reader_cold_open_enabled());
-        }
+        assert!(lsm_reader_cold_open_enabled(reader));
+        assert!(!lsm_reader_cold_open_enabled(writer));
+        assert!(!lsm_reader_cold_open_enabled(StorageBackendConfig::Lmdb));
+    }
 
-        {
-            let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
-            let _role = EnvRestore::set("HELIX_LSM_ROLE", "writer");
-            assert!(!lsm_reader_cold_open_enabled());
-        }
+    #[test]
+    fn lsm_cold_open_masks_cancellation_for_reader_and_writer_roles() {
+        let reader = StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Reader,
+        };
+        let writer = StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        };
 
-        {
-            let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lmdb");
-            let _role = EnvRestore::set("HELIX_LSM_ROLE", "reader");
-            assert!(!lsm_reader_cold_open_enabled());
-        }
+        assert!(lsm_cold_open_needs_cancellation_mask(reader));
+        assert!(lsm_cold_open_needs_cancellation_mask(writer));
+        assert!(!lsm_cold_open_needs_cancellation_mask(
+            StorageBackendConfig::Lmdb
+        ));
     }
 
     #[test]
     fn lsm_opened_handles_for_one_collection_share_write_gate() {
-        let _lock = ENV_TEST_LOCK.lock().unwrap();
-        let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
-        let _in_mem = EnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let tmp = TempDir::new().unwrap();
-        let mgr = CollectionManager::new(tmp.path().to_path_buf(), test_config()).unwrap();
+        let mgr =
+            CollectionManager::new(tmp.path().to_path_buf(), test_config().with_lsm_in_memory())
+                .unwrap();
 
         let path = mgr.collection_path("same");
         let first = mgr.open_collection_storage(&path, "same").unwrap();
@@ -5903,13 +6377,10 @@ mod tests {
 
     #[test]
     fn cancelled_writer_cold_open_skips_cache_and_failure_backoff() {
-        let _lock = ENV_TEST_LOCK.lock().unwrap();
-        let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
-        let _in_mem = EnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-        let _role = EnvRestore::set("HELIX_LSM_ROLE", "writer");
-
         let tmp = TempDir::new().unwrap();
-        let mgr = CollectionManager::new(tmp.path().to_path_buf(), test_config()).unwrap();
+        let mgr =
+            CollectionManager::new(tmp.path().to_path_buf(), test_config().with_lsm_in_memory())
+                .unwrap();
         let name = "cancelled_writer_cold_open";
         let storage = mgr.create_collection(name).unwrap();
         drop(storage);
@@ -5937,13 +6408,13 @@ mod tests {
     #[test]
     fn lsm_collection_cache_obeys_open_limit_by_default() {
         let _lock = ENV_TEST_LOCK.lock().unwrap();
-        let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
-        let _in_mem = EnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
         let _max_open = EnvRestore::set("HELIX_MAX_OPEN_COLLECTIONS", "1");
         let _unbounded = EnvRestore::unset("HELIX_LSM_COLLECTION_CACHE_UNBOUNDED");
 
         let tmp = TempDir::new().unwrap();
-        let mgr = CollectionManager::new(tmp.path().to_path_buf(), test_config()).unwrap();
+        let mgr =
+            CollectionManager::new(tmp.path().to_path_buf(), test_config().with_lsm_in_memory())
+                .unwrap();
 
         mgr.create_collection("first").unwrap();
         mgr.create_collection("second").unwrap();
@@ -5959,13 +6430,13 @@ mod tests {
     #[test]
     fn lsm_collection_cache_unbounded_when_explicitly_enabled() {
         let _lock = ENV_TEST_LOCK.lock().unwrap();
-        let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
-        let _in_mem = EnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
         let _max_open = EnvRestore::set("HELIX_MAX_OPEN_COLLECTIONS", "1");
         let _unbounded = EnvRestore::set("HELIX_LSM_COLLECTION_CACHE_UNBOUNDED", "1");
 
         let tmp = TempDir::new().unwrap();
-        let mgr = CollectionManager::new(tmp.path().to_path_buf(), test_config()).unwrap();
+        let mgr =
+            CollectionManager::new(tmp.path().to_path_buf(), test_config().with_lsm_in_memory())
+                .unwrap();
 
         mgr.create_collection("first").unwrap();
         mgr.create_collection("second").unwrap();
@@ -6053,7 +6524,6 @@ mod tests {
     #[test]
     fn cache_drop_hint_preserves_lsm_object_store_cache_subtree() {
         let _lock = ENV_TEST_LOCK.lock().unwrap();
-        let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
         let _hint = EnvRestore::set("HELIX_CACHE_DROP_HINT", "1");
         let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", "prod");
         let cache_root = TempDir::new().unwrap();
@@ -6073,7 +6543,6 @@ mod tests {
     #[test]
     fn cache_drop_hint_disabled_preserves_lsm_object_store_cache_subtree() {
         let _lock = ENV_TEST_LOCK.lock().unwrap();
-        let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
         let _hint = EnvRestore::set("HELIX_CACHE_DROP_HINT", "0");
         let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", "prod");
         let cache_root = TempDir::new().unwrap();
@@ -6114,7 +6583,6 @@ mod tests {
     #[test]
     fn lsm_startup_object_cache_sweep_retains_catalog_marker_dirs() {
         let _lock = ENV_TEST_LOCK.lock().unwrap();
-        let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
         let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", "prod");
         let cache_root = TempDir::new().unwrap();
         let _cache = EnvRestore::set("HELIX_LSM_CACHE_DIR", cache_root.path().to_str().unwrap());
@@ -6131,7 +6599,15 @@ mod tests {
         fs::write(orphan_dir.join("sst.bin"), b"orphan").unwrap();
         let collections = Arc::new(RwLock::new(HashMap::new()));
 
-        sweep_lsm_orphan_object_cache_dirs(&collections, &collections_dir, "startup_orphan");
+        sweep_lsm_orphan_object_cache_dirs(
+            &collections,
+            &collections_dir,
+            "startup_orphan",
+            StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Writer,
+            },
+        );
 
         assert!(retained_dir.exists());
         assert!(!orphan_dir.exists());
@@ -6663,12 +7139,10 @@ total_writeback 0
 
     #[test]
     fn lsm_collection_stats_missing_sidecar_does_not_cold_open() {
-        let _lock = ENV_TEST_LOCK.lock().unwrap();
-        let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
-        let _in_mem = EnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let tmp = TempDir::new().unwrap();
-        let mgr = CollectionManager::new(tmp.path().to_path_buf(), test_config()).unwrap();
+        let mgr =
+            CollectionManager::new(tmp.path().to_path_buf(), test_config().with_lsm_in_memory())
+                .unwrap();
         let path = mgr.collection_path("stats_lsm");
         fs::create_dir_all(&path).unwrap();
         assert!(HelixGraphStorage::read_metadata_sidecar_from_path(&path)
@@ -6688,18 +7162,22 @@ total_writeback 0
     #[test]
     fn lsm_collection_stats_uses_fresh_local_sidecar_without_remote_lookup() {
         let _lock = ENV_TEST_LOCK.lock().unwrap();
-        let _backend = EnvRestore::set(BackendKind::ENV_VAR, "lsm");
-        let _in_mem = EnvRestore::unset("HELIX_LSM_IN_MEMORY");
         let _bucket = EnvRestore::unset("HELIX_LSM_BUCKET");
 
         let tmp = TempDir::new().unwrap();
         {
-            let _lmdb = EnvRestore::set(BackendKind::ENV_VAR, "lmdb");
             let mgr = CollectionManager::new(tmp.path().to_path_buf(), test_config()).unwrap();
             mgr.create_collection("stats_cached").unwrap();
         }
 
-        let mgr = CollectionManager::new(tmp.path().to_path_buf(), test_config()).unwrap();
+        let mgr = CollectionManager::new(
+            tmp.path().to_path_buf(),
+            test_config().with_storage_backend(StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Writer,
+            }),
+        )
+        .unwrap();
         assert_eq!(mgr.loaded_count(), 0);
 
         let stats = mgr.collection_stats("stats_cached").unwrap();
@@ -6751,6 +7229,447 @@ total_writeback 0
         assert!(open_failure_backoff_error(name).is_none());
     }
 
+    /// A drop whose object-store purge fails leaves a durable tombstone outside
+    /// the collection prefix. After a restart (empty process registry + empty
+    /// local PVC), rediscovery must not resurrect the old manifest, and create
+    /// must stay blocked while purge still fails.
+    #[test]
+    fn lsm_failed_drop_purge_tombstone_blocks_restart_rediscovery_and_create() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", "drop_tombstone_restart");
+        let _fail_purge = EnvRestore::set("HELIX_LSM_TEST_FAIL_PURGE", "1");
+        let store_dir = TempDir::new().unwrap();
+        let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(
+            slatedb::object_store::local::LocalFileSystem::new_with_prefix(store_dir.path())
+                .unwrap(),
+        );
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let config = test_config().with_storage_backend(StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        });
+        let name = "purge_pending_restart";
+
+        let tmp = TempDir::new().unwrap();
+        let mgr = CollectionManager::new(tmp.path().to_path_buf(), config.clone()).unwrap();
+        let storage = mgr.create_collection(name).unwrap();
+        drop(storage);
+        let path = mgr.collection_path(name);
+
+        mgr.drop_collection(name)
+            .expect("purge failure must not abort the local drop");
+        assert!(lsm_purge_pending(&path), "failed purge must be registered");
+        assert!(
+            backend_any::lsm_drop_tombstone_exists_from_env(&path, config.storage_backend).unwrap(),
+            "failed purge must leave a durable tombstone"
+        );
+
+        lsm_purge_pending_clear(&path);
+        drop(mgr);
+
+        let restarted_tmp = TempDir::new().unwrap();
+        let restarted =
+            CollectionManager::new(restarted_tmp.path().to_path_buf(), config.clone()).unwrap();
+        assert!(
+            !restarted
+                .list_collections()
+                .unwrap()
+                .iter()
+                .any(|existing| existing == name),
+            "startup rediscovery must hide tombstoned object-store prefixes"
+        );
+        let get_err = match restarted.get_collection(name) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("dropped collection must not reopen while purge pending"),
+        };
+        assert!(get_err.contains("purge pending"), "got: {get_err}");
+        let create_err = match restarted.create_collection(name) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("recreate must be refused while purge still fails"),
+        };
+        assert!(create_err.contains("purge"), "got: {create_err}");
+        let goc_err = match restarted.get_or_create_collection(name) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("get_or_create must be refused while purge still fails"),
+        };
+        assert!(goc_err.contains("purge"), "got: {goc_err}");
+
+        // Release the background retry worker (it aborts as superseded).
+        lsm_purge_pending_clear(&path);
+    }
+
+    #[test]
+    fn lsm_unloaded_drop_failed_purge_blocks_restart_without_local_marker() {
+        use slatedb::object_store::{path::Path as ObjPath, ObjectStoreExt};
+
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let root = "unloaded_drop_restart";
+        let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", root);
+        let _fail_purge = EnvRestore::set("HELIX_LSM_TEST_FAIL_PURGE", "1");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(Arc::clone(&store));
+        let config = test_config().with_storage_backend(StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        });
+        let name = "remote_only";
+        let tmp = TempDir::new().unwrap();
+        let mgr = CollectionManager::new(tmp.path().to_path_buf(), config.clone()).unwrap();
+        let path = mgr.collection_path(name);
+        let object = ObjPath::from(format!("{root}/{name}/manifest/old"));
+        super::super::backend_lsm::shared_lsm_handle().block_on(async {
+            store
+                .put(&object, b"old incarnation".to_vec().into())
+                .await
+                .unwrap();
+        });
+        assert!(!path.exists());
+        assert_eq!(mgr.loaded_count(), 0);
+        assert_eq!(
+            backend_any::list_collection_prefixes_from_env(config.storage_backend).unwrap(),
+            vec![name]
+        );
+
+        mgr.drop_collection(name).unwrap();
+        lsm_purge_pending_clear(&path);
+        drop(mgr);
+
+        assert!(
+            backend_any::lsm_drop_tombstone_exists_from_env(&path, config.storage_backend).unwrap()
+        );
+        super::super::backend_lsm::shared_lsm_handle().block_on(async {
+            assert!(store.head(&object).await.is_ok());
+        });
+        let restarted_tmp = TempDir::new().unwrap();
+        let restarted = CollectionManager::new(restarted_tmp.path().to_path_buf(), config).unwrap();
+        assert!(!restarted.collection_path(name).exists());
+        assert!(!restarted.rediscover_lsm_collection(name, &restarted.collection_path(name)));
+        assert!(restarted.list_collections().unwrap().is_empty());
+        let get_err = match restarted.get_collection(name) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("dropped collection must not reopen after restart"),
+        };
+        assert!(get_err.contains("purge pending"), "got: {get_err}");
+        assert!(matches!(
+            restarted.create_collection(name),
+            Err(GraphError::PurgePending(_))
+        ));
+        assert!(matches!(
+            restarted.get_or_create_collection(name),
+            Err(GraphError::PurgePending(_))
+        ));
+        lsm_purge_pending_clear(&restarted.collection_path(name));
+    }
+
+    #[test]
+    fn lsm_unloaded_drop_missing_prefix_is_noop_without_local_marker() {
+        use slatedb::object_store::{path::Path as ObjPath, ObjectStoreExt};
+
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let root = "unloaded_drop_absent";
+        let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", root);
+        let _fail_purge = EnvRestore::set("HELIX_LSM_TEST_FAIL_PURGE", "1");
+        let _fail_write = EnvRestore::set("HELIX_LSM_TEST_FAIL_TOMBSTONE_WRITE", "1");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(Arc::clone(&store));
+        let config = test_config().with_storage_backend(StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        });
+        let tmp = TempDir::new().unwrap();
+        let mgr = CollectionManager::new(tmp.path().to_path_buf(), config.clone()).unwrap();
+        let name = "missing";
+        let path = mgr.collection_path(name);
+        let sibling = ObjPath::from(format!("{root}/{name}_sibling/manifest/keep"));
+        super::super::backend_lsm::shared_lsm_handle().block_on(async {
+            store.put(&sibling, b"keep".to_vec().into()).await.unwrap();
+        });
+        assert!(!path.exists());
+        assert_eq!(mgr.loaded_count(), 0);
+
+        mgr.drop_collection(name).unwrap();
+        let purge_attempted = lsm_purge_pending(&path);
+        lsm_purge_pending_clear(&path);
+
+        assert!(
+            !purge_attempted,
+            "missing prefixes must not schedule purge retries"
+        );
+        assert!(
+            !backend_any::lsm_drop_tombstone_exists_from_env(&path, config.storage_backend)
+                .unwrap()
+        );
+        assert!(!path.exists());
+        assert!(!mgr.is_dropping(name));
+        assert_eq!(mgr.list_collections().unwrap(), vec!["missing_sibling"]);
+        super::super::backend_lsm::shared_lsm_handle().block_on(async {
+            assert!(store.head(&sibling).await.is_ok());
+        });
+    }
+
+    fn assert_unloaded_drop_preflight_failure_preserves_prefix(failure_env: &'static str) {
+        use slatedb::object_store::{path::Path as ObjPath, ObjectStoreExt};
+
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let root = "unloaded_drop_preflight";
+        let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", root);
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(Arc::clone(&store));
+        let config = test_config().with_storage_backend(StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        });
+        let name = "preflight_failure";
+        let tmp = TempDir::new().unwrap();
+        let mgr = CollectionManager::new(tmp.path().to_path_buf(), config.clone()).unwrap();
+        let path = mgr.collection_path(name);
+        let object = ObjPath::from(format!("{root}/{name}/manifest/keep"));
+        super::super::backend_lsm::shared_lsm_handle().block_on(async {
+            store.put(&object, b"keep".to_vec().into()).await.unwrap();
+        });
+        assert!(!path.exists());
+        assert_eq!(mgr.loaded_count(), 0);
+        let _failure = EnvRestore::set(failure_env, "1");
+
+        assert!(matches!(
+            mgr.drop_collection(name),
+            Err(GraphError::PurgePending(_))
+        ));
+
+        super::super::backend_lsm::shared_lsm_handle().block_on(async {
+            assert!(
+                store.head(&object).await.is_ok(),
+                "preflight failure must not erase data"
+            );
+        });
+        assert!(!mgr.is_dropping(name));
+        assert!(!lsm_purge_pending(&path));
+        assert!(
+            !backend_any::lsm_drop_tombstone_exists_from_env(&path, config.storage_backend)
+                .unwrap()
+        );
+        assert_eq!(
+            backend_any::list_collection_prefixes_from_env(config.storage_backend).unwrap(),
+            vec![name]
+        );
+    }
+
+    #[test]
+    fn lsm_unloaded_drop_failed_marker_write_preserves_remote_prefix() {
+        assert_unloaded_drop_preflight_failure_preserves_prefix(
+            "HELIX_LSM_TEST_FAIL_TOMBSTONE_WRITE",
+        );
+    }
+
+    #[test]
+    fn lsm_unloaded_drop_failed_prefix_probe_preserves_remote_prefix() {
+        assert_unloaded_drop_preflight_failure_preserves_prefix("HELIX_LSM_TEST_FAIL_PREFIX_PROBE");
+    }
+
+    #[test]
+    fn lsm_unloaded_drop_successful_purge_clears_marker_and_allows_recreate() {
+        use slatedb::object_store::{path::Path as ObjPath, ObjectStoreExt};
+
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let root = "unloaded_drop_recreate";
+        let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", root);
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(Arc::clone(&store));
+        let config = test_config().with_storage_backend(StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        });
+        let name = "recreate";
+        let tmp = TempDir::new().unwrap();
+        let mgr = CollectionManager::new(tmp.path().to_path_buf(), config.clone()).unwrap();
+        let path = mgr.collection_path(name);
+        let object = ObjPath::from(format!("{root}/{name}/manifest/old"));
+        super::super::backend_lsm::shared_lsm_handle().block_on(async {
+            store.put(&object, b"old".to_vec().into()).await.unwrap();
+        });
+        assert!(!path.exists());
+        assert_eq!(mgr.loaded_count(), 0);
+
+        mgr.drop_collection(name).unwrap();
+
+        super::super::backend_lsm::shared_lsm_handle().block_on(async {
+            assert!(matches!(
+                store.head(&object).await,
+                Err(slatedb::object_store::Error::NotFound { .. })
+            ));
+        });
+        assert!(
+            !backend_any::lsm_drop_tombstone_exists_from_env(&path, config.storage_backend)
+                .unwrap()
+        );
+        assert!(!lsm_purge_pending(&path));
+        let fresh = mgr.create_collection(name).unwrap();
+        drop(fresh);
+        assert!(mgr.collection_exists(name).unwrap());
+    }
+
+    #[test]
+    fn lsm_successful_pending_purge_clears_tombstone_and_allows_recreate() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", "drop_tombstone_recreate");
+        let store_dir = TempDir::new().unwrap();
+        let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(
+            slatedb::object_store::local::LocalFileSystem::new_with_prefix(store_dir.path())
+                .unwrap(),
+        );
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let config = test_config().with_storage_backend(StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        });
+        let name = "purge_pending_recreate";
+
+        let old_tmp = TempDir::new().unwrap();
+        {
+            let old_mgr =
+                CollectionManager::new(old_tmp.path().to_path_buf(), config.clone()).unwrap();
+            let storage = old_mgr.create_collection(name).unwrap();
+            drop(storage);
+        }
+        let old_path = old_tmp.path().join("collections").join(name);
+        backend_any::persist_lsm_drop_tombstone_from_env(&old_path, config.storage_backend)
+            .unwrap();
+
+        let new_tmp = TempDir::new().unwrap();
+        let mgr = CollectionManager::new(new_tmp.path().to_path_buf(), config.clone()).unwrap();
+        let storage = mgr.create_collection(name).unwrap();
+        drop(storage);
+        let new_path = mgr.collection_path(name);
+        assert!(
+            !backend_any::lsm_drop_tombstone_exists_from_env(&new_path, config.storage_backend)
+                .unwrap(),
+            "confirmed purge must clear the durable tombstone before recreate succeeds"
+        );
+        assert!(mgr.collection_exists(name).unwrap());
+    }
+
+    #[test]
+    fn lsm_failed_tombstone_write_fails_drop_without_local_teardown() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let _bucket = EnvRestore::unset("HELIX_LSM_BUCKET");
+        let _prefix = EnvRestore::set("HELIX_LSM_PREFIX", "drop_tombstone_write_failure");
+        let config = test_config().with_storage_backend(StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        });
+        let name = "marker_write_failure";
+        let tmp = TempDir::new().unwrap();
+        let mgr = CollectionManager::new(tmp.path().to_path_buf(), config).unwrap();
+        let path = mgr.collection_path(name);
+        fs::create_dir_all(&path).unwrap();
+
+        let err = match mgr.drop_collection(name) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("drop must fail before teardown when tombstone cannot be persisted"),
+        };
+        assert!(err.contains("drop tombstone"), "got: {err}");
+        assert!(path.exists(), "local marker dir must not be removed");
+        assert!(
+            !lsm_purge_pending(&path),
+            "process purge retry must not register without a durable tombstone"
+        );
+    }
+
+    /// The background retry only purges while its token still owns the
+    /// pending entry; once a recreate/drop resolved (or re-registered) the
+    /// prefix, a stale retry must not touch it.
+    #[test]
+    fn lsm_purge_retry_attempt_aborts_when_superseded() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("collections").join("retry_superseded");
+        let gate = Mutex::new(());
+        let fail = || -> Result<(), super::super::backend::BackendError> {
+            Err(super::super::backend::BackendError::Io(
+                "injected".to_string(),
+            ))
+        };
+
+        let stale = lsm_purge_pending_register(&path);
+        let current = lsm_purge_pending_register(&path);
+        let step = lsm_purge_retry_attempt(
+            &path,
+            stale,
+            &gate,
+            || Ok(true),
+            || panic!("stale retry must not purge a re-registered prefix"),
+            || panic!("stale retry must not clear a re-registered tombstone"),
+            "retry_superseded",
+            1,
+        );
+        assert_eq!(step, LsmPurgeRetryStep::Superseded);
+
+        assert_eq!(
+            lsm_purge_retry_attempt(
+                &path,
+                current,
+                &gate,
+                || Ok(true),
+                fail,
+                || Ok(()),
+                "retry_superseded",
+                1
+            ),
+            LsmPurgeRetryStep::Failed
+        );
+        assert!(lsm_purge_pending(&path), "failed retry keeps the entry");
+        assert_eq!(
+            lsm_purge_retry_attempt(
+                &path,
+                current,
+                &gate,
+                || Ok(true),
+                || Ok(()),
+                || Ok(()),
+                "retry_superseded",
+                2
+            ),
+            LsmPurgeRetryStep::Purged
+        );
+        assert!(
+            !lsm_purge_pending(&path),
+            "successful retry clears the entry"
+        );
+
+        // Entry resolved elsewhere (e.g. recreate purged synchronously and a
+        // live collection now owns the prefix): the retry must not purge.
+        let token = lsm_purge_pending_register(&path);
+        lsm_purge_pending_clear(&path);
+        let step = lsm_purge_retry_attempt(
+            &path,
+            token,
+            &gate,
+            || Ok(true),
+            || panic!("retry must not purge a recreated collection's prefix"),
+            || panic!("retry must not clear a recreated collection's tombstone"),
+            "retry_superseded",
+            3,
+        );
+        assert_eq!(step, LsmPurgeRetryStep::Superseded);
+
+        let token = lsm_purge_pending_register(&path);
+        let step = lsm_purge_retry_attempt(
+            &path,
+            token,
+            &gate,
+            || Ok(false),
+            || panic!("retry must not purge after durable tombstone is gone"),
+            || panic!("retry must not clear after durable tombstone is gone"),
+            "retry_superseded",
+            4,
+        );
+        assert_eq!(step, LsmPurgeRetryStep::Superseded);
+        lsm_purge_pending_clear(&path);
+    }
+
     #[test]
     fn test_drop_collection() {
         let tmp = TempDir::new().unwrap();
@@ -6767,7 +7686,11 @@ total_writeback 0
     #[test]
     fn test_failed_drop_tombstones_collection_until_drop_retry_succeeds() {
         let tmp = TempDir::new().unwrap();
-        let mgr = CollectionManager::new(tmp.path().to_path_buf(), test_config()).unwrap();
+        let mgr = CollectionManager::new(
+            tmp.path().to_path_buf(),
+            test_config().with_storage_backend(StorageBackendConfig::Lmdb),
+        )
+        .unwrap();
         let name = "drop_wedge";
 
         fs::write(mgr.collection_path(name), b"not a directory").unwrap();
@@ -6904,6 +7827,7 @@ total_writeback 0
                 snapshot_keep_last: Some(1),
                 raft: Default::default(),
             },
+            storage_backend: StorageBackendConfig::Lmdb,
         };
         let mgr = CollectionManager::new(tmp.path().to_path_buf(), config).unwrap();
         let storage = mgr.create_collection("snap").unwrap();
@@ -7254,6 +8178,39 @@ total_writeback 0
     }
 
     #[test]
+    fn test_missing_manifest_not_found_keeps_base_backoff() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let _env = EnvRestore::set("HELIX_COLLECTION_OPEN_FAILURE_BACKOFF_MS", "20");
+        let missing = "backoff_missing_manifest";
+        let broken = "backoff_broken_open";
+        open_failure_clear(missing);
+        open_failure_clear(broken);
+
+        let not_found = missing_manifest_open_error(
+            missing,
+            GraphError::StorageError(format!(
+                "io error: {LSM_READER_DATABASE_MISSING}: Data error: database does not exist"
+            )),
+        );
+        for _ in 0..6 {
+            open_failure_record(missing, &not_found);
+            open_failure_record(broken, &GraphError::New("sst object missing".to_string()));
+        }
+        thread::sleep(Duration::from_millis(40));
+        assert!(
+            open_failure_backoff_error(missing).is_none(),
+            "repeated not-found must keep the base cooldown so a fresh create is visible"
+        );
+        assert!(
+            open_failure_backoff_error(broken).is_some(),
+            "real open failures must still back off exponentially"
+        );
+
+        open_failure_clear(missing);
+        open_failure_clear(broken);
+    }
+
+    #[test]
     fn test_handler_quarantine_survives_successful_open_clear() {
         let _guard = ENV_TEST_LOCK.lock().unwrap();
         let _env = EnvRestore::set("HELIX_COLLECTION_OPEN_FAILURE_BACKOFF_MS", "1");
@@ -7375,6 +8332,116 @@ total_writeback 0
         let evicted = CollectionManager::evict_unhealthy_writers(&mut collections);
         assert_eq!(evicted, 0);
         assert!(collections.contains_key("healthy_writer"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn manager_quarantines_fenced_writer_until_fresh_process_recovery() {
+        let _lock = ENV_TEST_LOCK.lock().unwrap();
+        let _prefix = EnvRestore::set(
+            "HELIX_LSM_PREFIX",
+            "manager_quarantines_fenced_writer_until_recovery",
+        );
+        let store_dir = TempDir::new().unwrap();
+        let store: Arc<dyn slatedb::object_store::ObjectStore> = Arc::new(
+            slatedb::object_store::local::LocalFileSystem::new_with_prefix(store_dir.path())
+                .unwrap(),
+        );
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let config = test_config().with_storage_backend(StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        });
+        let name = "fenced_manager";
+        open_failure_clear(name);
+
+        let data_dir = TempDir::new().unwrap();
+        let mgr_a = CollectionManager::new(data_dir.path().to_path_buf(), config.clone()).unwrap();
+        let storage_a = mgr_a.create_collection(name).unwrap();
+        storage_a
+            .with_write_backend(|write_context| {
+                storage_a.create_node_be(
+                    write_context,
+                    "Node",
+                    Vec::<(String, Value)>::new(),
+                    None,
+                    Some(1),
+                )
+            })
+            .unwrap();
+
+        let mgr_b = CollectionManager::new(data_dir.path().to_path_buf(), config.clone()).unwrap();
+        let storage_b = mgr_b.get_collection(name).unwrap();
+        storage_b
+            .with_write_backend(|write_context| {
+                storage_b.create_node_be(
+                    write_context,
+                    "Node",
+                    Vec::<(String, Value)>::new(),
+                    None,
+                    Some(2),
+                )
+            })
+            .unwrap();
+
+        let err = storage_a
+            .with_write_backend(|write_context| {
+                storage_a.create_node_be(
+                    write_context,
+                    "Node",
+                    Vec::<(String, Value)>::new(),
+                    None,
+                    Some(3),
+                )
+            })
+            .expect_err("stale writer must fail closed");
+        assert!(err.to_string().contains("fenced"), "got {err}");
+
+        let evicted = {
+            let mut collections = mgr_a.collections.write().unwrap();
+            CollectionManager::evict_unhealthy_writers(&mut collections)
+        };
+        assert_eq!(evicted, 0, "fenced writer must not be evicted/reopened");
+        assert_eq!(mgr_a.loaded_count(), 1);
+        assert!(mgr_a
+            .unhealthy_lsm_writer_close_reasons()
+            .unwrap()
+            .iter()
+            .any(
+                |(collection, reason)| collection == name && matches!(reason, CloseReason::Fenced)
+            ));
+
+        let quarantined = match mgr_a.get_collection(name) {
+            Err(err) => err,
+            Ok(_) => panic!("resident fenced writer must remain quarantined"),
+        };
+        assert!(
+            quarantined.to_string().contains("quarantined"),
+            "got {quarantined}"
+        );
+
+        drop(storage_a);
+        drop(mgr_a);
+        drop(storage_b);
+        drop(mgr_b);
+        open_failure_clear(name);
+
+        let recovered =
+            CollectionManager::new(data_dir.path().to_path_buf(), config.clone()).unwrap();
+        let storage = recovered
+            .get_collection(name)
+            .expect("fresh process may claim writer epoch");
+        storage
+            .with_write_backend(|write_context| {
+                storage.create_node_be(
+                    write_context,
+                    "Node",
+                    Vec::<(String, Value)>::new(),
+                    None,
+                    Some(4),
+                )
+            })
+            .expect("fresh process writer remains authorized");
     }
 
     /// Lifecycle hardening: a dropped collection with a lingering external

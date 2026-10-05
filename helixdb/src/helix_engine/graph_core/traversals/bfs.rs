@@ -325,6 +325,22 @@ fn expand_name_variants_be(
     name_cache: &mut HashMap<String, Vec<u128>>,
     visited: &mut HashSet<u128>,
 ) -> Vec<u128> {
+    let variants = name_variants_be(storage, r, node_id, name_cache);
+    for &vid in variants.iter() {
+        visited.insert(vid);
+    }
+    variants
+}
+
+/// Same-name variant lookup shared by BFS and cycle detection: returns every
+/// node id indexed under `node_id`'s `name` (bounded by the variant fan-out),
+/// cached by name. Degrades to `[node_id]` on any lookup failure.
+pub(super) fn name_variants_be(
+    storage: &HelixGraphStorage,
+    r: &AnyRead<'_>,
+    node_id: u128,
+    name_cache: &mut HashMap<String, Vec<u128>>,
+) -> Vec<u128> {
     let name = match storage.get_node_be(r, &node_id) {
         Ok(node) => match node.properties.get("name") {
             Some(Value::String(s)) if !s.is_empty() => s.clone(),
@@ -333,15 +349,13 @@ fn expand_name_variants_be(
         Err(_) => return vec![node_id],
     };
 
-    let variants = name_cache.entry(name.clone()).or_insert_with(|| {
-        match storage.get_nodes_by_multi_index_be(r, "name", &Value::String(name)) {
-            Ok(ids) if !ids.is_empty() => ids.into_iter().take(bfs_variant_fan_out()).collect(),
-            _ => vec![node_id],
-        }
-    });
-
-    for &vid in variants.iter() {
-        visited.insert(vid);
-    }
-    variants.clone()
+    name_cache
+        .entry(name.clone())
+        .or_insert_with(|| {
+            match storage.get_nodes_by_multi_index_be(r, "name", &Value::String(name)) {
+                Ok(ids) if !ids.is_empty() => ids.into_iter().take(bfs_variant_fan_out()).collect(),
+                _ => vec![node_id],
+            }
+        })
+        .clone()
 }

@@ -1,3 +1,4 @@
+use crate::helix_engine::storage_core::reader_warm;
 use crate::helix_engine::types::GraphError;
 use crate::helix_gateway::router::router::HandlerInput;
 use crate::protocol::response::Response;
@@ -16,6 +17,14 @@ pub fn handle_health(input: &HandlerInput, response: &mut Response) -> Result<()
 
 pub fn handle_ready(input: &HandlerInput, response: &mut Response) -> Result<(), GraphError> {
     if write_probe_unhealthy_lsm_writer(input, response, 503)? {
+        return Ok(());
+    }
+    if !reader_warm::startup_warm_ready() {
+        response.status = 503;
+        response.body = b"{\"status\":\"warming\"}".to_vec();
+        response
+            .headers
+            .insert("Content-Type".to_string(), "application/json".to_string());
         return Ok(());
     }
     let collections = &input.collections;

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::helix_engine::storage_core::backend::StorageBackendConfig;
 use crate::helix_engine::types::GraphError;
 
 pub const DEFAULT_SNAPSHOT_INTERVAL_SECS: u64 = 3600;
@@ -72,6 +73,8 @@ pub struct RaftConfig {
 pub struct Config {
     pub vector_config: VectorConfig,
     pub graph_config: GraphConfig,
+    #[serde(skip)]
+    pub storage_backend: StorageBackendConfig,
     // // Path to the database
     // pub db_path: String,
 
@@ -95,7 +98,22 @@ impl Config {
                 snapshot_keep_last: Some(DEFAULT_SNAPSHOT_KEEP_LAST),
                 raft: RaftConfig::default(),
             },
+            storage_backend: default_storage_backend(),
         }
+    }
+
+    pub fn with_storage_backend(mut self, storage_backend: StorageBackendConfig) -> Self {
+        self.storage_backend = storage_backend;
+        self
+    }
+
+    pub fn with_lsm_in_memory(self) -> Self {
+        self.with_storage_backend(StorageBackendConfig::lsm_in_memory())
+    }
+
+    pub fn with_env_storage_overrides(mut self) -> Self {
+        self.storage_backend = StorageBackendConfig::from_env();
+        self
     }
 
     pub fn snapshot_interval_secs(&self) -> u64 {
@@ -159,7 +177,7 @@ impl Config {
             return Err(GraphError::ConfigFileNotFound);
         }
         let config = std::fs::read_to_string(input_path)?;
-        let config = sonic_rs::from_str::<Config>(&config)?;
+        let config = sonic_rs::from_str::<Config>(&config)?.with_env_storage_overrides();
 
         Ok(config)
     }
@@ -212,6 +230,16 @@ fn env_bool(name: &str) -> Option<bool> {
     }
 }
 
+#[cfg(test)]
+fn default_storage_backend() -> StorageBackendConfig {
+    StorageBackendConfig::Lmdb
+}
+
+#[cfg(not(test))]
+fn default_storage_backend() -> StorageBackendConfig {
+    StorageBackendConfig::from_env()
+}
+
 /// Default initial LMDB map size in MB.  Sparse on 64-bit (only committed
 /// pages consume RAM), but each open env reserves virtual address space.
 /// At 5 000+ collections the total VA must stay within the OS limit
@@ -235,6 +263,7 @@ impl Default for Config {
                 snapshot_keep_last: Some(DEFAULT_SNAPSHOT_KEEP_LAST),
                 raft: RaftConfig::default(),
             },
+            storage_backend: default_storage_backend(),
         }
     }
 }
@@ -277,6 +306,7 @@ mod tests {
                 snapshot_keep_last: None,
                 raft: RaftConfig::default(),
             },
+            storage_backend: StorageBackendConfig::Lmdb,
         };
 
         assert_eq!(config.snapshot_interval_secs(), 1);

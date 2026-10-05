@@ -49,12 +49,9 @@ impl PartialOrd for Candidate {
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse: smaller distance => "greater" so a max-heap pops the
-        // closest neighbor first. NaN sorts as Equal (defensive — distance
-        // kernels are expected to never produce NaN).
-        other
-            .distance
-            .partial_cmp(&self.distance)
-            .unwrap_or(Ordering::Equal)
+        // closest neighbor first. NaN ranks as farthest (total order keeps
+        // heap invariants intact; inserts already reject non-finite vectors).
+        nan_as_farthest(other.distance).total_cmp(&nan_as_farthest(self.distance))
     }
 }
 
@@ -79,10 +76,18 @@ impl PartialOrd for MaxByDistance {
 
 impl Ord for MaxByDistance {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0
-            .distance
-            .partial_cmp(&other.0.distance)
-            .unwrap_or(Ordering::Equal)
+        nan_as_farthest(self.0.distance).total_cmp(&nan_as_farthest(other.0.distance))
+    }
+}
+
+/// Map NaN to +inf so total-order comparisons rank it as the farthest
+/// candidate rather than letting it compare Equal to everything.
+#[inline(always)]
+fn nan_as_farthest(distance: f32) -> f32 {
+    if distance.is_nan() {
+        f32::INFINITY
+    } else {
+        distance
     }
 }
 

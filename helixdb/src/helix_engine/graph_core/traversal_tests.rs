@@ -41,40 +41,35 @@ fn setup_test_db() -> (Arc<HelixGraphStorage>, TempDir) {
     (Arc::new(storage), temp_dir)
 }
 
-fn setup_test_db_with_secondary_indices(indices: &[&str]) -> (Arc<HelixGraphStorage>, TempDir) {
+fn setup_test_lsm_db() -> (Arc<HelixGraphStorage>, TempDir) {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().to_str().unwrap();
-    let mut config = super::config::Config::default();
-    config.graph_config.secondary_indices =
-        Some(indices.iter().map(|index| index.to_string()).collect());
+    let config = super::config::Config::default().with_lsm_in_memory();
     let storage = HelixGraphStorage::new(db_path, config).unwrap();
     (Arc::new(storage), temp_dir)
 }
 
-struct EnvGuard(&'static str, Option<String>);
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.1 {
-                Some(v) => std::env::set_var(self.0, v),
-                None => std::env::remove_var(self.0),
-            }
-        }
-    }
+fn setup_test_db_with_secondary_indices(indices: &[&str]) -> (Arc<HelixGraphStorage>, TempDir) {
+    setup_test_db_with_config_and_secondary_indices(super::config::Config::default(), indices)
 }
 
-fn set_env(key: &'static str, value: &str) -> EnvGuard {
-    let prev = std::env::var(key).ok();
-    unsafe { std::env::set_var(key, value) };
-    EnvGuard(key, prev)
-}
-
-fn force_lsm_in_memory() -> (EnvGuard, EnvGuard) {
-    (
-        set_env("HELIX_STORAGE_BACKEND", "lsm"),
-        set_env("HELIX_LSM_IN_MEMORY", "1"),
+fn setup_test_lsm_db_with_secondary_indices(indices: &[&str]) -> (Arc<HelixGraphStorage>, TempDir) {
+    setup_test_db_with_config_and_secondary_indices(
+        super::config::Config::default().with_lsm_in_memory(),
+        indices,
     )
+}
+
+fn setup_test_db_with_config_and_secondary_indices(
+    mut config: super::config::Config,
+    indices: &[&str],
+) -> (Arc<HelixGraphStorage>, TempDir) {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().to_str().unwrap();
+    config.graph_config.secondary_indices =
+        Some(indices.iter().map(|index| index.to_string()).collect());
+    let storage = HelixGraphStorage::new(db_path, config).unwrap();
+    (Arc::new(storage), temp_dir)
 }
 
 /// End-to-end acceptance gate for the LSM cutover: a fully in-memory
@@ -82,22 +77,14 @@ fn force_lsm_in_memory() -> (EnvGuard, EnvGuard) {
 /// dense vectors through the flipped write traversal, then reads the graph back
 /// and runs a vector search through the flipped single-snapshot read traversal —
 /// i.e. the whole stack runs on the LSM backend, not just LMDB.
-///
-/// `HELIX_STORAGE_BACKEND=lsm` + `HELIX_LSM_IN_MEMORY=1` are process-global, so
-/// this test is `#[serial]` and must run single-threaded (the repo's test
-/// convention, `--test-threads=1`), exactly like the env-mutating `#[serial]`
-/// tests in `storage_core.rs`.
 #[test]
-#[serial_test::serial]
 fn lsm_end_to_end_graph_and_vector_in_memory() {
     use crate::helix_engine::graph_core::ops::vectors::{
         insert::InsertVAdapter, search::SearchVAdapter,
     };
     use crate::helix_engine::vector_core::vector::HVector;
 
-    let (_backend, _in_mem) = force_lsm_in_memory();
-
-    let (storage, _temp_dir) = setup_test_db();
+    let (storage, _temp_dir) = setup_test_lsm_db();
     assert_eq!(
         storage.backend.kind(),
         BackendKind::Lsm,
@@ -222,15 +209,13 @@ fn lsm_end_to_end_graph_and_vector_in_memory() {
 }
 
 #[test]
-#[serial_test::serial]
 fn lsm_insert_vs_round_trips_from_backend_flat_segment() {
     use crate::helix_engine::graph_core::ops::vectors::{
         insert::InsertVAdapter, search::SearchVAdapter,
     };
     use crate::helix_engine::vector_core::vector::HVector;
 
-    let (_backend, _in_mem) = force_lsm_in_memory();
-    let (storage, _temp_dir) = setup_test_db();
+    let (storage, _temp_dir) = setup_test_lsm_db();
     assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
     {
@@ -535,10 +520,8 @@ fn test_update_moves_secondary_index_and_persists_node() {
 }
 
 #[test]
-#[serial_test::serial]
 fn lsm_update_moves_secondary_index_and_persists_node() {
-    let (_backend, _in_mem) = force_lsm_in_memory();
-    let (storage, _temp_dir) = setup_test_db_with_secondary_indices(&["email"]);
+    let (storage, _temp_dir) = setup_test_lsm_db_with_secondary_indices(&["email"]);
     assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
     let secondary_indices = vec!["email".to_string()];
@@ -630,10 +613,8 @@ fn test_update_persists_edge_properties() {
 }
 
 #[test]
-#[serial_test::serial]
 fn lsm_update_persists_edge_properties() {
-    let (_backend, _in_mem) = force_lsm_in_memory();
-    let (storage, _temp_dir) = setup_test_db();
+    let (storage, _temp_dir) = setup_test_lsm_db();
     assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
     let node1_id = 0x1A_0010;
@@ -686,11 +667,9 @@ fn lsm_update_persists_edge_properties() {
 /// the already-committed edge. Exercises the full traversal path (`G::new_mut().e()`
 /// → backend `scan` pending-overlay), not just the backend unit tests.
 #[test]
-#[serial_test::serial]
 fn lsm_write_context_e_reads_your_writes() {
     use crate::helix_engine::graph_core::ops::source::e::RwEAdapter;
-    let (_backend, _in_mem) = force_lsm_in_memory();
-    let (storage, _temp_dir) = setup_test_db();
+    let (storage, _temp_dir) = setup_test_lsm_db();
     assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
     let n1: u128 = 0x1A_0020;

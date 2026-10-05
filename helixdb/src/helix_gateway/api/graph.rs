@@ -31,6 +31,8 @@ const DEFAULT_GRAPH_DEPTH_MAX: usize = 10;
 const DEFAULT_GRAPH_LIMIT_MAX: usize = 500;
 const DEFAULT_GRAPH_ALGORITHM_ITERATIONS_MAX: usize = 50;
 const DEFAULT_GRAPH_SHORTEST_PATH_VISITED_MAX: usize = 100_000;
+const DEFAULT_GRAPH_CYCLES_VISITED_MAX: usize = 100_000;
+const DEFAULT_GRAPH_CYCLES_TIMEOUT_MS: usize = 10_000;
 const DEFAULT_GRAPH_SYMBOL_RESOLVE_MAX: usize = 32;
 const DEFAULT_GRAPH_DELETE_TXN_CHUNK_SIZE: usize = 5_000;
 
@@ -85,6 +87,20 @@ fn graph_shortest_path_visited_max() -> usize {
         "HELIX_GRAPH_SHORTEST_PATH_VISITED_MAX",
         DEFAULT_GRAPH_SHORTEST_PATH_VISITED_MAX,
     )
+}
+
+fn graph_cycles_visited_max() -> usize {
+    env_usize(
+        "HELIX_GRAPH_CYCLES_VISITED_MAX",
+        DEFAULT_GRAPH_CYCLES_VISITED_MAX,
+    )
+}
+
+fn graph_cycles_timeout() -> std::time::Duration {
+    std::time::Duration::from_millis(env_usize(
+        "HELIX_GRAPH_CYCLES_TIMEOUT_MS",
+        DEFAULT_GRAPH_CYCLES_TIMEOUT_MS,
+    ) as u64)
 }
 
 fn graph_symbol_resolve_max() -> usize {
@@ -628,15 +644,32 @@ pub fn handle_cycles(input: &HandlerInput, response: &mut Response) -> Result<()
         Ok(s) => s,
         Err(e) => return json_error(response, 404, &e.to_string()),
     };
+    let repo = q.repo.as_deref();
     let limit = clamp_graph_limit(q.limit);
+    let max_visited = graph_cycles_visited_max();
+    let deadline = t0 + graph_cycles_timeout();
     storage.with_read_backend(|r| {
         let start = resolve_symbol_id_be(&q, &storage, r);
-        let cycles = detect_cycles_be(&storage, r, start, &["CALLS"], limit)?;
-        let cycle_strs: Vec<Vec<String>> = cycles
+        let search = detect_cycles_be(
+            &storage,
+            r,
+            start,
+            &["CALLS"],
+            limit,
+            repo,
+            max_visited,
+            Some(deadline),
+        )?;
+        let cycle_strs: Vec<Vec<String>> = search
+            .cycles
             .into_iter()
             .map(|c| c.into_iter().map(|id| format!("{:032x}", id)).collect())
             .collect();
-        json_response(response, 200, &sonic_rs::json!({"cycles": cycle_strs}))
+        json_response(
+            response,
+            200,
+            &sonic_rs::json!({"cycles": cycle_strs, "truncated": search.truncated}),
+        )
     })?;
     tracing::debug!(
         collection = %collection,
@@ -848,6 +881,9 @@ pub fn handle_pagerank(input: &HandlerInput, response: &mut Response) -> Result<
         Ok(s) => s,
         Err(e) => return json_error(response, 404, &e.to_string()),
     };
+    if !(q.damping > 0.0 && q.damping < 1.0) {
+        return json_error(response, 400, "damping must be in the open interval (0, 1)");
+    }
     let labels: Vec<&str> = q.edge_labels.iter().map(|s| s.as_str()).collect();
     let iterations = clamp_graph_iterations(q.iterations);
     let limit = clamp_graph_limit(q.limit);
@@ -871,7 +907,6 @@ pub fn handle_pagerank(input: &HandlerInput, response: &mut Response) -> Result<
         // Return top-N with node metadata
         let results: Vec<sonic_rs::Value> = ranks
             .into_iter()
-            .take(limit)
             .filter_map(|(id, rank)| {
                 storage.get_node_be(r, &id).ok().map(|node| {
                     sonic_rs::json!({
@@ -882,6 +917,7 @@ pub fn handle_pagerank(input: &HandlerInput, response: &mut Response) -> Result<
                     })
                 })
             })
+            .take(limit)
             .collect();
 
         json_response(response, 200, &sonic_rs::json!({"results": results}))
@@ -924,6 +960,7 @@ pub fn handle_communities(input: &HandlerInput, response: &mut Response) -> Resu
             .0
         };
 
+        let total = communities.len();
         let results: Vec<sonic_rs::Value> = communities
             .into_iter()
             .take(limit)
@@ -939,7 +976,7 @@ pub fn handle_communities(input: &HandlerInput, response: &mut Response) -> Resu
         json_response(
             response,
             200,
-            &sonic_rs::json!({"communities": results, "total": results.len()}),
+            &sonic_rs::json!({"communities": results, "total": total}),
         )
     })?;
     tracing::debug!(
@@ -1135,6 +1172,9 @@ pub fn handle_backfill_adjacency_from_points(
     let batch_size = req.batch_size.clamp(1, 10_000);
     let (nodes_upserted, edges_upserted, complete, cursor) =
         storage.backfill_adjacency_from_points_batch(&req.collection, batch_size, req.force)?;
+    if nodes_upserted > 0 || edges_upserted > 0 {
+        algorithms::invalidate_algorithm_cache(&req.collection);
+    }
 
     json_response(
         response,
@@ -1193,6 +1233,9 @@ pub fn handle_rebuild_adjacency_for_paths(
 
     let (nodes_upserted, edges_upserted, chunk_candidates) =
         storage.rebuild_adjacency_for_paths(&req.collection, &req.paths)?;
+    if nodes_upserted > 0 || edges_upserted > 0 {
+        algorithms::invalidate_algorithm_cache(&req.collection);
+    }
 
     let mut chunk_edges_upserted = 0usize;
     let mut warning: Option<String> = None;
@@ -1201,6 +1244,9 @@ pub fn handle_rebuild_adjacency_for_paths(
             Ok(base_storage) => {
                 chunk_edges_upserted =
                     apply_chunk_edges(&base_storage, base_collection, &chunk_candidates)?;
+                if chunk_edges_upserted > 0 {
+                    algorithms::invalidate_algorithm_cache(base_collection);
+                }
             }
             Err(e) => {
                 warning = Some(format!(
@@ -1808,11 +1854,20 @@ pub fn handle_subgraph(input: &HandlerInput, response: &mut Response) -> Result<
         // snapshot, so the visualization gets real ranks on LSM too.
         let node_ids: Vec<u128> = if q.node_ids.is_empty() {
             let iterations = clamp_graph_iterations(default_pr_iterations());
-            algorithms::pagerank_scoped(&storage, r, &labels, iterations, 0.85, repo)?
-                .into_iter()
-                .take(limit)
-                .map(|(id, _rank)| id)
-                .collect()
+            algorithms::cached_pagerank(
+                &q.collection,
+                &storage,
+                r,
+                &labels,
+                iterations,
+                0.85,
+                repo,
+            )?
+            .0
+            .into_iter()
+            .take(limit)
+            .map(|(id, _rank)| id)
+            .collect()
         } else {
             q.node_ids
                 .iter()
@@ -2065,23 +2120,6 @@ mod tests {
         std::env::remove_var("HELIX_GRAPH_DELETE_TXN_CHUNK_SIZE");
     }
 
-    struct EnvGuard(&'static str, Option<String>);
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self(key, prev)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.1 {
-                Some(v) => std::env::set_var(self.0, v),
-                None => std::env::remove_var(self.0),
-            }
-        }
-    }
-
     fn setup_storage() -> (HelixGraphStorage, TempDir) {
         let tmp = TempDir::new().unwrap();
         let config = Config::new(16, 128, 768, 1);
@@ -2097,20 +2135,24 @@ mod tests {
     }
 
     fn setup_context() -> TestContext {
+        setup_context_with_config(Config::default())
+    }
+
+    fn setup_context_with_config(config: Config) -> TestContext {
         let tmp = TempDir::new().unwrap();
         let graph_path = tmp.path().join("graph");
         let collections_path = tmp.path().join("data");
         let graph = Arc::new(
             HelixGraphEngine::new(HelixGraphEngineOpts {
                 path: graph_path.display().to_string(),
-                config: Config::default(),
+                config: config.clone(),
             })
             .unwrap(),
         );
         let collections =
-            Arc::new(CollectionManager::new(collections_path, Config::default()).unwrap());
+            Arc::new(CollectionManager::new(collections_path, config.clone()).unwrap());
         let replication =
-            Arc::new(ReplicationManager::new(Arc::clone(&collections), Config::default()).unwrap());
+            Arc::new(ReplicationManager::new(Arc::clone(&collections), config).unwrap());
         TestContext {
             _tmp: tmp,
             graph,
@@ -2230,11 +2272,7 @@ mod tests {
 
     #[test]
     fn backfill_adjacency_from_points_rebuilds_lsm_traversal_from_graph_point_payload() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-
-        let ctx = setup_context();
+        let ctx = setup_context_with_config(Config::default().with_lsm_in_memory());
         let collection = "repo_graph";
         let storage = ctx.collections.create_collection(collection).unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
@@ -2325,13 +2363,124 @@ mod tests {
         );
     }
 
+    fn post_json(
+        ctx: &TestContext,
+        handler: fn(&HandlerInput, &mut Response) -> Result<(), GraphError>,
+        body: serde_json::Value,
+    ) -> (u16, serde_json::Value) {
+        let input = make_input(ctx, serde_json::to_vec(&body).unwrap());
+        let mut response = Response::new();
+        handler(&input, &mut response).unwrap();
+        let payload = serde_json::from_slice(&response.body).unwrap();
+        (response.status, payload)
+    }
+
+    #[test]
+    fn backfill_adjacency_invalidates_cached_pagerank() {
+        let ctx = setup_context_with_config(Config::default().with_lsm_in_memory());
+        let collection = "repo_graph_backfill_cache";
+        let storage = ctx.collections.create_collection(collection).unwrap();
+        let point = make_relationship_point(
+            0xCAC4E,
+            "caller_fn",
+            "target_fn",
+            "src/caller.rs",
+            "src/target.rs",
+            "calls",
+            "demo-repo",
+        );
+        storage
+            .with_write_backend(|w| storage.upsert_node_be(w, &point))
+            .unwrap();
+
+        let pagerank_body = serde_json::json!({"collection": collection, "edge_labels": ["CALLS"]});
+        let (status, before) = post_json(&ctx, handle_pagerank, pagerank_body.clone());
+        assert_eq!(status, 200);
+        assert_eq!(before["results"].as_array().unwrap().len(), 1);
+
+        let (status, _) = post_json(
+            &ctx,
+            handle_backfill_adjacency_from_points,
+            serde_json::json!({"collection": collection, "batch_size": 10}),
+        );
+        assert_eq!(status, 200);
+
+        let (status, after) = post_json(&ctx, handle_pagerank, pagerank_body);
+        assert_eq!(status, 200);
+        assert_eq!(
+            after["results"].as_array().unwrap().len(),
+            3,
+            "cached pre-backfill ranks must not be served: {}",
+            after
+        );
+    }
+
+    #[test]
+    fn pagerank_rejects_out_of_range_damping() {
+        let ctx = setup_context();
+        ctx.collections.create_collection("repo_damping").unwrap();
+        for damping in [0.0, 1.0, -0.5, 1.5] {
+            let (status, body) = post_json(
+                &ctx,
+                handle_pagerank,
+                serde_json::json!({"collection": "repo_damping", "damping": damping}),
+            );
+            assert_eq!(status, 400, "damping {damping}: {body}");
+        }
+        let (status, _) = post_json(
+            &ctx,
+            handle_pagerank,
+            serde_json::json!({"collection": "repo_damping", "damping": 0.85}),
+        );
+        assert_eq!(status, 200);
+    }
+
+    #[test]
+    fn cycles_query_follows_split_variants_and_honors_repo() {
+        let ctx = setup_context_with_config(Config::default().with_lsm_in_memory());
+        let collection = "repo_cycles_split";
+        let storage = ctx.collections.create_collection(collection).unwrap();
+        // CE model: caller(name, path) -> callee(name, "").
+        let nodes = [
+            make_node(collection, "alpha", "src/a.rs"),
+            make_node(collection, "alpha", ""),
+            make_node(collection, "beta", "src/b.rs"),
+            make_node(collection, "beta", ""),
+        ];
+        let forward = make_edge_with_repo(collection, "alpha", "beta", "src/a.rs", "", "repo-a");
+        let back = make_edge_with_repo(collection, "beta", "alpha", "src/b.rs", "", "repo-b");
+        storage
+            .with_write_backend(|w| {
+                for node in &nodes {
+                    storage.upsert_node_be(w, node)?;
+                }
+                storage.upsert_edge_be(w, &forward)?;
+                storage.upsert_edge_be(w, &back)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let query = |repo: Option<&str>| {
+            let mut body = serde_json::json!({
+                "collection": collection,
+                "symbol": "alpha",
+                "path": "src/a.rs",
+            });
+            if let Some(repo) = repo {
+                body["repo"] = serde_json::json!(repo);
+            }
+            let (status, payload) = post_json(&ctx, handle_cycles, body);
+            assert_eq!(status, 200);
+            assert_eq!(payload["truncated"], serde_json::json!(false));
+            payload["cycles"].as_array().unwrap().len()
+        };
+        assert_eq!(query(None), 1, "logical alpha <-> beta cycle");
+        assert_eq!(query(Some("repo-a")), 0, "back edge belongs to repo-b");
+    }
+
     #[test]
     fn backfill_adjacency_force_ignores_stale_complete_marker() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-
-        let ctx = setup_context();
+        let ctx = setup_context_with_config(Config::default().with_lsm_in_memory());
         let collection = "repo_graph_stale_marker";
         let storage = ctx.collections.create_collection(collection).unwrap();
         let point = make_relationship_point(
@@ -2487,11 +2636,7 @@ mod tests {
 
     #[test]
     fn delete_by_paths_uses_lsm_backend_without_lmdb_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-
-        let ctx = setup_context();
+        let ctx = setup_context_with_config(Config::default().with_lsm_in_memory());
         let storage = ctx.collections.create_collection("repo_lsm").unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
@@ -2590,11 +2735,7 @@ mod tests {
 
     #[test]
     fn native_graph_query_routes_use_lsm_backend_without_lmdb_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-
-        let ctx = setup_context();
+        let ctx = setup_context_with_config(Config::default().with_lsm_in_memory());
         let collection = "repo_graph_lsm";
         let storage = ctx.collections.create_collection(collection).unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);

@@ -33,6 +33,7 @@ use std::ops::Bound;
 #[derive(Debug, Clone)]
 pub enum BackendError {
     NotFound,
+    Cancelled,
     /// Optimistic-concurrency / CAS conflict or epoch-fencing on the LSM backend
     /// (a newer writer took the manifest, or a conditional write lost). Carries
     /// the underlying SlateDB message so the write layer can detect split-brain /
@@ -48,6 +49,7 @@ impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BackendError::NotFound => write!(f, "not found"),
+            BackendError::Cancelled => write!(f, "LSM read request cancelled"),
             BackendError::Conflict(m) => write!(f, "write conflict: {m}"),
             BackendError::Unsupported(m) => write!(f, "unsupported operation: {m}"),
             BackendError::Io(m) => write!(f, "io error: {m}"),
@@ -57,6 +59,12 @@ impl std::fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+impl BackendError {
+    pub const fn is_lsm_read_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
 
 /// The LMDB sub-databases that make up one dense vector segment
 /// (`vectors_*`, `vector_data_*`, `hnsw_out_*`, `hnsw_neighbors_*`,
@@ -396,6 +404,110 @@ pub enum BackendKind {
     #[default]
     Lmdb,
     Lsm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsmStorage {
+    ObjectStore,
+    InMemory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LsmRole {
+    Writer,
+    Reader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageBackendConfig {
+    #[default]
+    Lmdb,
+    Lsm {
+        storage: LsmStorage,
+        role: LsmRole,
+    },
+}
+
+impl StorageBackendConfig {
+    pub fn from_env() -> Self {
+        if BackendKind::from_env() == BackendKind::Lmdb {
+            return Self::Lmdb;
+        }
+        let storage = if env_enabled("HELIX_LSM_IN_MEMORY") {
+            LsmStorage::InMemory
+        } else {
+            LsmStorage::ObjectStore
+        };
+        let role = if std::env::var("HELIX_LSM_ROLE")
+            .map(|value| value.trim().eq_ignore_ascii_case("reader"))
+            .unwrap_or(false)
+        {
+            LsmRole::Reader
+        } else {
+            LsmRole::Writer
+        };
+        Self::Lsm { storage, role }
+    }
+
+    pub const fn lsm_in_memory() -> Self {
+        Self::Lsm {
+            storage: LsmStorage::InMemory,
+            role: LsmRole::Writer,
+        }
+    }
+
+    pub const fn kind(self) -> BackendKind {
+        match self {
+            Self::Lmdb => BackendKind::Lmdb,
+            Self::Lsm { .. } => BackendKind::Lsm,
+        }
+    }
+
+    pub const fn is_lsm(self) -> bool {
+        matches!(self, Self::Lsm { .. })
+    }
+
+    pub const fn is_lsm_in_memory(self) -> bool {
+        matches!(
+            self,
+            Self::Lsm {
+                storage: LsmStorage::InMemory,
+                ..
+            }
+        )
+    }
+
+    pub const fn is_reader(self) -> bool {
+        matches!(
+            self,
+            Self::Lsm {
+                role: LsmRole::Reader,
+                ..
+            }
+        )
+    }
+
+    pub const fn is_writer(self) -> bool {
+        matches!(
+            self,
+            Self::Lsm {
+                role: LsmRole::Writer,
+                ..
+            }
+        )
+    }
+}
+
+fn env_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 impl BackendKind {

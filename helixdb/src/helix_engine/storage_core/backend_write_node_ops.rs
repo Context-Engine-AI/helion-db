@@ -30,9 +30,10 @@
 //! error mid-way, then the counter) so failure behavior is identical.
 //!
 //! `drop_node` is reproduced for the writes the backend `Namespace` enum can
-//! address: edge teardown (edge bytes + out/in adjacency deletes), node-bytes
-//! delete, the `multi_indices` dup-deletes, payload-index de-indexing, and both
-//! metadata counter adjustments.
+//! address: edge teardown (edge bytes + out/in adjacency + edge-path index
+//! deletes), node-bytes delete, single-value secondary-index deletes, the
+//! `multi_indices` dup-deletes, payload-index de-indexing, and both metadata
+//! counter adjustments.
 
 #![allow(dead_code)]
 
@@ -319,12 +320,35 @@ impl HelixGraphStorage {
                     &Self::pack_edge_data(&edge.from_node, &edge.id),
                 )
                 .map_err(|e| GraphError::New(e.to_string()))?;
+            // Cascaded edges must leave the edge-path index too (as drop_edge_be
+            // does), or delete-by-path later resolves to a missing edge.
+            self.delete_edge_paths_be(w, edge)?;
         }
 
         // Delete node data — only adjust the node counter if the row existed.
         let deleted = self.backend_delete_returning(w, Namespace::Nodes, &id.to_be_bytes())?;
         if deleted {
             if let Some(node) = &existing_node {
+                // Single-value secondary indices written by create_node_be.
+                // Delete only an entry that still points at THIS node (the
+                // index is unique by value, so another node may own the key).
+                let id_bytes = id.to_be_bytes();
+                for index in self.secondary_indices.keys() {
+                    if let Some(value) = node.properties.get(index) {
+                        let key = Self::stable_index_key_for_value(value)?;
+                        let points_to_node = self
+                            .backend
+                            .get_for_update(w, Namespace::SecondaryIndex(index), &key, |v| {
+                                v.is_some_and(|bytes| bytes == id_bytes.as_slice())
+                            })
+                            .map_err(|e| GraphError::New(e.to_string()))?;
+                        if points_to_node {
+                            self.backend
+                                .delete(w, Namespace::SecondaryIndex(index), &key)
+                                .map_err(|e| GraphError::New(e.to_string()))?;
+                        }
+                    }
+                }
                 for (idx_name, _idx_db) in &self.multi_indices {
                     if let Some(value) = Self::payload_value_for_key(&node.properties, idx_name) {
                         let key = Self::stable_index_key_for_value(value)?;
@@ -1106,5 +1130,90 @@ mod tests {
                 .is_empty(),
             "nested-field index must not leak a ghost dup entry after drop_node_be"
         );
+    }
+
+    /// LSM twins of the heed regressions in `upsert.rs`: `upsert_edge_be` keeps
+    /// an unchanged path key (and drops a stale one on the no-adjacency-change
+    /// branch); `drop_node_be` clears cascaded edges' path keys and the node's
+    /// single-value secondary-index entry.
+    #[test]
+    #[serial_test::serial]
+    fn lsm_edge_path_keys_and_secondary_index_follow_upsert_and_drop_node() {
+        use super::super::upsert::EdgeUpsert;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = test_config().with_lsm_in_memory();
+        config.graph_config.secondary_indices = Some(vec!["k".to_string()]);
+        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), config).unwrap();
+        assert_eq!(storage.backend.kind(), BackendKind::Lsm);
+
+        let (n1, n2, eid) = (0xC1u128, 0xC2u128, 0xCE1u128);
+        let edge = |label: &str, to_path: &str| EdgeUpsert {
+            id: eid,
+            label: label.to_string(),
+            from_node: n1,
+            to_node: n2,
+            properties: std::collections::HashMap::from([
+                ("from_path".to_string(), Value::String("a.rs".to_string())),
+                ("to_path".to_string(), Value::String(to_path.to_string())),
+            ]),
+        };
+        let ids_for = |path: &str| {
+            let r = storage.backend.begin_read().unwrap();
+            storage.edge_ids_for_path_be(&r, path, 100).unwrap()
+        };
+
+        let mut w = storage.backend.begin_write().unwrap();
+        storage
+            .create_node_be(
+                &mut w,
+                "Sym",
+                vec![("k".to_string(), Value::String("key-1".to_string()))],
+                Some(&["k".to_string()]),
+                Some(n1),
+            )
+            .unwrap();
+        storage
+            .create_node_be(&mut w, "Sym", [], None, Some(n2))
+            .unwrap();
+        storage
+            .upsert_edge_be(&mut w, &edge("CALLS", "b.rs"))
+            .unwrap();
+        storage.backend.commit(w).unwrap();
+
+        // Adjacency change, paths unchanged.
+        let mut w = storage.backend.begin_write().unwrap();
+        storage
+            .upsert_edge_be(&mut w, &edge("REFS", "b.rs"))
+            .unwrap();
+        storage.backend.commit(w).unwrap();
+        assert_eq!(ids_for("a.rs"), vec![eid]);
+        assert_eq!(ids_for("b.rs"), vec![eid]);
+
+        // No adjacency change, to_path moved.
+        let mut w = storage.backend.begin_write().unwrap();
+        storage
+            .upsert_edge_be(&mut w, &edge("REFS", "c.rs"))
+            .unwrap();
+        storage.backend.commit(w).unwrap();
+        assert_eq!(ids_for("a.rs"), vec![eid]);
+        assert!(ids_for("b.rs").is_empty());
+        assert_eq!(ids_for("c.rs"), vec![eid]);
+
+        let mut w = storage.backend.begin_write().unwrap();
+        storage.drop_node_be(&mut w, &n1).unwrap();
+        storage.backend.commit(w).unwrap();
+        assert!(ids_for("a.rs").is_empty());
+        assert!(ids_for("c.rs").is_empty());
+
+        let key =
+            HelixGraphStorage::stable_index_key_for_value(&Value::String("key-1".to_string()))
+                .unwrap();
+        let r = storage.backend.begin_read().unwrap();
+        let present = storage
+            .backend
+            .get_with(&r, Namespace::SecondaryIndex("k"), &key, |v| v.is_some())
+            .unwrap();
+        assert!(!present, "secondary index entry must be removed");
     }
 }

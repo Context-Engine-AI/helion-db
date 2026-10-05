@@ -37,6 +37,10 @@ pub enum GraphError {
     /// the caller should retry after a short backoff (another thread/task
     /// holds an `Arc<HelixGraphStorage>` that hasn't dropped yet).
     EnvAlreadyOpen,
+    /// A collection cannot be (re)created yet because the object-store purge
+    /// of its previously dropped incarnation is still pending. Transient:
+    /// callers should retry later.
+    PurgePending(String),
     Default,
     New(String),
     Empty,
@@ -76,6 +80,7 @@ impl fmt::Display for GraphError {
                 write!(f, "Fatal collection storage error ({}): {}", code, message)
             }
             GraphError::ResizeBackpressure(msg) => write!(f, "Resize backpressure: {}", msg),
+            GraphError::PurgePending(msg) => write!(f, "Purge pending: {}", msg),
             GraphError::EnvAlreadyOpen => write!(
                 f,
                 "LMDB environment already open in this process — retry after close"

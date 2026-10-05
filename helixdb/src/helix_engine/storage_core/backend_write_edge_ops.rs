@@ -192,11 +192,15 @@ impl HelixGraphStorage {
                     &Self::pack_edge_data(&edge.from_node, &edge.id),
                 )
                 .map_err(|e| GraphError::New(e.to_string()))?;
+            // Path keys are `dir|path|edge_id`: delete the OLD keys before
+            // writing the new ones so an unchanged from/to path keeps its key.
+            if let Some(existing) = &existing {
+                self.delete_edge_paths_be(w, existing)?;
+            }
             self.index_edge_paths_be(w, &edge)?;
 
             if let Some(existing) = &existing {
                 let old_label_hash = hash_label(&existing.label, None);
-                self.delete_edge_paths_be(w, existing)?;
                 self.backend
                     .delete_dup(
                         w,
@@ -217,7 +221,8 @@ impl HelixGraphStorage {
         } else {
             // Idempotent repair (mirrors the heed no-op branch): re-put adjacency
             // so a historically-missing row is healed on reingest. DUP put of the
-            // same (key,value) is idempotent; nothing is deleted here.
+            // same (key,value) is idempotent; no adjacency is deleted here (only
+            // stale edge-path keys, below).
             self.backend
                 .put_dup(
                     w,
@@ -234,6 +239,11 @@ impl HelixGraphStorage {
                     &Self::pack_edge_data(&edge.from_node, &edge.id),
                 )
                 .map_err(|e| GraphError::New(e.to_string()))?;
+            // from_path/to_path are properties, so they can change even when
+            // adjacency does not: drop the old path keys, then re-index.
+            if let Some(existing) = &existing {
+                self.delete_edge_paths_be(w, existing)?;
+            }
             self.index_edge_paths_be(w, &edge)?;
         }
 

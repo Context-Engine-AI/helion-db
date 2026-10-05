@@ -15,7 +15,9 @@ use raft::prelude::Message;
 use serde::{Deserialize, Serialize};
 
 use crate::helix_engine::graph_core::{config::Config, traversals::algorithms};
-use crate::helix_engine::storage_core::backend::{BackendKind, Namespace, StorageBackend};
+use crate::helix_engine::storage_core::backend::{
+    BackendKind, Namespace, StorageBackend, StorageBackendConfig,
+};
 use crate::helix_engine::storage_core::collection_manager::{
     maintenance_process_resource_admission, CollectionManager, MaintenanceAdmission,
 };
@@ -29,8 +31,8 @@ use crate::helix_engine::storage_core::storage_methods::StorageMethods;
 use crate::helix_engine::storage_core::upsert::{EdgeUpsert, NodeUpsert};
 use crate::helix_engine::types::GraphError;
 use crate::helix_engine::vector_core::named_vectors::{
-    DenseDeletePlan, DenseMergeCandidateLimits, DenseSegmentDebt, NamedVectorConfig,
-    NamedVectorManager,
+    DenseDeletePlan, DenseMergeCandidateLimits, DenseSegmentDebt, DistanceMetric,
+    NamedVectorConfig, NamedVectorManager,
 };
 use crate::helix_engine::vector_core::sparse::{SparseVector, SparseVectorConfig};
 use crate::helix_engine::vector_core::vector_core::{
@@ -634,25 +636,17 @@ fn optimizer_debt_can_expand_build_budget(debt: DenseSegmentDebt) -> bool {
     debt.gate_debt > 0 && debt.active_segments >= NamedVectorManager::segment_creation_gate_cap()
 }
 
-/// True when this node is an LSM read-only replica (`HELIX_LSM_ROLE=reader`).
+/// True when this node is configured as an LSM read-only replica.
 /// Reader replicas serve reads from the writer's committed S3 state and reject
 /// all writes; the HNSW build/merge optimizer is a WRITE path, so running it on a
 /// reader just fails every cycle with "read-only LSM reader replica" (error spam
 /// + wasted CPU). The optimizer must run on the writer only.
-fn lsm_role_is_reader() -> bool {
-    std::env::var("HELIX_LSM_ROLE")
-        .map(|role| role.eq_ignore_ascii_case("reader"))
-        .unwrap_or(false)
-}
-
-fn lsm_role_is_writer() -> bool {
-    std::env::var("HELIX_LSM_ROLE")
-        .map(|role| role.eq_ignore_ascii_case("writer"))
-        .unwrap_or(false)
+fn lsm_config_is_reader(config: &Config) -> bool {
+    config.storage_backend.is_reader()
 }
 
 fn spawn_optimizer_backlog_sweeper(collections: Arc<CollectionManager>, config: Config) {
-    if lsm_role_is_reader() {
+    if lsm_config_is_reader(&config) {
         metrics::counter!("helix_optimizer_backlog_sweeper_total", "outcome" => "reader_disabled")
             .increment(1);
         return;
@@ -1077,7 +1071,7 @@ pub fn submit_collection_optimizer(
     // Guard here so post-open maintenance, the segment-breaker path, and any manual
     // submit all no-op on a reader instead of failing every cycle with the
     // "read-only LSM reader replica" write rejection.
-    if lsm_role_is_reader() {
+    if lsm_config_is_reader(config) {
         metrics::counter!("helix_index_executor_submit_skipped_total", "reason" => "reader_replica")
             .increment(1);
         return Ok(0);
@@ -1195,7 +1189,7 @@ pub(crate) fn submit_post_open_vector_maintenance(
     // logs "background optimizer failed: read-only LSM reader replica" each cycle.
     // The writer owns all optimizer work. (This path submits an IndexJob directly,
     // so it needs its own guard separate from submit_collection_optimizer.)
-    if lsm_role_is_reader() {
+    if storage.backend.is_reader_replica() {
         metrics::counter!(
             "helix_post_open_vector_maintenance_total",
             "outcome" => "reader_replica"
@@ -2770,6 +2764,86 @@ fn run_chunked_indices_publish(
     Ok(any_flushed)
 }
 
+fn recover_indexed_building_segments(
+    storage: &Arc<HelixGraphStorage>,
+    collection: &str,
+    vec_name: &str,
+) -> Result<usize, GraphError> {
+    let indexed = if storage.backend.kind() == BackendKind::Lsm {
+        let read = storage
+            .backend
+            .begin_read()
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        storage
+            .named_vectors
+            .indexed_building_segment_names_be(&read, vec_name)
+            .map_err(GraphError::from)?
+    } else {
+        storage.with_read_txn(|txn| {
+            storage
+                .named_vectors
+                .indexed_building_segment_names(txn, vec_name)
+                .map_err(GraphError::from)
+        })?
+    };
+    if indexed.is_empty() {
+        return Ok(0);
+    }
+
+    let changed = if storage.backend.kind() == BackendKind::Lsm {
+        let read = storage
+            .backend
+            .begin_read()
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        storage
+            .named_vectors
+            .promote_building_segments_to_indexed_be(&read, vec_name, &indexed)
+            .map_err(GraphError::from)?
+    } else {
+        storage.with_read_txn(|txn| {
+            storage
+                .named_vectors
+                .promote_building_segments_to_indexed(txn, vec_name, &indexed)
+                .map_err(GraphError::from)
+        })?
+    };
+    if !changed {
+        return Ok(0);
+    }
+
+    if storage.backend.kind() == BackendKind::Lsm {
+        storage.with_write_backend(|write| {
+            storage.set_dense_vector_spaces_metadata_be(
+                write,
+                storage.named_vectors.list_dense_vector_spaces(),
+            )?;
+            Ok(())
+        })?;
+    } else {
+        storage.with_write_txn(|txn| {
+            storage.set_dense_vector_spaces_metadata(
+                txn,
+                storage.named_vectors.list_dense_vector_spaces(),
+            )?;
+            Ok(())
+        })?;
+    }
+
+    metrics::counter!(
+        "helix_index_job_recovered_building_segments_total",
+        "collection" => collection.to_string(),
+        "vector" => vec_name.to_string()
+    )
+    .increment(indexed.len() as u64);
+    tracing::info!(
+        collection = %collection,
+        vector = %vec_name,
+        segments = indexed.len(),
+        "optimizer promoted completed Building segments without rebuilding"
+    );
+    Ok(indexed.len())
+}
+
 fn run_index_job(job: IndexJob) {
     let IndexJob {
         collection,
@@ -3075,6 +3149,18 @@ fn run_index_job(job: IndexJob) {
                     }
                 }
 
+                let had_building_debt = spaces_to_check.iter().any(|name| {
+                    !storage
+                        .named_vectors
+                        .building_segment_names(name)
+                        .is_empty()
+                });
+                if had_building_debt {
+                    for vec_name in &spaces_to_check {
+                        recover_indexed_building_segments(&storage, &collection, vec_name)?;
+                    }
+                }
+
                 let repair_limit = externalized_marker_repair_limit_per_segment();
                 if repair_limit > 0 && storage.backend.kind() != BackendKind::Lsm {
                     let mut attempted_marker_repair = false;
@@ -3126,6 +3212,9 @@ fn run_index_job(job: IndexJob) {
                 }
 
                 let quiesced = loop {
+                    if had_building_debt {
+                        break false;
+                    }
                     let now_ms = {
                         use std::time::{SystemTime, UNIX_EPOCH};
                         SystemTime::now()
@@ -3174,7 +3263,9 @@ fn run_index_job(job: IndexJob) {
                 // the O(vectors) prefix scan in get_dense_space_stats never holds
                 // the LMDB write lock. Enter the exclusive write txn only when
                 // there is actually work to do.
-                let spaces_to_seal: Vec<String> = if storage.backend.kind() == BackendKind::Lsm {
+                let spaces_to_seal: Vec<String> = if had_building_debt {
+                    Vec::new()
+                } else if storage.backend.kind() == BackendKind::Lsm {
                     let r = storage
                         .backend
                         .begin_read()
@@ -3654,6 +3745,13 @@ fn run_index_job(job: IndexJob) {
                     let prepared_index = VectorCore::build_hnsw_in_memory_owned_with_permit(
                         exported,
                         &hnsw_config,
+                        storage
+                            .named_vectors
+                            .get_config(vec_name)
+                            .map(|config| config.distance)
+                            .ok_or_else(|| {
+                                GraphError::New(format!("Named vector '{}' not found", vec_name))
+                            })?,
                         &build_permit,
                     )
                     .map_err(GraphError::from)?;
@@ -4236,11 +4334,11 @@ struct CloudGatewayRouter {
 }
 
 impl CloudGatewayConfig {
-    fn from_env() -> Option<Self> {
+    fn from_env(storage_backend: StorageBackendConfig) -> Option<Self> {
         // Reader replicas must execute requests against their local DbReader.
         // Enabling the shared gateway config on a reader sends the request back
         // through the reader Service and recursively proxies it until timeout.
-        if lsm_role_is_reader() {
+        if storage_backend.is_reader() {
             return None;
         }
         let writer_url = gateway_env_first(&[
@@ -4282,7 +4380,7 @@ impl CloudGatewayConfig {
             reader_eviction,
             reader_proxy_timeout,
             writer_proxy_timeout,
-            writer_is_local: lsm_role_is_writer(),
+            writer_is_local: storage_backend.is_writer(),
             include_writer_for_reads,
             buffer,
         })
@@ -4453,8 +4551,8 @@ impl CloudGatewayRouter {
         }
     }
 
-    fn from_env() -> Option<Self> {
-        CloudGatewayConfig::from_env().map(Self::new)
+    fn from_env(storage_backend: StorageBackendConfig) -> Option<Self> {
+        CloudGatewayConfig::from_env(storage_backend).map(Self::new)
     }
 
     fn target_plan(&self, request: &Request, now: Instant) -> Option<Vec<GatewayTarget>> {
@@ -4847,12 +4945,13 @@ impl ReplicationManager {
         } else {
             None
         };
+        let cloud_gateway = CloudGatewayRouter::from_env(config.storage_backend).map(Arc::new);
         Ok(Self {
             collections,
             config,
             runtime,
             transport,
-            cloud_gateway: CloudGatewayRouter::from_env().map(Arc::new),
+            cloud_gateway,
         })
     }
 
@@ -5693,6 +5792,7 @@ fn apply_create_collection(
                 .map_err(GraphError::from)?;
         }
 
+        let mut created_sparse: Vec<&str> = Vec::new();
         for (sp_name, sp_config) in sparse_vectors {
             if let Some(existing) = storage.named_vectors.get_sparse_config(sp_name) {
                 if existing != *sp_config {
@@ -5707,9 +5807,19 @@ fn apply_create_collection(
                 .named_vectors
                 .load_sparse_index_lsm(sp_name, sp_config.clone())
                 .map_err(GraphError::from)?;
+            created_sparse.push(sp_name.as_str());
         }
 
         storage.with_write_backend(|w| {
+            // A fresh token per new space: a reader replica that cached the
+            // dropped incarnation of a same-named collection must not keep
+            // serving it under the initial (absent-key) epoch.
+            for sp_name in &created_sparse {
+                storage
+                    .named_vectors
+                    .with_sparse_core(sp_name, |core| core.init_cache_epoch_be(w))
+                    .map_err(GraphError::from)?;
+            }
             if let Some(merged) = merged_overrides.as_ref() {
                 storage.set_hnsw_overrides_be(w, merged)?;
             }
@@ -5911,6 +6021,7 @@ fn apply_update_collection(
             dense_changed = true;
         }
 
+        let mut created_sparse: Vec<&str> = Vec::new();
         for (sp_name, sp_config) in sparse_vectors {
             if let Some(existing) = storage.named_vectors.get_sparse_config(sp_name) {
                 if existing != *sp_config {
@@ -5926,10 +6037,18 @@ fn apply_update_collection(
                 .create_sparse_index_lsm(sp_name, sp_config.clone())
                 .map_err(GraphError::from)?;
             sparse_changed = true;
+            created_sparse.push(sp_name.as_str());
         }
 
         if dense_changed || sparse_changed {
             storage.with_write_backend(|w| {
+                // See apply_create_collection: new spaces get a fresh epoch.
+                for sp_name in &created_sparse {
+                    storage
+                        .named_vectors
+                        .with_sparse_core(sp_name, |core| core.init_cache_epoch_be(w))
+                        .map_err(GraphError::from)?;
+                }
                 if dense_changed {
                     storage
                         .set_named_vectors_metadata_be(w, storage.named_vectors.list_vectors())?;
@@ -7860,6 +7979,7 @@ mod tests {
     use crate::helix_engine::graph_core::config::{
         Config, GraphConfig, RaftConfig, RaftPeerConfig, VectorConfig,
     };
+    use crate::helix_engine::storage_core::backend::{LsmRole, LsmStorage};
     use crate::helix_engine::storage_core::storage_methods::StorageMethods;
     use std::sync::Weak;
     use tempfile::TempDir;
@@ -7890,6 +8010,13 @@ mod tests {
             include_writer_for_reads,
             buffer: None,
         })
+    }
+
+    fn lsm_reader_backend_config_for_tests() -> StorageBackendConfig {
+        StorageBackendConfig::Lsm {
+            storage: LsmStorage::InMemory,
+            role: LsmRole::Reader,
+        }
     }
 
     fn writer_target() -> GatewayTarget {
@@ -8039,9 +8166,8 @@ mod tests {
     fn cloud_gateway_is_disabled_inside_reader_replicas() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _writer_url = EnvVarGuard::set("HELIX_GATEWAY_WRITER_URL", "http://writer:8080");
-        let _role = EnvVarGuard::set("HELIX_LSM_ROLE", "reader");
 
-        assert!(CloudGatewayConfig::from_env().is_none());
+        assert!(CloudGatewayConfig::from_env(lsm_reader_backend_config_for_tests()).is_none());
     }
 
     #[test]
@@ -8432,15 +8558,86 @@ mod tests {
     }
 
     #[test]
+    fn lsm_create_collection_writes_fresh_sparse_cache_epoch() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: "repo".into(),
+                vectors: HashMap::new(),
+                sparse_vectors: HashMap::from([(
+                    "lex_sparse".into(),
+                    SparseVectorConfig::default(),
+                )]),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        let storage = collections.get_collection("repo").unwrap();
+        assert_eq!(storage.backend.kind(), BackendKind::Lsm);
+        let token = storage
+            .named_vectors
+            .with_sparse_core("lex_sparse", |core| Ok(core.cache_epoch_token_for_test()))
+            .unwrap();
+        assert!(
+            matches!(token, Some(t) if t != 0),
+            "a new sparse space must not read as the initial epoch, got {token:?}"
+        );
+    }
+
+    #[test]
+    fn lsm_update_collection_writes_fresh_epoch_for_added_sparse_space() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: "repo".into(),
+                vectors: HashMap::new(),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::UpdateCollection {
+                name: "repo".into(),
+                vectors: HashMap::new(),
+                sparse_vectors: HashMap::from([(
+                    "lex_sparse".into(),
+                    SparseVectorConfig::default(),
+                )]),
+            },
+        )
+        .unwrap();
+        let storage = collections.get_collection("repo").unwrap();
+        let token = storage
+            .named_vectors
+            .with_sparse_core("lex_sparse", |core| Ok(core.cache_epoch_token_for_test()))
+            .unwrap();
+        assert!(
+            matches!(token, Some(t) if t != 0),
+            "an added sparse space must not read as the initial epoch, got {token:?}"
+        );
+    }
+
+    #[test]
     fn chunked_merge_publish_tq_attaches_ordinals_on_lsm_backend() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _backend = EnvVarGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvVarGuard::set("HELIX_LSM_IN_MEMORY", "1");
         let _format = EnvVarGuard::set("HELIX_SEGMENT_FORMAT", "tq");
         let spindle =
             crate::helix_engine::vector_core::spindle::SpindleConfig::turbo_prod_compact(4);
         let temp_dir = TempDir::new().unwrap();
-        let config = Config::new(8, 32, 64, 1);
+        let config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
         let collections =
             Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
         apply_mutation(
@@ -8495,6 +8692,23 @@ mod tests {
         assert!(
             ordinal.len() == 8,
             "HVTQ LSM publish must write sidecar ordinals through AnyWrite"
+        );
+        let vector_row = storage
+            .backend
+            .get_with(
+                &r,
+                Namespace::Segment {
+                    physical_name: TEST_MERGE_TARGET,
+                    db: crate::helix_engine::storage_core::backend::SegmentDb::Vectors,
+                },
+                vector_key_for_test(401, 0).as_slice(),
+                |opt| opt.map(|b| b.to_vec()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            vector_row.is_empty(),
+            "HVTQ LSM publish must store a marker instead of duplicate vector bytes"
         );
         let durable_blob = storage
             .backend
@@ -9313,6 +9527,7 @@ mod tests {
                         .collect(),
                 },
             },
+            storage_backend: StorageBackendConfig::Lmdb,
         }
     }
 
@@ -9496,11 +9711,9 @@ mod tests {
     #[test]
     fn apply_delete_points_lsm_removes_ids_across_indexed_and_mutable_segments() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _backend = EnvVarGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvVarGuard::set("HELIX_LSM_IN_MEMORY", "1");
 
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(8, 32, 64, 1);
+        let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
         config.vector_config.flat_scan_threshold = Some(3);
         let collections =
             Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
@@ -9975,6 +10188,7 @@ mod tests {
 
     #[test]
     fn bulk_upsert_finalizes_dense_tail_after_large_batch() {
+        const COLLECTION: &str = "bulk-upsert-finalizes-dense-tail";
         let temp_dir = TempDir::new().unwrap();
         let mut config = Config::new(8, 32, 64, 1);
         config.vector_config.flat_scan_threshold = Some(2);
@@ -9985,7 +10199,7 @@ mod tests {
             &collections,
             &config,
             &ReplicatedMutation::CreateCollection {
-                name: "repo".into(),
+                name: COLLECTION.into(),
                 vectors: HashMap::from([(
                     "dense".into(),
                     NamedVectorConfig {
@@ -10006,7 +10220,7 @@ mod tests {
             &collections,
             &config,
             &ReplicatedMutation::UpsertPoints {
-                collection: "repo".into(),
+                collection: COLLECTION.into(),
                 points: vec![
                     ReplicatedPoint {
                         id: 1,
@@ -10035,7 +10249,7 @@ mod tests {
         // The split-phase optimizer may briefly expose segment metadata before
         // the LMDB write transaction commits, causing transient read errors.
         // Tolerate those during polling.
-        let storage = collections.get_collection("repo").unwrap();
+        let storage = collections.get_collection(COLLECTION).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut stats = None;
         while Instant::now() < deadline {
@@ -10226,11 +10440,9 @@ mod tests {
     #[test]
     fn optimizer_indexes_lsm_collection_end_to_end() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _backend = EnvVarGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvVarGuard::set("HELIX_LSM_IN_MEMORY", "1");
 
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(8, 32, 64, 1);
+        let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
         // Low indexing threshold so a handful of inserts crosses it and the
         // optimizer seals + builds instead of staying flat.
         config.vector_config.flat_scan_threshold = Some(3);
@@ -10378,6 +10590,105 @@ mod tests {
             any_segment_has_index,
             "no dense segment carries an HNSW index on LSM after the optimizer ran"
         );
+    }
+
+    #[test]
+    fn optimizer_builds_existing_lsm_segment_before_waiting_for_tail_quiescence() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _runtime = EnvVarGuard::set("HELIX_INDEX_JOB_MAX_RUNTIME_MS", "50");
+        let _quiesced_tails = EnvVarGuard::set("HELIX_INDEX_SUBTHRESHOLD_QUIESCED_TAILS", "1");
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        config.vector_config.flat_scan_threshold = Some(1_000);
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: "repo".into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: 4,
+                        distance:
+                            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::UpsertPoints {
+                collection: "repo".into(),
+                points: (1..=6u128)
+                    .map(|id| ReplicatedPoint {
+                        id,
+                        vectors: HashMap::from([("dense".into(), vec![id as f32, 1.0, 0.0, 0.0])]),
+                        sparse_vectors: HashMap::new(),
+                        payload: HashMap::new(),
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+
+        let storage = collections.get_collection("repo").unwrap();
+        let read = storage.backend.begin_read().unwrap();
+        assert!(storage
+            .named_vectors
+            .seal_mutable_tail_lsm(
+                &read,
+                storage.collection_path(),
+                "dense",
+                HNSWConfig::new(Some(8), Some(32), Some(64)),
+            )
+            .unwrap());
+        drop(read);
+        storage
+            .with_write_backend(|write| {
+                storage.set_dense_vector_spaces_metadata_be(
+                    write,
+                    storage.named_vectors.list_dense_vector_spaces(),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        storage
+            .last_upsert_at
+            .store(now_ms, std::sync::atomic::Ordering::Release);
+
+        run_index_job(IndexJob {
+            collection: "repo".to_string(),
+            storage: Arc::downgrade(&storage),
+            spaces_to_check: vec!["dense".to_string()],
+            hnsw_config: HNSWConfig::new(Some(8), Some(32), Some(64)),
+            flat_scan_threshold: 1_000,
+        });
+
+        let read = storage.backend.begin_read().unwrap();
+        let stats = storage
+            .named_vectors
+            .get_dense_space_stats_be(&read, "dense")
+            .unwrap();
+        assert_eq!(stats.indexed_vectors_count, 6);
+        assert!(storage
+            .named_vectors
+            .building_segment_names("dense")
+            .is_empty());
     }
 
     #[test]
@@ -11688,6 +11999,7 @@ mod tests {
         let prepared_index = VectorCore::build_hnsw_in_memory_owned_with_permit(
             exported,
             &hnsw_config,
+            DistanceMetric::Cosine,
             &build_permit,
         )
         .unwrap();
@@ -11877,6 +12189,7 @@ mod tests {
         let prepared_index = VectorCore::build_hnsw_in_memory_owned_with_permit(
             exported,
             &hnsw_config,
+            DistanceMetric::Cosine,
             &build_permit,
         )
         .unwrap();
@@ -11945,11 +12258,9 @@ mod tests {
     #[test]
     fn optimizer_read_helpers_succeed_on_lsm_backend() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _backend = EnvVarGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvVarGuard::set("HELIX_LSM_IN_MEMORY", "1");
 
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config::new(8, 32, 64, 1);
+        let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
         config.vector_config.flat_scan_threshold = Some(3);
         let collections =
             Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());

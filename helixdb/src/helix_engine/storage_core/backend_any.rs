@@ -11,18 +11,27 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use heed3::{Env, RoTxn, RwTxn, WithTls};
+#[cfg(test)]
+use slatedb::object_store::ObjectStore;
 use slatedb::{bytes::Bytes, CloseReason};
 
 use super::backend::{
-    BackendError, BackendKind, KeyRange, Namespace, ReadTxn, StorageBackend, WriteTxn,
+    BackendError, BackendKind, KeyRange, Namespace, ReadTxn, StorageBackend, StorageBackendConfig,
+    WriteTxn,
 };
 use super::backend_lmdb::{LmdbBackend, LmdbRead, LmdbWrite};
 use super::backend_lsm::{
-    cache_root_from_env, cache_subtree_for_lsm_path, list_s3_collection_prefixes,
-    read_s3_metadata_sidecar, LsmBackend, LsmRead, LsmWrite, S3StoreConfig,
+    cache_root_from_env, cache_subtree_for_lsm_path, clear_s3_drop_tombstone,
+    list_s3_collection_prefixes, persist_s3_drop_tombstone, read_s3_drop_tombstone,
+    read_s3_metadata_sidecar, s3_collection_prefix_exists, LsmBackend, LsmRead, LsmWrite,
+    S3StoreConfig,
 };
+#[cfg(test)]
+use super::backend_lsm::{list_child_collection_names, purge_prefix_from_store, shared_lsm_handle};
 use super::backend_lsm_reader::LsmReader;
 
 fn unhealthy_lsm_writer_close_reason_from(reason: Option<CloseReason>) -> Option<CloseReason> {
@@ -38,6 +47,41 @@ fn unhealthy_lsm_writer_close_reason_from(reason: Option<CloseReason>) -> Option
 /// at the backend layer (defense-in-depth, independent of gateway routing).
 pub(crate) const LSM_READER_READONLY: &str =
     "read-only LSM reader replica; writes must go to the writer node";
+
+#[cfg(test)]
+static LSM_TEST_OBJECT_STORE: std::sync::LazyLock<Mutex<Option<Arc<dyn ObjectStore>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+pub(crate) struct LsmTestObjectStoreGuard {
+    previous: Option<Arc<dyn ObjectStore>>,
+}
+
+#[cfg(test)]
+impl Drop for LsmTestObjectStoreGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = LSM_TEST_OBJECT_STORE.lock() {
+            *slot = self.previous.take();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_lsm_test_object_store(store: Arc<dyn ObjectStore>) -> LsmTestObjectStoreGuard {
+    let previous = LSM_TEST_OBJECT_STORE
+        .lock()
+        .map(|mut slot| slot.replace(store))
+        .unwrap_or(None);
+    LsmTestObjectStoreGuard { previous }
+}
+
+#[cfg(test)]
+fn lsm_test_object_store() -> Option<Arc<dyn ObjectStore>> {
+    LSM_TEST_OBJECT_STORE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(Arc::clone))
+}
 
 /// The active storage engine.
 pub enum AnyBackend {
@@ -111,9 +155,26 @@ impl AnyBackend {
     /// - `HELIX_LSM_PREFIX` (default `helion`)
     /// - `HELIX_LSM_REGION`
     /// - `HELIX_LSM_ENDPOINT` + `HELIX_LSM_ALLOW_HTTP=1` for MinIO/S3-compatible stores
-    pub fn open_lsm_from_env(collection_path: &Path) -> Result<Self, BackendError> {
-        if lsm_in_memory_enabled() {
+    pub fn open_lsm_from_env(
+        collection_path: &Path,
+        config: StorageBackendConfig,
+    ) -> Result<Self, BackendError> {
+        if config.is_lsm_in_memory() {
             return Self::open_lsm_in_memory(&collection_lsm_path(collection_path));
+        }
+
+        let prefix = collection_lsm_path(collection_path);
+
+        #[cfg(test)]
+        if let Some(store) = lsm_test_object_store() {
+            if config.is_reader() {
+                return Err(BackendError::Unsupported(
+                    "test object-store override does not support LSM reader replicas".to_string(),
+                ));
+            }
+            return Ok(AnyBackend::Lsm(LsmBackend::open_with_store(
+                &prefix, store,
+            )?));
         }
 
         let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
@@ -122,7 +183,6 @@ impl AnyBackend {
                     .to_string(),
             )
         })?;
-        let prefix = collection_lsm_path(collection_path);
         let region = std::env::var("HELIX_LSM_REGION").ok();
         let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
         let allow_http = env_flag("HELIX_LSM_ALLOW_HTTP");
@@ -131,7 +191,7 @@ impl AnyBackend {
         // committed state at the same bucket/prefix (self-refreshing `DbReader` +
         // SSD cache); the default role opens the read-write LSM engine. Reads are
         // byte-identical because both arms share the namespace key encoding.
-        if lsm_role_is_reader() {
+        if config.is_reader() {
             return Ok(AnyBackend::LsmReader(LsmReader::open_s3_with_options(
                 &bucket,
                 &prefix,
@@ -151,15 +211,15 @@ impl AnyBackend {
     }
 
     pub fn open_selected_for_collection(
-        kind: BackendKind,
+        config: StorageBackendConfig,
         lmdb_env: Option<Env<WithTls>>,
         collection_path: &Path,
     ) -> Result<Self, BackendError> {
-        match kind {
-            BackendKind::Lmdb => lmdb_env
+        match config {
+            StorageBackendConfig::Lmdb => lmdb_env
                 .map(Self::from_lmdb_env)
                 .ok_or_else(|| BackendError::Io("LMDB backend requires a heed env".to_string())),
-            BackendKind::Lsm => Self::open_lsm_from_env(collection_path),
+            StorageBackendConfig::Lsm { .. } => Self::open_lsm_from_env(collection_path, config),
         }
     }
 
@@ -315,17 +375,23 @@ impl AnyBackend {
 /// each in-memory collection gets an isolated store, so there is no shared
 /// catalog to scan. Callers MUST treat any error as non-fatal (log + fall back to
 /// the local registry); a listing failure must never block startup or a request.
-pub fn list_collection_prefixes_from_env() -> Result<Vec<String>, BackendError> {
-    if lsm_in_memory_enabled() {
+pub fn list_collection_prefixes_from_env(
+    config: StorageBackendConfig,
+) -> Result<Vec<String>, BackendError> {
+    if config.is_lsm_in_memory() {
         return Ok(Vec::new());
+    }
+    let root = std::env::var("HELIX_LSM_PREFIX").unwrap_or_else(|_| "helion".to_string());
+    let root = root.trim_matches('/').to_string();
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return list_child_collection_names(&shared_lsm_handle(), &store, &root);
     }
     let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
         BackendError::Io(
             "HELIX_STORAGE_BACKEND=lsm catalog rediscovery requires HELIX_LSM_BUCKET".to_string(),
         )
     })?;
-    let root = std::env::var("HELIX_LSM_PREFIX").unwrap_or_else(|_| "helion".to_string());
-    let root = root.trim_matches('/').to_string();
     let region = std::env::var("HELIX_LSM_REGION").ok();
     let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
     let allow_http = env_flag("HELIX_LSM_ALLOW_HTTP");
@@ -340,8 +406,14 @@ pub fn list_collection_prefixes_from_env() -> Result<Vec<String>, BackendError> 
 
 pub fn read_metadata_sidecar_from_lsm_env(
     collection_path: &Path,
+    config: StorageBackendConfig,
 ) -> Result<Option<Vec<u8>>, BackendError> {
-    if lsm_in_memory_enabled() {
+    if config.is_lsm_in_memory() {
+        return Ok(None);
+    }
+    let prefix = collection_lsm_path(collection_path);
+    #[cfg(test)]
+    if lsm_test_object_store().is_some() {
         return Ok(None);
     }
     let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
@@ -350,7 +422,6 @@ pub fn read_metadata_sidecar_from_lsm_env(
                 .to_string(),
         )
     })?;
-    let prefix = collection_lsm_path(collection_path);
     let region = std::env::var("HELIX_LSM_REGION").ok();
     let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
     let allow_http = env_flag("HELIX_LSM_ALLOW_HTTP");
@@ -363,16 +434,145 @@ pub fn read_metadata_sidecar_from_lsm_env(
     read_s3_metadata_sidecar(&config, &prefix)
 }
 
-pub(crate) fn purge_lsm_prefix_from_env(collection_path: &Path) -> Result<(), BackendError> {
-    if lsm_in_memory_enabled() || lsm_role_is_reader() {
+pub(crate) fn lsm_collection_prefix_exists_from_env(
+    collection_path: &Path,
+    config: StorageBackendConfig,
+) -> Result<bool, BackendError> {
+    if !config.is_lsm() || config.is_lsm_in_memory() || config.is_reader() {
+        return Ok(false);
+    }
+    let prefix = collection_lsm_path(collection_path);
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return super::backend_lsm::collection_prefix_exists_with_store(store, &prefix);
+    }
+    let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
+        BackendError::Io(
+            "HELIX_STORAGE_BACKEND=lsm prefix probe requires HELIX_LSM_BUCKET".to_string(),
+        )
+    })?;
+    let region = std::env::var("HELIX_LSM_REGION").ok();
+    let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
+    let config = S3StoreConfig {
+        bucket: &bucket,
+        region: region.as_deref(),
+        endpoint: endpoint.as_deref(),
+        allow_http: env_flag("HELIX_LSM_ALLOW_HTTP"),
+    };
+    s3_collection_prefix_exists(&config, &prefix)
+}
+
+pub(crate) fn persist_lsm_drop_tombstone_from_env(
+    collection_path: &Path,
+    config: StorageBackendConfig,
+) -> Result<(), BackendError> {
+    if !config.is_lsm() || config.is_lsm_in_memory() || config.is_reader() {
         return Ok(());
+    }
+    let prefix = collection_lsm_path(collection_path);
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return super::backend_lsm::persist_drop_tombstone_with_store(store, &prefix);
+    }
+    let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
+        BackendError::Io(
+            "HELIX_STORAGE_BACKEND=lsm drop tombstone persist requires HELIX_LSM_BUCKET"
+                .to_string(),
+        )
+    })?;
+    let region = std::env::var("HELIX_LSM_REGION").ok();
+    let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
+    let allow_http = env_flag("HELIX_LSM_ALLOW_HTTP");
+    let config = S3StoreConfig {
+        bucket: &bucket,
+        region: region.as_deref(),
+        endpoint: endpoint.as_deref(),
+        allow_http,
+    };
+    persist_s3_drop_tombstone(&config, &prefix)
+}
+
+pub(crate) fn lsm_drop_tombstone_exists_from_env(
+    collection_path: &Path,
+    config: StorageBackendConfig,
+) -> Result<bool, BackendError> {
+    if !config.is_lsm() || config.is_lsm_in_memory() || config.is_reader() {
+        return Ok(false);
+    }
+    let prefix = collection_lsm_path(collection_path);
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return super::backend_lsm::read_drop_tombstone_with_store(store, &prefix);
+    }
+    let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
+        BackendError::Io(
+            "HELIX_STORAGE_BACKEND=lsm drop tombstone lookup requires HELIX_LSM_BUCKET".to_string(),
+        )
+    })?;
+    let region = std::env::var("HELIX_LSM_REGION").ok();
+    let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
+    let allow_http = env_flag("HELIX_LSM_ALLOW_HTTP");
+    let config = S3StoreConfig {
+        bucket: &bucket,
+        region: region.as_deref(),
+        endpoint: endpoint.as_deref(),
+        allow_http,
+    };
+    read_s3_drop_tombstone(&config, &prefix)
+}
+
+pub(crate) fn clear_lsm_drop_tombstone_from_env(
+    collection_path: &Path,
+    config: StorageBackendConfig,
+) -> Result<(), BackendError> {
+    if !config.is_lsm() || config.is_lsm_in_memory() || config.is_reader() {
+        return Ok(());
+    }
+    let prefix = collection_lsm_path(collection_path);
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return super::backend_lsm::clear_drop_tombstone_with_store(store, &prefix);
+    }
+    let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
+        BackendError::Io(
+            "HELIX_STORAGE_BACKEND=lsm drop tombstone clear requires HELIX_LSM_BUCKET".to_string(),
+        )
+    })?;
+    let region = std::env::var("HELIX_LSM_REGION").ok();
+    let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
+    let allow_http = env_flag("HELIX_LSM_ALLOW_HTTP");
+    let config = S3StoreConfig {
+        bucket: &bucket,
+        region: region.as_deref(),
+        endpoint: endpoint.as_deref(),
+        allow_http,
+    };
+    clear_s3_drop_tombstone(&config, &prefix)
+}
+
+pub(crate) fn purge_lsm_prefix_from_env(
+    collection_path: &Path,
+    config: StorageBackendConfig,
+) -> Result<(), BackendError> {
+    if !config.is_lsm() || config.is_lsm_in_memory() || config.is_reader() {
+        return Ok(());
+    }
+    let prefix = collection_lsm_path(collection_path);
+    #[cfg(test)]
+    if std::env::var("HELIX_LSM_TEST_FAIL_PURGE").is_ok() {
+        return Err(BackendError::Io(
+            "injected test object-store purge failure".to_string(),
+        ));
+    }
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return purge_prefix_from_store(shared_lsm_handle(), store, &prefix);
     }
     let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
         BackendError::Io(
             "HELIX_STORAGE_BACKEND=lsm prefix purge requires HELIX_LSM_BUCKET".to_string(),
         )
     })?;
-    let prefix = collection_lsm_path(collection_path);
     let region = std::env::var("HELIX_LSM_REGION").ok();
     let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
     let allow_http = env_flag("HELIX_LSM_ALLOW_HTTP");
@@ -447,6 +647,19 @@ impl<'s> AnyRead<'s> {
             AnyRead::Failed(_) => None,
         }
     }
+
+    /// True when every read through this handle observes one committed
+    /// state: LMDB read txns and LSM writer snapshots always, reader-replica
+    /// handles only when a `DbSnapshot` was pinned. A latest-state reader
+    /// handle (`LsmReader(None)`, including the snapshot-open failure
+    /// fallback) may observe a manifest refresh between two reads.
+    pub(crate) fn is_snapshot_pinned(&self) -> bool {
+        match self {
+            AnyRead::Lmdb(_) | AnyRead::Lsm(_) => true,
+            AnyRead::LsmReader(snapshot) => snapshot.is_some(),
+            AnyRead::Failed(_) => false,
+        }
+    }
 }
 
 /// Build the reader-replica read handle: a snapshot-pinned handle when
@@ -479,18 +692,6 @@ fn env_flag(name: &str) -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
-        .unwrap_or(false)
-}
-
-fn lsm_in_memory_enabled() -> bool {
-    env_flag("HELIX_LSM_IN_MEMORY")
-}
-
-/// `HELIX_LSM_ROLE=reader` selects a read-only replica; anything else (including
-/// unset) is the default writer role.
-fn lsm_role_is_reader() -> bool {
-    std::env::var("HELIX_LSM_ROLE")
-        .map(|v| v.trim().eq_ignore_ascii_case("reader"))
         .unwrap_or(false)
 }
 

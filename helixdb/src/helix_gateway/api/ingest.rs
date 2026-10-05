@@ -605,32 +605,6 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::BufReader;
 
-    /// Serializes tests that mutate process-global storage-backend env vars
-    /// (`HELIX_STORAGE_BACKEND`, `HELIX_LSM_IN_MEMORY`). Without it, an LSM test's
-    /// env leaks into a concurrently-running heed test (or vice versa) because
-    /// `std::env::set_var` is process-wide. Mirrors the `ENV_LOCK` used in
-    /// `replication.rs`. Lock it BEFORE constructing the `EnvGuard`s and hold the
-    /// guard for the whole test body.
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
-    struct EnvGuard(&'static str, Option<String>);
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self(key, prev)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.1 {
-                Some(v) => std::env::set_var(self.0, v),
-                None => std::env::remove_var(self.0),
-            }
-        }
-    }
-
     struct TestContext {
         _tmp: TempDir,
         graph: Arc<HelixGraphEngine>,
@@ -639,20 +613,24 @@ mod tests {
     }
 
     fn setup() -> TestContext {
+        setup_with_config(Config::default())
+    }
+
+    fn setup_with_config(config: Config) -> TestContext {
         let tmp = TempDir::new().unwrap();
         let graph_path = tmp.path().join("graph");
         let collections_path = tmp.path().join("data");
         let graph = Arc::new(
             HelixGraphEngine::new(HelixGraphEngineOpts {
                 path: graph_path.display().to_string(),
-                config: Config::default(),
+                config: config.clone(),
             })
             .unwrap(),
         );
         let collections =
-            Arc::new(CollectionManager::new(collections_path, Config::default()).unwrap());
+            Arc::new(CollectionManager::new(collections_path, config.clone()).unwrap());
         let replication =
-            Arc::new(ReplicationManager::new(Arc::clone(&collections), Config::default()).unwrap());
+            Arc::new(ReplicationManager::new(Arc::clone(&collections), config).unwrap());
         TestContext {
             _tmp: tmp,
             graph,
@@ -683,7 +661,6 @@ mod tests {
 
     #[test]
     fn edge_ingest_preserves_git_branches() {
-        let _env = ENV_LOCK.lock().unwrap();
         let ctx = setup();
         let body = sonic_rs::to_vec(&sonic_rs::json!({
             "collection": "repo",
@@ -725,7 +702,6 @@ mod tests {
 
     #[test]
     fn stream_ingest_processes_nodes_and_edges_in_batches() {
-        let _env = ENV_LOCK.lock().unwrap();
         let ctx = setup();
         let body = [
             r#"{"type":"node","label":"Symbol","name":"main","path":"src/main.rs"}"#,
@@ -754,10 +730,7 @@ mod tests {
 
     #[test]
     fn stream_ingest_writes_nodes_and_edges_on_lsm_backend() {
-        let _env = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-        let ctx = setup();
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
         let body = [
             r#"{"type":"node","label":"Symbol","name":"main","path":"src/main.rs","properties":{"repo":"repo-a"}}"#,
             r#"{"type":"node","label":"Symbol","name":"helper","path":"src/lib.rs","properties":{"repo":"repo-a"}}"#,
@@ -808,10 +781,7 @@ mod tests {
     /// applied count).
     #[test]
     fn stream_ingest_refreshes_collection_stats_on_lsm_backend() {
-        let _env = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-        let ctx = setup();
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
         let body = [
             r#"{"type":"node","label":"Symbol","name":"main","path":"src/main.rs"}"#,
             r#"{"type":"node","label":"Symbol","name":"helper","path":"src/lib.rs"}"#,
@@ -839,10 +809,7 @@ mod tests {
     /// persisted, and `collection_stats` reflects it, on the LSM backend.
     #[test]
     fn handle_ingest_nodes_edges_report_applied_count_on_lsm_backend() {
-        let _env = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-        let ctx = setup();
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
 
         let nodes_body = sonic_rs::to_vec(&sonic_rs::json!({
             "collection": "repo_count",
@@ -882,7 +849,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_socket_ingest_processes_body_incrementally() {
-        let _env = ENV_LOCK.lock().unwrap();
         let ctx = setup();
         let body = [
             r#"{"type":"node","label":"Symbol","name":"main","path":"src/main.rs"}"#,

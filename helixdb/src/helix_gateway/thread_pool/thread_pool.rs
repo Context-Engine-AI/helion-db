@@ -1,7 +1,7 @@
 use crate::helix_engine::graph_core::graph_core::HelixGraphEngine;
 use crate::helix_engine::storage_core::{
-    backend_lsm::allow_lsm_blocking, collection_manager::CollectionManager,
-    replication::ReplicationManager,
+    backend::StorageBackendConfig, backend_lsm::allow_lsm_blocking,
+    collection_manager::CollectionManager, reader_warm, replication::ReplicationManager,
 };
 use crate::helix_engine::types::GraphError;
 use crate::helix_gateway::api::ingest;
@@ -467,7 +467,11 @@ pub(crate) fn route_label_for(path: &str) -> &'static str {
     if path == "/health" || path == "/healthz" || path == "/livez" || path == "/" {
         return "/health";
     }
-    if path == "/ready" || path == "/readyz" {
+    if path == "/ready"
+        || path == "/readyz"
+        || path == "/readyz/warm"
+        || path == reader_warm::HOT_COLLECTIONS_PATH
+    {
         return "/ready";
     }
     if path.starts_with("/_raft/") {
@@ -536,8 +540,11 @@ fn error_response(status: u16, body: &[u8]) -> Response {
     response
 }
 
-pub(crate) fn lsm_reader_write_rejection(class: RouteClass) -> Option<Response> {
-    if !class.is_write_like() || !lsm_reader_role_enabled() {
+pub(crate) fn lsm_reader_write_rejection(
+    class: RouteClass,
+    storage_backend: StorageBackendConfig,
+) -> Option<Response> {
+    if !class.is_write_like() || !storage_backend.is_reader() {
         return None;
     }
     metrics::counter!(
@@ -565,12 +572,6 @@ pub(crate) fn lsm_reader_write_rejection(class: RouteClass) -> Option<Response> 
     Some(response)
 }
 
-fn lsm_reader_role_enabled() -> bool {
-    std::env::var("HELIX_LSM_ROLE")
-        .map(|value| value.trim().eq_ignore_ascii_case("reader"))
-        .unwrap_or(false)
-}
-
 fn probe_response(path: &str) -> Option<Response> {
     let path = path.split('?').next().unwrap_or(path);
     let mut response = Response::new();
@@ -584,9 +585,27 @@ fn probe_response(path: &str) -> Option<Response> {
             response.body = b"{\"status\":\"ok\"}".to_vec();
             Some(response)
         }
-        "/ready" | "/readyz" => {
-            response.status = 200;
-            response.body = b"{\"status\":\"ready\"}".to_vec();
+        reader_warm::HOT_COLLECTIONS_PATH => {
+            match reader_warm::hot_collections_response_body() {
+                Some(body) => {
+                    response.status = 200;
+                    response.body = body;
+                }
+                None => {
+                    response.status = 404;
+                    response.body = b"{\"status\":\"not_found\"}".to_vec();
+                }
+            }
+            Some(response)
+        }
+        "/ready" | "/readyz" | "/readyz/warm" => {
+            if reader_warm::startup_warm_ready() {
+                response.status = 200;
+                response.body = b"{\"status\":\"ready\"}".to_vec();
+            } else {
+                response.status = 503;
+                response.body = b"{\"status\":\"warming\"}".to_vec();
+            }
             Some(response)
         }
         _ => None,
@@ -747,7 +766,9 @@ impl Worker {
                         }
                     }
 
-                    if let Some(mut response) = lsm_reader_write_rejection(req_class) {
+                    if let Some(mut response) =
+                        lsm_reader_write_rejection(req_class, collections.config().storage_backend)
+                    {
                         let status = response.status;
                         let _ = response.send(reader.get_mut()).await;
                         let route_label = route_label_for(&req_path);
@@ -1116,43 +1137,16 @@ impl ThreadPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_inflight_cap, graph_error_response, lsm_reader_write_rejection, queue_capacity,
-        request_timeout_secs, route_class, route_inflight_cap, route_label_for, route_timeout,
-        RouteClass,
+        collection_inflight_cap, graph_error_response, lsm_reader_write_rejection, probe_response,
+        queue_capacity, request_timeout_secs, route_class, route_inflight_cap, route_label_for,
+        route_timeout, RouteClass,
     };
+    use crate::helix_engine::storage_core::backend::{LsmRole, LsmStorage, StorageBackendConfig};
+    use crate::helix_engine::storage_core::reader_warm;
     use crate::helix_engine::types::GraphError;
     use std::sync::{LazyLock, Mutex};
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct EnvRestore {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            let restore = Self {
-                key,
-                previous: std::env::var(key).ok(),
-            };
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            restore
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
 
     #[test]
     fn request_timeout_defaults_and_clamps() {
@@ -1187,6 +1181,33 @@ mod tests {
         assert_eq!(route_label_for("/collections/my-coll"), "/collections/{n}");
         assert_eq!(route_label_for("/v1/graph/delete_by_paths"), "/v1/graph/*");
         assert_eq!(route_label_for("/health"), "/health");
+    }
+
+    #[test]
+    fn warm_readiness_probe_gates_ready_but_never_health() {
+        let _gate_lock = reader_warm::warm_gate_test_lock();
+        assert_eq!(route_label_for("/readyz/warm"), "/ready");
+        assert_eq!(route_class("GET", "/readyz/warm"), RouteClass::Probe);
+        let status = |path: &str| probe_response(path).map(|response| response.status);
+
+        reader_warm::set_startup_warm_pending(true);
+        let warming = ["/ready", "/readyz", "/readyz/warm", "/health"].map(status);
+        reader_warm::set_startup_warm_pending(false);
+        assert_eq!(warming, [Some(503), Some(503), Some(503), Some(200)]);
+
+        for path in ["/ready", "/readyz", "/readyz/warm", "/health"] {
+            assert_eq!(status(path), Some(200), "{path} after warm");
+        }
+    }
+
+    #[test]
+    fn hot_collections_probe_is_404_unless_reader_published() {
+        let _gate_lock = reader_warm::warm_gate_test_lock();
+        let path = reader_warm::HOT_COLLECTIONS_PATH;
+        assert_eq!(route_label_for(path), "/ready");
+        assert_eq!(route_class("GET", path), RouteClass::Probe);
+        // No reader warm task has published in this test → writer behavior.
+        assert_eq!(probe_response(path).map(|r| r.status), Some(404));
     }
 
     #[test]
@@ -1246,10 +1267,16 @@ mod tests {
 
     #[test]
     fn lsm_reader_role_rejects_write_like_routes() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _role = EnvRestore::set("HELIX_LSM_ROLE", "reader");
+        let reader = StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Reader,
+        };
+        let writer = StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Writer,
+        };
 
-        let response = lsm_reader_write_rejection(RouteClass::Write).unwrap();
+        let response = lsm_reader_write_rejection(RouteClass::Write, reader).unwrap();
         assert_eq!(response.status, 503);
         assert_eq!(
             response.headers.get("Retry-After").map(String::as_str),
@@ -1270,10 +1297,11 @@ mod tests {
             Some("write")
         );
         assert!(String::from_utf8_lossy(&response.body).contains("read-only"));
-        assert!(lsm_reader_write_rejection(RouteClass::Index).is_some());
-        assert!(lsm_reader_write_rejection(RouteClass::Maintenance).is_some());
-        assert!(lsm_reader_write_rejection(RouteClass::Read).is_none());
-        assert!(lsm_reader_write_rejection(RouteClass::Search).is_none());
+        assert!(lsm_reader_write_rejection(RouteClass::Index, reader).is_some());
+        assert!(lsm_reader_write_rejection(RouteClass::Maintenance, reader).is_some());
+        assert!(lsm_reader_write_rejection(RouteClass::Read, reader).is_none());
+        assert!(lsm_reader_write_rejection(RouteClass::Search, reader).is_none());
+        assert!(lsm_reader_write_rejection(RouteClass::Write, writer).is_none());
     }
 
     #[test]

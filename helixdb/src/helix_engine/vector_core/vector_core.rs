@@ -550,6 +550,11 @@ fn decode_delete_tombstone_id(physical_name: &str, key: &[u8]) -> Option<u128> {
 /// to avoid catastrophic recall loss. 75% is conservative enough to benefit from
 /// the ranking (worst candidates are pruned) without killing recall.
 const LEVEL0_APPROX_KEEP_FRACTION: f64 = 0.75;
+const MIN_HNSW_M: usize = 2;
+/// Create-time upper bound for client-supplied `m`; very large `m` only burns
+/// memory and build time without recall benefit.
+const MAX_HNSW_M: usize = 128;
+const MAX_HNSW_LEVEL: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HNSWConfig {
@@ -797,9 +802,20 @@ impl NeighborBlock {
     }
 }
 
+/// Reject vectors with NaN/inf components at the engine boundary: they yield
+/// NaN distances that corrupt heap ordering and graph construction.
+#[inline]
+fn ensure_finite_vector(data: &[f32]) -> Result<(), VectorError> {
+    if data.iter().all(|v| v.is_finite()) {
+        Ok(())
+    } else {
+        Err(VectorError::InvalidVectorData)
+    }
+}
+
 impl HNSWConfig {
     pub fn new(m: Option<usize>, ef_construct: Option<usize>, ef: Option<usize>) -> Self {
-        let m = m.unwrap_or(16);
+        let m = m.unwrap_or(16).max(MIN_HNSW_M);
         Self {
             m,
             m_max_0: 2 * m,
@@ -828,6 +844,23 @@ impl HNSWConfig {
     }
 }
 
+fn assign_hnsw_level(sample: f64, m_l: f64) -> usize {
+    if !m_l.is_finite() || m_l <= 0.0 {
+        return 0;
+    }
+    let normalized_sample = if sample.is_finite() && sample > 0.0 {
+        sample
+    } else {
+        f64::MIN_POSITIVE
+    };
+    let level = (-normalized_sample.ln() * m_l).floor();
+    if !level.is_finite() || level < 0.0 {
+        0
+    } else {
+        (level as usize).min(MAX_HNSW_LEVEL)
+    }
+}
+
 /// Per-collection HNSW tuning overrides. Persisted in `metadata_db` under
 /// the `HNSW_OVERRIDES_KEY` for collections whose create request supplied a
 /// `hnsw_config` block. Missing fields fall back to global `HELIX_HNSW_*`
@@ -850,6 +883,36 @@ pub struct HnswOverrides {
 impl HnswOverrides {
     pub fn is_empty(&self) -> bool {
         self.m.is_none() && self.ef_construction.is_none() && self.ef.is_none()
+    }
+
+    /// Reject client-supplied HNSW parameters that would degenerate the
+    /// graph. Collection-create entry points should call this before
+    /// persisting overrides; `HNSWConfig::new` additionally clamps `m` up to
+    /// `MIN_HNSW_M` so already-persisted bad values cannot hang a build.
+    pub fn validate(&self) -> Result<(), VectorError> {
+        if let Some(m) = self.m {
+            if m < MIN_HNSW_M {
+                return Err(VectorError::VectorCoreError(format!(
+                    "hnsw_config.m must be at least {MIN_HNSW_M}"
+                )));
+            }
+            if m > MAX_HNSW_M {
+                return Err(VectorError::VectorCoreError(format!(
+                    "hnsw_config.m must be at most {MAX_HNSW_M}"
+                )));
+            }
+        }
+        if self.ef_construction == Some(0) {
+            return Err(VectorError::VectorCoreError(
+                "invalid hnsw_config.ef_construct=0: must be at least 1".into(),
+            ));
+        }
+        if self.ef == Some(0) {
+            return Err(VectorError::VectorCoreError(
+                "invalid hnsw_config.ef=0: must be at least 1".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1020,6 +1083,32 @@ fn select_neighbor_ords(
         .take(max_neighbors)
         .filter_map(|&(ord, _)| (ord < point_count).then_some(ord as u32))
         .collect()
+}
+
+/// Construction distance for the in-memory merge and split builds between
+/// ordinals `a` and `b`. Cosine uses the SQ8 codes (`codes`, `dim` bytes per point) as it
+/// always has. Dot and Euclid use the raw f32 vectors with the same distances
+/// as the monolithic build and serving search: SQ8's per-dimension min-shift
+/// and scale does not preserve inner products or L2 geometry (in 1D Dot,
+/// [-2, -1, +1] all become non-negative codes, so -1 links to +1 instead of
+/// -2), and `codes` is left empty for them.
+fn merge_build_distance(
+    distance_metric: &DistanceMetric,
+    raw: &[Vec<f32>],
+    codes: &[u8],
+    dim: usize,
+    a: usize,
+    b: usize,
+) -> f32 {
+    use super::simd;
+    match distance_metric {
+        DistanceMetric::Cosine => simd::cosine_u8(
+            &codes[a * dim..(a + 1) * dim],
+            &codes[b * dim..(b + 1) * dim],
+        ),
+        DistanceMetric::Dot => simd::dot_f32(&raw[a], &raw[b]),
+        DistanceMetric::Euclid => simd::euclid_f32(&raw[a], &raw[b]).sqrt(),
+    }
 }
 
 fn insert_point_ord<DF>(
@@ -1199,6 +1288,57 @@ impl<T> HeapOps<T> for BinaryHeap<T> {
     }
 }
 
+enum SidecarOrdinals {
+    Partial(HashMap<u128, u64>),
+    Complete(HashMap<u128, u64>),
+}
+
+impl SidecarOrdinals {
+    fn entries(&self) -> &HashMap<u128, u64> {
+        match self {
+            Self::Partial(entries) | Self::Complete(entries) => entries,
+        }
+    }
+
+    fn entries_mut(&mut self) -> &mut HashMap<u128, u64> {
+        match self {
+            Self::Partial(entries) | Self::Complete(entries) => entries,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
+}
+
+const REQUEST_SIDECAR_ORDINAL_CACHE_MAX: usize = 4096;
+
+#[derive(Default)]
+struct SidecarOrdinalRequestCache {
+    entries: HashMap<u128, Option<u64>>,
+}
+
+impl SidecarOrdinalRequestCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, id: u128) -> Option<Option<u64>> {
+        self.entries.get(&id).copied()
+    }
+
+    fn insert(&mut self, id: u128, ordinal: Option<u64>) {
+        if self.entries.contains_key(&id) || self.entries.len() < REQUEST_SIDECAR_ORDINAL_CACHE_MAX
+        {
+            self.entries.insert(id, ordinal);
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.entries.len() >= REQUEST_SIDECAR_ORDINAL_CACHE_MAX
+    }
+}
+
 pub struct VectorCore {
     pub vectors_db: Option<Database<Bytes, Bytes>>,
     pub vector_data_db: Option<Database<Bytes, Bytes>>,
@@ -1220,7 +1360,7 @@ pub struct VectorCore {
     mmap_store: StdRwLock<Option<super::mmap_vectors::MmapBackend>>,
     /// In-process id -> sidecar ordinal map. When present, HNSW scoring avoids
     /// a SlateDB point-get for every neighbor before reading the mmap row.
-    mmap_ordinals: StdRwLock<Option<HashMap<u128, u64>>>,
+    mmap_ordinals: StdRwLock<Option<SidecarOrdinals>>,
     /// Graph out-edges index from the owning collection's storage core.
     ///
     /// Populated when the VectorCore is constructed for a segment that lives
@@ -1515,7 +1655,7 @@ impl VectorCore {
             spindle,
             mmap_sidecar_stem,
             mmap_store: StdRwLock::new(mmap_store),
-            mmap_ordinals: StdRwLock::new(mmap_ordinals),
+            mmap_ordinals: StdRwLock::new(mmap_ordinals.map(SidecarOrdinals::Complete)),
             graph_out_edges_db: None,
             neighbor_cache: Mutex::new(LruCache::new(neighbor_cache_cap())),
             vector_cache: Mutex::new(LruCache::new(vector_cache_cap())),
@@ -2426,6 +2566,24 @@ impl VectorCore {
         }
     }
 
+    #[inline]
+    fn can_use_global_vector_cache(read_context: &AnyRead<'_>) -> bool {
+        !matches!(read_context, AnyRead::LsmReader(Some(_)))
+    }
+
+    #[inline]
+    fn cache_vector_for_read(
+        &self,
+        read_context: &AnyRead<'_>,
+        id: u128,
+        level: usize,
+        data: &[f32],
+    ) {
+        if Self::can_use_global_vector_cache(read_context) {
+            self.cache_vector(id, level, data);
+        }
+    }
+
     /// Namespace for one of this segment's five sub-DBs, addressed by the
     /// segment's physical name. Replaces the raw `heed3::Database` handle so
     /// access routes through the backend seam (`self.backend`).
@@ -2842,8 +3000,7 @@ impl VectorCore {
         // Should instead using an atomic mutable seed and the XOR shift algorithm
         let mut rng = rand::rng();
         let r: f64 = rng.random::<f64>();
-        let level = (-r.ln() * self.config.m_l).floor() as usize;
-        level
+        assign_hnsw_level(r, self.config.m_l)
     }
 
     fn get_highest_level(&self, r: &AnyRead<'_>, id: u128) -> Result<usize, VectorError> {
@@ -3183,6 +3340,54 @@ impl VectorCore {
                 .try_into()
                 .map_err(|_| VectorError::InvalidVectorData)?,
         );
+        let slot = self
+            .mmap_store
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?;
+        let Some(store) = slot.as_ref() else {
+            return Ok(false);
+        };
+        Ok(store.is_hvtq() && store.dim() == expected_dim && ordinal < store.count())
+    }
+
+    fn cached_turbo_quant_payload_matches(
+        &self,
+        id: u128,
+        data: &[f32],
+    ) -> Result<Option<bool>, VectorError> {
+        if self.spindle.mode != SpindleMode::TurboProd || self.spindle.keep_original {
+            return Ok(None);
+        }
+        let Some(ordinal) = self.cached_sidecar_ordinal(id)? else {
+            return Ok(None);
+        };
+        let slot = self
+            .mmap_store
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?;
+        let Some(store) = slot.as_ref() else {
+            return Ok(None);
+        };
+        if !store.is_hvtq() {
+            return Ok(None);
+        }
+        let encoded = encode_vector(data, &self.spindle)?;
+        Ok(Some(
+            store.dim() == data.len() && store.hvtq_encoded_matches(ordinal, &encoded),
+        ))
+    }
+
+    fn can_externalize_cached_turbo_quant_vector(
+        &self,
+        id: u128,
+        expected_dim: usize,
+    ) -> Result<bool, VectorError> {
+        if self.spindle.mode != SpindleMode::TurboProd || self.spindle.keep_original {
+            return Ok(false);
+        }
+        let Some(ordinal) = self.cached_sidecar_ordinal(id)? else {
+            return Ok(false);
+        };
         let slot = self
             .mmap_store
             .read()
@@ -3753,6 +3958,7 @@ impl VectorCore {
     ) -> Result<(), VectorError> {
         self.persist_hvtq_sidecar_blob(txn)?;
         self.persist_hvec_sidecar_blob(txn)?;
+        let externalize_turbo_quant = self.mmap_is_turbo_quantized();
         for (ordinal, id) in prepared.point_ids.iter().enumerate() {
             let ordinal = u64::try_from(ordinal)
                 .map_err(|_| VectorError::VectorCoreError("sidecar ordinal exceeds u64".into()))?;
@@ -3764,6 +3970,9 @@ impl VectorCore {
                     &ordinal.to_le_bytes(),
                 )
                 .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            if externalize_turbo_quant {
+                self.put_vector_marker(txn, *id, 0)?;
+            }
         }
         self.replace_cached_sidecar_ordinals(&prepared.point_ids)?;
         Ok(())
@@ -3784,6 +3993,7 @@ impl VectorCore {
     ) -> Result<(), VectorError> {
         self.persist_hvtq_sidecar_blob_be(w)?;
         self.persist_hvec_sidecar_blob_be(w)?;
+        let externalize_turbo_quant = self.mmap_is_turbo_quantized();
         for (ordinal, id) in point_ids.iter().enumerate() {
             let ordinal = u64::try_from(ordinal)
                 .map_err(|_| VectorError::VectorCoreError("sidecar ordinal exceeds u64".into()))?;
@@ -3795,6 +4005,16 @@ impl VectorCore {
                     &ordinal.to_le_bytes(),
                 )
                 .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            if externalize_turbo_quant {
+                self.backend
+                    .put(
+                        w,
+                        self.seg_ns(SegmentDb::Vectors),
+                        &Self::vector_key(*id, 0),
+                        EXTERNALIZED_VECTOR_MARKER,
+                    )
+                    .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            }
         }
         self.persist_hvec_sidecar_ordinals_blob_be(w, point_ids)?;
         self.replace_cached_sidecar_ordinals(point_ids)?;
@@ -3898,6 +4118,7 @@ impl VectorCore {
         nid: Option<u128>,
         fields: Option<HashMap<String, Value>>,
     ) -> Result<HVector, VectorError> {
+        ensure_finite_vector(data)?;
         let id = nid.unwrap_or(uuid::Uuid::new_v4().as_u128());
         let projected = project_for_search(data, &self.spindle)?;
         self.put_raw_vector(txn, id, 0, data)?;
@@ -3920,15 +4141,29 @@ impl VectorCore {
         nid: Option<u128>,
         fields: Option<HashMap<String, Value>>,
     ) -> Result<HVector, VectorError> {
+        ensure_finite_vector(data)?;
         let id = nid.unwrap_or(uuid::Uuid::new_v4().as_u128());
         let projected = project_for_search(data, &self.spindle)?;
-        let encoded = encode_vector(data, &self.spindle)?;
+        let externalize = self.cached_turbo_quant_payload_matches(id, data)?;
+        if matches!(externalize, Some(false)) {
+            self.backend
+                .delete(w, self.seg_ns(SegmentDb::Ordinals), &id.to_be_bytes())
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            self.remove_cached_sidecar_ordinals(&[id]);
+        }
+        let encoded;
+        let stored = if matches!(externalize, Some(true)) {
+            EXTERNALIZED_VECTOR_MARKER
+        } else {
+            encoded = encode_vector(data, &self.spindle)?;
+            encoded.as_slice()
+        };
         self.backend
             .put(
                 w,
                 self.seg_ns(SegmentDb::Vectors),
                 &Self::vector_key(id, 0),
-                encoded.as_ref(),
+                stored,
             )
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
 
@@ -4028,9 +4263,90 @@ impl VectorCore {
         }
     }
 
+    /// Choose a replacement HNSW entry point for a deleted `old_ep`.
+    ///
+    /// Prefers the surviving neighbor with the highest level, walking
+    /// `old_ep`'s neighbor lists from its top layer down (a neighbor at layer
+    /// L has level >= L, so the first non-empty layer yields the best
+    /// candidates). If `old_ep` had no surviving neighbors at all, falls back
+    /// to a key-only scan for the highest-level surviving row — rare (only on
+    /// an isolated entry point) and still cheaper than losing the index.
+    /// Returns `None` only when no level-0 row survives, i.e. the space is
+    /// genuinely empty and the entry point may be cleared.
+    fn replacement_entry_point(
+        &self,
+        r: &AnyRead<'_>,
+        old_ep: &HVector,
+        is_deleted: impl Fn(u128) -> bool,
+    ) -> Result<Option<HVector>, VectorError> {
+        let old_id = old_ep.get_id();
+        let mut best: Option<(usize, u128)> = None;
+        for level in (0..=old_ep.get_level()).rev() {
+            let Ok(neighbor_ids) = self.get_neighbor_ids(r, old_id, level) else {
+                continue;
+            };
+            for neighbor_id in neighbor_ids {
+                if neighbor_id == old_id || is_deleted(neighbor_id) {
+                    continue;
+                }
+                if let Ok(neighbor_level) = self.get_highest_level(r, neighbor_id) {
+                    if best.is_none_or(|(best_level, _)| neighbor_level > best_level) {
+                        best = Some((neighbor_level, neighbor_id));
+                    }
+                }
+            }
+            if best.is_some() {
+                break;
+            }
+        }
+
+        if best.is_none() {
+            let id_offset = VECTOR_PREFIX.len();
+            let level_offset = id_offset + std::mem::size_of::<u128>();
+            let level_end = level_offset + std::mem::size_of::<usize>();
+            self.backend
+                .scan(
+                    r,
+                    self.seg_ns(SegmentDb::Vectors),
+                    KeyRange::prefix(VECTOR_PREFIX),
+                    |key, _v| {
+                        if key.len() < level_end {
+                            return true;
+                        }
+                        let (Ok(id_arr), Ok(level_arr)) = (
+                            key[id_offset..level_offset].try_into(),
+                            key[level_offset..level_end].try_into(),
+                        ) else {
+                            return true;
+                        };
+                        let id = u128::from_be_bytes(id_arr);
+                        let level = usize::from_be_bytes(level_arr);
+                        if id != old_id
+                            && !is_deleted(id)
+                            && best.is_none_or(|(best_level, _)| level > best_level)
+                        {
+                            best = Some((level, id));
+                        }
+                        true
+                    },
+                )
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        }
+
+        let Some((level, id)) = best else {
+            return Ok(None);
+        };
+        match self.get_vector(r, id, level, false) {
+            Ok(vector) => Ok(Some(vector)),
+            Err(VectorError::VectorNotFound(_)) => self.get_vector(r, id, 0, false).map(Some),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Remove a vector from the HNSW index: delete vector data, stored properties/original,
     /// and all HNSW edges (both outgoing and incoming references to this id).
-    /// If the deleted vector is the entry point, a replacement is chosen from its neighbors.
+    /// If the deleted vector is the entry point, it is replaced by the
+    /// highest-level survivor (see `replacement_entry_point`).
     pub fn delete_vector(&self, txn: &mut RwTxn, id: u128) -> Result<(), VectorError> {
         self.clear_neighbor_cache();
         self.clear_vector_cache();
@@ -4041,30 +4357,17 @@ impl VectorCore {
         };
         if let Some(ep) = entry_point {
             if ep.get_id() == id {
-                // Pick a neighbor as the new entry point, or clear if none
-                let neighbors = {
+                let replacement = {
                     let r = self.backend.read_borrowed(&*txn);
-                    self.get_neighbor_ids(&r, id, 0).ok().map(|neighbor_ids| {
-                        neighbor_ids
-                            .into_iter()
-                            .filter_map(|neighbor_id| {
-                                self.get_vector(&r, neighbor_id, 0, false).ok()
-                            })
-                            .collect::<Vec<_>>()
-                    })
+                    self.replacement_entry_point(&r, &ep, |other| other == id)?
                 };
-                if let Some(neighbors) = neighbors {
-                    if let Some(new_ep) = neighbors.into_iter().next() {
-                        let _ = self.set_entry_point(txn, &new_ep);
-                    } else {
-                        // Last vector — clear entry point
+                match replacement {
+                    Some(new_ep) => self.set_entry_point(txn, &new_ep)?,
+                    // Last vector — clear entry point
+                    None => {
                         if let Some(db) = self.vectors_db {
                             let _ = db.delete(txn, ENTRY_POINT_KEY.as_bytes());
                         }
-                    }
-                } else {
-                    if let Some(db) = self.vectors_db {
-                        let _ = db.delete(txn, ENTRY_POINT_KEY.as_bytes());
                     }
                 }
             }
@@ -4329,21 +4632,7 @@ impl VectorCore {
             let r = self.backend.read_borrowed(&*txn);
             match self.get_entry_point(&r) {
                 Ok(ep) if id_set.contains(&ep.get_id()) => {
-                    let mut survivor = None;
-                    'outer: for &id in ids {
-                        if let Ok(neighbor_ids) = self.get_neighbor_ids(&r, id, 0) {
-                            for nid in neighbor_ids {
-                                if id_set.contains(&nid) {
-                                    continue;
-                                }
-                                if let Ok(v) = self.get_vector(&r, nid, 0, false) {
-                                    survivor = Some(v);
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                    Some(survivor)
+                    Some(self.replacement_entry_point(&r, &ep, |other| id_set.contains(&other))?)
                 }
                 _ => None,
             }
@@ -4351,7 +4640,7 @@ impl VectorCore {
         if let Some(survivor) = entry_point_replacement {
             match survivor {
                 Some(v) => {
-                    let _ = self.set_entry_point(txn, &v);
+                    self.set_entry_point(txn, &v)?;
                 }
                 None => {
                     if let Some(db) = self.vectors_db {
@@ -5529,13 +5818,16 @@ impl VectorCore {
         let ordinals = self.mmap_ordinals.read().map_err(|e| {
             VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {e}"))
         })?;
-        Ok(ordinals.as_ref().and_then(|map| map.get(&id).copied()))
+        Ok(ordinals
+            .as_ref()
+            .and_then(|cache| cache.entries().get(&id).copied()))
     }
 
     fn cache_sidecar_ordinal(&self, id: u128, ordinal: u64) {
         if let Ok(mut ordinals) = self.mmap_ordinals.write() {
             ordinals
-                .get_or_insert_with(HashMap::new)
+                .get_or_insert_with(|| SidecarOrdinals::Partial(HashMap::new()))
+                .entries_mut()
                 .insert(id, ordinal);
         }
     }
@@ -5544,7 +5836,7 @@ impl VectorCore {
         let ordinals = self.mmap_ordinals.read().map_err(|e| {
             VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {e}"))
         })?;
-        Ok(ordinals.is_some())
+        Ok(ordinals.as_ref().is_some_and(SidecarOrdinals::is_complete))
     }
 
     fn has_mmap_sidecar(&self) -> bool {
@@ -5560,6 +5852,16 @@ impl VectorCore {
     }
 
     fn ensure_lsm_mmap_sidecar(&self) -> Result<bool, VectorError> {
+        self.ensure_lsm_mmap_sidecar_with_lock_observer(|| {})
+    }
+
+    fn ensure_lsm_mmap_sidecar_with_lock_observer<F>(
+        &self,
+        on_lock_attempt: F,
+    ) -> Result<bool, VectorError>
+    where
+        F: FnOnce(),
+    {
         if self.has_mmap_sidecar() {
             return Ok(true);
         }
@@ -5574,15 +5876,7 @@ impl VectorCore {
         let Some(stem) = self.mmap_sidecar_stem.as_ref().cloned() else {
             return Ok(false);
         };
-        // Acquire the process-wide materialization permit BEFORE the mmap write
-        // lock: a cold search wave over many collections must not fan out into
-        // unbounded concurrent SlateDB scans. Deferred probes fall back to the
-        // full-vector read path and a later query retries.
-        let Some(_permit) = SidecarMaterializePermit::try_acquire() else {
-            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "deferred")
-                .increment(1);
-            return Ok(false);
-        };
+        on_lock_attempt();
         let mut slot = self
             .mmap_store
             .write()
@@ -5595,6 +5889,14 @@ impl VectorCore {
                 .increment(1);
             return Ok(false);
         }
+        // Only the request that won this core's write lock and still needs a
+        // scan consumes a process-wide permit. Duplicate requests wait here
+        // without starving unrelated segments of materialization capacity.
+        let Some(_permit) = SidecarMaterializePermit::try_acquire() else {
+            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "deferred")
+                .increment(1);
+            return Ok(false);
+        };
 
         let started = std::time::Instant::now();
         let (store, ordinals) = Self::open_lsm_mmap_sidecar(
@@ -5616,7 +5918,7 @@ impl VectorCore {
             let mut slot = self.mmap_ordinals.write().map_err(|e| {
                 VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {}", e))
             })?;
-            *slot = Some(ordinals);
+            *slot = Some(SidecarOrdinals::Complete(ordinals));
         }
         metrics::histogram!(
             "helix_lsm_sidecar_materialize_ms",
@@ -5633,8 +5935,11 @@ impl VectorCore {
         Ok(loaded)
     }
 
-    fn ensure_sidecar_ordinals_loaded(&self, r: &AnyRead<'_>) -> Result<(), VectorError> {
-        if self.sidecar_ordinals_loaded()? || !self.has_mmap_sidecar() {
+    fn ensure_sidecar_ordinals_loaded(&self, read: &AnyRead<'_>) -> Result<(), VectorError> {
+        if matches!(read, AnyRead::LsmReader(_))
+            || self.sidecar_ordinals_loaded()?
+            || !self.has_mmap_sidecar()
+        {
             return Ok(());
         }
 
@@ -5643,7 +5948,7 @@ impl VectorCore {
         let mut scan_err: Option<VectorError> = None;
         self.backend
             .scan(
-                r,
+                read,
                 self.seg_ns(SegmentDb::Ordinals),
                 KeyRange::all(),
                 |key, value| {
@@ -5676,8 +5981,8 @@ impl VectorCore {
         let mut ordinals = self.mmap_ordinals.write().map_err(|e| {
             VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {e}"))
         })?;
-        if ordinals.is_none() {
-            *ordinals = Some(loaded);
+        if !ordinals.as_ref().is_some_and(SidecarOrdinals::is_complete) {
+            *ordinals = Some(SidecarOrdinals::Complete(loaded));
             metrics::histogram!("helix_lsm_sidecar_ordinals_load_ms", "outcome" => outcome)
                 .record(started.elapsed().as_secs_f64() * 1000.0);
             metrics::histogram!("helix_lsm_sidecar_ordinals_items", "outcome" => outcome)
@@ -5744,7 +6049,7 @@ impl VectorCore {
         let mut ordinals = self.mmap_ordinals.write().map_err(|e| {
             VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {e}"))
         })?;
-        *ordinals = Some(map);
+        *ordinals = Some(SidecarOrdinals::Complete(map));
         Ok(())
     }
 
@@ -5752,37 +6057,127 @@ impl VectorCore {
         if let Ok(mut ordinals) = self.mmap_ordinals.write() {
             if let Some(map) = ordinals.as_mut() {
                 for id in point_ids {
-                    map.remove(id);
+                    map.entries_mut().remove(id);
                 }
             }
         }
     }
 
-    fn sidecar_ordinal(&self, r: &AnyRead<'_>, id: u128) -> Result<Option<u64>, VectorError> {
-        if let Some(ordinal) = self.cached_sidecar_ordinal(id)? {
-            return Ok(Some(ordinal));
+    fn sidecar_ordinal(&self, read: &AnyRead<'_>, id: u128) -> Result<Option<u64>, VectorError> {
+        if matches!(read, AnyRead::LsmReader(_)) {
+            return self.sidecar_ordinal_from_store(read, id);
         }
-        self.ensure_sidecar_ordinals_loaded(r)?;
-        {
+        let needs_initial_load = {
             let ordinals = self.mmap_ordinals.read().map_err(|e| {
                 VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {e}"))
             })?;
-            if let Some(map) = ordinals.as_ref() {
-                return Ok(map.get(&id).copied());
+            match ordinals.as_ref() {
+                Some(SidecarOrdinals::Complete(entries)) => return Ok(entries.get(&id).copied()),
+                Some(SidecarOrdinals::Partial(entries)) => {
+                    if let Some(ordinal) = entries.get(&id) {
+                        return Ok(Some(*ordinal));
+                    }
+                    false
+                }
+                None => true,
+            }
+        };
+        if needs_initial_load {
+            self.ensure_sidecar_ordinals_loaded(read)?;
+            let ordinals = self.mmap_ordinals.read().map_err(|e| {
+                VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {e}"))
+            })?;
+            if let Some(SidecarOrdinals::Complete(entries)) = ordinals.as_ref() {
+                return Ok(entries.get(&id).copied());
             }
         }
-        self.sidecar_ordinal_from_store(r, id)
+        self.sidecar_ordinal_from_store(read, id)
+    }
+
+    fn sidecar_ordinal_with_request_cache(
+        &self,
+        read_context: &AnyRead<'_>,
+        id: u128,
+        cache: &mut SidecarOrdinalRequestCache,
+    ) -> Result<Option<u64>, VectorError> {
+        if !read_context.is_snapshot_pinned() {
+            return self.sidecar_ordinal(read_context, id);
+        }
+        if let Some(ordinal) = cache.get(id) {
+            return Ok(ordinal);
+        }
+        let ordinal = self.sidecar_ordinal(read_context, id)?;
+        cache.insert(id, ordinal);
+        Ok(ordinal)
+    }
+
+    fn prefetch_sidecar_ordinals(
+        &self,
+        read_context: &AnyRead<'_>,
+        ids: &[u128],
+        visited: &HashSet<u128>,
+        cache: &mut SidecarOrdinalRequestCache,
+    ) -> Result<(), VectorError> {
+        if cache.is_full()
+            || !read_context.is_snapshot_pinned()
+            || !(self.has_mmap_sidecar() || self.should_try_lsm_sidecar())
+            || !self.ensure_lsm_mmap_sidecar()?
+        {
+            return Ok(());
+        }
+
+        let mut keys = Vec::new();
+        let mut key_ids = Vec::new();
+        let mut unique = HashSet::new();
+        for &id in ids {
+            if visited.contains(&id) || cache.get(id).is_some() || !unique.insert(id) {
+                continue;
+            }
+            keys.push(id.to_be_bytes().to_vec());
+            key_ids.push(id);
+            if key_ids.len() >= REQUEST_SIDECAR_ORDINAL_CACHE_MAX {
+                break;
+            }
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let rows = match (&*self.backend, read_context) {
+            (AnyBackend::Lsm(writer), AnyRead::Lsm(snapshot)) => {
+                writer.collect_values_many_with(snapshot, self.seg_ns(SegmentDb::Ordinals), &keys)
+            }
+            (AnyBackend::LsmReader(reader), AnyRead::LsmReader(snapshot)) => reader
+                .collect_values_many_with_at(
+                    snapshot.as_ref(),
+                    self.seg_ns(SegmentDb::Ordinals),
+                    &keys,
+                ),
+            _ => return Ok(()),
+        }
+        .map_err(|error| VectorError::VectorCoreError(error.to_string()))?;
+        metrics::counter!("helix_hnsw_ordinal_prefetch_batches_total").increment(1);
+        metrics::counter!("helix_hnsw_ordinal_prefetch_rows_total").increment(keys.len() as u64);
+
+        for (id, row) in key_ids.into_iter().zip(rows) {
+            let ordinal = match row {
+                Some(bytes) => Some(Self::ordinal_from_bytes(&bytes)?),
+                None => None,
+            };
+            cache.insert(id, ordinal);
+        }
+        Ok(())
     }
 
     fn sidecar_ordinal_from_store(
         &self,
-        r: &AnyRead<'_>,
+        read: &AnyRead<'_>,
         id: u128,
     ) -> Result<Option<u64>, VectorError> {
         let Some(ordinal_bytes) = self
             .backend
             .get_with(
-                r,
+                read,
                 self.seg_ns(SegmentDb::Ordinals),
                 &id.to_be_bytes(),
                 |opt| opt.map(|bytes| bytes.to_vec()),
@@ -5792,7 +6187,9 @@ impl VectorCore {
             return Ok(None);
         };
         let ordinal = Self::ordinal_from_bytes(&ordinal_bytes)?;
-        self.cache_sidecar_ordinal(id, ordinal);
+        if !matches!(read, AnyRead::LsmReader(_)) {
+            self.cache_sidecar_ordinal(id, ordinal);
+        }
         Ok(Some(ordinal))
     }
 
@@ -5828,11 +6225,12 @@ impl VectorCore {
     }
 
     #[inline]
-    fn score_sidecar_approx_distance(
+    fn score_sidecar_approx_distance_with_cache(
         &self,
-        r: &AnyRead<'_>,
+        read_context: &AnyRead<'_>,
         prepared: &PreparedSpindleQuery,
         neighbor_id: u128,
+        mut ordinal_cache: Option<&mut SidecarOrdinalRequestCache>,
     ) -> Result<Option<f32>, VectorError> {
         if matches!(prepared, PreparedSpindleQuery::None) {
             return Ok(None);
@@ -5844,7 +6242,12 @@ impl VectorCore {
         let Some(store) = slot.as_ref() else {
             return Ok(None);
         };
-        let Some(ordinal) = self.sidecar_ordinal(r, neighbor_id)? else {
+        let ordinal = if let Some(cache) = ordinal_cache.as_deref_mut() {
+            self.sidecar_ordinal_with_request_cache(read_context, neighbor_id, cache)?
+        } else {
+            self.sidecar_ordinal(read_context, neighbor_id)?
+        };
+        let Some(ordinal) = ordinal else {
             return Ok(None);
         };
         match store.score_encoded_to(ordinal, prepared) {
@@ -5884,6 +6287,19 @@ impl VectorCore {
         level: usize,
         query_data: &[f32],
     ) -> Result<Option<f32>, VectorError> {
+        self.score_neighbor_distance_with_cache(r, prepared, neighbor_id, level, query_data, None)
+    }
+
+    #[inline]
+    fn score_neighbor_distance_with_cache(
+        &self,
+        read_context: &AnyRead<'_>,
+        prepared: &PreparedSpindleQuery,
+        neighbor_id: u128,
+        level: usize,
+        query_data: &[f32],
+        ordinal_cache: Option<&mut SidecarOrdinalRequestCache>,
+    ) -> Result<Option<f32>, VectorError> {
         // Deferred-repair deletes (HELIX_LSM_DELETE_TOMBSTONES): a tombstoned
         // id's row is still physically present until this segment's next
         // merge, so every resolution tier below (spindle approx / mmap direct
@@ -5894,12 +6310,61 @@ impl VectorCore {
         if self.is_delete_tombstoned(neighbor_id) {
             return Ok(None);
         }
+        self.score_neighbor_distance_for_traversal_with_cache(
+            read_context,
+            prepared,
+            neighbor_id,
+            level,
+            query_data,
+            ordinal_cache,
+        )
+    }
+
+    /// `score_neighbor_distance` without the delete-tombstone gate. Only for
+    /// HNSW frontier expansion: a tombstoned node's row and links are still
+    /// present until merge, so it must stay traversable as a bridge (otherwise
+    /// each delete punches a hole in the graph) — callers keep it out of the
+    /// result set themselves.
+    #[inline]
+    fn score_neighbor_distance_for_traversal(
+        &self,
+        r: &AnyRead<'_>,
+        prepared: &PreparedSpindleQuery,
+        neighbor_id: u128,
+        level: usize,
+        query_data: &[f32],
+    ) -> Result<Option<f32>, VectorError> {
+        self.score_neighbor_distance_for_traversal_with_cache(
+            r,
+            prepared,
+            neighbor_id,
+            level,
+            query_data,
+            None,
+        )
+    }
+
+    #[inline]
+    fn score_neighbor_distance_for_traversal_with_cache(
+        &self,
+        read_context: &AnyRead<'_>,
+        prepared: &PreparedSpindleQuery,
+        neighbor_id: u128,
+        level: usize,
+        query_data: &[f32],
+        mut ordinal_cache: Option<&mut SidecarOrdinalRequestCache>,
+    ) -> Result<Option<f32>, VectorError> {
         // 1. Spindle approx path: no full-vector load needed.
         if !matches!(prepared, PreparedSpindleQuery::None) {
-            if let Some(distance) = self.score_sidecar_approx_distance(r, prepared, neighbor_id)? {
+            if let Some(distance) = self.score_sidecar_approx_distance_with_cache(
+                read_context,
+                prepared,
+                neighbor_id,
+                ordinal_cache.as_deref_mut(),
+            )? {
                 return Ok(Some(distance));
             }
-            if let Ok(bytes) = self.get_encoded_vector(r, neighbor_id, level) {
+            if let Ok(bytes) = self.get_encoded_vector(read_context, neighbor_id, level) {
                 if let Ok(Some(approx)) = score_encoded(prepared, &bytes) {
                     return Ok(Some(self.distance_from_approximate(&approx)));
                 }
@@ -5913,23 +6378,39 @@ impl VectorCore {
         if (self.has_mmap_sidecar() || self.should_try_lsm_sidecar())
             && self.ensure_lsm_mmap_sidecar()?
         {
-            if let Some(ordinal) = self.sidecar_ordinal(r, neighbor_id)? {
+            let ordinal = if let Some(cache) = ordinal_cache.as_deref_mut() {
+                self.sidecar_ordinal_with_request_cache(read_context, neighbor_id, cache)?
+            } else {
+                self.sidecar_ordinal(read_context, neighbor_id)?
+            };
+            if let Some(ordinal) = ordinal {
                 if let Some(distance) = self.sidecar_distance(ordinal, query_data)? {
                     return Ok(Some(distance));
                 }
             }
         }
 
+        let known_ordinal_miss = ordinal_cache
+            .as_deref()
+            .and_then(|cache| cache.get(neighbor_id))
+            == Some(None);
+
         // 3. Fallback: full vector load + distance compute. Same allocation
         // profile as the pre-mmap-slice code path; preserves correctness for
         // HVS8, level > 0, and any race where the mmap is between remaps.
-        let neighbor = match self.get_vector(r, neighbor_id, level, true) {
+        let neighbor = match if known_ordinal_miss {
+            self.get_vector_from_row(read_context, neighbor_id, level, true, false)
+        } else if let Some(cache) = ordinal_cache.as_deref_mut() {
+            self.get_vector_with_ordinal_cache(read_context, neighbor_id, level, true, cache)
+        } else {
+            self.get_vector(read_context, neighbor_id, level, true)
+        } {
             Ok(n) => n,
             Err(VectorError::VectorNotFound(_)) => return Ok(None),
-            Err(e) => return Err(e),
+            Err(error) => return Err(error),
         };
         let distance = self.scored_distance(
-            r,
+            read_context,
             prepared,
             neighbor.get_id(),
             neighbor.get_level(),
@@ -5937,6 +6418,194 @@ impl VectorCore {
             query_data,
         )?;
         Ok(Some(distance))
+    }
+
+    fn prefetch_neighbor_vectors(
+        &self,
+        read_context: &AnyRead<'_>,
+        prepared: &PreparedSpindleQuery,
+        neighbors: &[u128],
+        visited: &HashSet<u128>,
+        level: usize,
+    ) -> HashMap<u128, HVector> {
+        let mut prefetched = HashMap::new();
+        if !read_context.is_snapshot_pinned()
+            || !matches!(prepared, PreparedSpindleQuery::None)
+            || self.backend.kind() != BackendKind::Lsm
+            || self.has_mmap_sidecar()
+            || (self.should_try_lsm_sidecar() && !self.lsm_sidecar_miss_is_cached())
+        {
+            return prefetched;
+        }
+        let mut missing = Vec::new();
+        let mut unique = HashSet::new();
+        for &id in neighbors {
+            if visited.contains(&id) || !unique.insert(id) {
+                continue;
+            }
+            let cached = if let Some(shared) = self.shared_caches.as_ref() {
+                let key = super::shared_cache::CacheKey::new(self.cache_namespace, id, level);
+                (level > 0 && shared.nav_vector.get(&key).is_some())
+                    || shared.vector.get(&key).is_some()
+            } else {
+                (level > 0
+                    && self
+                        .nav_vector_cache
+                        .lock()
+                        .is_ok_and(|cache| cache.peek(&(id, level)).is_some()))
+                    || self
+                        .vector_cache
+                        .lock()
+                        .is_ok_and(|cache| cache.peek(&(id, level)).is_some())
+            };
+            if !cached {
+                missing.push(id);
+            }
+        }
+        for ids in missing.chunks(64) {
+            let keys: Vec<Vec<u8>> = ids.iter().map(|&id| Self::vector_key(id, level)).collect();
+            let fetched = match (&*self.backend, read_context) {
+                (AnyBackend::Lsm(writer), AnyRead::Lsm(read)) => {
+                    writer.collect_values_many_with(read, self.seg_ns(SegmentDb::Vectors), &keys)
+                }
+                (AnyBackend::LsmReader(reader), AnyRead::LsmReader(snapshot)) => reader
+                    .collect_values_many_with_at(
+                        snapshot.as_ref(),
+                        self.seg_ns(SegmentDb::Vectors),
+                        &keys,
+                    ),
+                _ => return prefetched,
+            };
+            metrics::counter!("helix_hnsw_vector_prefetch_batches_total").increment(1);
+            metrics::counter!("helix_hnsw_vector_prefetch_rows_total").increment(ids.len() as u64);
+            let Ok(rows) = fetched else {
+                metrics::counter!("helix_hnsw_vector_prefetch_fallback_total").increment(1);
+                continue;
+            };
+            for (&id, row) in ids.iter().zip(rows) {
+                let Some(bytes) = row else {
+                    continue;
+                };
+                if Self::is_vector_marker(&bytes) {
+                    continue;
+                }
+                if let Ok(decoded) = decode_vector(&bytes) {
+                    prefetched.insert(id, HVector::from_slice(id, level, decoded));
+                }
+            }
+        }
+        prefetched
+    }
+
+    fn get_vector_from_row(
+        &self,
+        read_context: &AnyRead<'_>,
+        id: u128,
+        level: usize,
+        with_data: bool,
+        resolve_marker_sidecar: bool,
+    ) -> Result<HVector, VectorError> {
+        let key = Self::vector_key(id, level);
+        let stored = self
+            .backend
+            .get_with(
+                read_context,
+                self.seg_ns(SegmentDb::Vectors),
+                key.as_ref(),
+                |opt| opt.map(|bytes| bytes.to_vec()),
+            )
+            .map_err(|error| VectorError::VectorCoreError(error.to_string()))?;
+        match stored {
+            Some(bytes) => {
+                let vector = if with_data {
+                    let decoded = if Self::is_vector_marker(&bytes) {
+                        if !resolve_marker_sidecar {
+                            self.resolve_marker_vector_after_known_ordinal_miss(
+                                read_context,
+                                id,
+                                level,
+                            )?
+                        } else {
+                            self.resolve_marker_vector(read_context, id, level)?
+                        }
+                    } else {
+                        decode_vector(&bytes)?
+                    };
+                    self.cache_vector_for_read(read_context, id, level, &decoded);
+                    HVector::from_slice(id, level, decoded)
+                } else {
+                    HVector::from_slice(id, level, Vec::new())
+                };
+                Ok(vector)
+            }
+            None if level > 0 => {
+                self.get_vector_from_row(read_context, id, 0, with_data, resolve_marker_sidecar)
+            }
+            None => Err(VectorError::VectorNotFound(id.to_string())),
+        }
+    }
+
+    fn resolve_marker_vector_after_known_ordinal_miss(
+        &self,
+        read_context: &AnyRead<'_>,
+        id: u128,
+        level: usize,
+    ) -> Result<Vec<f32>, VectorError> {
+        if level > 0 {
+            let level_zero_key = Self::vector_key(id, 0);
+            let level_zero_bytes = self
+                .backend
+                .get_with(
+                    read_context,
+                    self.seg_ns(SegmentDb::Vectors),
+                    level_zero_key.as_ref(),
+                    |opt| opt.map(|bytes| bytes.to_vec()),
+                )
+                .map_err(|error| VectorError::VectorCoreError(error.to_string()))?;
+            if let Some(level_zero_bytes) = level_zero_bytes {
+                if !Self::is_vector_marker(&level_zero_bytes) {
+                    return decode_vector(&level_zero_bytes);
+                }
+            }
+        }
+        Err(VectorError::VectorCoreError(format!(
+            "externalized vector {} missing ordinal mapping",
+            id
+        )))
+    }
+
+    fn get_vector_with_ordinal_cache(
+        &self,
+        read_context: &AnyRead<'_>,
+        id: u128,
+        level: usize,
+        with_data: bool,
+        ordinal_cache: &mut SidecarOrdinalRequestCache,
+    ) -> Result<HVector, VectorError> {
+        let mut known_ordinal = None;
+        if with_data
+            && (self.has_mmap_sidecar() || self.should_try_lsm_sidecar())
+            && self.ensure_lsm_mmap_sidecar()?
+        {
+            known_ordinal =
+                Some(self.sidecar_ordinal_with_request_cache(read_context, id, ordinal_cache)?);
+            if let Some(ordinal) = known_ordinal.flatten() {
+                if let Some(vector_data) = self.sidecar_vec(ordinal)? {
+                    self.cache_vector_for_read(read_context, id, level, &vector_data);
+                    return Ok(HVector::from_slice(id, level, vector_data));
+                }
+            }
+        }
+        if known_ordinal.is_some() {
+            return self.get_vector_from_row(
+                read_context,
+                id,
+                level,
+                with_data,
+                known_ordinal != Some(None),
+            );
+        }
+        self.get_vector(read_context, id, level, with_data)
     }
 
     /// Compute distance from an ApproximateInnerProduct. Internal math stays f64, cast at boundary.
@@ -6245,7 +6914,14 @@ impl VectorCore {
         let metric = self.mmap_distance_metric();
         let mut nearest: BinaryHeap<MmapFlatCandidate> = BinaryHeap::with_capacity(target_k);
         let mut scan_err: Option<VectorError> = None;
+        // Deferred-repair deletes: tombstoned rows are still physically
+        // present. Probe the set once so the common no-delete case pays
+        // nothing per row.
+        let has_tombstones = self.deleted_count() > 0;
         let mut consider = |id: u128, ordinal: u64| -> Result<(), VectorError> {
+            if has_tombstones && self.is_delete_tombstoned(id) {
+                return Ok(());
+            }
             if let Some(filters) = filter {
                 if !filters.iter().all(|f| f(id)) {
                     return Ok(());
@@ -6275,16 +6951,20 @@ impl VectorCore {
             let ordinals = self.mmap_ordinals.read().map_err(|e| {
                 VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {e}"))
             })?;
-            if let Some(map) = ordinals.as_ref() {
-                for (&id, &ordinal) in map {
-                    consider(id, ordinal)?;
+            match ordinals.as_ref() {
+                Some(SidecarOrdinals::Complete(map)) if !matches!(r, AnyRead::LsmReader(_)) => {
+                    for (&id, &ordinal) in map {
+                        consider(id, ordinal)?;
+                    }
+                    true
                 }
-                true
-            } else {
-                false
+                Some(SidecarOrdinals::Partial(_)) | Some(SidecarOrdinals::Complete(_)) | None => {
+                    false
+                }
             }
         };
         if !used_cached_ordinals {
+            let mut scanned_ordinals = Vec::new();
             self.backend
                 .scan(
                     r,
@@ -6300,11 +6980,6 @@ impl VectorCore {
                             return false;
                         };
                         let id = u128::from_be_bytes(id_bytes);
-                        if let Some(filters) = filter {
-                            if !filters.iter().all(|f| f(id)) {
-                                return true;
-                            }
-                        }
                         let ordinal = match Self::ordinal_from_bytes(value) {
                             Ok(ordinal) => ordinal,
                             Err(err) => {
@@ -6312,16 +6987,17 @@ impl VectorCore {
                                 return false;
                             }
                         };
-                        match consider(id, ordinal) {
-                            Ok(()) => true,
-                            Err(err) => {
-                                scan_err = Some(err);
-                                false
-                            }
-                        }
+                        scanned_ordinals.push((id, ordinal));
+                        true
                     },
                 )
                 .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            if let Some(err) = scan_err {
+                return Err(err);
+            }
+            for (id, ordinal) in scanned_ordinals {
+                consider(id, ordinal)?;
+            }
         }
         if let Some(err) = scan_err {
             return Err(err);
@@ -6372,6 +7048,7 @@ impl VectorCore {
         let level_offset = VECTOR_PREFIX.len() + std::mem::size_of::<u128>();
         let level_end = level_offset + std::mem::size_of::<usize>();
         let mut nearest: BinaryHeap<FlatCandidate> = BinaryHeap::with_capacity(target_k);
+        let mut ordinal_cache = SidecarOrdinalRequestCache::new();
 
         // Collect filtered level-0 ids first; the scoring loop re-reads the DB
         // through the seam and cannot run inside the scan closure (which already
@@ -6418,29 +7095,35 @@ impl VectorCore {
         for id in candidate_ids {
             let level = 0usize;
 
-            let distance =
-                match self.score_neighbor_distance(r, prepared, id, level, projected_query) {
-                    Ok(Some(distance)) => distance,
-                    Ok(None) | Err(VectorError::VectorNotFound(_)) => continue,
-                    Err(VectorError::VectorCoreError(message))
-                        if Self::is_externalized_vector_unavailable(&message) =>
-                    {
-                        self.mark_externalized_marker_repair_needed();
-                        metrics::counter!(
-                            "helix_externalized_marker_unavailable_total",
-                            "level" => level.to_string()
-                        )
-                        .increment(1);
-                        tracing::warn!(
-                            vector_id = %id,
-                            level,
-                            error = %message,
-                            "skipping unavailable externalized vector marker"
-                        );
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                };
+            let distance = match self.score_neighbor_distance_with_cache(
+                r,
+                prepared,
+                id,
+                level,
+                projected_query,
+                Some(&mut ordinal_cache),
+            ) {
+                Ok(Some(distance)) => distance,
+                Ok(None) | Err(VectorError::VectorNotFound(_)) => continue,
+                Err(VectorError::VectorCoreError(message))
+                    if Self::is_externalized_vector_unavailable(&message) =>
+                {
+                    self.mark_externalized_marker_repair_needed();
+                    metrics::counter!(
+                        "helix_externalized_marker_unavailable_total",
+                        "level" => level.to_string()
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        vector_id = %id,
+                        level,
+                        error = %message,
+                        "skipping unavailable externalized vector marker"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
 
             let candidate = FlatCandidate {
                 id,
@@ -6466,7 +7149,13 @@ impl VectorCore {
         });
         let mut results = Vec::with_capacity(scored.len());
         for candidate in scored {
-            match self.get_vector(r, candidate.id, candidate.level, true) {
+            match self.get_vector_with_ordinal_cache(
+                r,
+                candidate.id,
+                candidate.level,
+                true,
+                &mut ordinal_cache,
+            ) {
                 Ok(mut hydrated) => {
                     hydrated.set_distance(candidate.distance);
                     results.push(hydrated);
@@ -6515,10 +7204,17 @@ impl VectorCore {
         let prepared = prepare_query(raw_query, &self.spindle)?;
         let target_k = self.rerank_target_k(k, selectivity_hint);
         let mut nearest: BinaryHeap<FlatCandidate> = BinaryHeap::with_capacity(target_k);
+        let mut ordinal_cache = SidecarOrdinalRequestCache::new();
 
         for id in candidate_ids {
-            let distance = match self.score_neighbor_distance(r, &prepared, id, 0, &projected_query)
-            {
+            let distance = match self.score_neighbor_distance_with_cache(
+                r,
+                &prepared,
+                id,
+                0,
+                &projected_query,
+                Some(&mut ordinal_cache),
+            ) {
                 Ok(Some(distance)) => distance,
                 Ok(None) | Err(VectorError::VectorNotFound(_)) => continue,
                 Err(VectorError::VectorCoreError(message))
@@ -6565,7 +7261,7 @@ impl VectorCore {
         });
         let mut results = Vec::with_capacity(scored.len());
         for candidate in scored {
-            match self.get_vector(r, candidate.id, 0, true) {
+            match self.get_vector_with_ordinal_cache(r, candidate.id, 0, true, &mut ordinal_cache) {
                 Ok(mut hydrated) => {
                     hydrated.set_distance(candidate.distance);
                     results.push(hydrated);
@@ -6632,6 +7328,7 @@ impl VectorCore {
         }
 
         let mut ordinal_to_id = vec![None; count];
+        let has_tombstones = self.deleted_count() > 0;
         self.backend
             .scan(
                 r,
@@ -6647,6 +7344,11 @@ impl VectorCore {
                         return true;
                     };
                     let id = u128::from_be_bytes(id_arr);
+                    // Deferred-repair deletes: unmapped ordinals are skipped
+                    // by both the fast scan and the exact rerank below.
+                    if has_tombstones && self.is_delete_tombstoned(id) {
+                        return true;
+                    }
                     if let Some(fs) = filter {
                         if !fs.iter().all(|f| f(id)) {
                             return true;
@@ -6986,7 +7688,7 @@ impl VectorCore {
         let mut entry_ord: usize = 0;
         for i in 0..n {
             let r: f64 = rng.random::<f64>();
-            let level = (-r.ln() * m_l).floor() as usize;
+            let level = assign_hnsw_level(r, m_l);
             levels.push(level);
             if level > max_level {
                 max_level = level;
@@ -7152,13 +7854,14 @@ impl VectorCore {
     pub fn build_hnsw_in_memory(
         exported: &[(u128, Vec<f32>, HashMap<String, Value>)],
         hnsw_config: &HNSWConfig,
+        distance_metric: DistanceMetric,
     ) -> Result<PreparedIndex, VectorError> {
         let permit = acquire_build_permit()?;
         let owned = exported
             .iter()
             .map(|(id, data, fields)| (*id, data.clone(), fields.clone()))
             .collect();
-        Self::build_hnsw_in_memory_owned_with_permit(owned, hnsw_config, &permit)
+        Self::build_hnsw_in_memory_owned_with_permit(owned, hnsw_config, distance_metric, &permit)
     }
 
     /// Borrowing compatibility wrapper. Merge callers should prefer
@@ -7168,13 +7871,14 @@ impl VectorCore {
     pub(crate) fn build_hnsw_in_memory_with_permit(
         exported: &[(u128, Vec<f32>, HashMap<String, Value>)],
         hnsw_config: &HNSWConfig,
+        distance_metric: DistanceMetric,
         permit: &BuildPermit,
     ) -> Result<PreparedIndex, VectorError> {
         let owned = exported
             .iter()
             .map(|(id, data, fields)| (*id, data.clone(), fields.clone()))
             .collect();
-        Self::build_hnsw_in_memory_owned_with_permit(owned, hnsw_config, permit)
+        Self::build_hnsw_in_memory_owned_with_permit(owned, hnsw_config, distance_metric, permit)
     }
 
     /// Same as `build_hnsw_in_memory`, but consumes exported rows. This is the
@@ -7183,6 +7887,7 @@ impl VectorCore {
     pub(crate) fn build_hnsw_in_memory_owned_with_permit(
         exported: Vec<(u128, Vec<f32>, HashMap<String, Value>)>,
         hnsw_config: &HNSWConfig,
+        distance_metric: DistanceMetric,
         _permit: &BuildPermit,
     ) -> Result<PreparedIndex, VectorError> {
         if exported.is_empty() {
@@ -7217,7 +7922,7 @@ impl VectorCore {
         let mut entry_ord: usize = 0;
         for i in 0..n {
             let r: f64 = rng.random::<f64>();
-            let level = (-r.ln() * m_l).floor() as usize;
+            let level = assign_hnsw_level(r, m_l);
             levels.push(level);
             if level > max_level {
                 max_level = level;
@@ -7225,22 +7930,32 @@ impl VectorCore {
             }
         }
 
-        // SQ8 quantized construction. Fit + quantize directly from
-        // `original_data` — no spindle projection on the merge path —
-        // avoiding an extra N×dim×4 byte clone of the working set.
-        use super::simd::{cosine_u8, SQ8Params};
-        let sq8 = SQ8Params::fit(&original_data);
+        // Cosine: SQ8 quantized construction, fit + quantized directly from
+        // `original_data` (no spindle projection on the merge path). Dot and
+        // Euclid construct on the raw f32 rows; see `merge_build_distance`.
+        use super::simd::SQ8Params;
         let dim = original_data[0].len();
-        let (quantized_flat, _qdim) = sq8.quantize_bulk(&original_data);
+        let quantized_flat = if matches!(distance_metric, DistanceMetric::Cosine) {
+            SQ8Params::fit(&original_data)
+                .quantize_bulk(&original_data)
+                .0
+        } else {
+            Vec::new()
+        };
 
         let adjacency: Vec<StdRwLock<Vec<Vec<u32>>>> = (0..n)
             .map(|i| StdRwLock::new(vec![Vec::new(); levels[i] + 1]))
             .collect();
 
         let dist_fn_q = |a_ord: usize, b_ord: usize| -> f32 {
-            let a_slice = &quantized_flat[a_ord * dim..(a_ord + 1) * dim];
-            let b_slice = &quantized_flat[b_ord * dim..(b_ord + 1) * dim];
-            cosine_u8(a_slice, b_slice)
+            merge_build_distance(
+                &distance_metric,
+                &original_data,
+                &quantized_flat,
+                dim,
+                a_ord,
+                b_ord,
+            )
         };
 
         // Serial bootstrap
@@ -7428,7 +8143,7 @@ impl VectorCore {
         let mut entry_ord: usize = 0;
         for i in 0..n {
             let r: f64 = rng.random::<f64>();
-            let level = (-r.ln() * m_l).floor() as usize;
+            let level = assign_hnsw_level(r, m_l);
             levels.push(level);
             if level > max_level {
                 max_level = level;
@@ -7447,13 +8162,21 @@ impl VectorCore {
         // The full-precision f32 vectors are retained for the final
         // stored index; only the graph topology (neighbor selection)
         // uses approximate SQ8 distances.
-        use super::simd::{cosine_u8, dot_u8, euclid_u8, SQ8Params};
+        //
+        // Cosine only: SQ8's per-dimension min-shift/scale distorts inner
+        // products and L2, so Dot/Euclid construct on the projected f32
+        // rows exactly like the monolithic build (see `merge_build_distance`).
+        use super::simd::SQ8Params;
         let phase_start = std::time::Instant::now();
-        let sq8 = SQ8Params::fit(&point_data);
         let dim = point_data[0].len();
-        let (quantized_flat, _qdim) = sq8.quantize_bulk(&point_data);
-        // Drop the f32 working copies — only u8 needed for construction
-        drop(point_data);
+        let (quantized_flat, point_data) = if matches!(self.distance_metric, DistanceMetric::Cosine)
+        {
+            let (quantized_flat, _qdim) = SQ8Params::fit(&point_data).quantize_bulk(&point_data);
+            // Drop the f32 working copies — only u8 needed for construction
+            (quantized_flat, Vec::new())
+        } else {
+            (Vec::new(), point_data)
+        };
         self.observe_hnsw_build_phase("split_prepare", "quantize", n, phase_start.elapsed());
 
         if n > u32::MAX as usize {
@@ -7474,13 +8197,14 @@ impl VectorCore {
         );
 
         let dist_fn_q = |a_ord: usize, b_ord: usize| -> f32 {
-            let a_slice = &quantized_flat[a_ord * dim..(a_ord + 1) * dim];
-            let b_slice = &quantized_flat[b_ord * dim..(b_ord + 1) * dim];
-            match self.distance_metric {
-                DistanceMetric::Cosine => cosine_u8(a_slice, b_slice),
-                DistanceMetric::Dot => dot_u8(a_slice, b_slice),
-                DistanceMetric::Euclid => euclid_u8(a_slice, b_slice),
-            }
+            merge_build_distance(
+                &self.distance_metric,
+                &point_data,
+                &quantized_flat,
+                dim,
+                a_ord,
+                b_ord,
+            )
         };
 
         // Serial bootstrap
@@ -7808,13 +8532,20 @@ impl VectorCore {
                 self.insert_flat_be(w, raw, Some(id), fields)?;
             }
             if level > 0 {
-                let encoded = encode_vector(raw, &self.spindle)?;
+                let externalize = self.can_externalize_cached_turbo_quant_vector(id, raw.len())?;
+                let encoded;
+                let stored = if externalize {
+                    EXTERNALIZED_VECTOR_MARKER
+                } else {
+                    encoded = encode_vector(raw, &self.spindle)?;
+                    encoded.as_slice()
+                };
                 self.backend
                     .put(
                         w,
                         self.seg_ns(SegmentDb::Vectors),
                         &Self::vector_key(id, level),
-                        encoded.as_ref(),
+                        stored,
                     )
                     .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
             }
@@ -8102,10 +8833,12 @@ impl VectorCore {
     where
         F: Fn(&HVector) -> bool,
     {
+        // Same caps as the bulk builder (`insert_point_ord`): the dense base
+        // layer keeps up to `m_max_0` (2*m) links, upper layers `m`.
         let m: usize = if level == 0 {
-            self.config.m
-        } else {
             self.config.m_max_0
+        } else {
+            self.config.m
         };
         let mut visited: HashSet<u128> = HashSet::new();
         if should_extend {
@@ -8497,6 +9230,7 @@ impl VectorCore {
         prepared: &PreparedSpindleQuery,
         metrics_labels: Option<VectorSearchMetrics<'_>>,
         seed_ids: &[u128],
+        ordinal_cache: &mut SidecarOrdinalRequestCache,
     ) -> Result<BinaryHeap<HVector>, VectorError>
     where
         F: Fn(&HVector) -> bool,
@@ -8550,12 +9284,13 @@ impl VectorCore {
                 if !visited.insert(seed_id) {
                     continue;
                 }
-                let distance = match self.score_neighbor_distance(
+                let distance = match self.score_neighbor_distance_with_cache(
                     r,
                     prepared,
                     seed_id,
                     level,
                     query.get_data(),
+                    Some(ordinal_cache),
                 ) {
                     Ok(Some(d)) => d,
                     Ok(None) => continue,
@@ -8647,56 +9382,83 @@ impl VectorCore {
                 None => &block.ids,
             };
 
+            let mut prefetched =
+                self.prefetch_neighbor_vectors(r, prepared, neighbor_iter, &visited, level);
+            self.prefetch_sidecar_ordinals(r, neighbor_iter, &visited, ordinal_cache)?;
+
             for &neighbor_id in neighbor_iter {
                 if !visited.insert(neighbor_id) {
                     continue;
                 }
-                // Deferred-repair deletes: skip a tombstoned id before it
-                // reaches either the filtered `get_vector` path below or
-                // `score_neighbor_distance` — the row is still physically
-                // present until this segment's next merge.
-                if self.is_delete_tombstoned(neighbor_id) {
-                    continue;
-                }
+                // Deferred-repair deletes: a tombstoned id's row and links
+                // are still present until this segment's next merge. Keep it
+                // in the frontier as a traversal bridge (like a filtered-out
+                // node) but never admit it to `results`.
+                let tombstoned = self.is_delete_tombstoned(neighbor_id);
 
-                let distance = if let Some(fs) = filter {
-                    // Preserve the generic HNSW filter contract: callers
-                    // receive the same full HVector they received before
-                    // this optimization. Qdrant/CE id-only filters can use
-                    // the no-filter branch when no payload filter is active.
-                    let neighbor = match self.get_vector(r, neighbor_id, level, true) {
-                        Ok(n) => n,
-                        Err(VectorError::VectorNotFound(_)) => continue,
-                        Err(e) => return Err(e),
+                let (distance, filter_passes) =
+                    if let Some(neighbor) = prefetched.remove(&neighbor_id) {
+                        (
+                            self.distance_between(neighbor.get_data(), query.get_data())?,
+                            !tombstoned && filter.is_none_or(|fs| fs.iter().all(|f| f(&neighbor))),
+                        )
+                    } else if tombstoned {
+                        let Some(distance) = self.score_neighbor_distance_for_traversal(
+                            r,
+                            prepared,
+                            neighbor_id,
+                            level,
+                            query.get_data(),
+                        )?
+                        else {
+                            continue;
+                        };
+                        (distance, false)
+                    } else if let Some(fs) = filter {
+                        // Preserve the generic HNSW filter contract: callers
+                        // receive the same full HVector they received before
+                        // this optimization. Qdrant/CE id-only filters can use
+                        // the no-filter branch when no payload filter is active.
+                        let neighbor = match self.get_vector_with_ordinal_cache(
+                            r,
+                            neighbor_id,
+                            level,
+                            true,
+                            ordinal_cache,
+                        ) {
+                            Ok(n) => n,
+                            Err(VectorError::VectorNotFound(_)) => continue,
+                            Err(e) => return Err(e),
+                        };
+                        (
+                            self.scored_distance(
+                                r,
+                                prepared,
+                                neighbor.get_id(),
+                                neighbor.get_level(),
+                                neighbor.get_data(),
+                                query.get_data(),
+                            )?,
+                            fs.iter().all(|f| f(&neighbor)),
+                        )
+                    } else {
+                        // Score directly from the mmap-borrowed slice when
+                        // possible (HVEC, level 0). Falls back to full vector
+                        // load + score for HVS8 / level > 0 / no-mmap. `None`
+                        // means the vector row is missing.
+                        let Some(distance) = self.score_neighbor_distance_with_cache(
+                            r,
+                            prepared,
+                            neighbor_id,
+                            level,
+                            query.get_data(),
+                            Some(ordinal_cache),
+                        )?
+                        else {
+                            continue;
+                        };
+                        (distance, true)
                     };
-                    if !fs.iter().all(|f| f(&neighbor)) {
-                        filtered_out += 1;
-                        continue;
-                    }
-                    self.scored_distance(
-                        r,
-                        prepared,
-                        neighbor.get_id(),
-                        neighbor.get_level(),
-                        neighbor.get_data(),
-                        query.get_data(),
-                    )?
-                } else {
-                    // Score directly from the mmap-borrowed slice when
-                    // possible (HVEC, level 0). Falls back to full vector
-                    // load + score for HVS8 / level > 0 / no-mmap. `None`
-                    // means the vector row is missing.
-                    match self.score_neighbor_distance(
-                        r,
-                        prepared,
-                        neighbor_id,
-                        level,
-                        query.get_data(),
-                    )? {
-                        Some(d) => d,
-                        None => continue,
-                    }
-                };
                 neighbor_edges_scored += 1;
 
                 if results.len() < ef || distance < worst_distance {
@@ -8704,6 +9466,10 @@ impl VectorCore {
                         id: neighbor_id,
                         distance,
                     });
+                    if !filter_passes {
+                        filtered_out += 1;
+                        continue;
+                    }
                     results.push((neighbor_id, distance));
 
                     if results.len() > ef {
@@ -8751,7 +9517,8 @@ impl VectorCore {
             if self.is_delete_tombstoned(*id) {
                 continue;
             }
-            let mut v = match self.get_vector(r, *id, level, true) {
+            let mut v = match self.get_vector_with_ordinal_cache(r, *id, level, true, ordinal_cache)
+            {
                 Ok(vector) => vector,
                 Err(VectorError::VectorNotFound(_)) => continue,
                 Err(e) => return Err(e),
@@ -8790,6 +9557,7 @@ impl VectorCore {
         prepared: &PreparedSpindleQuery,
         metrics_labels: Option<VectorSearchMetrics<'_>>,
         _seed_ids: &[u128],
+        ordinal_cache: &mut SidecarOrdinalRequestCache,
     ) -> Result<BinaryHeap<HVector>, VectorError>
     where
         F: Fn(u128) -> bool,
@@ -8890,24 +9658,33 @@ impl VectorCore {
                 None => &block.ids,
             };
 
+            let mut prefetched =
+                self.prefetch_neighbor_vectors(r, prepared, neighbor_iter, &visited, level);
+            self.prefetch_sidecar_ordinals(r, neighbor_iter, &visited, ordinal_cache)?;
+
             for &neighbor_id in neighbor_iter {
                 if !visited.insert(neighbor_id) {
                     continue;
                 }
-                if self.is_delete_tombstoned(neighbor_id) {
-                    continue;
-                }
-                let filter_passes = filter.is_none_or(|fs| fs.iter().all(|f| f(neighbor_id)));
+                // Tombstoned ids stay traversable (graph bridge) but never
+                // enter `results`; see `search_level`.
+                let filter_passes = !self.is_delete_tombstoned(neighbor_id)
+                    && filter.is_none_or(|fs| fs.iter().all(|f| f(neighbor_id)));
 
-                let distance = match self.score_neighbor_distance(
-                    r,
-                    prepared,
-                    neighbor_id,
-                    level,
-                    query.get_data(),
-                )? {
-                    Some(d) => d,
-                    None => continue,
+                let distance = if let Some(neighbor) = prefetched.remove(&neighbor_id) {
+                    self.distance_between(neighbor.get_data(), query.get_data())?
+                } else {
+                    match self.score_neighbor_distance_for_traversal_with_cache(
+                        r,
+                        prepared,
+                        neighbor_id,
+                        level,
+                        query.get_data(),
+                        Some(ordinal_cache),
+                    )? {
+                        Some(d) => d,
+                        None => continue,
+                    }
                 };
                 neighbor_edges_scored += 1;
 
@@ -8975,7 +9752,8 @@ impl VectorCore {
             if self.is_delete_tombstoned(*id) {
                 continue;
             }
-            let mut v = match self.get_vector(r, *id, level, true) {
+            let mut v = match self.get_vector_with_ordinal_cache(r, *id, level, true, ordinal_cache)
+            {
                 Ok(vector) => vector,
                 Err(VectorError::VectorNotFound(_)) => continue,
                 Err(e) => return Err(e),
@@ -9167,6 +9945,7 @@ impl VectorCore {
         let query = HVector::from_slice(0, 0, projected_query);
         let prepared = prepare_query(&raw_query, &self.spindle)?;
         let arena = Bump::new();
+        let mut ordinal_cache = SidecarOrdinalRequestCache::new();
         let target_k = self.rerank_target_k(k, selectivity_hint);
 
         let t0 = std::time::Instant::now();
@@ -9208,6 +9987,7 @@ impl VectorCore {
                 &prepared,
                 None,
                 &[],
+                &mut ordinal_cache,
             )?;
             if let Some(closest) = nearest.pop() {
                 entry_point = closest;
@@ -9230,6 +10010,7 @@ impl VectorCore {
             &prepared,
             metrics_labels,
             &[],
+            &mut ordinal_cache,
         )?;
         let t_l0 = t_l0_start.elapsed();
         let total_elapsed = t0.elapsed();
@@ -9328,6 +10109,7 @@ impl VectorCore {
         let query = HVector::from_slice(0, 0, projected_query);
         let prepared = prepare_query(&raw_query, &self.spindle)?;
         let arena = Bump::new();
+        let mut ordinal_cache = SidecarOrdinalRequestCache::new();
         let target_k = self.rerank_target_k(k, selectivity_hint);
 
         let t0 = std::time::Instant::now();
@@ -9358,6 +10140,7 @@ impl VectorCore {
                 &prepared,
                 None,
                 &[],
+                &mut ordinal_cache,
             )?;
             if let Some(closest) = nearest.pop() {
                 entry_point = closest;
@@ -9380,6 +10163,7 @@ impl VectorCore {
             &prepared,
             metrics_labels,
             &[],
+            &mut ordinal_cache,
         )?;
         let t_l0 = t_l0_start.elapsed();
         let total_elapsed = t0.elapsed();
@@ -9448,14 +10232,19 @@ impl HNSW for VectorCore {
     #[inline(always)]
     fn get_vector(
         &self,
-        r: &AnyRead<'_>,
+        read_context: &AnyRead<'_>,
         id: u128,
         level: usize,
         with_data: bool,
     ) -> Result<HVector, VectorError> {
         if with_data {
             // Check in-memory caches first (upper-level nav cache, then general cache).
-            if let Some(shared) = self.shared_caches.as_ref() {
+            if !Self::can_use_global_vector_cache(read_context) {
+                metrics::counter!("helix_vector_cache_misses_total",
+                    "cache" => "vector",
+                    "tier" => if level > 0 { "nav" } else { "level0" })
+                .increment(1);
+            } else if let Some(shared) = self.shared_caches.as_ref() {
                 let key = super::shared_cache::CacheKey::new(self.cache_namespace, id, level);
                 if level > 0 {
                     if let Some(data) = shared.nav_vector.get(&key) {
@@ -9506,10 +10295,10 @@ impl HNSW for VectorCore {
                 && (self.has_mmap_sidecar() || self.should_try_lsm_sidecar())
                 && self.ensure_lsm_mmap_sidecar()?
             {
-                if let Some(ordinal) = self.sidecar_ordinal(r, id)? {
-                    if let Some(vec) = self.sidecar_vec(ordinal)? {
-                        self.cache_vector(id, level, &vec);
-                        return Ok(HVector::from_slice(id, level, vec));
+                if let Some(ordinal) = self.sidecar_ordinal(read_context, id)? {
+                    if let Some(vector_data) = self.sidecar_vec(ordinal)? {
+                        self.cache_vector_for_read(read_context, id, level, &vector_data);
+                        return Ok(HVector::from_slice(id, level, vector_data));
                     }
                 }
             }
@@ -9519,26 +10308,29 @@ impl HNSW for VectorCore {
         let key = Self::vector_key(id, level);
         let stored = self
             .backend
-            .get_with(r, self.seg_ns(SegmentDb::Vectors), key.as_ref(), |opt| {
-                opt.map(|b| b.to_vec())
-            })
-            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            .get_with(
+                read_context,
+                self.seg_ns(SegmentDb::Vectors),
+                key.as_ref(),
+                |opt| opt.map(|bytes| bytes.to_vec()),
+            )
+            .map_err(|error| VectorError::VectorCoreError(error.to_string()))?;
         match stored {
             Some(bytes) => {
                 let vector = if with_data {
                     let decoded = if Self::is_vector_marker(&bytes) {
-                        self.resolve_marker_vector(r, id, level)?
+                        self.resolve_marker_vector(read_context, id, level)?
                     } else {
                         decode_vector(&bytes)?
                     };
-                    self.cache_vector(id, level, &decoded);
+                    self.cache_vector_for_read(read_context, id, level, &decoded);
                     HVector::from_slice(id, level, decoded)
                 } else {
                     HVector::from_slice(id, level, vec![])
                 };
                 Ok(vector)
             }
-            None if level > 0 => self.get_vector(r, id, 0, with_data),
+            None if level > 0 => self.get_vector(read_context, id, 0, with_data),
             None => Err(VectorError::VectorNotFound(id.to_string())),
         }
     }
@@ -9563,6 +10355,7 @@ impl HNSW for VectorCore {
         let query = HVector::from_slice(0, 0, projected_query);
         let prepared = prepare_query(&raw_query, &self.spindle)?;
         let arena = Bump::new();
+        let mut ordinal_cache = SidecarOrdinalRequestCache::new();
         let target_k = self.rerank_target_k(k, None);
 
         let mut entry_point = self.get_entry_point(r)?;
@@ -9586,6 +10379,7 @@ impl HNSW for VectorCore {
                 &prepared,
                 None,
                 &[],
+                &mut ordinal_cache,
             )?;
             if let Some(closest) = nearest.pop() {
                 entry_point = closest;
@@ -9606,6 +10400,7 @@ impl HNSW for VectorCore {
             &prepared,
             None,
             &[],
+            &mut ordinal_cache,
         )?;
 
         let mut results = candidates.to_vec_with_filter(target_k, filter);
@@ -9626,6 +10421,7 @@ impl HNSW for VectorCore {
     where
         F: Fn(&HVector) -> bool,
     {
+        ensure_finite_vector(data)?;
         let id = nid.unwrap_or(uuid::Uuid::new_v4().as_u128());
         let new_level = self.get_new_level();
         let projected = project_for_search(data, &self.spindle)?;
@@ -9656,6 +10452,7 @@ impl HNSW for VectorCore {
         let mut curr_ep = entry_point;
         let no_prepared = PreparedSpindleQuery::None;
         let arena = Bump::new();
+        let mut ordinal_cache = SidecarOrdinalRequestCache::new();
         {
             let rd = self.backend.read_borrowed(&*txn);
             for level in (new_level + 1..=l).rev() {
@@ -9670,8 +10467,13 @@ impl HNSW for VectorCore {
                     &no_prepared,
                     None,
                     &[],
+                    &mut ordinal_cache,
                 )?;
-                curr_ep = nearest.peek().unwrap().clone();
+                // Empty only when the sole candidate was a tombstoned entry
+                // point (excluded from results); keep descending from it.
+                if let Some(closest) = nearest.peek() {
+                    curr_ep = closest.clone();
+                }
             }
         }
 
@@ -9705,10 +10507,11 @@ impl HNSW for VectorCore {
                     &no_prepared,
                     None,
                     seeds,
+                    &mut ordinal_cache,
                 )?;
                 // Capture the closest candidate before `nearest` is consumed by
                 // `select_neighbors` (preserves the original entry-point update).
-                let next_ep = nearest.peek().unwrap().clone();
+                let next_ep = nearest.peek().cloned().unwrap_or_else(|| curr_ep.clone());
                 let neighbors =
                     self.select_neighbors::<F>(&rd, &query, nearest, level, true, None)?;
                 (next_ep, neighbors)
@@ -9718,30 +10521,46 @@ impl HNSW for VectorCore {
 
             self.set_neighbours(txn, query.get_id(), &neighbors, level)?;
 
+            let max_conns = if level == 0 {
+                self.config.m_max_0
+            } else {
+                self.config.m
+            };
             for e in neighbors {
                 let id = e.get_id();
-                let e_conns: Vec<HVector> = {
+                // Overflow prune of `e`'s own list: rank e's existing links by
+                // distance to `e` (not to the inserted point) and keep the
+                // closest `max_conns`. Only e's list is rewritten — dropped
+                // nodes keep their link to `e` (HNSW links are directed after
+                // pruning), matching the bulk builder.
+                let pruned: Option<Vec<u128>> = {
                     let rd = self.backend.read_borrowed(&*txn);
-                    self.get_neighbor_ids(&rd, id, level)?
-                        .into_iter()
-                        .filter_map(|neighbor_id| {
-                            self.get_vector(&rd, neighbor_id, level, true).ok()
-                        })
-                        .collect()
-                };
-                if e_conns.len()
-                    > if level == 0 {
-                        self.config.m_max_0
+                    let conn_ids = self.get_neighbor_ids(&rd, id, level)?;
+                    if conn_ids.len() > max_conns {
+                        let mut scored: Vec<(u128, f32)> = Vec::with_capacity(conn_ids.len());
+                        for neighbor_id in conn_ids {
+                            // Level-0 row always exists and carries the same
+                            // data; upper-level rows may not be materialized.
+                            if let Ok(conn) = self.get_vector(&rd, neighbor_id, 0, true) {
+                                let distance =
+                                    self.distance_between(conn.get_data(), e.get_data())?;
+                                scored.push((neighbor_id, distance));
+                            }
+                        }
+                        scored.sort_by(|lhs, rhs| lhs.1.total_cmp(&rhs.1));
+                        scored.truncate(max_conns);
+                        Some(
+                            scored
+                                .into_iter()
+                                .map(|(neighbor_id, _)| neighbor_id)
+                                .collect(),
+                        )
                     } else {
-                        self.config.m_max_0
+                        None
                     }
-                {
-                    let e_conns = BinaryHeap::from(e_conns);
-                    let e_new_conn = {
-                        let rd = self.backend.read_borrowed(&*txn);
-                        self.select_neighbors::<F>(&rd, &query, e_conns, level, true, None)?
-                    };
-                    self.set_neighbours(txn, id, &e_new_conn, level)?;
+                };
+                if let Some(pruned) = pruned {
+                    self.put_neighbor_ids(txn, id, level, &pruned)?;
                 }
             }
         }
@@ -9865,6 +10684,340 @@ mod tests {
 
     type VF = fn(&HVector) -> bool;
 
+    fn prefetch_test_core(backend: Arc<AnyBackend>, name: &str) -> VectorCore {
+        VectorCore::new_named_lsm_with_dir(
+            name,
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Euclid,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            None,
+            2,
+            backend,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn hnsw_prefetch_matches_scalar_pending_overlay_and_bounds_batches() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("hnsw-prefetch-{}", uuid::Uuid::new_v4())).unwrap(),
+        ));
+        let core = prefetch_test_core(Arc::clone(&backend), "prefetch_overlay");
+        let mut write = backend.begin_write().unwrap();
+        for id in 1..=130 {
+            let data = encode_vector(&[id as f32, 1.0], &core.spindle).unwrap();
+            backend
+                .put(
+                    &mut write,
+                    core.seg_ns(SegmentDb::Vectors),
+                    &VectorCore::vector_key(id, 0),
+                    &data,
+                )
+                .unwrap();
+        }
+        backend.commit(write).unwrap();
+        let committed = backend.begin_read().unwrap();
+        let mut write = backend.begin_write().unwrap();
+        let replacement = encode_vector(&[999.0, 2.0], &core.spindle).unwrap();
+        backend
+            .put(
+                &mut write,
+                core.seg_ns(SegmentDb::Vectors),
+                &VectorCore::vector_key(2, 0),
+                &replacement,
+            )
+            .unwrap();
+        backend
+            .delete(
+                &mut write,
+                core.seg_ns(SegmentDb::Vectors),
+                &VectorCore::vector_key(3, 0),
+            )
+            .unwrap();
+        backend
+            .put(
+                &mut write,
+                core.seg_ns(SegmentDb::Vectors),
+                &VectorCore::vector_key(131, 0),
+                &[1, 2, 3],
+            )
+            .unwrap();
+        let overlay = backend
+            .lsm_read_with_pending(write.lsm_pending().unwrap().clone())
+            .unwrap();
+        let neighbors: Vec<u128> = (1..=131).chain([2, 1]).collect();
+        let visited = HashSet::from([1]);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let rows = metrics::with_local_recorder(&recorder, || {
+            core.prefetch_neighbor_vectors(
+                &overlay,
+                &PreparedSpindleQuery::None,
+                &neighbors,
+                &visited,
+                0,
+            )
+        });
+        assert_eq!(rows.len(), 128);
+        assert_eq!(rows.get(&2).unwrap().get_data(), &[999.0, 2.0]);
+        assert!(!rows.contains_key(&1));
+        assert!(!rows.contains_key(&3));
+        assert!(!rows.contains_key(&131));
+        for (&id, row) in &rows {
+            let scalar = core.get_vector(&overlay, id, 0, true).unwrap();
+            assert_eq!(row.get_data(), scalar.get_data());
+            assert_eq!(row.get_level(), scalar.get_level());
+        }
+        assert!(matches!(
+            core.get_vector(&overlay, 3, 0, true),
+            Err(VectorError::VectorNotFound(_))
+        ));
+        assert!(core.get_vector(&overlay, 131, 0, true).is_err());
+        let metrics = handle.render();
+        assert!(
+            metrics.contains("helix_hnsw_vector_prefetch_batches_total 3"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("helix_hnsw_vector_prefetch_rows_total 130"),
+            "{metrics}"
+        );
+        let isolated = prefetch_test_core(Arc::clone(&backend), "prefetch_overlay");
+        assert_eq!(
+            isolated
+                .get_vector(&committed, 2, 0, true)
+                .unwrap()
+                .get_data(),
+            &[2.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn hnsw_prefetch_preserves_reader_snapshot_and_shared_cache_isolation() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+        use object_store::memory::InMemory;
+        use object_store::ObjectStore;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = format!("hnsw-prefetch-reader-{}", uuid::Uuid::new_v4());
+        let writer = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_with_store(&path, Arc::clone(&store)).unwrap(),
+        ));
+        let core = prefetch_test_core(Arc::clone(&writer), "prefetch_reader");
+        let mut write = writer.begin_write().unwrap();
+        for id in [1, 2] {
+            let data = encode_vector(&[id as f32, 0.0], &core.spindle).unwrap();
+            writer
+                .put(
+                    &mut write,
+                    core.seg_ns(SegmentDb::Vectors),
+                    &VectorCore::vector_key(id, 0),
+                    &data,
+                )
+                .unwrap();
+        }
+        writer.commit(write).unwrap();
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, Arc::clone(&store)).unwrap(),
+        ));
+        let mut reader_core = prefetch_test_core(Arc::clone(&reader), "prefetch_reader");
+        let shared = Arc::new(super::super::shared_cache::SharedVectorCaches::new(
+            NonZeroUsize::new(16).unwrap(),
+            NonZeroUsize::new(16).unwrap(),
+            NonZeroUsize::new(16).unwrap(),
+        ));
+        reader_core.shared_caches = Some(Arc::clone(&shared));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let pinned = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        let mut write = writer.begin_write().unwrap();
+        let data = encode_vector(&[99.0, 0.0], &core.spindle).unwrap();
+        writer
+            .put(
+                &mut write,
+                core.seg_ns(SegmentDb::Vectors),
+                &VectorCore::vector_key(1, 0),
+                &data,
+            )
+            .unwrap();
+        writer.commit(write).unwrap();
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let rows = reader_core.prefetch_neighbor_vectors(
+            &pinned,
+            &PreparedSpindleQuery::None,
+            &[1, 2],
+            &HashSet::new(),
+            0,
+        );
+        assert_eq!(rows.get(&1).unwrap().get_data(), &[1.0, 0.0]);
+        assert_eq!(
+            rows.get(&1).unwrap().get_data(),
+            reader_core
+                .get_vector(&pinned, 1, 0, true)
+                .unwrap()
+                .get_data()
+        );
+        assert!(shared
+            .vector
+            .get(&super::super::shared_cache::CacheKey::new(
+                reader_core.cache_namespace,
+                2,
+                0
+            ))
+            .is_none());
+        assert!(reader_core
+            .prefetch_neighbor_vectors(
+                &AnyRead::LsmReader(None),
+                &PreparedSpindleQuery::None,
+                &[2],
+                &HashSet::new(),
+                0
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn hnsw_prefetch_traversal_matches_scalar_cache_with_filters_and_stale_links() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("hnsw-prefetch-search-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        ));
+        let mut batch_core = prefetch_test_core(Arc::clone(&backend), "prefetch_search");
+        let mut scalar_core = prefetch_test_core(Arc::clone(&backend), "prefetch_search");
+        batch_core.shared_caches = None;
+        scalar_core.shared_caches = None;
+        let mut write = backend.begin_write().unwrap();
+        for id in 1..=48 {
+            let data = [id as f32, 49.0 - id as f32];
+            let encoded = encode_vector(&data, &batch_core.spindle).unwrap();
+            backend
+                .put(
+                    &mut write,
+                    batch_core.seg_ns(SegmentDb::Vectors),
+                    &VectorCore::vector_key(id, 0),
+                    &encoded,
+                )
+                .unwrap();
+            scalar_core.cache_vector(id, 0, &data);
+            let neighbors = if id == 1 {
+                NeighborBlock::from_ids((2..=48).chain([2, 999]).collect())
+            } else {
+                NeighborBlock::from_ids(vec![1])
+            };
+            backend
+                .put(
+                    &mut write,
+                    batch_core.seg_ns(SegmentDb::HnswNeighbors),
+                    &VectorCore::neighbor_list_key(id, 0),
+                    &VectorCore::encode_neighbor_block(&neighbors),
+                )
+                .unwrap();
+        }
+        backend.commit(write).unwrap();
+        let read = backend.begin_read().unwrap();
+        let query = HVector::new(0, vec![37.0, 12.0]);
+        let vector_filter: [VF; 1] = [|vector| vector.get_id() % 2 == 0];
+        let id_filter: [fn(u128) -> bool; 1] = [|id| id % 2 == 0];
+        let summarize = |heap: BinaryHeap<HVector>| {
+            heap.into_sorted_vec()
+                .into_iter()
+                .map(|row| (row.get_id(), row.get_distance()))
+                .collect::<Vec<_>>()
+        };
+        for metric in [
+            DistanceMetric::Euclid,
+            DistanceMetric::Dot,
+            DistanceMetric::Cosine,
+        ] {
+            batch_core.distance_metric = metric.clone();
+            scalar_core.distance_metric = metric;
+            let mut expected_entry = HVector::new(1, vec![1.0, 48.0]);
+            let mut actual_entry = expected_entry.clone();
+            let expected_arena = Bump::new();
+            let actual_arena = Bump::new();
+            let mut expected_ordinals = SidecarOrdinalRequestCache::new();
+            let mut actual_ordinals = SidecarOrdinalRequestCache::new();
+            let expected = scalar_core
+                .search_level(
+                    &read,
+                    &query,
+                    &mut expected_entry,
+                    16,
+                    0,
+                    Some(&vector_filter),
+                    &expected_arena,
+                    &PreparedSpindleQuery::None,
+                    None,
+                    &[],
+                    &mut expected_ordinals,
+                )
+                .unwrap();
+            let actual = batch_core
+                .search_level(
+                    &read,
+                    &query,
+                    &mut actual_entry,
+                    16,
+                    0,
+                    Some(&vector_filter),
+                    &actual_arena,
+                    &PreparedSpindleQuery::None,
+                    None,
+                    &[],
+                    &mut actual_ordinals,
+                )
+                .unwrap();
+            assert_eq!(summarize(actual), summarize(expected));
+            batch_core.clear_vector_cache();
+            let mut expected_entry = HVector::new(1, vec![1.0, 48.0]);
+            let mut actual_entry = expected_entry.clone();
+            let expected_arena = Bump::new();
+            let actual_arena = Bump::new();
+            let mut expected_ordinals = SidecarOrdinalRequestCache::new();
+            let mut actual_ordinals = SidecarOrdinalRequestCache::new();
+            let expected = scalar_core
+                .search_level_id_filter(
+                    &read,
+                    &query,
+                    &mut expected_entry,
+                    16,
+                    0,
+                    Some(&id_filter),
+                    &expected_arena,
+                    &PreparedSpindleQuery::None,
+                    None,
+                    &[],
+                    &mut expected_ordinals,
+                )
+                .unwrap();
+            let actual = batch_core
+                .search_level_id_filter(
+                    &read,
+                    &query,
+                    &mut actual_entry,
+                    16,
+                    0,
+                    Some(&id_filter),
+                    &actual_arena,
+                    &PreparedSpindleQuery::None,
+                    None,
+                    &[],
+                    &mut actual_ordinals,
+                )
+                .unwrap();
+            assert_eq!(summarize(actual), summarize(expected));
+            batch_core.clear_vector_cache();
+        }
+    }
+
     struct EnvGuard {
         key: &'static str,
         prev: Option<String>,
@@ -9874,6 +11027,12 @@ mod tests {
         fn set(key: &'static str, val: &str) -> Self {
             let prev = std::env::var(key).ok();
             std::env::set_var(key, val);
+            Self { key, prev }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::remove_var(key);
             Self { key, prev }
         }
     }
@@ -9893,6 +11052,44 @@ mod tests {
         assert_eq!(nav_cache_warm_cap_from_raw(Some("0"), 512), 0);
         assert_eq!(nav_cache_warm_cap_from_raw(Some("nope"), 512), 512);
         assert_eq!(nav_cache_warm_cap_from_raw(None, 0), 0);
+    }
+
+    #[test]
+    fn hnsw_config_clamps_m_below_two() {
+        let config = HNSWConfig::new(Some(1), Some(32), Some(64));
+
+        assert_eq!(config.m, MIN_HNSW_M);
+        assert_eq!(config.m_max_0, MIN_HNSW_M * 2);
+        assert!(config.m_l.is_finite());
+    }
+
+    #[test]
+    fn hnsw_level_assignment_caps_non_finite_samples() {
+        assert_eq!(assign_hnsw_level(1.0, 1.0), 0);
+        assert_eq!(assign_hnsw_level(0.0, 1.0), MAX_HNSW_LEVEL);
+        assert_eq!(assign_hnsw_level(f64::NAN, 1.0), MAX_HNSW_LEVEL);
+        assert_eq!(assign_hnsw_level(0.5, f64::INFINITY), 0);
+    }
+
+    #[test]
+    fn merge_build_distance_uses_raw_geometry_for_dot_and_euclid() {
+        // 1D Dot counterexample: under SQ8 codes -1 would rank +1 nearer
+        // than -2; the raw inner product ranks -2 nearer.
+        let dot_raw = vec![vec![-2.0f32], vec![-1.0], vec![1.0]];
+        let d = |a, b| merge_build_distance(&DistanceMetric::Dot, &dot_raw, &[], 1, a, b);
+        assert!(d(1, 0) < d(1, 2));
+
+        // Unequal ranges: the wide dimension decides L2 nearness.
+        let l2_raw = vec![vec![0.0f32, 0.0], vec![1.0, 1.0], vec![100.0, 0.0]];
+        let e = |a, b| merge_build_distance(&DistanceMetric::Euclid, &l2_raw, &[], 2, a, b);
+        assert!(e(0, 1) < e(0, 2));
+        assert!((e(0, 2) - 100.0).abs() < 1e-4);
+
+        // Cosine keeps using SQ8 codes.
+        let codes = [255u8, 0, 128, 0, 0, 255];
+        let c = |a, b| merge_build_distance(&DistanceMetric::Cosine, &[], &codes, 2, a, b);
+        assert_eq!(c(0, 0), c(0, 1));
+        assert!(c(0, 1) < c(0, 2));
     }
 
     fn setup() -> (heed3::Env, TempDir) {
@@ -10048,6 +11245,666 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_partial_ordinals_flat_filter_reads_share_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(
+            AnyBackend::open_lsm_in_memory(&format!("ordinal-filter-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        );
+        let core = VectorCore::new_named_lsm_with_dir(
+            "ordinal_filter",
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Euclid,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            Some(directory.path()),
+            2,
+            Arc::clone(&backend),
+        )
+        .unwrap();
+        let rows = [[1.0, 0.0], [0.0, 1.0]];
+        let mut write = backend.begin_write().unwrap();
+        for (id, row) in [(11u128, &rows[0]), (22, &rows[1])] {
+            core.insert_flat_be(&mut write, row, Some(id), None)
+                .unwrap();
+            backend
+                .put(&mut write, Namespace::Nodes, &id.to_be_bytes(), b"visible")
+                .unwrap();
+        }
+        backend.commit(write).unwrap();
+        assert!(!core.sidecar_ordinals_loaded().unwrap());
+
+        let old_read = backend.begin_read().unwrap();
+        let mut pending = backend.begin_write().unwrap();
+        backend
+            .delete(&mut pending, Namespace::Nodes, &22u128.to_be_bytes())
+            .unwrap();
+        let pending_read = backend
+            .lsm_read_with_pending(pending.lsm_pending().unwrap().clone())
+            .unwrap();
+        for (read, expected_ids) in [(&old_read, vec![22, 11]), (&pending_read, vec![11])] {
+            let read_errors = std::cell::Cell::new(0usize);
+            let filter = |id: u128| match backend.get_with(
+                read,
+                Namespace::Nodes,
+                &id.to_be_bytes(),
+                |value| value.is_some(),
+            ) {
+                Ok(visible) => visible,
+                Err(_) => {
+                    read_errors.set(read_errors.get() + 1);
+                    false
+                }
+            };
+            let results = core
+                .search_flat_mmap_ordinals_direct(read, &rows[1], 2, Some(&[filter]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(read_errors.get(), 0);
+            assert_eq!(
+                results.iter().map(HVector::get_id).collect::<Vec<_>>(),
+                expected_ids
+            );
+            for result in results {
+                let row = if result.get_id() == 11 {
+                    &rows[0]
+                } else {
+                    &rows[1]
+                };
+                assert_eq!(
+                    result.get_distance(),
+                    core.distance_between(row, &rows[1]).unwrap()
+                );
+            }
+        }
+        assert!(!core.sidecar_ordinals_loaded().unwrap());
+    }
+
+    #[test]
+    fn sidecar_partial_ordinals_preserve_exact_scoring_and_flat_results() {
+        use crate::helix_engine::vector_core::mmap_vectors::MmapVectorStore;
+
+        let directory = TempDir::new().unwrap();
+        let segment = "partial_ordinals";
+        let rows = [vec![1.0, 0.0], vec![0.0, 1.0]];
+        let slices = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        drop(
+            MmapVectorStore::create_from_slices(
+                &directory.path().join(segment).with_extension("hvec"),
+                &slices,
+            )
+            .unwrap(),
+        );
+        let backend = Arc::new(
+            AnyBackend::open_lsm_in_memory(&format!("partial-ordinals-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        );
+        let mut write = backend.begin_write().unwrap();
+        for (id, ordinal) in [(11u128, 0u64), (22, 1)] {
+            backend
+                .put(
+                    &mut write,
+                    Namespace::Segment {
+                        physical_name: segment,
+                        db: SegmentDb::Ordinals,
+                    },
+                    &id.to_be_bytes(),
+                    &ordinal.to_le_bytes(),
+                )
+                .unwrap();
+        }
+        backend.commit(write).unwrap();
+        let core = VectorCore::new_named_lsm_with_dir(
+            segment,
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Euclid,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            Some(directory.path()),
+            2,
+            Arc::clone(&backend),
+        )
+        .unwrap();
+        core.cache_sidecar_ordinal(11, 0);
+        let read = backend.begin_read().unwrap();
+        let results = core
+            .search_flat_mmap_ordinals_direct::<fn(u128) -> bool>(&read, &rows[1], 2, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().any(|result| result.get_id() == 22));
+        assert_eq!(core.sidecar_ordinal(&read, 22).unwrap(), Some(1));
+        for (id, expected_row) in [(11, &rows[0]), (22, &rows[1])] {
+            let distance = core
+                .score_neighbor_distance(&read, &PreparedSpindleQuery::None, id, 0, &rows[1])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                distance,
+                core.distance_between(expected_row, &rows[1]).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_request_ordinals_batch_and_memoize_reads() {
+        use crate::helix_engine::vector_core::mmap_vectors::MmapVectorStore;
+
+        let directory = TempDir::new().unwrap();
+        let segment = "request_ordinals";
+        let rows = [vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
+        let raw_fallback = encode_vector(&[2.0, 2.0], &SpindleConfig::default()).unwrap();
+        let decoded_fallback = decode_vector(&raw_fallback).unwrap();
+        let marker_fallback = encode_vector(&[3.0, 3.0], &SpindleConfig::default()).unwrap();
+        let decoded_marker_fallback = decode_vector(&marker_fallback).unwrap();
+        let slices = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        drop(
+            MmapVectorStore::create_from_slices(
+                &directory.path().join(segment).with_extension("hvec"),
+                &slices,
+            )
+            .unwrap(),
+        );
+        let backend = Arc::new(
+            AnyBackend::open_lsm_in_memory(&format!("request-ordinals-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        );
+        let mut write = backend.begin_write().unwrap();
+        for (id, ordinal) in [(11u128, 0u64), (22, 1), (33, 2)] {
+            backend
+                .put(
+                    &mut write,
+                    Namespace::Segment {
+                        physical_name: segment,
+                        db: SegmentDb::Ordinals,
+                    },
+                    &id.to_be_bytes(),
+                    &ordinal.to_le_bytes(),
+                )
+                .unwrap();
+        }
+        backend
+            .put(
+                &mut write,
+                Namespace::Segment {
+                    physical_name: segment,
+                    db: SegmentDb::Vectors,
+                },
+                &VectorCore::vector_key(44, 0),
+                &raw_fallback,
+            )
+            .unwrap();
+        backend
+            .put(
+                &mut write,
+                Namespace::Segment {
+                    physical_name: segment,
+                    db: SegmentDb::Vectors,
+                },
+                &VectorCore::vector_key(55, 0),
+                &marker_fallback,
+            )
+            .unwrap();
+        backend
+            .put(
+                &mut write,
+                Namespace::Segment {
+                    physical_name: segment,
+                    db: SegmentDb::Vectors,
+                },
+                &VectorCore::vector_key(55, 1),
+                EXTERNALIZED_VECTOR_MARKER,
+            )
+            .unwrap();
+        backend
+            .put(
+                &mut write,
+                Namespace::Segment {
+                    physical_name: segment,
+                    db: SegmentDb::Vectors,
+                },
+                &VectorCore::vector_key(66, 0),
+                EXTERNALIZED_VECTOR_MARKER,
+            )
+            .unwrap();
+        backend.commit(write).unwrap();
+        let core = VectorCore::new_named_lsm_with_dir(
+            segment,
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Euclid,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            Some(directory.path()),
+            2,
+            Arc::clone(&backend),
+        )
+        .unwrap();
+        let AnyBackend::Lsm(lsm) = &*backend else {
+            unreachable!("backend is LSM in this test");
+        };
+        let read = backend.begin_read().unwrap();
+        let repeated_ids = [11u128, 22, 33, 22, 44, 33, 11, 44, 22];
+
+        lsm.reset_read_count();
+        let uncached = repeated_ids
+            .iter()
+            .map(|id| core.sidecar_ordinal_from_store(&read, *id).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uncached,
+            vec![
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(1),
+                None,
+                Some(2),
+                Some(0),
+                None,
+                Some(1)
+            ]
+        );
+        let uncached_reads = lsm.read_count();
+        assert_eq!(uncached_reads, repeated_ids.len());
+
+        lsm.reset_read_count();
+        let mut request_cache = SidecarOrdinalRequestCache::new();
+        core.prefetch_sidecar_ordinals(&read, &repeated_ids, &HashSet::new(), &mut request_cache)
+            .unwrap();
+        let cached = repeated_ids
+            .iter()
+            .map(|id| {
+                core.sidecar_ordinal_with_request_cache(&read, *id, &mut request_cache)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cached, uncached);
+        let request_cached_reads = lsm.read_count();
+        assert_eq!(request_cached_reads, 4);
+        eprintln!(
+            "ordinal_request_cache_evidence uncached_reads={uncached_reads} prefetched_reads={request_cached_reads}"
+        );
+        assert!(
+            request_cached_reads < uncached_reads,
+            "request cache should reduce repeated ordinal point reads: uncached={uncached_reads}, request_cached={request_cached_reads}"
+        );
+
+        lsm.reset_read_count();
+        let vector = core
+            .get_vector_with_ordinal_cache(&read, 44, 0, true, &mut request_cache)
+            .unwrap();
+        assert_eq!(vector.get_data(), decoded_fallback.as_slice());
+        assert_eq!(
+            lsm.read_count(),
+            1,
+            "known ordinal miss should read only the raw vector row"
+        );
+        eprintln!("known_ordinal_miss_get_vector_reads={}", lsm.read_count());
+
+        core.clear_vector_cache();
+        lsm.reset_read_count();
+        let distance = core
+            .score_neighbor_distance_with_cache(
+                &read,
+                &PreparedSpindleQuery::None,
+                44,
+                0,
+                decoded_fallback.as_slice(),
+                Some(&mut request_cache),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(distance < 1e-6);
+        assert_eq!(
+            lsm.read_count(),
+            1,
+            "known ordinal miss scoring should not re-probe the ordinal key"
+        );
+        eprintln!("known_ordinal_miss_scoring_reads={}", lsm.read_count());
+
+        core.sidecar_ordinal_with_request_cache(&read, 55, &mut request_cache)
+            .unwrap();
+        lsm.reset_read_count();
+        let vector = core
+            .get_vector_with_ordinal_cache(&read, 55, 1, true, &mut request_cache)
+            .unwrap();
+        assert_eq!(vector.get_level(), 1);
+        assert_eq!(vector.get_data(), decoded_marker_fallback.as_slice());
+        assert_eq!(
+            lsm.read_count(),
+            2,
+            "known ordinal miss on an upper-level marker should read marker + raw level-0 row, not re-probe the ordinal"
+        );
+
+        core.clear_vector_cache();
+        lsm.reset_read_count();
+        let distance = core
+            .score_neighbor_distance_with_cache(
+                &read,
+                &PreparedSpindleQuery::None,
+                55,
+                1,
+                decoded_marker_fallback.as_slice(),
+                Some(&mut request_cache),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(distance < 1e-6);
+        assert_eq!(
+            lsm.read_count(),
+            2,
+            "known ordinal miss scoring for an upper-level marker should fall back to raw level-0 without another ordinal read"
+        );
+
+        core.sidecar_ordinal_with_request_cache(&read, 66, &mut request_cache)
+            .unwrap();
+        lsm.reset_read_count();
+        let error = core
+            .get_vector_with_ordinal_cache(&read, 66, 0, true, &mut request_cache)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("externalized vector 66 missing ordinal mapping"));
+        assert_eq!(
+            lsm.read_count(),
+            1,
+            "known ordinal miss on a level-0 marker should read only the marker row before returning the repairable error"
+        );
+        core.clear_externalized_marker_repair_needed();
+        let repaired = core
+            .search_exact_ids_with_selectivity(
+                &read,
+                decoded_marker_fallback.as_slice(),
+                [66],
+                1,
+                None,
+            )
+            .unwrap();
+        assert!(repaired.is_empty());
+        assert!(
+            core.externalized_marker_repair_needed(),
+            "search callers must still mark missing-ordinal markers for repair"
+        );
+
+        let results = core
+            .search_exact_ids_with_selectivity(&read, &rows[1], [11u128, 22, 33], 3, None)
+            .unwrap();
+        assert_eq!(
+            results.iter().map(HVector::get_id).collect::<Vec<_>>(),
+            vec![22, 33, 11]
+        );
+        let distances = results
+            .iter()
+            .map(HVector::get_distance)
+            .collect::<Vec<_>>();
+        assert!((distances[0] - 0.0).abs() < 1e-6);
+        assert!((distances[1] - 1.0).abs() < 1e-6);
+        assert!((distances[2] - 2.0_f32.sqrt()).abs() < 1e-6);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sidecar_request_ordinals_prefetch_file_backed_reader_snapshot() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+        use crate::helix_engine::vector_core::mmap_vectors::MmapVectorStore;
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
+
+        let _cache_dir = EnvGuard::unset("HELIX_LSM_CACHE_DIR");
+        let _multi_get = EnvGuard::set("HELIX_LSM_MULTI_GET", "1");
+        let directory = TempDir::new().unwrap();
+        let segment = "request_ordinals_reader";
+        let rows = (1..=96)
+            .map(|id| vec![id as f32, 96.0 - id as f32])
+            .collect::<Vec<_>>();
+        let slices = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        drop(
+            MmapVectorStore::create_from_slices(
+                &directory.path().join(segment).with_extension("hvec"),
+                &slices,
+            )
+            .unwrap(),
+        );
+
+        let store_directory = TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(store_directory.path()).unwrap());
+        let path = format!("reader-ordinal-prefetch-{}", uuid::Uuid::new_v4());
+        let writer = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_with_store(&path, Arc::clone(&store)).unwrap(),
+        ));
+        let mut write = writer.begin_write().unwrap();
+        for id in 1..=96u128 {
+            let ordinal = (id - 1) as u64;
+            writer
+                .put(
+                    &mut write,
+                    Namespace::Segment {
+                        physical_name: segment,
+                        db: SegmentDb::Ordinals,
+                    },
+                    &id.to_be_bytes(),
+                    &ordinal.to_le_bytes(),
+                )
+                .unwrap();
+        }
+        writer.commit(write).unwrap();
+        let AnyBackend::Lsm(lsm_writer) = &*writer else {
+            unreachable!("writer backend is LSM in this test");
+        };
+        lsm_writer.flush_durable().unwrap();
+        let mut pending_directories = vec![store_directory.path().to_path_buf()];
+        let mut sst_files = 0usize;
+        while let Some(directory) = pending_directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending_directories.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "sst") {
+                    sst_files += 1;
+                }
+            }
+        }
+        assert!(sst_files > 0, "fixture must place ordinals in SST files");
+
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, Arc::clone(&store)).unwrap(),
+        ));
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!("reader backend is LsmReader in this test");
+        };
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        let core = VectorCore::new_named_lsm_with_dir(
+            segment,
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Euclid,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            Some(directory.path()),
+            2,
+            Arc::clone(&reader),
+        )
+        .unwrap();
+        let frontier_ids = (1..=96u128).chain([17, 31, 95]).collect::<Vec<_>>();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut request_cache = SidecarOrdinalRequestCache::new();
+
+        metrics::with_local_recorder(&recorder, || {
+            core.prefetch_sidecar_ordinals(
+                &read,
+                &frontier_ids,
+                &HashSet::new(),
+                &mut request_cache,
+            )
+            .unwrap();
+        });
+        let metrics = handle.render();
+        assert!(
+            metrics.contains("helix_hnsw_ordinal_prefetch_batches_total 1"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("helix_hnsw_ordinal_prefetch_rows_total 96"),
+            "{metrics}"
+        );
+        eprintln!(
+            "reader_snapshot_ordinal_prefetch_evidence sst_files={sst_files} batches=1 rows=96"
+        );
+        assert_eq!(request_cache.entries.len(), 96);
+        assert_eq!(request_cache.get(17), Some(Some(16)));
+
+        for id in frontier_ids {
+            assert!(core
+                .sidecar_ordinal_with_request_cache(&read, id, &mut request_cache)
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn sidecar_partial_ordinals_preserve_pinned_reader_after_refresh() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+        use crate::helix_engine::vector_core::mmap_vectors::MmapVectorStore;
+        use object_store::memory::InMemory;
+        use object_store::ObjectStore;
+
+        let directory = TempDir::new().unwrap();
+        let segment = "partial_reader_ordinals";
+        let rows = [vec![1.0, 0.0], vec![0.0, 1.0], vec![9.0, 0.0]];
+        let slices = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        drop(
+            MmapVectorStore::create_from_slices(
+                &directory.path().join(segment).with_extension("hvec"),
+                &slices,
+            )
+            .unwrap(),
+        );
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = format!("partial-reader-ordinals-{}", uuid::Uuid::new_v4());
+        let writer = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_with_store(&path, Arc::clone(&store)).unwrap(),
+        ));
+        let namespace = Namespace::Segment {
+            physical_name: segment,
+            db: SegmentDb::Ordinals,
+        };
+        let mut write = writer.begin_write().unwrap();
+        for (id, ordinal) in [(11u128, 0u64), (22, 1)] {
+            writer
+                .put(
+                    &mut write,
+                    namespace,
+                    &id.to_be_bytes(),
+                    &ordinal.to_le_bytes(),
+                )
+                .unwrap();
+        }
+        writer.commit(write).unwrap();
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, Arc::clone(&store)).unwrap(),
+        ));
+        let core = VectorCore::new_named_lsm_with_dir(
+            segment,
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Euclid,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            Some(directory.path()),
+            2,
+            Arc::clone(&reader),
+        )
+        .unwrap();
+        core.cache_sidecar_ordinal(11, 0);
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let old_read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        let mut write = writer.begin_write().unwrap();
+        writer
+            .put(
+                &mut write,
+                namespace,
+                &22u128.to_be_bytes(),
+                &2u64.to_le_bytes(),
+            )
+            .unwrap();
+        writer.commit(write).unwrap();
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let new_read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(
+            core.sidecar_ordinal_from_store(&new_read, 22).unwrap(),
+            Some(2)
+        );
+        assert_eq!(core.sidecar_ordinal(&old_read, 22).unwrap(), Some(1));
+        let mut old_request_cache = SidecarOrdinalRequestCache::new();
+        assert_eq!(
+            core.sidecar_ordinal_with_request_cache(&old_read, 22, &mut old_request_cache)
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            core.sidecar_ordinal_with_request_cache(&old_read, 22, &mut old_request_cache)
+                .unwrap(),
+            Some(1)
+        );
+        let mut new_request_cache = SidecarOrdinalRequestCache::new();
+        assert_eq!(
+            core.sidecar_ordinal_with_request_cache(&new_read, 22, &mut new_request_cache)
+                .unwrap(),
+            Some(2)
+        );
+        core.clear_vector_cache();
+        let old_hydrated = core
+            .get_vector_with_ordinal_cache(&old_read, 22, 0, true, &mut old_request_cache)
+            .unwrap();
+        assert_eq!(old_hydrated.get_data(), rows[1].as_slice());
+        let old_then_new_new = core.get_vector(&new_read, 22, 0, true).unwrap();
+        assert_eq!(old_then_new_new.get_data(), rows[2].as_slice());
+
+        core.clear_vector_cache();
+        let new_hydrated = core
+            .get_vector_with_ordinal_cache(&new_read, 22, 0, true, &mut new_request_cache)
+            .unwrap();
+        assert_eq!(new_hydrated.get_data(), rows[2].as_slice());
+        let new_then_old_old = core.get_vector(&old_read, 22, 0, true).unwrap();
+        assert_eq!(new_then_old_old.get_data(), rows[1].as_slice());
+        for (read, expected_row) in [(&old_read, &rows[1]), (&new_read, &rows[2])] {
+            let distance = core
+                .score_neighbor_distance(read, &PreparedSpindleQuery::None, 22, 0, &rows[1])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                distance,
+                core.distance_between(expected_row, &rows[1]).unwrap()
+            );
+            let results = core
+                .search_flat_mmap_ordinals_direct::<fn(u128) -> bool>(read, &rows[1], 2, None)
+                .unwrap()
+                .unwrap();
+            let result = results.iter().find(|result| result.get_id() == 22).unwrap();
+            assert_eq!(result.get_data(), expected_row.as_slice());
+        }
+        assert_eq!(core.cached_sidecar_ordinal(22).unwrap(), None);
+    }
+
+    #[test]
     fn lsm_named_core_defers_sidecar_ordinal_scan_on_open() {
         use crate::helix_engine::storage_core::backend::StorageBackend;
 
@@ -10109,8 +11966,8 @@ mod tests {
         assert_eq!(core.sidecar_ordinal(&read, 1).unwrap(), Some(0));
         let ordinals = core.mmap_ordinals.read().unwrap();
         let ordinals = ordinals.as_ref().unwrap();
-        assert_eq!(ordinals.get(&1), Some(&0));
-        assert_eq!(ordinals.get(&2), Some(&1));
+        assert_eq!(ordinals.entries().get(&1), Some(&0));
+        assert_eq!(ordinals.entries().get(&2), Some(&1));
     }
 
     #[test]
@@ -11144,6 +13001,96 @@ mod tests {
         assert_eq!(ids1, ids2, "Second build should not change search results");
     }
 
+    /// Split-build topology for `rows` (id i+1 -> rows[i]) under `metric`.
+    fn split_build_level0(
+        name: &str,
+        metric: DistanceMetric,
+        m: usize,
+        rows: &[Vec<f32>],
+    ) -> Vec<(u128, Vec<u128>)> {
+        let (env, _dir) = setup();
+        let core = core_with_config(
+            &env,
+            name,
+            HNSWConfig::new(Some(m), Some(64), Some(64)),
+            metric,
+        );
+        let mut txn = env.write_txn().unwrap();
+        for (i, row) in rows.iter().enumerate() {
+            core.insert_flat(&mut txn, row, Some((i + 1) as u128), None)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let txn = env.read_txn().unwrap();
+        let prepared = core
+            .prepare_index_from_flat(&core.backend.read_borrowed(&txn))
+            .unwrap()
+            .unwrap();
+        prepared
+            .adjacency
+            .iter()
+            .enumerate()
+            .map(|(ord, adjacency)| {
+                let neighbors = adjacency.as_ref().unwrap()[0]
+                    .iter()
+                    .map(|&other| prepared.point_ids[other as usize])
+                    .collect();
+                (prepared.point_ids[ord], neighbors)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_build_uses_raw_geometry_for_dot_and_euclid() {
+        // Dot on the unit circle (see `dot_circle_rows`).
+        let n = 200usize;
+        let (dot_positions, rows) = dot_circle_rows(29, n);
+        let level0 = split_build_level0("split_dot", DistanceMetric::Dot, 4, &rows)
+            .into_iter()
+            .map(|(id, neighbors)| {
+                let pos = |id: u128| dot_positions[id as usize - 1];
+                (pos(id), neighbors.into_iter().map(pos).collect())
+            });
+        let pct = circle_locality_percent(n, 16, level0);
+        assert!(
+            pct >= 90,
+            "split Dot build must follow inner products: {pct}% local"
+        );
+        let mut rng = rand::rngs::StdRng::seed_from_u64(31);
+
+        // Euclid with unequal ranges: dim 0 spans [0, 2000), dim 1 [0, 1).
+        let mut positions: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let j = rand::Rng::random_range(&mut rng, 0..=i);
+            positions.swap(i, j);
+        }
+        let rows: Vec<Vec<f32>> = positions
+            .iter()
+            .map(|&x| {
+                vec![
+                    x as f32 * 10.0,
+                    rand::Rng::random_range(&mut rng, 0.0f32..1.0f32),
+                ]
+            })
+            .collect();
+        let pos_of = |id: u128| positions[id as usize - 1] as i64;
+        let bound = 16i64;
+        let local = split_build_level0("split_l2", DistanceMetric::Euclid, 4, &rows)
+            .into_iter()
+            .filter(|(id, neighbors)| {
+                neighbors
+                    .iter()
+                    .all(|&other| (pos_of(other) - pos_of(*id)).abs() <= bound)
+            })
+            .count();
+        // Level assignment is unseeded, so locality varies a few points run
+        // to run (89% seen in a full-suite run).
+        assert!(
+            local * 100 >= n * 85,
+            "split Euclid build must follow raw L2 geometry: {local}/{n} local"
+        );
+    }
+
     #[test]
     fn split_phase_build_produces_searchable_index() {
         let (env, _dir) = setup();
@@ -11269,7 +13216,8 @@ mod tests {
             .collect();
 
         let config = HNSWConfig::new(Some(8), Some(32), Some(64));
-        let prepared = VectorCore::build_hnsw_in_memory(&exported, &config).unwrap();
+        let prepared =
+            VectorCore::build_hnsw_in_memory(&exported, &config, DistanceMetric::Cosine).unwrap();
 
         assert_eq!(prepared.point_ids.len(), exported.len());
         assert_eq!(prepared.original_data.len(), exported.len());
@@ -12171,7 +14119,7 @@ mod tests {
     }
 
     #[test]
-    fn externalized_marker_missing_sidecar_is_repairable_error() {
+    fn externalized_marker_missing_ordinal_is_repairable_error() {
         let (env, dir) = setup();
         let core = core_with_mode_and_mmap(&env, dir.path(), "mmap_missing", SpindleMode::None, 4);
 
@@ -12187,6 +14135,7 @@ mod tests {
             .delete(&mut txn, &9u128.to_be_bytes())
             .unwrap();
         txn.commit().unwrap();
+        core.remove_cached_sidecar_ordinals(&[9]);
 
         let txn = env.read_txn().unwrap();
         let err = core
@@ -12940,6 +14889,85 @@ mod tests {
             core.write_sidecar_ordinals_be(&mut w, &point_ids).unwrap();
             backend.commit(w).unwrap();
         }
+
+        {
+            let mut w = backend.begin_write().unwrap();
+            core.insert_flat_be(&mut w, &[0.10, 0.20, 0.30, 0.40], Some(11), None)
+                .unwrap();
+            backend.commit(w).unwrap();
+        }
+        let ro = backend.begin_read().unwrap();
+        let same_payload = backend
+            .get_with(
+                &ro,
+                Namespace::Segment {
+                    physical_name: segment,
+                    db: SegmentDb::Vectors,
+                },
+                VectorCore::vector_key(11, 0).as_ref(),
+                |value| value.map(|bytes| bytes.to_vec()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            same_payload.is_empty(),
+            "an unchanged HVTQ vector may keep using its sidecar marker"
+        );
+        drop(ro);
+
+        let replacement = [-0.80, 0.15, 0.45, 0.70];
+        {
+            let mut w = backend.begin_write().unwrap();
+            core.insert_flat_be(&mut w, &replacement, Some(11), None)
+                .unwrap();
+            backend.commit(w).unwrap();
+        }
+        let ro = backend.begin_read().unwrap();
+        let changed_payload = backend
+            .get_with(
+                &ro,
+                Namespace::Segment {
+                    physical_name: segment,
+                    db: SegmentDb::Vectors,
+                },
+                VectorCore::vector_key(11, 0).as_ref(),
+                |value| value.map(|bytes| bytes.to_vec()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            !changed_payload.is_empty(),
+            "a changed vector must not resolve through a stale HVTQ ordinal"
+        );
+        let expected = encode_vector(&replacement, &core.spindle).unwrap();
+        assert_eq!(changed_payload, expected);
+        assert_eq!(
+            core.get_encoded_vector(&ro, 11, 0).unwrap(),
+            expected,
+            "reads must observe the replacement payload"
+        );
+        assert_eq!(
+            core.get_vector(&ro, 11, 0, true).unwrap().get_data(),
+            decode_vector(&expected).unwrap(),
+            "decoded reads must not use the stale HVTQ sidecar row"
+        );
+        let ordinal_exists = backend
+            .get_with(
+                &ro,
+                Namespace::Segment {
+                    physical_name: segment,
+                    db: SegmentDb::Ordinals,
+                },
+                &11u128.to_be_bytes(),
+                |value| value.is_some(),
+            )
+            .unwrap();
+        assert!(
+            !ordinal_exists,
+            "replacement payload must detach its stale sidecar ordinal"
+        );
+        assert_eq!(core.cached_sidecar_ordinal(11).unwrap(), None);
+        drop(ro);
 
         let ro = backend.begin_read().unwrap();
         assert!(
@@ -13713,6 +15741,18 @@ mod tests {
             "no-sidecar get_vector should read only the vector row, not an ordinal miss first"
         );
 
+        let mut request_cache = SidecarOrdinalRequestCache::new();
+        lsm.reset_read_count();
+        let vector = core
+            .get_vector_with_ordinal_cache(&ro, 41, 0, true, &mut request_cache)
+            .unwrap();
+        assert_eq!(vector.get_data(), &[1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            lsm.read_count(),
+            0,
+            "no-sidecar cache-aware hydration should preserve plain get_vector's global cache hit"
+        );
+
         lsm.reset_read_count();
         let distance = core
             .score_neighbor_distance(
@@ -13890,6 +15930,7 @@ mod tests {
     /// Item-3 regression: the process-wide materialization permit caps
     /// concurrent first-touch scans; capped probes defer instead of queueing.
     #[test]
+    #[serial_test::serial]
     fn sidecar_materialize_permit_caps_and_releases() {
         // The cap is read from env at acquire time; hold permits and verify
         // acquisition fails at the cap and recovers after drop.
@@ -13910,6 +15951,100 @@ mod tests {
         assert!(
             SidecarMaterializePermit::try_acquire().is_some(),
             "released permit must be reusable"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lsm_sidecar_lock_waiter_does_not_consume_materialization_permit() {
+        use crate::helix_engine::storage_core::backend_any::AnyBackend;
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::sync::{mpsc, Arc};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let cap = sidecar_materialize_concurrency();
+        assert!(
+            (1..=64).contains(&cap),
+            "test requires a finite materialization cap, got {cap}"
+        );
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0,
+            "serial permit test must start without an in-flight materialization"
+        );
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("sidecar-permit-order-{nanos}"))
+                .expect("open in-memory LSM backend"),
+        ));
+        let (_env, dir) = setup();
+        let core = VectorCore::new_named_lsm_with_dir(
+            "dense__seg_000000",
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Cosine,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            Some(dir.path()),
+            4,
+            backend,
+        )
+        .unwrap();
+
+        let held = (1..cap)
+            .map(|_| {
+                SidecarMaterializePermit::try_acquire()
+                    .expect("cap-minus-one setup acquisition must succeed")
+            })
+            .collect::<Vec<_>>();
+        let inflight_while_blocked = std::thread::scope(|scope| {
+            let (lock_attempt_tx, lock_attempt_rx) = mpsc::sync_channel(0);
+            let (continue_tx, continue_rx) = mpsc::sync_channel(0);
+            let core_ref = &core;
+            let worker = scope.spawn(move || {
+                core_ref.ensure_lsm_mmap_sidecar_with_lock_observer(|| {
+                    lock_attempt_tx
+                        .send(())
+                        .expect("test receiver must remain connected");
+                    let _ = continue_rx.recv();
+                })
+            });
+
+            lock_attempt_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("materialization worker must attempt the mmap write lock");
+            let mmap_guard = core.mmap_store.write().unwrap();
+            let inflight = SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire);
+
+            continue_tx
+                .send(())
+                .expect("materialization worker must remain connected");
+            drop(mmap_guard);
+            assert!(
+                !worker
+                    .join()
+                    .expect("materialization worker must not panic")
+                    .expect("missing-sidecar probe must succeed"),
+                "empty LSM backend should not materialize a sidecar"
+            );
+            inflight
+        });
+        assert_eq!(
+            inflight_while_blocked,
+            cap - 1,
+            "a duplicate request blocked on the per-core lock must not consume the final global permit"
+        );
+
+        drop(held);
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0,
+            "all materialization permits must be released after the test"
         );
     }
 
@@ -14437,5 +16572,581 @@ mod tests {
         assert!(results.iter().all(|v| v.get_distance().is_finite()));
         // The query is a stored vector: its own id must be the top hit.
         assert_eq!(results[0].get_id(), 3);
+    }
+
+    // ── Review-fix regressions (HNSW params, metric, pruning, deletes) ──
+
+    fn core_with_config(
+        env: &heed3::Env,
+        name: &str,
+        config: HNSWConfig,
+        metric: DistanceMetric,
+    ) -> VectorCore {
+        let mut txn = env.write_txn().unwrap();
+        let core = VectorCore::new_named(
+            env,
+            &mut txn,
+            name,
+            config,
+            metric,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            test_backend(env),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        core
+    }
+
+    #[test]
+    fn hnsw_overrides_validate_rejects_degenerate_params() {
+        for m in [0usize, 1, MAX_HNSW_M + 1] {
+            let overrides = HnswOverrides {
+                m: Some(m),
+                ..HnswOverrides::default()
+            };
+            assert!(overrides.validate().is_err(), "m={m} must be rejected");
+        }
+        for m in [MIN_HNSW_M, 16, MAX_HNSW_M] {
+            let overrides = HnswOverrides {
+                m: Some(m),
+                ..HnswOverrides::default()
+            };
+            assert!(overrides.validate().is_ok(), "m={m} must be accepted");
+        }
+        assert!(HnswOverrides {
+            ef_construction: Some(0),
+            ..HnswOverrides::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HnswOverrides {
+            ef: Some(0),
+            ..HnswOverrides::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HnswOverrides::default().validate().is_ok());
+
+        // Already-persisted bad overrides are clamped, never yielding inf m_l.
+        for m in [0usize, 1] {
+            let config = HNSWConfig::new(Some(m), None, None);
+            assert_eq!(config.m, MIN_HNSW_M);
+            assert!(config.m_l.is_finite() && config.m_l > 0.0);
+        }
+    }
+
+    #[test]
+    fn in_memory_merge_build_dispatches_distance_metric() {
+        // Points on the diagonal ray, positions shuffled relative to
+        // ordinals: under Euclid each point's true neighbors are its
+        // positional neighbors. Every SQ8 code is a multiple of [1,1,1,1], so a
+        // cosine-built graph sees all-equal distances and is non-local.
+        let n = 200usize;
+        let mut positions: Vec<usize> = (0..n).collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        for i in (1..n).rev() {
+            let j = rand::Rng::random_range(&mut rng, 0..=i);
+            positions.swap(i, j);
+        }
+        let exported: Vec<(u128, Vec<f32>, HashMap<String, Value>)> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| (i as u128, vec![(x + 1) as f32; 4], HashMap::new()))
+            .collect();
+        let config = HNSWConfig::new(Some(4), Some(64), Some(64));
+        let permit = acquire_build_permit().unwrap();
+        let prepared = VectorCore::build_hnsw_in_memory_owned_with_permit(
+            exported,
+            &config,
+            DistanceMetric::Euclid,
+            &permit,
+        )
+        .unwrap();
+
+        let bound = (2 * config.m_max_0) as i64;
+        let mut local = 0usize;
+        for (ord, adjacency) in prepared.adjacency.iter().enumerate() {
+            let level0 = &adjacency.as_ref().unwrap()[0];
+            if level0.iter().all(|&other| {
+                (positions[other as usize] as i64 - positions[ord] as i64).abs() <= bound
+            }) {
+                local += 1;
+            }
+        }
+        assert!(
+            local * 100 >= n * 90,
+            "euclid build should link points to nearby points: {local}/{n} local"
+        );
+    }
+
+    /// Points on the unit circle at shuffled angular positions `0..n`. Raw
+    /// Dot equals cosine here, so true neighbors are angular neighbors. SQ8
+    /// shifts both dimensions to non-negative codes, which makes every point
+    /// prefer partners toward the 45-degree direction instead.
+    fn dot_circle_rows(seed: u64, n: usize) -> (Vec<usize>, Vec<Vec<f32>>) {
+        let mut positions: Vec<usize> = (0..n).collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        for i in (1..n).rev() {
+            let j = rand::Rng::random_range(&mut rng, 0..=i);
+            positions.swap(i, j);
+        }
+        let rows = positions
+            .iter()
+            .map(|&p| {
+                let theta = p as f32 * std::f32::consts::TAU / n as f32;
+                vec![theta.cos(), theta.sin()]
+            })
+            .collect();
+        (positions, rows)
+    }
+
+    /// Fraction (percent) of points whose level-0 neighbors are all within
+    /// `bound` angular positions on a circle of `n`.
+    fn circle_locality_percent(
+        n: usize,
+        bound: usize,
+        level0: impl Iterator<Item = (usize, Vec<usize>)>,
+    ) -> usize {
+        let local = level0
+            .filter(|(p, neighbors)| {
+                neighbors.iter().all(|&q| {
+                    let d = p.abs_diff(q);
+                    d.min(n - d) <= bound
+                })
+            })
+            .count();
+        local * 100 / n
+    }
+
+    #[test]
+    fn dot_merge_build_links_by_inner_product_not_sq8_codes() {
+        let n = 200usize;
+        let (positions, rows) = dot_circle_rows(17, n);
+        let exported: Vec<(u128, Vec<f32>, HashMap<String, Value>)> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| (i as u128, row, HashMap::new()))
+            .collect();
+        let config = HNSWConfig::new(Some(4), Some(64), Some(64));
+        let permit = acquire_build_permit().unwrap();
+        let prepared = VectorCore::build_hnsw_in_memory_owned_with_permit(
+            exported,
+            &config,
+            DistanceMetric::Dot,
+            &permit,
+        )
+        .unwrap();
+        let level0 = prepared.adjacency.iter().enumerate().map(|(ord, adj)| {
+            let neighbors = adj.as_ref().unwrap()[0]
+                .iter()
+                .map(|&o| positions[o as usize])
+                .collect();
+            (positions[ord], neighbors)
+        });
+        let pct = circle_locality_percent(n, 2 * config.m_max_0, level0);
+        assert!(
+            pct >= 90,
+            "Dot merge build must follow inner products: {pct}% local"
+        );
+    }
+
+    #[test]
+    fn euclid_merge_build_respects_unequal_dimension_ranges() {
+        // dim 0 spans [0, 2000), dim 1 only [0, 1): true L2 neighbors are
+        // decided by dim 0. SQ8 normalizes each dimension to 0..=255, which
+        // inflates the dim-1 noise to the same weight and breaks locality.
+        let n = 200usize;
+        let mut positions: Vec<usize> = (0..n).collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(23);
+        for i in (1..n).rev() {
+            let j = rand::Rng::random_range(&mut rng, 0..=i);
+            positions.swap(i, j);
+        }
+        let exported: Vec<(u128, Vec<f32>, HashMap<String, Value>)> = positions
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                let noise = rand::Rng::random_range(&mut rng, 0.0f32..1.0f32);
+                (i as u128, vec![x as f32 * 10.0, noise], HashMap::new())
+            })
+            .collect();
+        let config = HNSWConfig::new(Some(4), Some(64), Some(64));
+        let permit = acquire_build_permit().unwrap();
+        let prepared = VectorCore::build_hnsw_in_memory_owned_with_permit(
+            exported,
+            &config,
+            DistanceMetric::Euclid,
+            &permit,
+        )
+        .unwrap();
+
+        let bound = (2 * config.m_max_0) as i64;
+        let mut local = 0usize;
+        for (ord, adjacency) in prepared.adjacency.iter().enumerate() {
+            let level0 = &adjacency.as_ref().unwrap()[0];
+            if level0.iter().all(|&other| {
+                (positions[other as usize] as i64 - positions[ord] as i64).abs() <= bound
+            }) {
+                local += 1;
+            }
+        }
+        assert!(
+            local * 100 >= n * 90,
+            "euclid build must follow raw L2 geometry: {local}/{n} local"
+        );
+    }
+
+    #[test]
+    fn incremental_insert_respects_caps_and_keeps_true_neighbors() {
+        let (env, _dir) = setup();
+        let config = HNSWConfig::new(Some(4), Some(64), Some(64));
+        let (m, m_max_0) = (config.m, config.m_max_0);
+        let core = core_with_config(&env, "prune_caps", config, DistanceMetric::Euclid);
+
+        let n = 300usize;
+        let dim = 8usize;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let points: Vec<Vec<f32>> = (0..n)
+            .map(|_| {
+                (0..dim)
+                    .map(|_| rand::Rng::random_range(&mut rng, -1.0f32..1.0f32))
+                    .collect()
+            })
+            .collect();
+        let mut txn = env.write_txn().unwrap();
+        for (i, point) in points.iter().enumerate() {
+            core.insert::<VF>(&mut txn, point, Some(i as u128 + 1), None)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let txn = env.read_txn().unwrap();
+        let r = core.backend.read_borrowed(&txn);
+        let mut has_true_nearest = 0usize;
+        for (i, point) in points.iter().enumerate() {
+            let id = i as u128 + 1;
+            let top = core.get_highest_level(&r, id).unwrap();
+            for level in 0..=top {
+                let ids = core.get_neighbor_ids(&r, id, level).unwrap();
+                let cap = if level == 0 { m_max_0 } else { m };
+                assert!(
+                    ids.len() <= cap,
+                    "id {id} level {level} has {} links > cap {cap}",
+                    ids.len()
+                );
+            }
+            let nearest = (0..n)
+                .filter(|&j| j != i)
+                .min_by(|&a, &b| {
+                    let da = core.distance_between(&points[a], point).unwrap();
+                    let db = core.distance_between(&points[b], point).unwrap();
+                    da.total_cmp(&db)
+                })
+                .unwrap() as u128
+                + 1;
+            if core.get_neighbor_ids(&r, id, 0).unwrap().contains(&nearest) {
+                has_true_nearest += 1;
+            }
+        }
+        assert!(
+            has_true_nearest * 100 >= n * 90,
+            "overflow pruning must keep each node's true nearest: {has_true_nearest}/{n}"
+        );
+    }
+
+    #[test]
+    fn flat_mmap_fast_path_excludes_delete_tombstoned_ids() {
+        let (env, dir) = setup();
+        let core =
+            core_with_mode_and_mmap(&env, dir.path(), "flat_tomb_mmap", SpindleMode::None, 4);
+        let mut txn = env.write_txn().unwrap();
+        for id in 1..=8u128 {
+            let v = id as f32;
+            core.insert_flat(&mut txn, &[v, 1.0, 0.5, -0.5], Some(id), None)
+                .unwrap();
+        }
+        core.build_index_from_flat(&mut txn).unwrap();
+        txn.commit().unwrap();
+
+        let query = [3.0f32, 1.0, 0.5, -0.5];
+        let txn = env.read_txn().unwrap();
+        let r = core.backend.read_borrowed(&txn);
+        let before = core
+            .search_flat_mmap_ordinals_direct::<fn(u128) -> bool>(&r, &query, 8, None)
+            .unwrap()
+            .expect("mmap ordinal fast path must be active for this core");
+        assert!(before.iter().any(|v| v.get_id() == 3));
+
+        core.apply_delete_tombstones(&[3]);
+        let after = core
+            .search_flat_mmap_ordinals_direct::<fn(u128) -> bool>(&r, &query, 8, None)
+            .unwrap()
+            .unwrap();
+        assert!(!after.is_empty());
+        assert!(!after.iter().any(|v| v.get_id() == 3));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[serial_test::serial]
+    fn flat_hvtq_fastscan_excludes_delete_tombstoned_ids() {
+        use crate::helix_engine::storage_core::backend::StorageBackend;
+
+        let _fastscan = EnvGuard::set("HELIX_HVTQ_FASTSCAN", "1");
+        let dir = TempDir::new().unwrap();
+        let physical_name = "flat_tomb_hvtq";
+        let hvtq_path = dir.path().join(physical_name).with_extension("hvtq");
+        let vectors: Vec<Vec<f32>> = (0..8)
+            .map(|i| {
+                let t = i as f32 * 0.2;
+                vec![t.cos(), t.sin(), 0.25, -0.25]
+            })
+            .collect();
+        let slices = vectors.iter().map(Vec::as_slice).collect::<Vec<&[f32]>>();
+        let spindle = SpindleConfig {
+            mode: SpindleMode::TurboProd,
+            keep_original: false,
+            ..SpindleConfig::default()
+        };
+        drop(MmapTurboQuantStore::create_from_slices(&hvtq_path, &slices, &spindle).unwrap());
+
+        let backend = Arc::new(AnyBackend::open_lsm_in_memory("/flat-tomb-hvtq").unwrap());
+        let mut write = backend.begin_write().unwrap();
+        for ordinal in 0..vectors.len() as u64 {
+            let id = ordinal as u128 + 1;
+            let ns = |db| Namespace::Segment { physical_name, db };
+            backend
+                .put(
+                    &mut write,
+                    ns(SegmentDb::Ordinals),
+                    &id.to_be_bytes(),
+                    &ordinal.to_le_bytes(),
+                )
+                .unwrap();
+            backend
+                .put(
+                    &mut write,
+                    ns(SegmentDb::Vectors),
+                    &VectorCore::vector_key(id, 0),
+                    EXTERNALIZED_VECTOR_MARKER,
+                )
+                .unwrap();
+        }
+        backend.commit(write).unwrap();
+
+        let core = VectorCore::new_named_lsm_with_dir(
+            physical_name,
+            HNSWConfig::new(Some(8), Some(32), Some(64)),
+            DistanceMetric::Cosine,
+            spindle,
+            Some(dir.path()),
+            4,
+            backend,
+        )
+        .unwrap();
+        let prepared = prepare_query(&vectors[2], &core.spindle).unwrap();
+        let read = core.backend.begin_read().unwrap();
+        let before = core
+            .search_flat_hvtq_fastscan_direct::<fn(u128) -> bool>(&read, &prepared, 8, None)
+            .unwrap()
+            .expect("hvtq fastscan path must be active");
+        assert!(before.iter().any(|v| v.get_id() == 3));
+
+        core.apply_delete_tombstones(&[3]);
+        let after = core
+            .search_flat_hvtq_fastscan_direct::<fn(u128) -> bool>(&read, &prepared, 8, None)
+            .unwrap()
+            .unwrap();
+        assert!(!after.is_empty());
+        assert!(!after.iter().any(|v| v.get_id() == 3));
+    }
+
+    /// A -> B -> C chain at level 0 with B delete-tombstoned: C is reachable
+    /// only through B, so B must stay traversable while never being returned.
+    fn tombstone_bridge_core(env: &heed3::Env, name: &str) -> VectorCore {
+        let core = core_with_mode(env, name, SpindleMode::None);
+        let mut txn = env.write_txn().unwrap();
+        core.put_raw_vector(&mut txn, 1, 0, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        core.put_raw_vector(&mut txn, 2, 0, &[0.7, 0.7, 0.0, 0.0])
+            .unwrap();
+        core.put_raw_vector(&mut txn, 3, 0, &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        core.put_neighbor_ids(&mut txn, 1, 0, &[2]).unwrap();
+        core.put_neighbor_ids(&mut txn, 2, 0, &[1, 3]).unwrap();
+        core.put_neighbor_ids(&mut txn, 3, 0, &[2]).unwrap();
+        core.set_entry_point(
+            &mut txn,
+            &HVector::from_slice(1, 0, vec![1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        core.apply_delete_tombstones(&[2]);
+        core
+    }
+
+    #[test]
+    fn hnsw_search_traverses_through_delete_tombstoned_nodes() {
+        let (env, _dir) = setup();
+        let core = tombstone_bridge_core(&env, "tomb_bridge");
+        let txn = env.read_txn().unwrap();
+        let r = core.backend.read_borrowed(&txn);
+        let query = [0.0f32, 1.0, 0.0, 0.0];
+
+        let results = core.search::<VF>(&r, &query, 2, None, false).unwrap();
+        let ids: Vec<u128> = results.iter().map(|v| v.get_id()).collect();
+        assert!(
+            ids.contains(&3),
+            "C must be reachable via tombstoned B: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&2),
+            "tombstoned B must not be returned: {ids:?}"
+        );
+
+        let id_filter = |_id: u128| true;
+        let results = core
+            .search_with_id_filter_ef_observed(
+                &r,
+                &query,
+                2,
+                Some(&[id_filter]),
+                false,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let ids: Vec<u128> = results.iter().map(|v| v.get_id()).collect();
+        assert!(ids.contains(&3), "id-filter search must reach C: {ids:?}");
+        assert!(!ids.contains(&2), "id-filter search returned tombstoned B");
+    }
+
+    #[test]
+    fn delete_entry_point_promotes_highest_level_survivor() {
+        let (env, _dir) = setup();
+        let core = core_with_mode(&env, "ep_promote", SpindleMode::None);
+        insert_n(&env, &core, 300, 8);
+
+        let (ep_id, max_survivor_level) = {
+            let txn = env.read_txn().unwrap();
+            let r = core.backend.read_borrowed(&txn);
+            let ep = core.get_entry_point(&r).unwrap();
+            let max_level = (1..=300u128)
+                .filter(|&id| id != ep.get_id())
+                .map(|id| core.get_highest_level(&r, id).unwrap())
+                .max()
+                .unwrap();
+            (ep.get_id(), max_level)
+        };
+
+        let mut wtxn = env.write_txn().unwrap();
+        core.delete_vector(&mut wtxn, ep_id).unwrap();
+        wtxn.commit().unwrap();
+
+        let txn = env.read_txn().unwrap();
+        let r = core.backend.read_borrowed(&txn);
+        assert!(core.has_index(&r).unwrap());
+        let new_ep = core.get_entry_point(&r).unwrap();
+        assert_ne!(new_ep.get_id(), ep_id);
+        assert_eq!(
+            new_ep.get_level(),
+            max_survivor_level,
+            "replacement entry point must keep the upper layers reachable"
+        );
+    }
+
+    #[test]
+    fn delete_isolated_entry_point_keeps_has_index_while_rows_remain() {
+        let (env, _dir) = setup();
+        let core = core_with_mode(&env, "ep_isolated", SpindleMode::None);
+        let mut txn = env.write_txn().unwrap();
+        core.put_raw_vector(&mut txn, 1, 0, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        core.put_raw_vector(&mut txn, 2, 0, &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        core.set_entry_point(
+            &mut txn,
+            &HVector::from_slice(1, 0, vec![1.0, 0.0, 0.0, 0.0]),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        let mut txn = env.write_txn().unwrap();
+        core.delete_vector(&mut txn, 1).unwrap();
+        txn.commit().unwrap();
+        {
+            let txn = env.read_txn().unwrap();
+            let r = core.backend.read_borrowed(&txn);
+            assert!(
+                core.has_index(&r).unwrap(),
+                "row 2 remains, index must stay"
+            );
+            assert_eq!(core.get_entry_point(&r).unwrap().get_id(), 2);
+        }
+
+        let mut txn = env.write_txn().unwrap();
+        core.delete_vectors_batch(&mut txn, &[2]).unwrap();
+        txn.commit().unwrap();
+        let txn = env.read_txn().unwrap();
+        assert!(!core.has_index(&core.backend.read_borrowed(&txn)).unwrap());
+    }
+
+    #[test]
+    fn insert_rejects_non_finite_components() {
+        let (env, _dir) = setup();
+        let core = core_with_mode(&env, "non_finite", SpindleMode::None);
+        let mut txn = env.write_txn().unwrap();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let data = [1.0, bad, 0.0, 0.0];
+            assert!(matches!(
+                core.insert::<VF>(&mut txn, &data, Some(1), None),
+                Err(VectorError::InvalidVectorData)
+            ));
+            assert!(matches!(
+                core.insert_flat(&mut txn, &data, Some(1), None),
+                Err(VectorError::InvalidVectorData)
+            ));
+        }
+    }
+
+    #[test]
+    fn heap_orders_treat_nan_distance_as_farthest() {
+        use super::super::heap_utils::{Candidate, MaxByDistance};
+        let mut heap = BinaryHeap::new();
+        for (id, distance) in [(1u128, 0.5f32), (2, f32::NAN), (3, 0.1), (4, 0.9)] {
+            let mut v = HVector::from_slice(id, 0, vec![0.0]);
+            v.set_distance(distance);
+            heap.push(v);
+        }
+        let popped: Vec<u128> = std::iter::from_fn(|| heap.pop().map(|v| v.get_id())).collect();
+        assert_eq!(popped, vec![3, 1, 4, 2]);
+
+        let mut candidates: BinaryHeap<Candidate> = [0.5f32, f32::NAN, 0.1]
+            .iter()
+            .enumerate()
+            .map(|(i, &distance)| Candidate {
+                id: i as u128,
+                distance,
+            })
+            .collect();
+        assert_eq!(candidates.pop().unwrap().id, 2);
+        assert_eq!(candidates.pop().unwrap().id, 0);
+        assert_eq!(candidates.pop().unwrap().id, 1);
+
+        let mut worst: BinaryHeap<MaxByDistance> = [0.5f32, f32::NAN, 0.1]
+            .iter()
+            .enumerate()
+            .map(|(i, &distance)| {
+                MaxByDistance(Candidate {
+                    id: i as u128,
+                    distance,
+                })
+            })
+            .collect();
+        assert_eq!(worst.pop().unwrap().0.id, 1, "NaN must be evicted first");
     }
 }

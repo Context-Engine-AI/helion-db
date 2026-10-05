@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -160,9 +160,9 @@ impl Drop for LsmReadCancellationContext {
     }
 }
 
-/// Temporarily hides a request's read-cancellation token while a writer cold
-/// open is in its non-abortable phase. The token is restored on drop so the
-/// handler's first ordinary read still observes a disconnect.
+/// Temporarily hides a request's read-cancellation token while an LSM cold open
+/// is in its non-abortable phase. The token is restored on drop so the handler's
+/// first ordinary read still observes a disconnect.
 pub(crate) struct LsmReadCancellationMask {
     previous: Option<LsmReadCancellation>,
 }
@@ -177,9 +177,9 @@ impl Drop for LsmReadCancellationMask {
 
 /// Atomically reject an already-cancelled request or mask its live token. A
 /// cancellation racing just after the check is deferred until the returned
-/// guard drops, which lets a side-effecting writer build reach the collection
-/// cache instead of discarding a newly fencing handle.
-pub(crate) fn mask_lsm_read_cancellation_for_writer_open(
+/// guard drops, which lets a side-effecting LSM build reach the collection
+/// cache instead of discarding the completed handle.
+pub(crate) fn mask_lsm_read_cancellation_for_cold_open(
 ) -> Result<LsmReadCancellationMask, BackendError> {
     let previous = LSM_READ_CANCELLATION.with(|slot| slot.replace(None));
     if previous
@@ -218,10 +218,9 @@ fn io<E: std::fmt::Display>(e: E) -> BackendError {
 
 /// Classify a SlateDB WRITE/commit/flush failure. SlateDB epoch-fencing (a newer
 /// writer took the manifest — "detected newer DB client") and CAS / conditional-
-/// write conflicts (transaction or manifest version conflicts) mean this writer
-/// is stale or lost a compare-and-swap. That is a split-brain/failover signal the
-/// write layer must distinguish from transient I/O, so it maps to
-/// [`BackendError::Conflict`]; everything else stays [`BackendError::Io`].
+/// write conflicts (transaction or manifest version conflicts) must be kept
+/// distinct from transient I/O, so both map to [`BackendError::Conflict`];
+/// callers then decide whether a conflict is retryable.
 ///
 /// slatedb 0.13.1 exposes typed variants publicly (`ErrorKind::Transaction` and
 /// `ErrorKind::Closed(CloseReason::Fenced)`), but the [`block_on_lsm`] bridge
@@ -232,6 +231,14 @@ fn io<E: std::fmt::Display>(e: E) -> BackendError {
 /// Conservative on purpose — only clear fencing/CAS signals become `Conflict`.
 fn map_slatedb_err<E: std::fmt::Display>(e: E) -> BackendError {
     let msg = e.to_string();
+    if lsm_error_message_is_conflict(&msg) {
+        BackendError::Conflict(msg)
+    } else {
+        BackendError::Io(msg)
+    }
+}
+
+fn lsm_error_message_is_conflict(msg: &str) -> bool {
     let lower = msg.to_ascii_lowercase();
     // Bare "cas" is intentionally excluded: it false-positives inside ordinary
     // words ("case", "cascade", "cast", "broadcast") that can appear in transient
@@ -248,10 +255,36 @@ fn map_slatedb_err<E: std::fmt::Display>(e: E) -> BackendError {
         "version mismatch",
         "version already exists", // TransactionalObjectVersionExists (manifest CAS)
     ];
-    if CONFLICT_SIGNALS.iter().any(|sig| lower.contains(sig)) {
-        BackendError::Conflict(msg)
-    } else {
-        BackendError::Io(msg)
+    CONFLICT_SIGNALS.iter().any(|sig| lower.contains(sig))
+}
+
+fn lsm_error_message_is_fenced(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    const FENCED_SIGNALS: &[&str] = &[
+        "detected newer db client", // SlateDB CloseReason::Fenced
+        "detected newer client",    // slatedb-txn-obj fence wording
+        "fenced",
+        "fencing",
+    ];
+    FENCED_SIGNALS.iter().any(|sig| lower.contains(sig))
+}
+
+fn lsm_fenced_error(context: &'static str, message: String) -> BackendError {
+    BackendError::Conflict(format!(
+        "{context}: SlateDB writer is fenced by a newer writer; failing closed until process replacement: {message}"
+    ))
+}
+
+fn lsm_retryable_cas_error(context: &'static str, message: String) -> BackendError {
+    BackendError::Conflict(format!(
+        "{context}: SlateDB CAS/transaction conflict retry exhausted without claiming a new writer epoch: {message}"
+    ))
+}
+
+fn lsm_conflict_message(error: &BackendError) -> Option<&str> {
+    match error {
+        BackendError::Conflict(message) => Some(message.as_str()),
+        _ => None,
     }
 }
 
@@ -1408,7 +1441,7 @@ fn lsm_read_cancelled_error() -> BackendError {
     // Retain the deployed metric name for dashboard continuity; it now covers
     // writer-local reads too.
     metrics::counter!("helix_lsm_reader_request_cancelled_total").increment(1);
-    BackendError::Io("LSM read request cancelled".to_string())
+    BackendError::Cancelled
 }
 
 /// Cheap cancellation checkpoint for operations that must finish atomically
@@ -1571,6 +1604,57 @@ pub(crate) fn collections_root_prefix(collection_path: &str) -> &str {
     }
 }
 
+const LSM_DROP_TOMBSTONE_DIR: &str = "_helix_drop_tombstones";
+const LSM_DROP_TOMBSTONE_BODY: &[u8] = b"pending\n";
+
+pub(crate) fn drop_tombstone_object_path(collection_path: &str) -> ObjPath {
+    let root = collections_root_prefix(collection_path).trim_matches('/');
+    let collection = collection_path
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(collection_path);
+    if root.is_empty() {
+        ObjPath::from(format!("{}/{}", LSM_DROP_TOMBSTONE_DIR, collection))
+    } else {
+        ObjPath::from(format!(
+            "{}/{}/{}",
+            root, LSM_DROP_TOMBSTONE_DIR, collection
+        ))
+    }
+}
+
+fn tombstone_collection_name(path: &ObjPath) -> Option<String> {
+    let raw = path.as_ref();
+    let (parent, name) = raw.rsplit_once('/')?;
+    (parent.rsplit('/').next() == Some(LSM_DROP_TOMBSTONE_DIR)).then(|| name.to_string())
+}
+
+fn list_drop_tombstones(
+    rt: &Handle,
+    store: &Arc<dyn ObjectStore>,
+    root_prefix: &str,
+) -> Result<HashSet<String>, BackendError> {
+    let tombstone_prefix = if root_prefix.trim_matches('/').is_empty() {
+        ObjPath::from(LSM_DROP_TOMBSTONE_DIR)
+    } else {
+        ObjPath::from(format!(
+            "{}/{}",
+            root_prefix.trim_matches('/'),
+            LSM_DROP_TOMBSTONE_DIR
+        ))
+    };
+    block_on_lsm_read(rt, async move {
+        store
+            .list(Some(&tombstone_prefix))
+            .map_ok(|meta| meta.location)
+            .try_filter_map(|path| async move { Ok(tombstone_collection_name(&path)) })
+            .try_collect::<HashSet<String>>()
+            .await
+            .map_err(io)
+    })
+}
+
 /// List the immediate child collection names under `root_prefix` in `store` via
 /// one `list_with_delimiter` (the object-store "directory listing"): each
 /// returned common-prefix is `<root>/<name>`, and its last path segment is the
@@ -1583,10 +1667,12 @@ pub(crate) fn list_child_collection_names(
 ) -> Result<Vec<String>, BackendError> {
     let root = ObjPath::from(root_prefix);
     let result = block_on_lsm_read(rt, store.list_with_delimiter(Some(&root)))?;
+    let tombstoned = list_drop_tombstones(rt, store, root_prefix)?;
     let mut names: Vec<String> = result
         .common_prefixes
         .iter()
         .filter_map(|p| p.filename().map(|name| name.to_string()))
+        .filter(|name| name != LSM_DROP_TOMBSTONE_DIR && !tombstoned.contains(name))
         .collect();
     names.sort();
     names.dedup();
@@ -1631,6 +1717,106 @@ pub(crate) fn read_s3_metadata_sidecar(
                 .map(|bytes| Some(bytes.to_vec()))
                 .map_err(io),
             Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+            Err(err) => Err(io(err)),
+        }
+    })
+}
+
+pub(crate) fn persist_s3_drop_tombstone(
+    config: &S3StoreConfig<'_>,
+    collection_prefix: &str,
+) -> Result<(), BackendError> {
+    let store = build_s3_store(config)?;
+    persist_drop_tombstone_with_store(store, collection_prefix)
+}
+
+pub(crate) fn s3_collection_prefix_exists(
+    config: &S3StoreConfig<'_>,
+    collection_prefix: &str,
+) -> Result<bool, BackendError> {
+    let store = build_s3_store(config)?;
+    collection_prefix_exists_with_store(store, collection_prefix)
+}
+
+pub(crate) fn collection_prefix_exists_with_store(
+    store: Arc<dyn ObjectStore>,
+    collection_prefix: &str,
+) -> Result<bool, BackendError> {
+    #[cfg(test)]
+    if std::env::var("HELIX_LSM_TEST_FAIL_PREFIX_PROBE").is_ok() {
+        return Err(BackendError::Io(
+            "injected test object-store prefix probe failure".to_string(),
+        ));
+    }
+    let prefix = ObjPath::from(collection_prefix);
+    block_on_lsm_read(&shared_lsm_handle(), async move {
+        store
+            .list(Some(&prefix))
+            .try_next()
+            .await
+            .map(|object| object.is_some())
+            .map_err(io)
+    })
+}
+
+pub(crate) fn read_s3_drop_tombstone(
+    config: &S3StoreConfig<'_>,
+    collection_prefix: &str,
+) -> Result<bool, BackendError> {
+    let store = build_s3_store(config)?;
+    read_drop_tombstone_with_store(store, collection_prefix)
+}
+
+pub(crate) fn clear_s3_drop_tombstone(
+    config: &S3StoreConfig<'_>,
+    collection_prefix: &str,
+) -> Result<(), BackendError> {
+    let store = build_s3_store(config)?;
+    clear_drop_tombstone_with_store(store, collection_prefix)
+}
+
+pub(crate) fn persist_drop_tombstone_with_store(
+    store: Arc<dyn ObjectStore>,
+    collection_prefix: &str,
+) -> Result<(), BackendError> {
+    #[cfg(test)]
+    if std::env::var("HELIX_LSM_TEST_FAIL_TOMBSTONE_WRITE").is_ok() {
+        return Err(BackendError::Io(
+            "injected test object-store drop tombstone write failure".to_string(),
+        ));
+    }
+    let path = drop_tombstone_object_path(collection_prefix);
+    block_on_lsm(&shared_lsm_handle(), async move {
+        store
+            .put(&path, LSM_DROP_TOMBSTONE_BODY.to_vec().into())
+            .await
+            .map_err(io)?;
+        Ok::<(), BackendError>(())
+    })
+}
+
+pub(crate) fn read_drop_tombstone_with_store(
+    store: Arc<dyn ObjectStore>,
+    collection_prefix: &str,
+) -> Result<bool, BackendError> {
+    let path = drop_tombstone_object_path(collection_prefix);
+    block_on_lsm_read(&shared_lsm_handle(), async move {
+        match store.head(&path).await {
+            Ok(_) => Ok(true),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(false),
+            Err(err) => Err(io(err)),
+        }
+    })
+}
+
+pub(crate) fn clear_drop_tombstone_with_store(
+    store: Arc<dyn ObjectStore>,
+    collection_prefix: &str,
+) -> Result<(), BackendError> {
+    let path = drop_tombstone_object_path(collection_prefix);
+    block_on_lsm(&shared_lsm_handle(), async move {
+        match store.delete(&path).await {
+            Ok(()) | Err(ObjectStoreError::NotFound { .. }) => Ok(()),
             Err(err) => Err(io(err)),
         }
     })
@@ -1790,26 +1976,12 @@ impl LsmBackend {
         self.db.read().clone()
     }
 
-    fn reopen_db_after_conflict(&self, context: &'static str) -> Result<Db, BackendError> {
-        tracing::warn!(
-            path = %self.path,
-            context,
-            "reopening SlateDB handle after fenced/CAS write conflict"
-        );
-        let db = Self::open_db_uncancellable(
-            &self.rt,
-            &self.path,
-            Arc::clone(&self.store),
-            self.settings.clone(),
-        )?;
-        *self.db.write() = db.clone();
-        metrics::counter!("helix_lsm_reopen_after_conflict_total", "context" => context)
-            .increment(1);
-        Ok(db)
-    }
-
     fn is_conflict(error: &BackendError) -> bool {
         matches!(error, BackendError::Conflict(_))
+    }
+
+    fn is_fenced_conflict(error: &BackendError) -> bool {
+        lsm_conflict_message(error).is_some_and(lsm_error_message_is_fenced)
     }
 
     /// Test-only: number of backend reads served since the last `reset_read_count`
@@ -1851,11 +2023,6 @@ impl LsmBackend {
         let db = self.db();
         let snapshot = match block_on_lsm_read_mapped(&self.rt, db.snapshot(), map_slatedb_err) {
             Ok(snapshot) => snapshot,
-            Err(error) if Self::is_conflict(&error) => {
-                ensure_lsm_read_not_cancelled()?;
-                let db = self.reopen_db_after_conflict("begin_read_with_pending")?;
-                block_on_lsm_read_mapped(&self.rt, db.snapshot(), map_slatedb_err)?
-            }
             Err(error) => return Err(error),
         };
         Ok(LsmRead::with_pending(snapshot, pending))
@@ -1995,7 +2162,7 @@ impl LsmBackend {
         key: &[u8],
         mut update: impl FnMut(Option<&[u8]>) -> Result<(Vec<u8>, T), BackendError>,
     ) -> Result<T, BackendError> {
-        let mut db = self.db();
+        let db = self.db();
         let full = prefixed(ns, key);
         for attempt in 0..LSM_METADATA_TXN_MAX_ATTEMPTS {
             let result = block_on_lsm_mapped(
@@ -2015,10 +2182,19 @@ impl LsmBackend {
                 |e| e,
             );
             match result {
-                Err(BackendError::Conflict(_)) if attempt + 1 < LSM_METADATA_TXN_MAX_ATTEMPTS => {
-                    db = self.reopen_db_after_conflict("metadata_transaction")?;
+                Err(error) if Self::is_fenced_conflict(&error) => {
+                    let message = lsm_conflict_message(&error).unwrap_or("").to_string();
+                    return Err(lsm_fenced_error("metadata_transaction", message));
+                }
+                Err(error)
+                    if Self::is_conflict(&error) && attempt + 1 < LSM_METADATA_TXN_MAX_ATTEMPTS =>
+                {
                     std::thread::yield_now();
                     continue;
+                }
+                Err(error) if Self::is_conflict(&error) => {
+                    let message = lsm_conflict_message(&error).unwrap_or("").to_string();
+                    return Err(lsm_retryable_cas_error("metadata_transaction", message));
                 }
                 other => return other,
             }
@@ -2435,11 +2611,17 @@ impl LsmBackend {
     }
 }
 
-fn purge_prefix_from_store(
+pub(crate) fn purge_prefix_from_store(
     rt: Handle,
     store: Arc<dyn ObjectStore>,
     path: &str,
 ) -> Result<(), BackendError> {
+    #[cfg(test)]
+    if std::env::var("HELIX_LSM_TEST_FAIL_PURGE").is_ok() {
+        return Err(BackendError::Io(
+            "injected test object-store purge failure".to_string(),
+        ));
+    }
     let prefix = ObjPath::from(path);
     block_on_lsm(&rt, async move {
         let locations: Vec<ObjPath> = store
@@ -2484,11 +2666,6 @@ impl StorageBackend for LsmBackend {
         let db = self.db();
         let snapshot = match block_on_lsm_read_mapped(&self.rt, db.snapshot(), map_slatedb_err) {
             Ok(snapshot) => snapshot,
-            Err(error) if Self::is_conflict(&error) => {
-                ensure_lsm_read_not_cancelled()?;
-                let db = self.reopen_db_after_conflict("begin_read")?;
-                block_on_lsm_read_mapped(&self.rt, db.snapshot(), map_slatedb_err)?
-            }
             Err(error) => return Err(error),
         };
         Ok(LsmRead {
@@ -2518,11 +2695,13 @@ impl StorageBackend for LsmBackend {
                 self.publish_durable_commit();
                 Ok(())
             }
+            Err(error) if Self::is_fenced_conflict(&error) => {
+                let message = lsm_conflict_message(&error).unwrap_or("").to_string();
+                Err(lsm_fenced_error("commit", message))
+            }
             Err(error) if Self::is_conflict(&error) => {
-                let db = self.reopen_db_after_conflict("commit")?;
-                block_on_lsm_mapped(&self.rt, db.write(batch), map_slatedb_err)?;
-                self.publish_durable_commit();
-                Ok(())
+                block_on_lsm_mapped(&self.rt, db.write(batch), map_slatedb_err)
+                    .map(|_handle| self.publish_durable_commit())
             }
             Err(error) => Err(error),
         }
@@ -2554,8 +2733,11 @@ impl StorageBackend for LsmBackend {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
+            Err(error) if Self::is_fenced_conflict(&error) => {
+                let message = lsm_conflict_message(&error).unwrap_or("").to_string();
+                Err(lsm_fenced_error("commit_buffered", message))
+            }
             Err(error) if Self::is_conflict(&error) => {
-                let db = self.reopen_db_after_conflict("commit_buffered")?;
                 let options = WriteOptions {
                     await_durable: false,
                     ..Default::default()
@@ -2577,7 +2759,14 @@ impl StorageBackend for LsmBackend {
     /// object-store flush makes ALL prior [`commit_buffered`] writes durable.
     fn flush_durable(&self) -> Result<(), BackendError> {
         let db = self.db();
-        match block_on_lsm_mapped(&self.rt, db.flush(), map_slatedb_err) {
+        let flushed = block_on_lsm_mapped(&self.rt, db.flush(), map_slatedb_err);
+        if matches!(self.close_reason(), Some(CloseReason::Fenced)) {
+            return Err(lsm_fenced_error(
+                "flush_durable",
+                "SlateDB writer close reason is Fenced".to_string(),
+            ));
+        }
+        match flushed {
             Ok(()) => {
                 // Publish only when buffered writes actually became durable —
                 // a no-op barrier must not signal readers.
@@ -2589,9 +2778,9 @@ impl StorageBackend for LsmBackend {
                 }
                 Ok(())
             }
-            Err(error) if Self::is_conflict(&error) => {
-                let _ = self.reopen_db_after_conflict("flush_durable");
-                Err(error)
+            Err(error) if Self::is_fenced_conflict(&error) => {
+                let message = lsm_conflict_message(&error).unwrap_or("").to_string();
+                Err(lsm_fenced_error("flush_durable", message))
             }
             Err(error) => Err(error),
         }
@@ -2802,10 +2991,6 @@ impl StorageBackend for LsmBackend {
         let db = self.db();
         let val = match block_on_lsm_mapped(&self.rt, db.get(full.as_slice()), map_slatedb_err) {
             Ok(val) => val,
-            Err(error) if Self::is_conflict(&error) => {
-                let db = self.reopen_db_after_conflict("get_for_update")?;
-                block_on_lsm_mapped(&self.rt, db.get(full.as_slice()), map_slatedb_err)?
-            }
             Err(error) => return Err(error),
         };
         Ok(f(val.as_deref()))
@@ -2909,7 +3094,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("cancellation should release the blocking read worker");
         assert!(
-            matches!(result, Err(BackendError::Io(ref message)) if message.contains("cancelled")),
+            matches!(result, Err(BackendError::Cancelled)),
             "cancelled read should return a clear backend error: {result:?}"
         );
         worker.join().unwrap();
@@ -2923,16 +3108,14 @@ mod tests {
         let cancellation = LsmReadCancellation::new();
         cancellation.cancel();
         let begin_read = allow_lsm_blocking_cancellable(cancellation, || backend.begin_read());
-        assert!(
-            matches!(begin_read, Err(BackendError::Io(ref message)) if message.contains("cancelled"))
-        );
+        assert!(matches!(begin_read, Err(BackendError::Cancelled)));
 
         let cancellation = LsmReadCancellation::new();
         cancellation.cancel();
         let get = allow_lsm_blocking_cancellable(cancellation, || {
             backend.get_with(&read, Namespace::Nodes, b"missing", |_| ())
         });
-        assert!(matches!(get, Err(BackendError::Io(ref message)) if message.contains("cancelled")));
+        assert!(matches!(get, Err(BackendError::Cancelled)));
 
         let cancellation = LsmReadCancellation::new();
         cancellation.cancel();
@@ -2941,17 +3124,13 @@ mod tests {
                 true
             })
         });
-        assert!(
-            matches!(scan, Err(BackendError::Io(ref message)) if message.contains("cancelled"))
-        );
+        assert!(matches!(scan, Err(BackendError::Cancelled)));
 
         let cancellation = LsmReadCancellation::new();
         cancellation.cancel();
         let list =
             allow_lsm_blocking_cancellable(cancellation, || backend.list_collection_prefixes());
-        assert!(
-            matches!(list, Err(BackendError::Io(ref message)) if message.contains("cancelled"))
-        );
+        assert!(matches!(list, Err(BackendError::Cancelled)));
     }
 
     #[test]
@@ -2959,27 +3138,27 @@ mod tests {
         let cancellation = LsmReadCancellation::new();
         cancellation.cancel();
         let mask = allow_lsm_blocking_cancellable(cancellation.clone(), || {
-            mask_lsm_read_cancellation_for_writer_open()
+            mask_lsm_read_cancellation_for_cold_open()
         });
         assert!(
-            matches!(mask, Err(BackendError::Io(ref message)) if message.contains("cancelled")),
+            matches!(mask, Err(BackendError::Cancelled)),
             "pre-cancelled writer-open mask must reject the request"
         );
         let open = allow_lsm_blocking_cancellable(cancellation, || {
             LsmBackend::open_with_store("writer-open-not-cancellable", Arc::new(InMemory::new()))
         });
         assert!(
-            matches!(open, Err(BackendError::Io(ref message)) if message.contains("cancelled")),
+            matches!(open, Err(BackendError::Cancelled)),
             "pre-cancelled writer open must stop before builder side effects"
         );
     }
 
     #[test]
-    fn writer_open_mask_defers_inflight_cancellation_until_first_read() {
+    fn cold_open_mask_defers_inflight_cancellation_until_first_read() {
         let cancellation = LsmReadCancellation::new();
         let worker_cancellation = cancellation.clone();
         allow_lsm_blocking_cancellable(worker_cancellation, || {
-            let mask = mask_lsm_read_cancellation_for_writer_open()
+            let mask = mask_lsm_read_cancellation_for_cold_open()
                 .expect("live request should enter the writer-open mask");
             cancellation.cancel();
             ensure_lsm_read_not_cancelled()
@@ -2994,7 +3173,7 @@ mod tests {
 
             let read = backend.begin_read();
             assert!(
-                matches!(read, Err(BackendError::Io(ref message)) if message.contains("cancelled")),
+                matches!(read, Err(BackendError::Cancelled)),
                 "the first read after writer publication must observe cancellation"
             );
             backend
@@ -3054,7 +3233,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_transaction_retries_serializable_conflict() {
+    fn metadata_fence_fails_closed_while_normal_cas_retries() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::mpsc;
 
@@ -3096,17 +3275,13 @@ mod tests {
             get_owned(&be, &read, Namespace::Metadata, b"metadata-current"),
             Some(b"slow-after-retry".to_vec())
         );
-    }
 
-    #[test]
-    #[serial]
-    fn metadata_transaction_reopens_fenced_handle() {
         use slatedb::object_store::local::LocalFileSystem;
 
         let data_dir = tempfile::TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(data_dir.path()).unwrap());
-        let path = "helion/metadata-reopen-fenced-handle";
+        let path = "helion/metadata-fence-fails-closed";
 
         let be1 = LsmBackend::open_with_store(path, store.clone()).unwrap();
         be1.update_key_transactional(Namespace::Metadata, b"metadata-current", |value| {
@@ -3125,12 +3300,12 @@ mod tests {
         be1.update_key_transactional(Namespace::Metadata, b"metadata-current", |_value| {
             Ok((b"after-fence".to_vec(), ()))
         })
-        .expect("fenced metadata transaction should reopen and retry");
+        .expect_err("fenced metadata transaction must fail closed");
 
-        let read = be1.begin_read().unwrap();
+        let read = be2.begin_read().unwrap();
         assert_eq!(
-            get_owned(&be1, &read, Namespace::Metadata, b"metadata-current"),
-            Some(b"after-fence".to_vec())
+            get_owned(&be2, &read, Namespace::Metadata, b"metadata-current"),
+            Some(b"fencer".to_vec())
         );
     }
 
@@ -4109,7 +4284,7 @@ mod tests {
         let mut w1 = be1.begin_write().unwrap();
         be1.put(&mut w1, Namespace::Nodes, b"b", b"2").unwrap();
         be1.commit(w1)
-            .expect("fenced writer should reopen and retry the batch");
+            .expect_err("fenced writer must fail closed instead of reopening");
 
         let mut w2 = be2.begin_write().unwrap();
         be2.put(&mut w2, Namespace::Nodes, b"c", b"3").unwrap();
@@ -4118,13 +4293,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn lsm_reopens_fenced_handle_and_retries_commits() {
+    fn stale_a_failed_commit_does_not_fence_b_and_no_failed_batch_write() {
         use slatedb::object_store::local::LocalFileSystem;
 
         let data_dir = tempfile::TempDir::new().unwrap();
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(data_dir.path()).unwrap());
-        let path = "helion/reopen-fenced-handle";
+        let path = "helion/stale-a-failed-commit-does-not-fence-b";
 
         let be1 = LsmBackend::open_with_store(path, store.clone()).unwrap();
         let mut initial = be1.begin_write().unwrap();
@@ -4138,32 +4313,109 @@ mod tests {
 
         let mut stale = be1.begin_write().unwrap();
         be1.put(&mut stale, Namespace::Nodes, b"c", b"3").unwrap();
-        be1.commit(stale)
-            .expect("stale handle should reopen and retry the batch");
+        let err = be1
+            .commit(stale)
+            .expect_err("stale fenced writer must fail closed");
+        assert!(matches!(err, BackendError::Conflict(_)), "got {err:?}");
 
-        let mut follow_up = be1.begin_write().unwrap();
-        be1.put(&mut follow_up, Namespace::Nodes, b"d", b"4")
+        let mut follow_up = be2.begin_write().unwrap();
+        be2.put(&mut follow_up, Namespace::Nodes, b"d", b"4")
             .unwrap();
-        be1.commit(follow_up)
-            .expect("refreshed handle should keep accepting writes");
+        be2.commit(follow_up)
+            .expect("active writer must not be fenced by stale writer failure");
 
-        let r = be1.begin_read().unwrap();
+        let r = be2.begin_read().unwrap();
         assert_eq!(
-            get_owned(&be1, &r, Namespace::Nodes, b"a"),
+            get_owned(&be2, &r, Namespace::Nodes, b"a"),
             Some(b"1".to_vec())
         );
         assert_eq!(
-            get_owned(&be1, &r, Namespace::Nodes, b"b"),
+            get_owned(&be2, &r, Namespace::Nodes, b"b"),
             Some(b"2".to_vec())
         );
+        assert_eq!(get_owned(&be2, &r, Namespace::Nodes, b"c"), None);
         assert_eq!(
-            get_owned(&be1, &r, Namespace::Nodes, b"c"),
-            Some(b"3".to_vec())
-        );
-        assert_eq!(
-            get_owned(&be1, &r, Namespace::Nodes, b"d"),
+            get_owned(&be2, &r, Namespace::Nodes, b"d"),
             Some(b"4".to_vec())
         );
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_fenced_buffered_commit_fails_without_reopen() {
+        use slatedb::object_store::local::LocalFileSystem;
+
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(data_dir.path()).unwrap());
+        let path = "helion/reopen-buffered-lost";
+
+        let be1 = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let mut buffered = be1.begin_write().unwrap();
+        be1.put(&mut buffered, Namespace::Nodes, b"a", b"1")
+            .unwrap();
+        be1.commit_buffered(buffered).unwrap();
+
+        let be2 = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let mut fencer = be2.begin_write().unwrap();
+        be2.put(&mut fencer, Namespace::Nodes, b"b", b"2").unwrap();
+        be2.commit(fencer).unwrap();
+
+        let mut stale = be1.begin_write().unwrap();
+        be1.put(&mut stale, Namespace::Nodes, b"c", b"3").unwrap();
+        let err = be1
+            .commit(stale)
+            .expect_err("fenced durable commit must fail closed");
+        assert!(matches!(err, BackendError::Conflict(_)), "got {err:?}");
+
+        let mut active = be2.begin_write().unwrap();
+        be2.put(&mut active, Namespace::Nodes, b"d", b"4").unwrap();
+        be2.commit(active).unwrap();
+
+        let r = be2.begin_read().unwrap();
+        assert_eq!(get_owned(&be2, &r, Namespace::Nodes, b"c"), None);
+        assert_eq!(
+            get_owned(&be2, &r, Namespace::Nodes, b"d"),
+            Some(b"4".to_vec())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_fenced_flush_durable_fails_closed() {
+        use slatedb::object_store::local::LocalFileSystem;
+
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(data_dir.path()).unwrap());
+        let path = "helion/reopen-buffered-chunk";
+
+        let be1 = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let mut first = be1.begin_write().unwrap();
+        be1.put(&mut first, Namespace::Nodes, b"a", b"1").unwrap();
+        be1.commit_buffered(first).unwrap();
+
+        let be2 = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let mut fencer = be2.begin_write().unwrap();
+        be2.put(&mut fencer, Namespace::Nodes, b"b", b"2").unwrap();
+        be2.commit(fencer).unwrap();
+
+        let mut stale = be1.begin_write().unwrap();
+        be1.put(&mut stale, Namespace::Nodes, b"c", b"3").unwrap();
+        be1.commit(stale)
+            .expect_err("stale writer must observe genuine fencing");
+
+        let err = be1
+            .flush_durable()
+            .expect_err("fenced barrier must fail closed without reopening");
+        assert!(matches!(err, BackendError::Conflict(_)), "got {err:?}");
+
+        let mut active = be2.begin_write().unwrap();
+        be2.put(&mut active, Namespace::Nodes, b"d", b"4").unwrap();
+        be2.commit(active).unwrap();
+
+        let r = be2.begin_read().unwrap();
+        assert_eq!(get_owned(&be2, &r, Namespace::Nodes, b"c"), None);
     }
 
     #[test]
@@ -4407,14 +4659,7 @@ mod tests {
     /// / PVC loss. (Each `open_in_memory` makes its OWN isolated store, so the
     /// shared-store path is the one that mirrors production S3.)
     #[test]
-    #[serial]
     fn list_collection_prefixes_enumerates_shared_object_store() {
-        let _b = EnvGuard::set(
-            crate::helix_engine::storage_core::backend::BackendKind::ENV_VAR,
-            "lsm",
-        );
-        let _m = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
 
         // Three collections committed into the same store under the "helion" root.

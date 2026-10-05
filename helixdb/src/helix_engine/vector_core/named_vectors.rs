@@ -4763,6 +4763,54 @@ impl NamedVectorManager {
             .collect()
     }
 
+    /// Building segments whose HNSW publish completed before their metadata
+    /// role was persisted. These are safe to validate and promote without
+    /// rebuilding the index.
+    pub fn indexed_building_segment_names(
+        &self,
+        txn: &RoTxn,
+        logical_name: &str,
+    ) -> Result<HashSet<String>, VectorError> {
+        let building_names = self.building_segment_names(logical_name);
+        let cores = self
+            .cores
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+        let mut indexed = HashSet::new();
+        for physical_name in building_names {
+            let Some(core) = cores.get(&physical_name) else {
+                continue;
+            };
+            let read = core.backend.read_borrowed(txn);
+            if core.has_index(&read)? {
+                indexed.insert(physical_name);
+            }
+        }
+        Ok(indexed)
+    }
+
+    pub fn indexed_building_segment_names_be(
+        &self,
+        r: &AnyRead<'_>,
+        logical_name: &str,
+    ) -> Result<HashSet<String>, VectorError> {
+        let building_names = self.building_segment_names(logical_name);
+        let cores = self
+            .cores
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+        let mut indexed = HashSet::new();
+        for physical_name in building_names {
+            let Some(core) = cores.get(&physical_name) else {
+                continue;
+            };
+            if core.has_index(r)? {
+                indexed.insert(physical_name);
+            }
+        }
+        Ok(indexed)
+    }
+
     /// Prepare HNSW indices for Building segments using only a read
     /// transaction (no write lock needed). Returns a map from physical
     /// segment name to the prepared index data.
@@ -5463,7 +5511,7 @@ impl NamedVectorManager {
     pub fn prepare_merge(
         &self,
         txn: &RoTxn,
-        _logical_name: &str,
+        logical_name: &str,
         merge_targets: &[String],
         hnsw_config: &HNSWConfig,
     ) -> Result<PreparedMerge, VectorError> {
@@ -5540,9 +5588,16 @@ impl NamedVectorManager {
 
         // Build HNSW in memory using the same logic as prepare_index_from_flat
         // but operating on the exported vector set.
+        let distance_metric = self
+            .get_config(logical_name)
+            .map(|config| config.distance)
+            .ok_or_else(|| {
+                VectorError::VectorCoreError(format!("Named vector '{}' not found", logical_name))
+            })?;
         let prepared_index = VectorCore::build_hnsw_in_memory_owned_with_permit(
             exported,
             hnsw_config,
+            distance_metric,
             &build_permit,
         )?;
 
@@ -11017,6 +11072,51 @@ mod tests {
 
         std::env::set_var("HELIX_LSM_DELETE_TOMBSTONES", "0");
         assert!(!lsm_delete_tombstones_enabled());
+    }
+
+    #[test]
+    fn indexed_building_segments_are_recoverable_on_lsm() {
+        let seg_name = "dense__seg_000000";
+        let (backend, manager, _dir) = setup_lsm_manager_with_flat_segment(
+            "indexed_building_recovery",
+            seg_name,
+            &[(1, [1.0, 0.0, 0.0]), (2, [0.0, 1.0, 0.0])],
+        );
+        manager
+            .dense_spaces
+            .write()
+            .unwrap()
+            .get_mut("dense")
+            .unwrap()
+            .segments[0]
+            .role = DenseVectorSegmentRole::Building;
+
+        let mut prepared = {
+            let read = backend.begin_read().unwrap();
+            manager
+                .prepare_building_indices_limited_be(&read, "dense", 1)
+                .unwrap()
+        };
+        let (prepared_name, mut index) = prepared.pop().unwrap();
+        assert_eq!(prepared_name, seg_name);
+        {
+            let mut write = backend.begin_write().unwrap();
+            let cores = manager.cores.read().unwrap();
+            let core = cores.get(seg_name).unwrap();
+            let total = index.point_ids.len();
+            core.flush_prepared_index_chunk_be(&mut write, &mut index, 0, total)
+                .unwrap();
+            core.finalize_prepared_index_entry_be(&mut write, &index)
+                .unwrap();
+            drop(cores);
+            backend.commit(write).unwrap();
+        }
+
+        let read = backend.begin_read().unwrap();
+        let recoverable = manager
+            .indexed_building_segment_names_be(&read, "dense")
+            .unwrap();
+        assert_eq!(recoverable, HashSet::from([seg_name.to_string()]));
     }
 
     /// Test rig: a `NamedVectorManager` over an in-memory LSM backend with one

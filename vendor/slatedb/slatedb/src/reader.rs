@@ -21,8 +21,12 @@ use crate::types::{KeyValue, RowEntry, ValueDeletable};
 use crate::{error::SlateDBError, DbIterator};
 
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+
+/// Block-range reads issued at once per SST in `multi_get`.
+const MULTI_GET_BLOCK_RANGE_CONCURRENCY: usize = 32;
 
 pub(crate) trait DbStateReader {
     fn memtable(&self) -> Arc<KVTable>;
@@ -681,18 +685,29 @@ impl Reader {
             block_ranges.push(start..(previous_block + 1));
         }
 
-        let mut found_in_sst = HashSet::<usize>::new();
-        for block_range in block_ranges {
-            let blocks = self
-                .table_store
-                .read_blocks_using_index(
-                    &sst.sst,
-                    index.clone(),
-                    block_range.clone(),
-                    options.cache_blocks,
-                )
-                .await?;
+        // Fetch the disjoint block ranges concurrently (scattered keys on a
+        // cold cache otherwise cost one sequential object-store read each),
+        // then resolve them in order.
+        let fetched: Vec<_> = futures::stream::iter(block_ranges.into_iter().map(|block_range| {
+            let index = index.clone();
+            async move {
+                self.table_store
+                    .read_blocks_using_index(
+                        &sst.sst,
+                        index,
+                        block_range.clone(),
+                        options.cache_blocks,
+                    )
+                    .await
+                    .map(|blocks| (block_range, blocks))
+            }
+        }))
+        .buffered(MULTI_GET_BLOCK_RANGE_CONCURRENCY)
+        .try_collect()
+        .await?;
 
+        let mut found_in_sst = HashSet::<usize>::new();
+        for (block_range, blocks) in fetched {
             for (offset, block) in blocks.into_iter().enumerate() {
                 let block_idx = block_range.start + offset;
                 let Some(key_idxs) = block_to_key_indices.get(&block_idx) else {

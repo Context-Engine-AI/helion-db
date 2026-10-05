@@ -506,30 +506,6 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
-    struct EnvGuard(&'static str, Option<String>);
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self(key, prev)
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.1 {
-                    Some(v) => std::env::set_var(self.0, v),
-                    None => std::env::remove_var(self.0),
-                }
-            }
-        }
-    }
-
     struct TestContext {
         _tmp: TempDir,
         graph: std::sync::Arc<HelixGraphEngine>,
@@ -538,22 +514,24 @@ mod tests {
     }
 
     fn setup() -> TestContext {
+        setup_with_config(Config::default())
+    }
+
+    fn setup_with_config(config: Config) -> TestContext {
         let tmp = TempDir::new().unwrap();
         let graph_path = tmp.path().join("graph");
         let collections_path = tmp.path().join("data");
         let graph = std::sync::Arc::new(
             HelixGraphEngine::new(HelixGraphEngineOpts {
                 path: graph_path.display().to_string(),
-                config: Config::default(),
+                config: config.clone(),
             })
             .unwrap(),
         );
-        let collections = std::sync::Arc::new(
-            CollectionManager::new(collections_path, Config::default()).unwrap(),
-        );
+        let collections =
+            std::sync::Arc::new(CollectionManager::new(collections_path, config.clone()).unwrap());
         let replication = std::sync::Arc::new(
-            ReplicationManager::new(std::sync::Arc::clone(&collections), Config::default())
-                .unwrap(),
+            ReplicationManager::new(std::sync::Arc::clone(&collections), config).unwrap(),
         );
         TestContext {
             _tmp: tmp,
@@ -580,7 +558,6 @@ mod tests {
 
     #[test]
     fn handle_recount_unknown_collection_returns_404() {
-        let _env = ENV_LOCK.lock().unwrap();
         let ctx = setup();
         let body = sonic_rs::to_vec(&sonic_rs::json!({"name": "nope"})).unwrap();
         let input = make_input(&ctx, "/v1/collections/recount", body);
@@ -592,10 +569,7 @@ mod tests {
 
     #[test]
     fn handle_recount_repairs_corrupted_counter() {
-        let _env = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-        let ctx = setup();
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
 
         ctx.collections.create_collection("repo").unwrap();
         let storage = ctx.collections.get_collection("repo").unwrap();
@@ -649,10 +623,7 @@ mod tests {
     /// call with 409 instead of racing.
     #[test]
     fn handle_recount_returns_409_when_already_in_progress() {
-        let _env = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-        let ctx = setup();
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
 
         ctx.collections.create_collection("repo").unwrap();
         let storage = ctx.collections.get_collection("repo").unwrap();
@@ -685,7 +656,6 @@ mod tests {
 
     #[test]
     fn handle_gc_payload_index_unknown_collection_returns_404() {
-        let _env = ENV_LOCK.lock().unwrap();
         let ctx = setup();
         let body = sonic_rs::to_vec(&sonic_rs::json!({"name": "nope"})).unwrap();
         let input = make_input(&ctx, "/v1/collections/gc_payload_index", body);
@@ -706,10 +676,7 @@ mod tests {
     fn handle_gc_payload_index_repairs_ghost_entry() {
         use crate::helix_engine::storage_core::metadata::PayloadIndexSchema;
 
-        let _env = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-        let ctx = setup();
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
 
         ctx.collections.create_collection("repo").unwrap();
         let storage = ctx.collections.get_collection("repo").unwrap();
@@ -790,10 +757,7 @@ mod tests {
     /// Same CAS-guard contract as `handle_recount_returns_409_when_already_in_progress`.
     #[test]
     fn handle_gc_payload_index_returns_409_when_already_in_progress() {
-        let _env = ENV_LOCK.lock().unwrap();
-        let _backend = EnvGuard::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = EnvGuard::set("HELIX_LSM_IN_MEMORY", "1");
-        let ctx = setup();
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
 
         ctx.collections.create_collection("repo").unwrap();
         let storage = ctx.collections.get_collection("repo").unwrap();

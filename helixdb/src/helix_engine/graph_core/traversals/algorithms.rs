@@ -231,14 +231,42 @@ pub fn cached_label_propagation(
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-/// Collect all node IDs in the graph.
-fn all_node_ids(storage: &HelixGraphStorage, r: &AnyRead<'_>) -> Result<Vec<u128>, GraphError> {
-    let mut ids = Vec::new();
-    for node in storage.scan_all_nodes_be(r)? {
-        ids.push(node?.id);
-    }
-    Ok(ids)
+/// Wall-clock budget for one whole-graph algorithm run. Checked while
+/// processing the node/edge scans and during adjacency precompute as well as
+/// the iteration loop, since on large collections the pre-iteration work alone
+/// can exceed the timeout. (The `scan_all_*_be` calls materialize their
+/// results, so a single scan call itself cannot be interrupted.)
+#[derive(Clone, Copy)]
+struct AlgoDeadline {
+    algorithm: &'static str,
+    started: Instant,
+    timeout: Duration,
 }
+
+impl AlgoDeadline {
+    fn start(algorithm: &'static str) -> Self {
+        Self {
+            algorithm,
+            started: Instant::now(),
+            timeout: graph_algo_timeout(),
+        }
+    }
+
+    fn check(&self, phase: &str) -> Result<(), GraphError> {
+        if self.started.elapsed() > self.timeout {
+            return Err(GraphError::New(format!(
+                "{} timed out after {}s during {}",
+                self.algorithm,
+                self.timeout.as_secs(),
+                phase,
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Scan loops check the deadline every this many items.
+const DEADLINE_CHECK_STRIDE: usize = 1024;
 
 fn value_matches_repo(value: Option<&Value>, repo: &str) -> bool {
     match value {
@@ -254,23 +282,40 @@ fn properties_match_repo(properties: &HashMap<String, Value>, repo: &str) -> boo
     value_matches_repo(properties.get("repo"), repo)
 }
 
+/// Node ids in scope, sorted ascending so downstream iteration order (and
+/// therefore results) is deterministic.
 fn all_node_ids_scoped(
     storage: &HelixGraphStorage,
     r: &AnyRead<'_>,
     repo_filter: Option<&str>,
+    deadline: &AlgoDeadline,
 ) -> Result<Vec<u128>, GraphError> {
     let Some(repo) = repo_filter else {
-        return all_node_ids(storage, r);
+        let mut ids = Vec::new();
+        for (i, node) in storage.scan_all_nodes_be(r)?.into_iter().enumerate() {
+            if i % DEADLINE_CHECK_STRIDE == 0 {
+                deadline.check("node scan")?;
+            }
+            ids.push(node?.id);
+        }
+        ids.sort_unstable();
+        return Ok(ids);
     };
 
     let mut ids = HashSet::new();
-    for node in storage.scan_all_nodes_be(r)? {
+    for (i, node) in storage.scan_all_nodes_be(r)?.into_iter().enumerate() {
+        if i % DEADLINE_CHECK_STRIDE == 0 {
+            deadline.check("node scan")?;
+        }
         let node = node?;
         if properties_match_repo(&node.properties, repo) {
             ids.insert(node.id);
         }
     }
-    for edge in storage.scan_all_edges_be(r)? {
+    for (i, edge) in storage.scan_all_edges_be(r)?.into_iter().enumerate() {
+        if i % DEADLINE_CHECK_STRIDE == 0 {
+            deadline.check("edge scan")?;
+        }
         let edge = edge?;
         if properties_match_repo(&edge.properties, repo) {
             ids.insert(edge.from_node);
@@ -307,7 +352,13 @@ fn out_neighbors_scoped(
         // Backend-routed adjacency (heed cursor on LMDB, SlateDB snapshot on LSM).
         for (neighbor_id, edge_id) in storage.adjacency_pairs_be(r, node_id, lh, true)? {
             if let Some(repo) = repo_filter {
-                let edge = storage.get_edge_be(r, &edge_id)?;
+                // A dangling adjacency entry (edge already dropped) is skipped
+                // rather than failing the whole algorithm run.
+                let edge = match storage.get_edge_be(r, &edge_id) {
+                    Ok(edge) => edge,
+                    Err(GraphError::EdgeNotFound) => continue,
+                    Err(e) => return Err(e),
+                };
                 if !properties_match_repo(&edge.properties, repo) {
                     continue;
                 }
@@ -331,7 +382,13 @@ fn in_neighbors_scoped(
         // Backend-routed adjacency (heed cursor on LMDB, SlateDB snapshot on LSM).
         for (neighbor_id, edge_id) in storage.adjacency_pairs_be(r, node_id, lh, false)? {
             if let Some(repo) = repo_filter {
-                let edge = storage.get_edge_be(r, &edge_id)?;
+                // A dangling adjacency entry (edge already dropped) is skipped
+                // rather than failing the whole algorithm run.
+                let edge = match storage.get_edge_be(r, &edge_id) {
+                    Ok(edge) => edge,
+                    Err(GraphError::EdgeNotFound) => continue,
+                    Err(e) => return Err(e),
+                };
                 if !properties_match_repo(&edge.properties, repo) {
                     continue;
                 }
@@ -366,11 +423,10 @@ pub fn pagerank_scoped(
     damping: f64,
     repo_filter: Option<&str>,
 ) -> Result<Vec<(u128, f64)>, GraphError> {
-    let started = Instant::now();
-    let timeout = graph_algo_timeout();
+    let deadline = AlgoDeadline::start("pagerank");
 
     let label_hashes: Vec<[u8; 4]> = edge_labels.iter().map(|l| hash_label(l, None)).collect();
-    let nodes = all_node_ids_scoped(storage, r, repo_filter)?;
+    let nodes = all_node_ids_scoped(storage, r, repo_filter, &deadline)?;
     let n = nodes.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -386,6 +442,7 @@ pub fn pagerank_scoped(
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); n]; // incoming edges by index
 
     for (i, &nid) in nodes.iter().enumerate() {
+        deadline.check("adjacency precompute")?;
         let outs = out_neighbors_scoped(storage, r, nid, &label_hashes, repo_filter)?;
         out_degree[i] = outs.len();
         for &target in &outs {
@@ -398,14 +455,7 @@ pub fn pagerank_scoped(
     let teleport = (1.0 - damping) / n as f64;
 
     for iter in 0..iterations {
-        if started.elapsed() > timeout {
-            return Err(GraphError::New(format!(
-                "pagerank timed out after {}s at iteration {} of {}",
-                timeout.as_secs(),
-                iter,
-                iterations,
-            )));
-        }
+        deadline.check(&format!("iteration {} of {}", iter, iterations))?;
 
         // Dangling mass: nodes with no out-edges redistribute rank uniformly
         let dangling: f64 = nodes
@@ -454,11 +504,12 @@ pub fn label_propagation_scoped(
     max_iterations: usize,
     repo_filter: Option<&str>,
 ) -> Result<Vec<(u128, Vec<u128>)>, GraphError> {
-    let started = Instant::now();
-    let timeout = graph_algo_timeout();
+    let deadline = AlgoDeadline::start("label propagation");
 
     let label_hashes: Vec<[u8; 4]> = edge_labels.iter().map(|l| hash_label(l, None)).collect();
-    let nodes = all_node_ids_scoped(storage, r, repo_filter)?;
+    // Sorted, so the in-place (asynchronous) label updates below run in a
+    // fixed order.
+    let nodes = all_node_ids_scoped(storage, r, repo_filter, &deadline)?;
     if nodes.is_empty() {
         return Ok(Vec::new());
     }
@@ -467,6 +518,7 @@ pub fn label_propagation_scoped(
     // This avoids re-reading LMDB on every node every iteration.
     let mut neighbors: HashMap<u128, Vec<u128>> = HashMap::with_capacity(nodes.len());
     for &nid in &nodes {
+        deadline.check("adjacency precompute")?;
         let outs = out_neighbors_scoped(storage, r, nid, &label_hashes, repo_filter)?;
         let ins = in_neighbors_scoped(storage, r, nid, &label_hashes, repo_filter)?;
         let mut combined = outs;
@@ -478,14 +530,7 @@ pub fn label_propagation_scoped(
     let mut labels: HashMap<u128, u128> = nodes.iter().map(|&id| (id, id)).collect();
 
     for iter in 0..max_iterations {
-        if started.elapsed() > timeout {
-            return Err(GraphError::New(format!(
-                "label propagation timed out after {}s at iteration {} of {}",
-                timeout.as_secs(),
-                iter,
-                max_iterations,
-            )));
-        }
+        deadline.check(&format!("iteration {} of {}", iter, max_iterations))?;
 
         let mut changed = false;
 
@@ -501,12 +546,25 @@ pub fn label_propagation_scoped(
                 }
             }
 
-            if let Some((&best_label, _)) = label_counts.iter().max_by_key(|(_, &count)| count) {
-                let current = labels[&nid];
-                if best_label != current {
-                    labels.insert(nid, best_label);
-                    changed = true;
-                }
+            // Deterministic tie-break: keep the current label if it is among
+            // the most frequent, otherwise take the smallest label id. Keeping
+            // the current label on ties is what lets the loop converge.
+            let Some(&max_count) = label_counts.values().max() else {
+                continue;
+            };
+            let current = labels[&nid];
+            if label_counts.get(&current) == Some(&max_count) {
+                continue;
+            }
+            let best_label = label_counts
+                .iter()
+                .filter(|(_, &count)| count == max_count)
+                .map(|(&label, _)| label)
+                .min()
+                .unwrap_or(current);
+            if best_label != current {
+                labels.insert(nid, best_label);
+                changed = true;
             }
         }
 
@@ -521,8 +579,15 @@ pub fn label_propagation_scoped(
         communities.entry(lbl).or_default().push(nid);
     }
 
-    let mut result: Vec<(u128, Vec<u128>)> = communities.into_iter().collect();
-    result.sort_by(|a, b| b.1.len().cmp(&a.1.len())); // Largest communities first
+    let mut result: Vec<(u128, Vec<u128>)> = communities
+        .into_iter()
+        .map(|(label, mut members)| {
+            members.sort_unstable();
+            (label, members)
+        })
+        .collect();
+    // Largest communities first; equal sizes by ascending community id.
+    result.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
     Ok(result)
 }
 
@@ -566,17 +631,20 @@ pub fn shortest_path(
             if visited.contains(&neighbor) {
                 continue;
             }
+            // Reaching the target never needs budget for further expansion,
+            // so test it before the visited cap.
+            if neighbor == to_id {
+                visited.insert(neighbor);
+                parent.insert(neighbor, current);
+                found = true;
+                break;
+            }
             if visited.len() >= max_visited {
                 return Ok((Vec::new(), 0));
             }
-            if visited.insert(neighbor) {
-                parent.insert(neighbor, current);
-                if neighbor == to_id {
-                    found = true;
-                    break;
-                }
-                queue.push_back((neighbor, depth + 1));
-            }
+            visited.insert(neighbor);
+            parent.insert(neighbor, current);
+            queue.push_back((neighbor, depth + 1));
         }
         if found {
             break;

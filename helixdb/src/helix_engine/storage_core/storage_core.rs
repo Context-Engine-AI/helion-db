@@ -47,7 +47,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime};
 use twox_hash::XxHash64;
 
-use super::backend::{BackendError, BackendKind, KeyRange, Namespace, StorageBackend};
+use super::backend::{
+    BackendError, BackendKind, KeyRange, Namespace, StorageBackend, StorageBackendConfig,
+};
 use super::backend_any::{
     read_metadata_sidecar_from_lsm_env, AnyBackend, AnyRead, AnyWrite, LSM_READER_READONLY,
 };
@@ -2390,7 +2392,7 @@ impl HelixGraphStorage {
         let open_start = std::time::Instant::now();
         let phase_start = std::time::Instant::now();
         let backend = Arc::new(
-            AnyBackend::open_selected_for_collection(BackendKind::Lsm, None, Path::new(path))
+            AnyBackend::open_selected_for_collection(config.storage_backend, None, Path::new(path))
                 .map_err(|e| GraphError::StorageError(e.to_string()))?,
         );
         metrics::histogram!("helix_lsm_collection_open_phase_ms", "phase" => "backend_open")
@@ -2401,6 +2403,7 @@ impl HelixGraphStorage {
         let read = backend
             .begin_read()
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        let overrides_started = std::time::Instant::now();
         let hnsw_overrides = backend
             .get_with(
                 &read,
@@ -2409,6 +2412,12 @@ impl HelixGraphStorage {
                 |bytes| bytes.and_then(|b| bincode::deserialize::<HnswOverrides>(b).ok()),
             )
             .map_err(|e| GraphError::StorageError(e.to_string()))?;
+        metrics::histogram!(
+            "helix_lsm_metadata_read_step_ms",
+            "step" => "hnsw_overrides"
+        )
+        .record(overrides_started.elapsed().as_secs_f64() * 1000.0);
+        let metadata_started = std::time::Instant::now();
         let metadata = backend
             .get_with(
                 &read,
@@ -2418,6 +2427,11 @@ impl HelixGraphStorage {
             )
             .map_err(|e| GraphError::StorageError(e.to_string()))??
             .unwrap_or_else(|| StorageMetadata::new(configured_secondary_indices.clone()));
+        metrics::histogram!(
+            "helix_lsm_metadata_read_step_ms",
+            "step" => "metadata_current"
+        )
+        .record(metadata_started.elapsed().as_secs_f64() * 1000.0);
         drop(read);
         metrics::histogram!("helix_lsm_collection_open_phase_ms", "phase" => "metadata_read")
             .record(phase_start.elapsed().as_secs_f64() * 1000.0);
@@ -2569,7 +2583,7 @@ impl HelixGraphStorage {
             .clone()
             .unwrap_or_default();
 
-        let backend_kind = BackendKind::from_env();
+        let backend_kind = config.storage_backend.kind();
         if backend_kind == BackendKind::Lsm {
             return Self::new_lsm(path, config, wal, configured_secondary_indices);
         }
@@ -2645,7 +2659,7 @@ impl HelixGraphStorage {
         // `HELIX_STORAGE_BACKEND=lsm` selects SlateDB for backend-routed paths.
         let backend = Arc::new(
             AnyBackend::open_selected_for_collection(
-                backend_kind,
+                config.storage_backend,
                 Some(graph_env.clone()),
                 Path::new(path),
             )
@@ -4090,9 +4104,13 @@ impl HelixGraphStorage {
 
     pub fn read_metadata_sidecar_from_path_or_lsm(
         path: &Path,
+        storage_backend: StorageBackendConfig,
     ) -> Result<Option<StorageMetadataSidecar>, GraphError> {
         let local_sidecar = Self::read_metadata_sidecar_from_path(path)?;
-        if BackendKind::from_env() != BackendKind::Lsm {
+        if !storage_backend.is_lsm() || storage_backend.is_lsm_in_memory() {
+            return Ok(local_sidecar);
+        }
+        if std::env::var_os("HELIX_LSM_BUCKET").is_none() {
             return Ok(local_sidecar);
         }
         if local_sidecar.is_some() && Self::metadata_sidecar_cache_is_fresh(path) {
@@ -4101,7 +4119,7 @@ impl HelixGraphStorage {
         if Self::lsm_metadata_sidecar_miss_is_fresh(path) {
             return Ok(local_sidecar);
         }
-        match read_metadata_sidecar_from_lsm_env(path) {
+        match read_metadata_sidecar_from_lsm_env(path, storage_backend) {
             Ok(Some(bytes)) => {
                 let sidecar: StorageMetadataSidecar = sonic_rs::from_slice(&bytes)?;
                 Self::persist_metadata_sidecar_bytes_at_path(path, &bytes)?;
@@ -6410,6 +6428,42 @@ mod tests {
     type Filter = fn(&HVector) -> bool;
 
     #[test]
+    #[serial]
+    fn lsm_open_records_metadata_steps_without_duplicating_aggregate() {
+        let directory = TempDir::new().unwrap();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let _storage = metrics::with_local_recorder(&recorder, || {
+            HelixGraphStorage::new(
+                directory.path().to_str().unwrap(),
+                test_config().with_lsm_in_memory(),
+            )
+            .unwrap()
+        });
+
+        let rendered = handle.render();
+        let mut counts = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("helix_lsm_metadata_read_step_ms_count")
+                    || line.starts_with(
+                        "helix_lsm_collection_open_phase_ms_count{phase=\"metadata_read\"}",
+                    )
+            })
+            .collect::<Vec<_>>();
+        counts.sort_unstable();
+        assert_eq!(
+            counts,
+            [
+                "helix_lsm_collection_open_phase_ms_count{phase=\"metadata_read\"} 1",
+                "helix_lsm_metadata_read_step_ms_count{step=\"hnsw_overrides\"} 1",
+                "helix_lsm_metadata_read_step_ms_count{step=\"metadata_current\"} 1",
+            ]
+        );
+    }
+
+    #[test]
     fn metadata_refresh_logging_only_downgrades_cooperative_cancellation() {
         let cancelled = GraphError::New("LSM I/O: LSM read request cancelled".into());
         assert_eq!(
@@ -6702,11 +6756,12 @@ mod tests {
         use crate::helix_engine::storage_core::upsert::EdgeUpsert;
         use crate::protocol::value::Value;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         let from: u128 = 0xB1;
@@ -6796,11 +6851,12 @@ mod tests {
     #[test]
     #[serial]
     fn missing_lsm_counter_key_reseeds_from_scan_not_stale_blob() {
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         for _ in 0..3 {
@@ -6885,11 +6941,12 @@ mod tests {
         use super::super::backend::StorageBackend;
         use crate::protocol::value::Value;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         let id: u128 = 0xAA;
@@ -6944,11 +7001,12 @@ mod tests {
     fn lsm_get_metadata_be_matches_snapshot_without_lmdb_env() {
         use super::super::metadata::PayloadIndexSchema;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         // No local heed env on LSM: the old reconcile path failed here.
@@ -7010,12 +7068,14 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage =
-            Arc::new(HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap());
+        let storage = Arc::new(
+            HelixGraphStorage::new(
+                dir.path().to_str().unwrap(),
+                test_config().with_lsm_in_memory(),
+            )
+            .unwrap(),
+        );
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         let (stale_ready_tx, stale_ready_rx) = mpsc::channel();
@@ -7071,12 +7131,14 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage =
-            Arc::new(HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap());
+        let storage = Arc::new(
+            HelixGraphStorage::new(
+                dir.path().to_str().unwrap(),
+                test_config().with_lsm_in_memory(),
+            )
+            .unwrap(),
+        );
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         let gate = storage.write_txn_gate.lock().unwrap();
@@ -7133,11 +7195,12 @@ mod tests {
     #[test]
     #[serial]
     fn write_time_counter_reseed_uses_scan_truth_not_stale_blob() {
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         for _ in 0..3 {
@@ -7195,11 +7258,12 @@ mod tests {
         use super::super::metadata::PayloadIndexSchema;
         use crate::protocol::value::Value;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         // Seed nodes carrying a "repo" payload field (CE's filter field).
@@ -7250,11 +7314,12 @@ mod tests {
         use super::super::metadata::PayloadIndexSchema;
         use crate::protocol::value::Value;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         {
@@ -7382,15 +7447,16 @@ mod tests {
         use slatedb::object_store::ObjectStore;
         use std::collections::HashMap;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
         // Small chunk size -> multiple backfill chunks (cursor advancement +
         // cumulative indexed_nodes), mirroring a large prod backfill.
         let _chunk = TestEnvRestore::set("HELIX_PAYLOAD_INDEX_CHUNK_SIZE", "200");
 
         let dir = tempfile::TempDir::new().unwrap();
-        let mut storage =
-            HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let mut storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
 
         // Swap in a FILE-BACKED LSM (LocalFileSystem object store), not in-memory.
         let data_dir = tempfile::TempDir::new().unwrap();
@@ -7500,11 +7566,12 @@ mod tests {
         use super::super::backend::StorageBackend;
         use crate::protocol::value::Value;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         let from: u128 = 0xCA;
@@ -7591,11 +7658,12 @@ mod tests {
         use crate::protocol::value::Value;
         use std::collections::HashMap;
 
-        let _backend = TestEnvRestore::set("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = TestEnvRestore::set("HELIX_LSM_IN_MEMORY", "1");
-
         let dir = tempfile::TempDir::new().unwrap();
-        let storage = HelixGraphStorage::new(dir.path().to_str().unwrap(), test_config()).unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
         const NODE_COUNT: u128 = 2_048;
@@ -10627,11 +10695,17 @@ impl HelixGraphStorage {
         Ok(count)
     }
 
+    /// Resolve a Qdrant `match.text` (case-insensitive substring) condition by
+    /// walking the keyword index terms. Returns `Ok(None)` — "treat as
+    /// unindexed", the caller falls back to a recheck scan — when a term can't
+    /// be decoded or the walk would visit more than `walk_max` index entries
+    /// (`0` = unbounded).
     pub(crate) fn get_nodes_by_payload_text(
         &self,
         txn: &RoTxn,
         field: &str,
         text: &str,
+        walk_max: usize,
     ) -> Result<Option<Vec<u128>>, GraphError> {
         let payload_indices = self
             .payload_indices
@@ -10650,40 +10724,72 @@ impl HelixGraphStorage {
 
         if self.backend.kind() == BackendKind::Lsm {
             let r = self.backend.read_borrowed(txn);
-            return self.get_nodes_by_payload_text_be(&r, field, text);
+            return self.get_nodes_by_payload_text_be(&r, field, text, walk_max);
         }
 
-        let exact =
-            self.get_nodes_by_payload_value(txn, field, &Value::String(text.to_string()))?;
-        if !exact.is_empty() {
-            return Ok(Some(exact));
-        }
-
+        // No exact-value shortcut: Qdrant `match.text` is a case-insensitive
+        // substring match, so the exact keyword hits are only a subset of the
+        // answer. The planner treats these ids as the complete candidate set,
+        // so returning just the exact hits silently dropped every point whose
+        // value merely contains `text` from scroll/count/search results.
         let needle = text.to_lowercase();
+        let db = handle.lmdb_db()?;
         let mut ids = Vec::new();
-        let iter = handle.lmdb_db()?.iter(txn)?;
-        for item in iter {
-            let (key, val_bytes) = item?;
+        let mut visited = 0usize;
+        // One cursor step per DISTINCT term (MDB_NEXT_NODUP); duplicates (ids)
+        // are only read for matching terms, so low-cardinality fields scale
+        // with their term count rather than their point count.
+        for item in db.iter(txn)?.move_between_keys() {
+            let (key, _) = item?;
+            visited += 1;
+            if Self::payload_text_walk_capped(visited, walk_max) {
+                return Ok(None);
+            }
             match Self::payload_index_key_matches_text(key, &needle) {
-                Some(true) => ids.push(u128::from_be_bytes(
-                    val_bytes
-                        .try_into()
-                        .map_err(|_| GraphError::SliceLengthError)?,
-                )),
+                Some(true) => {
+                    if let Some(dups) = db.get_duplicates(txn, key)? {
+                        for dup in dups {
+                            let (_, val_bytes) = dup?;
+                            visited += 1;
+                            if Self::payload_text_walk_capped(visited, walk_max) {
+                                return Ok(None);
+                            }
+                            ids.push(u128::from_be_bytes(
+                                val_bytes
+                                    .try_into()
+                                    .map_err(|_| GraphError::SliceLengthError)?,
+                            ));
+                        }
+                    }
+                }
                 Some(false) => {}
                 None => return Ok(None),
             }
         }
         ids.sort_unstable();
         ids.dedup();
+        metrics::counter!("helix_payload_text_walk_total", "outcome" => "walked").increment(1);
         Ok(Some(ids))
     }
 
+    /// True (and counted) once a text walk has visited more than `walk_max`
+    /// index entries; `walk_max == 0` disables the cap.
+    fn payload_text_walk_capped(visited: usize, walk_max: usize) -> bool {
+        let capped = walk_max > 0 && visited > walk_max;
+        if capped {
+            metrics::counter!("helix_payload_text_walk_total", "outcome" => "capped").increment(1);
+        }
+        capped
+    }
+
+    /// Backend twin of [`Self::get_nodes_by_payload_text`]; same `walk_max`
+    /// and `Ok(None)` contract.
     pub(crate) fn get_nodes_by_payload_text_be(
         &self,
         r: &AnyRead<'_>,
         field: &str,
         text: &str,
+        walk_max: usize,
     ) -> Result<Option<Vec<u128>>, GraphError> {
         let payload_indices = self
             .payload_indices
@@ -10700,43 +10806,59 @@ impl HelixGraphStorage {
             )));
         }
 
-        let exact =
-            self.get_nodes_by_payload_value_be(r, field, &Value::String(text.to_string()))?;
-        if !exact.is_empty() {
-            return Ok(Some(exact));
-        }
-
+        // No exact-value shortcut — see `get_nodes_by_payload_text`: the exact
+        // hits are a strict subset of the substring match the filter applies.
         let needle = text.to_lowercase();
         let db_name = Self::payload_index_db_name(field, &handle.schema);
         let mut ids = Vec::new();
         let mut undecodable = false;
+        let mut capped = false;
+        let mut visited = 0usize;
+        // Entries arrive grouped by term; decode a term once and reuse the
+        // verdict (a memcmp) for each of its duplicate ids.
+        let mut last_term: Vec<u8> = Vec::new();
+        let mut last_matched: Option<bool> = None;
         self.backend
             .scan(
                 r,
                 Namespace::PayloadIndex(&db_name),
                 KeyRange::all(),
                 |key, val_bytes| {
-                    match Self::payload_index_key_matches_text(key, &needle) {
-                        Some(true) => {
-                            if let Ok(arr) = <[u8; 16]>::try_from(val_bytes) {
-                                ids.push(u128::from_be_bytes(arr));
+                    visited += 1;
+                    if Self::payload_text_walk_capped(visited, walk_max) {
+                        capped = true;
+                        return false;
+                    }
+                    let matched = match last_matched {
+                        Some(matched) if key == last_term.as_slice() => matched,
+                        _ => match Self::payload_index_key_matches_text(key, &needle) {
+                            Some(matched) => {
+                                last_term.clear();
+                                last_term.extend_from_slice(key);
+                                last_matched = Some(matched);
+                                matched
                             }
-                        }
-                        Some(false) => {}
-                        None => {
-                            undecodable = true;
-                            return false;
+                            None => {
+                                undecodable = true;
+                                return false;
+                            }
+                        },
+                    };
+                    if matched {
+                        if let Ok(arr) = <[u8; 16]>::try_from(val_bytes) {
+                            ids.push(u128::from_be_bytes(arr));
                         }
                     }
                     true
                 },
             )
             .map_err(|e| GraphError::New(e.to_string()))?;
-        if undecodable {
+        if undecodable || capped {
             return Ok(None);
         }
         ids.sort_unstable();
         ids.dedup();
+        metrics::counter!("helix_payload_text_walk_total", "outcome" => "walked").increment(1);
         Ok(Some(ids))
     }
 
@@ -11868,6 +11990,9 @@ impl StorageMethods for HelixGraphStorage {
                     &Self::pack_edge_data(&edge.from_node, &edge.id),
                 )
                 .map_err(|e| GraphError::New(e.to_string()))?;
+            // Cascaded edges must leave the edge-path index too (as drop_edge
+            // does), or delete-by-path later resolves to a missing edge.
+            self.delete_edge_paths(txn, edge)?;
         }
 
         // Delete node bytes, then de-index — only when the row existed. Because
@@ -11880,6 +12005,26 @@ impl StorageMethods for HelixGraphStorage {
             .delete_heed(txn, Namespace::Nodes, &id.to_be_bytes())
             .map_err(|e| GraphError::New(e.to_string()))?;
         if let Some(node) = &existing_node {
+            // Single-value secondary indices written by create_node. Delete only
+            // an entry that still points at THIS node (the index is unique by
+            // value, so another node may own the key now).
+            let id_bytes = id.to_be_bytes();
+            for index in self.secondary_indices.keys() {
+                if let Some(value) = node.properties.get(index) {
+                    let key = Self::stable_index_key_for_value(value)?;
+                    let points_to_node = self
+                        .backend
+                        .get_for_update_heed(txn, Namespace::SecondaryIndex(index), &key, |v| {
+                            v.is_some_and(|bytes| bytes == id_bytes.as_slice())
+                        })
+                        .map_err(|e| GraphError::New(e.to_string()))?;
+                    if points_to_node {
+                        self.backend
+                            .delete_heed(txn, Namespace::SecondaryIndex(index), &key)
+                            .map_err(|e| GraphError::New(e.to_string()))?;
+                    }
+                }
+            }
             // Multi-index de-indexing routed through the seam: Namespace::MultiIndex
             // (idx_name) resolves to the same midx_{name} DUP_SORT DB the
             // multi_indices map holds; delete_dup_raw maps 1:1 to heed

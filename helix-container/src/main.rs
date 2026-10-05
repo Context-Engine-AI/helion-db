@@ -12,7 +12,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use helixdb::helix_engine::graph_core::config::Config;
 use helixdb::helix_engine::graph_core::graph_core::{HelixGraphEngine, HelixGraphEngineOpts};
 use helixdb::helix_engine::storage_core::{
-    collection_manager::CollectionManager, replication::ReplicationManager,
+    backend_lsm_reader::LSM_READER_DATABASE_MISSING, collection_manager::CollectionManager,
+    reader_warm, replication::ReplicationManager,
 };
 use helixdb::helix_gateway::{
     api::register::register_api_routes,
@@ -67,7 +68,10 @@ fn open_graph_engine(path: String, config: Config) -> HelixGraphEngine {
                 // Match SlateDB's specific "missing manifest" error string only —
                 // a bare "manifest" substring could match unrelated errors and turn
                 // an immediate failure into a 120s-delayed panic.
-                let uninitialized = lower.contains("latest transactional object");
+                // A reader replica reports the same condition as SlateDB's typed
+                // `DatabaseMissing`, tagged by `LsmReader` with its marker.
+                let uninitialized = lower.contains("latest transactional object")
+                    || msg.contains(LSM_READER_DATABASE_MISSING);
                 if uninitialized && std::time::Instant::now() < deadline {
                     warn!(
                         error = %msg,
@@ -252,6 +256,14 @@ fn main() {
         .enable_all()
         .build()
         .expect("Failed to create Tokio runtime");
+
+    // Reader replicas re-open their persisted hot collections before reporting
+    // ready on /readyz/warm (no-op for writers). Spawned before the listener
+    // binds so the very first readiness probe already sees the warming state.
+    {
+        let _runtime_guard = runtime.enter();
+        reader_warm::spawn_reader_startup_warm(Arc::clone(&collection_manager));
+    }
 
     // create gateway
     let gateway = runtime.block_on(HelixGateway::new_with_router(

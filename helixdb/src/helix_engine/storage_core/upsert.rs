@@ -401,11 +401,15 @@ impl HelixGraphStorage {
                 &Self::in_edge_key(&edge.to_node, &label_hash),
                 &Self::pack_edge_data(&edge.from_node, &edge.id),
             )?;
+            // Path keys are `dir|path|edge_id`: delete the OLD keys before
+            // writing the new ones so an unchanged from/to path keeps its key.
+            if let Some(existing) = &existing {
+                self.delete_edge_paths(txn, existing)?;
+            }
             self.index_edge_paths(txn, &edge)?;
 
             if let Some(existing) = &existing {
                 let old_label_hash = hash_label(&existing.label, None);
-                self.delete_edge_paths(txn, existing)?;
                 out_edges_db.delete_one_duplicate(
                     txn,
                     &Self::out_edge_key(&existing.from_node, &old_label_hash),
@@ -423,8 +427,8 @@ impl HelixGraphStorage {
             // must repair those rows; otherwise graph endpoints that traverse
             // out_edges_db/in_edges_db permanently miss an edge that still
             // appears in primary scans. DUP_SORT/DUP_FIXED keeps the same
-            // (key, value) put idempotent, and we intentionally do not delete
-            // anything in this branch.
+            // (key, value) put idempotent, and no adjacency is deleted in
+            // this branch (only stale edge-path keys, below).
             out_edges_db.put(
                 txn,
                 &Self::out_edge_key(&edge.from_node, &label_hash),
@@ -435,6 +439,11 @@ impl HelixGraphStorage {
                 &Self::in_edge_key(&edge.to_node, &label_hash),
                 &Self::pack_edge_data(&edge.from_node, &edge.id),
             )?;
+            // from_path/to_path are properties, so they can change even when
+            // adjacency does not: drop the old path keys, then re-index.
+            if let Some(existing) = &existing {
+                self.delete_edge_paths(txn, existing)?;
+            }
             self.index_edge_paths(txn, &edge)?;
         }
 
@@ -523,7 +532,10 @@ mod tests {
     use super::*;
     use crate::helix_engine::{
         graph_core::config::Config,
-        storage_core::{metadata::PayloadIndexSchema, storage_methods::StorageMethods},
+        storage_core::{
+            metadata::PayloadIndexSchema,
+            storage_methods::{DBMethods, StorageMethods},
+        },
     };
     use crate::protocol::deterministic_id;
     use tempfile::TempDir;
@@ -1248,5 +1260,118 @@ mod tests {
             vec![eid]
         );
         assert_eq!(metadata.stats.edge_count, 1);
+    }
+
+    fn path_edge(
+        id: u128,
+        label: &str,
+        from: u128,
+        to: u128,
+        from_path: &str,
+        to_path: &str,
+    ) -> EdgeUpsert {
+        EdgeUpsert {
+            id,
+            label: label.into(),
+            from_node: from,
+            to_node: to,
+            properties: HashMap::from([
+                ("from_path".into(), Value::String(from_path.into())),
+                ("to_path".into(), Value::String(to_path.into())),
+            ]),
+        }
+    }
+
+    fn ids_for_path(storage: &HelixGraphStorage, path: &str) -> Vec<u128> {
+        let txn = storage.lmdb_env().unwrap().read_txn().unwrap();
+        storage.edge_ids_for_path(&txn, path, 100).unwrap()
+    }
+
+    /// Edge-path keys are `dir|path|edge_id`, so re-upserting an edge whose
+    /// from/to path is unchanged must keep (not delete) that key, and a path
+    /// change on the no-adjacency-change branch must drop the stale key.
+    #[test]
+    fn test_upsert_edge_keeps_unchanged_path_key_and_drops_stale_one() {
+        let (storage, _tmp) = setup();
+        let (n1, n2, eid) = (0xA1u128, 0xA2u128, 0xAE1u128);
+        let mut txn = storage.lmdb_env().unwrap().write_txn().unwrap();
+        for id in [n1, n2] {
+            storage
+                .upsert_node(
+                    &mut txn,
+                    &NodeUpsert {
+                        id,
+                        label: "Symbol".into(),
+                        properties: HashMap::new(),
+                    },
+                )
+                .unwrap();
+        }
+        storage
+            .upsert_edge(&mut txn, &path_edge(eid, "CALLS", n1, n2, "a.rs", "b.rs"))
+            .unwrap();
+        // Adjacency change (label), paths unchanged: keys must survive.
+        storage
+            .upsert_edge(&mut txn, &path_edge(eid, "REFS", n1, n2, "a.rs", "b.rs"))
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(ids_for_path(&storage, "a.rs"), vec![eid]);
+        assert_eq!(ids_for_path(&storage, "b.rs"), vec![eid]);
+
+        // No adjacency change, to_path moved: stale key removed, new indexed.
+        let mut txn = storage.lmdb_env().unwrap().write_txn().unwrap();
+        storage
+            .upsert_edge(&mut txn, &path_edge(eid, "REFS", n1, n2, "a.rs", "c.rs"))
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(ids_for_path(&storage, "a.rs"), vec![eid]);
+        assert!(ids_for_path(&storage, "b.rs").is_empty());
+        assert_eq!(ids_for_path(&storage, "c.rs"), vec![eid]);
+    }
+
+    /// drop_node must remove cascaded edges' path keys and the node's
+    /// single-value secondary-index entry.
+    #[test]
+    fn test_drop_node_clears_cascaded_edge_paths_and_secondary_index() {
+        let (mut storage, _tmp) = setup();
+        storage.create_secondary_index("k").unwrap();
+        let (n1, n2, eid) = (0xB1u128, 0xB2u128, 0xBE1u128);
+        let mut txn = storage.lmdb_env().unwrap().write_txn().unwrap();
+        storage
+            .create_node(
+                &mut txn,
+                "Symbol",
+                vec![("k".to_string(), Value::String("key-1".into()))],
+                Some(&["k".to_string()]),
+                Some(n1),
+            )
+            .unwrap();
+        storage
+            .create_node(&mut txn, "Symbol", vec![], None, Some(n2))
+            .unwrap();
+        storage
+            .upsert_edge(&mut txn, &path_edge(eid, "CALLS", n1, n2, "a.rs", "b.rs"))
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(ids_for_path(&storage, "a.rs"), vec![eid]);
+
+        let mut txn = storage.lmdb_env().unwrap().write_txn().unwrap();
+        storage.drop_node(&mut txn, &n1).unwrap();
+        txn.commit().unwrap();
+
+        assert!(ids_for_path(&storage, "a.rs").is_empty());
+        assert!(ids_for_path(&storage, "b.rs").is_empty());
+        let txn = storage.lmdb_env().unwrap().read_txn().unwrap();
+        let key =
+            HelixGraphStorage::stable_index_key_for_value(&Value::String("key-1".into())).unwrap();
+        let raw = storage
+            .secondary_indices
+            .get("k")
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get(&txn, &key)
+            .unwrap();
+        assert!(raw.is_none(), "secondary index entry must be removed");
     }
 }

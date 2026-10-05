@@ -24,13 +24,29 @@ impl Eq for HVector {}
 
 impl PartialOrd for HVector {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        other.distance.partial_cmp(&self.distance)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for HVector {
+    /// Reversed distance order (closest is "greatest"). Total: a NaN distance
+    /// ranks as farthest instead of comparing Equal to everything, which
+    /// would break heap invariants; an unset distance ranks below any set one
+    /// (same as the previous `Option::partial_cmp`).
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        match (other.distance, self.distance) {
+            (Some(lhs), Some(rhs)) => nan_as_farthest(lhs).total_cmp(&nan_as_farthest(rhs)),
+            (lhs, rhs) => lhs.is_some().cmp(&rhs.is_some()),
+        }
+    }
+}
+
+#[inline(always)]
+fn nan_as_farthest(distance: f32) -> f32 {
+    if distance.is_nan() {
+        f32::INFINITY
+    } else {
+        distance
     }
 }
 

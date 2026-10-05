@@ -84,11 +84,30 @@ pub fn merge_directions(dir: PprDirection, out: Vec<u128>, inn: Vec<u128>) -> Ve
 /// order the closure returns them. Ties in the output are broken by ascending id.
 pub fn personalized_pagerank<F>(
     seeds: &[(u128, f64)],
-    mut neighbors: F,
+    neighbors: F,
     params: &PprParams,
 ) -> Vec<RankedItem>
 where
     F: FnMut(u128) -> Vec<u128>,
+{
+    personalized_pagerank_filtered(seeds, neighbors, |_| true, params)
+}
+
+/// [`personalized_pagerank`] whose output keeps only nodes accepted by
+/// `admit`. The walk itself still flows through rejected nodes (they can
+/// bridge admitted ones); `admit` only gates what is ranked and returned, and
+/// is applied before `limit` truncation so rejected nodes don't eat slots.
+/// Hybrid search uses this to drop neighbors that fail the request filter or
+/// no longer exist.
+pub fn personalized_pagerank_filtered<F, A>(
+    seeds: &[(u128, f64)],
+    mut neighbors: F,
+    mut admit: A,
+    params: &PprParams,
+) -> Vec<RankedItem>
+where
+    F: FnMut(u128) -> Vec<u128>,
+    A: FnMut(u128) -> bool,
 {
     // Dedup seeds, preserving first-occurrence order, summing weights.
     let mut seed_order: Vec<u128> = Vec::new();
@@ -166,7 +185,7 @@ where
 
     let mut results: Vec<RankedItem> = p
         .into_iter()
-        .filter(|(_, score)| *score > 0.0)
+        .filter(|(id, score)| *score > 0.0 && admit(*id))
         .map(|(id, score)| RankedItem { id, score })
         .collect();
 
@@ -329,6 +348,48 @@ mod tests {
                 .unwrap_or(0.0)
         };
         assert!(score(100) > score(200));
+    }
+
+    #[test]
+    fn admit_filters_output_but_walk_crosses_rejected_nodes() {
+        // 1 -> 2 -> 3; node 2 is rejected (e.g. other repo) but still bridges.
+        let seeds = vec![(1u128, 1.0)];
+        let neighbors = |node: u128| -> Vec<u128> {
+            match node {
+                1 => vec![2],
+                2 => vec![3],
+                _ => vec![],
+            }
+        };
+        let params = PprParams::default();
+        let results = personalized_pagerank_filtered(&seeds, neighbors, |id| id != 2, &params);
+        let ids: Vec<u128> = results.iter().map(|item| item.id).collect();
+        assert!(!ids.contains(&2));
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&3));
+    }
+
+    #[test]
+    fn admit_applies_before_limit() {
+        // Seed 1 fans out to 2..=6; with limit 2 and only {1, 6} admitted,
+        // both must survive even though rejected nodes tie 6 and win on id order.
+        let seeds = vec![(1u128, 1.0)];
+        let neighbors = |node: u128| -> Vec<u128> {
+            if node == 1 {
+                vec![2, 3, 4, 5, 6]
+            } else {
+                vec![]
+            }
+        };
+        let params = PprParams {
+            limit: 2,
+            ..PprParams::default()
+        };
+        let results =
+            personalized_pagerank_filtered(&seeds, neighbors, |id| id == 1 || id == 6, &params);
+        let mut ids: Vec<u128> = results.iter().map(|item| item.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 6]);
     }
 
     #[test]

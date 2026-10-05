@@ -7,7 +7,7 @@ use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::helix_engine::storage_core::backend::{
-    BackendKind, KeyRange, Namespace, StorageBackend,
+    BackendError, BackendKind, KeyRange, Namespace, StorageBackend,
 };
 use crate::helix_engine::storage_core::backend_any::{AnyBackend, AnyRead};
 use crate::helix_engine::storage_core::collection_manager::reader_refresh_ttl_ms;
@@ -18,12 +18,12 @@ use crate::helix_engine::storage_core::metadata::PayloadIndexSchema;
 use crate::helix_engine::storage_core::replication::{ReplicatedMutation, ReplicatedPoint};
 use crate::helix_engine::storage_core::storage_core::HelixGraphStorage;
 use crate::helix_engine::storage_core::storage_methods::StorageMethods;
-use crate::helix_engine::types::GraphError;
+use crate::helix_engine::types::{graph_error_from_backend_error, GraphError};
 use crate::helix_engine::vector_core::fusion::{
     mmr_rerank_fused, rrf_fusion, rrf_fusion_with_k, RankedItem,
 };
 use crate::helix_engine::vector_core::graph_signal::{
-    merge_directions, personalized_pagerank, PprDirection, PprParams,
+    merge_directions, personalized_pagerank_filtered, PprDirection, PprParams,
 };
 use crate::helix_engine::vector_core::hnsw::HNSW;
 use crate::helix_engine::vector_core::named_vectors::{
@@ -38,6 +38,13 @@ use crate::protocol::items::{Node, SerializedNode};
 use crate::protocol::label_hash::hash_label;
 use crate::protocol::response::Response;
 use crate::protocol::value::Value;
+
+#[cfg(test)]
+#[path = "qdrant_payload_cache_handler_tests.rs"]
+mod qdrant_payload_cache_handler_tests;
+#[cfg(test)]
+#[path = "qdrant_payload_cache_tests.rs"]
+mod qdrant_payload_cache_tests;
 
 // ─── Helpers ───
 
@@ -243,8 +250,12 @@ fn indexed_condition_ids(
                 return Ok(Some(ids));
             }
             Some(MatchCondition::Text(value)) => {
-                let Some(ids) =
-                    storage.get_nodes_by_payload_text(txn, &condition.key, &value.text)?
+                let Some(ids) = storage.get_nodes_by_payload_text(
+                    txn,
+                    &condition.key,
+                    &value.text,
+                    text_candidate_walk_max(),
+                )?
                 else {
                     return Ok(None);
                 };
@@ -292,8 +303,12 @@ fn indexed_condition_ids_be(
                 return Ok(Some(ids));
             }
             Some(MatchCondition::Text(value)) => {
-                let Some(ids) =
-                    storage.get_nodes_by_payload_text_be(r, &condition.key, &value.text)?
+                let Some(ids) = storage.get_nodes_by_payload_text_be(
+                    r,
+                    &condition.key,
+                    &value.text,
+                    text_candidate_walk_max(),
+                )?
                 else {
                     return Ok(None);
                 };
@@ -324,14 +339,39 @@ fn indexed_filter_candidates(
 ) -> Result<Option<HashSet<u128>>, GraphError> {
     let mut candidates: Option<HashSet<u128>> = None;
 
+    // Text conditions are resolved by walking index terms, so materialize
+    // the cheap keyword/range/nested conditions first and skip the walk when
+    // they are already selective: the candidate set stays a superset and the
+    // per-point recheck applies the text predicate.
+    let mut text_conditions = Vec::new();
     for condition in &filter.must {
+        if is_text_field_condition(condition) {
+            text_conditions.push(condition);
+            continue;
+        }
+        let Some(ids) = indexed_condition_candidates(storage, txn, condition)? else {
+            continue;
+        };
+        candidates = intersect_candidate_sets(candidates, ids);
+    }
+    for condition in text_conditions {
+        if text_walk_skippable(candidates.as_ref()) {
+            continue;
+        }
         let Some(ids) = indexed_condition_candidates(storage, txn, condition)? else {
             continue;
         };
         candidates = intersect_candidate_sets(candidates, ids);
     }
 
-    if !filter.should.is_empty() {
+    // A single unindexable branch discards the whole should set, so check
+    // every branch before walking any (text walks are not free).
+    if !filter.should.is_empty()
+        && filter
+            .should
+            .iter()
+            .all(|condition| condition_may_yield_candidates(storage, condition))
+    {
         let mut should_candidates: Option<HashSet<u128>> = None;
 
         for condition in &filter.should {
@@ -375,6 +415,13 @@ fn indexed_filter_candidates(
         let mut must_not_candidates: Option<HashSet<u128>> = None;
         let mut any_unindexed = false;
         for condition in &filter.must_not {
+            // A nested filter's candidate set may be a superset (unindexed
+            // inner clauses are skipped); subtracting a superset would drop
+            // points that do not actually match the exclusion.
+            if !indexed_condition_candidates_are_exact(storage, condition) {
+                any_unindexed = true;
+                break;
+            }
             match indexed_condition_candidates(storage, txn, condition)? {
                 Some(ids) => {
                     must_not_candidates = union_candidate_sets(must_not_candidates, ids);
@@ -402,14 +449,39 @@ fn indexed_filter_candidates_be(
 ) -> Result<Option<HashSet<u128>>, GraphError> {
     let mut candidates: Option<HashSet<u128>> = None;
 
+    // Text conditions are resolved by walking index terms, so materialize
+    // the cheap keyword/range/nested conditions first and skip the walk when
+    // they are already selective: the candidate set stays a superset and the
+    // per-point recheck applies the text predicate.
+    let mut text_conditions = Vec::new();
     for condition in &filter.must {
+        if is_text_field_condition(condition) {
+            text_conditions.push(condition);
+            continue;
+        }
+        let Some(ids) = indexed_condition_candidates_be(storage, r, condition)? else {
+            continue;
+        };
+        candidates = intersect_candidate_sets(candidates, ids);
+    }
+    for condition in text_conditions {
+        if text_walk_skippable(candidates.as_ref()) {
+            continue;
+        }
         let Some(ids) = indexed_condition_candidates_be(storage, r, condition)? else {
             continue;
         };
         candidates = intersect_candidate_sets(candidates, ids);
     }
 
-    if !filter.should.is_empty() {
+    // A single unindexable branch discards the whole should set, so check
+    // every branch before walking any (text walks are not free).
+    if !filter.should.is_empty()
+        && filter
+            .should
+            .iter()
+            .all(|condition| condition_may_yield_candidates(storage, condition))
+    {
         let mut should_candidates: Option<HashSet<u128>> = None;
 
         for condition in &filter.should {
@@ -429,6 +501,13 @@ fn indexed_filter_candidates_be(
         let mut must_not_candidates: Option<HashSet<u128>> = None;
         let mut any_unindexed = false;
         for condition in &filter.must_not {
+            // A nested filter's candidate set may be a superset (unindexed
+            // inner clauses are skipped); subtracting a superset would drop
+            // points that do not actually match the exclusion.
+            if !indexed_condition_candidates_are_exact(storage, condition) {
+                any_unindexed = true;
+                break;
+            }
             match indexed_condition_candidates_be(storage, r, condition)? {
                 Some(ids) => {
                     must_not_candidates = union_candidate_sets(must_not_candidates, ids);
@@ -447,6 +526,61 @@ fn indexed_filter_candidates_be(
     }
 
     Ok(candidates)
+}
+
+/// Entries a single `match.text` index-term walk may visit before the planner
+/// gives up on it (the condition is then treated as unindexed and the scan
+/// recheck applies it). `0` disables the cap.
+fn text_candidate_walk_max() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| env_usize_or("HELIX_TEXT_CANDIDATE_WALK_MAX", 200_000))
+}
+
+/// When the non-text `must` conditions already narrowed candidates to at most
+/// this many ids, a `must` text condition is not walked at all.
+fn text_candidate_skip_max() -> usize {
+    static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| env_usize_or("HELIX_TEXT_CANDIDATE_SKIP_MAX", 50_000))
+}
+
+fn is_text_field_condition(condition: &Condition) -> bool {
+    matches!(
+        condition,
+        Condition::Field(field) if matches!(field.match_cond, Some(MatchCondition::Text(_)))
+    )
+}
+
+fn text_walk_skippable(candidates: Option<&HashSet<u128>>) -> bool {
+    let skip = candidates.is_some_and(|ids| ids.len() <= text_candidate_skip_max());
+    if skip {
+        metrics::counter!("helix_payload_text_walk_total", "outcome" => "skipped_selective")
+            .increment(1);
+    }
+    skip
+}
+
+/// Cheap, read-free mirror of the planner: could `condition` produce an
+/// indexed candidate set? Used to avoid walking `should` branches whose
+/// siblings would discard the set anyway.
+fn condition_may_yield_candidates(
+    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+    condition: &Condition,
+) -> bool {
+    match condition {
+        Condition::Field(field) => indexed_field_condition_supported(storage, field),
+        Condition::Nested(filter) => {
+            filter
+                .must
+                .iter()
+                .any(|condition| condition_may_yield_candidates(storage, condition))
+                || (!filter.should.is_empty()
+                    && filter
+                        .should
+                        .iter()
+                        .all(|condition| condition_may_yield_candidates(storage, condition)))
+        }
+        Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => false,
+    }
 }
 
 fn indexed_field_condition_supported(
@@ -473,9 +607,16 @@ fn indexed_condition_candidates_are_exact(
     condition: &Condition,
 ) -> bool {
     match condition {
-        Condition::Field(field) => indexed_field_condition_supported(storage, field),
+        // Text candidates are resolved by a substring walk over index terms
+        // (historically they were only the exact keyword hits — a subset).
+        // Keep them out of must_not subtraction; the scan recheck applies the
+        // exclusion, which is always correct.
+        Condition::Field(field) => {
+            indexed_field_condition_supported(storage, field)
+                && !matches!(field.match_cond, Some(MatchCondition::Text(_)))
+        }
         Condition::Nested(filter) => indexed_filter_candidates_are_exact(storage, filter),
-        Condition::HasId(_) => false,
+        Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => false,
     }
 }
 
@@ -495,6 +636,8 @@ fn indexed_filter_candidates_are_exact(
             .should
             .iter()
             .all(|condition| indexed_condition_candidates_are_exact(storage, condition))
+        // Candidate derivation ignores `min_should`, so the set is a superset.
+        && filter.min_should.is_none()
 }
 
 fn indexed_condition_candidates(
@@ -505,7 +648,7 @@ fn indexed_condition_candidates(
     match condition {
         Condition::Field(field) => indexed_condition_ids(storage, txn, field),
         Condition::Nested(filter) => indexed_filter_candidates(storage, txn, filter),
-        Condition::HasId(_) => Ok(None),
+        Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => Ok(None),
     }
 }
 
@@ -517,7 +660,7 @@ fn indexed_condition_candidates_be(
     match condition {
         Condition::Field(field) => indexed_condition_ids_be(storage, r, field),
         Condition::Nested(filter) => indexed_filter_candidates_be(storage, r, filter),
-        Condition::HasId(_) => Ok(None),
+        Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => Ok(None),
     }
 }
 
@@ -609,9 +752,11 @@ fn indexed_condition_count_be(
                 count
             }
             Some(MatchCondition::Text(value)) => {
-                // The text reader returns exact keyword matches when any
-                // exist and only falls back to a full index scan when none
-                // do; mirror the cheap half and abstain on the scan half.
+                // The text reader walks every index term for substring hits;
+                // the exact-keyword count is only a cheap LOWER bound. That is
+                // still safe for the too-broad skip (lower bound > cap implies
+                // the true count > cap); an underestimate only forgoes a skip.
+                // Abstain when there is no exact hit to count.
                 let count = storage.count_nodes_by_payload_value_be(
                     r,
                     &condition.key,
@@ -667,7 +812,7 @@ fn indexed_filter_must_count_estimate_be(
             Condition::Nested(nested) => {
                 indexed_filter_must_count_estimate_be(storage, r, nested, cap)?
             }
-            Condition::HasId(_) => None,
+            Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => None,
         };
         if let Some(count) = count {
             estimate = Some(estimate.map_or(count, |existing| existing.min(count)));
@@ -735,6 +880,50 @@ fn vector_query_indexed_filter_candidates_probed(
     }
 
     let Some(candidates) = indexed_filter_candidates(storage, txn, filter)? else {
+        return Ok(ProbedCandidates {
+            candidates: None,
+            probe_estimate,
+            probe_skipped: false,
+        });
+    };
+    if vector_query_candidates_too_broad(candidates.len(), total) {
+        return Ok(ProbedCandidates {
+            candidates: None,
+            probe_estimate,
+            probe_skipped: false,
+        });
+    }
+    Ok(ProbedCandidates {
+        candidates: Some(candidates),
+        probe_estimate,
+        probe_skipped: false,
+    })
+}
+
+fn vector_query_indexed_filter_candidates_be_probed(
+    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+    r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+    filter: &Filter,
+    probe_enabled: bool,
+) -> Result<ProbedCandidates, GraphError> {
+    let total = collection_vector_count_be(storage) as usize;
+
+    let mut probe_estimate = None;
+    if probe_enabled && total > 0 && !filter.must.is_empty() {
+        let cap = vector_query_broad_candidate_cap(total);
+        probe_estimate = indexed_filter_must_count_estimate_be(storage, r, filter, cap)?;
+        if let Some(estimate) = probe_estimate {
+            if vector_query_candidates_too_broad(estimate, total) {
+                return Ok(ProbedCandidates {
+                    candidates: None,
+                    probe_estimate,
+                    probe_skipped: true,
+                });
+            }
+        }
+    }
+
+    let Some(candidates) = indexed_filter_candidates_be(storage, r, filter)? else {
         return Ok(ProbedCandidates {
             candidates: None,
             probe_estimate,
@@ -881,19 +1070,22 @@ fn scan_indexed_filter_candidates_be_probed(
     })
 }
 
+/// When both inclusive and exclusive bounds are present, the index scan must
+/// use the stricter one: candidates are treated as exact (e.g. for must_not
+/// subtraction), so a looser bound would over-select.
 fn range_lower_bound(range: &RangeCondition) -> Option<(f64, bool)> {
-    if let Some(value) = range.gte {
-        Some((value, true))
-    } else {
-        range.gt.map(|value| (value, false))
+    match (range.gte, range.gt) {
+        (Some(gte), Some(gt)) if gt >= gte => Some((gt, false)),
+        (Some(gte), _) => Some((gte, true)),
+        (None, gt) => gt.map(|value| (value, false)),
     }
 }
 
 fn range_upper_bound(range: &RangeCondition) -> Option<(f64, bool)> {
-    if let Some(value) = range.lte {
-        Some((value, true))
-    } else {
-        range.lt.map(|value| (value, false))
+    match (range.lte, range.lt) {
+        (Some(lte), Some(lt)) if lt <= lte => Some((lt, false)),
+        (Some(lte), _) => Some((lte, true)),
+        (None, lt) => lt.map(|value| (value, false)),
     }
 }
 
@@ -944,12 +1136,14 @@ struct HnswConfigInput {
 }
 
 impl HnswConfigInput {
-    fn to_overrides(&self) -> HnswOverrides {
-        HnswOverrides {
+    fn to_overrides(&self) -> Result<HnswOverrides, String> {
+        let overrides = HnswOverrides {
             m: self.m,
             ef_construction: self.ef_construct,
             ef: self.ef,
-        }
+        };
+        overrides.validate().map_err(|e| e.to_string())?;
+        Ok(overrides)
     }
 }
 
@@ -1443,11 +1637,11 @@ pub fn handle_create_collection(
         );
     }
 
-    let hnsw_overrides = req
-        .hnsw_config
-        .as_ref()
-        .map(HnswConfigInput::to_overrides)
-        .filter(|o| !o.is_empty());
+    let hnsw_overrides = match req.hnsw_config.as_ref().map(HnswConfigInput::to_overrides) {
+        Some(Ok(overrides)) if !overrides.is_empty() => Some(overrides),
+        Some(Ok(_)) | None => None,
+        Some(Err(message)) => return json_err(response, 400, &message),
+    };
 
     // Idempotent fast-path for existing collections.
     //
@@ -2843,6 +3037,10 @@ struct SearchRequest {
     #[serde(default = "default_limit")]
     limit: usize,
     #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    score_threshold: Option<f32>,
+    #[serde(default)]
     filter: Option<Filter>,
     #[serde(default = "default_true")]
     with_payload: bool,
@@ -2914,6 +3112,100 @@ fn clamp_limit(limit: usize) -> usize {
     } else {
         limit.min(cap)
     }
+}
+
+fn clamp_offset(offset: usize) -> usize {
+    offset.min(max_search_limit())
+}
+
+fn result_window(limit: usize, offset: usize) -> usize {
+    limit.saturating_add(offset).min(max_search_limit())
+}
+
+fn channel_result_window(channel_limit: usize, result_window: usize, offset: usize) -> usize {
+    if offset > 0 {
+        channel_limit.max(result_window).min(max_search_limit())
+    } else {
+        channel_limit
+    }
+}
+
+fn validate_score_threshold(threshold: Option<f32>) -> Result<(), &'static str> {
+    if threshold.is_some_and(|score| !score.is_finite()) {
+        Err("score_threshold must be finite")
+    } else {
+        Ok(())
+    }
+}
+
+fn dense_score_threshold_for_metric(
+    storage: &HelixGraphStorage,
+    vector_name: &str,
+    threshold: Option<f32>,
+) -> Option<f32> {
+    let threshold = threshold?;
+    let Some(config) = storage.named_vectors.get_config(vector_name) else {
+        return Some(threshold);
+    };
+    match config.distance {
+        DistanceMetric::Euclid => Some(-threshold),
+        DistanceMetric::Cosine | DistanceMetric::Dot => Some(threshold),
+    }
+}
+
+fn score_passes_threshold(score: f32, threshold: Option<f32>) -> bool {
+    threshold.is_none_or(|min_score| score >= min_score)
+}
+
+fn apply_hvector_score_threshold_and_offset(
+    results: &mut Vec<HVector>,
+    threshold: Option<f32>,
+    offset: usize,
+    limit: usize,
+) {
+    results.retain(|result| score_passes_threshold(result.distance.unwrap_or(0.0), threshold));
+    if offset > 0 {
+        if offset >= results.len() {
+            results.clear();
+        } else {
+            results.drain(..offset);
+        }
+    }
+    results.truncate(limit);
+}
+
+fn apply_sparse_score_threshold_and_offset(
+    results: &mut Vec<(u128, f64)>,
+    threshold: Option<f32>,
+    offset: usize,
+    limit: usize,
+) {
+    results.retain(|(_, score)| score_passes_threshold(*score as f32, threshold));
+    if offset > 0 {
+        if offset >= results.len() {
+            results.clear();
+        } else {
+            results.drain(..offset);
+        }
+    }
+    results.truncate(limit);
+}
+
+fn apply_ranked_score_threshold_and_offset(
+    results: &mut Vec<RankedItem>,
+    threshold: Option<f32>,
+    offset: usize,
+    limit: usize,
+) {
+    results.retain(|item| score_passes_threshold(item.score as f32, threshold));
+    if offset > 0 {
+        if offset >= results.len() {
+            results.clear();
+        } else {
+            results.drain(..offset);
+        }
+    }
+    results.truncate(limit);
 }
 
 fn dense_exact_index_candidate_max() -> usize {
@@ -3156,7 +3448,12 @@ pub fn handle_search_points(
         Ok(r) => r,
         Err(e) => return json_err(response, 400, &format!("Invalid JSON: {}", e)),
     };
+    if let Err(message) = validate_score_threshold(req.score_threshold) {
+        return json_err(response, 400, message);
+    }
     req.limit = clamp_limit(req.limit);
+    req.offset = clamp_offset(req.offset);
+    let result_window = result_window(req.limit, req.offset);
 
     let storage = match input.collections.get_collection(&name) {
         Ok(s) => s,
@@ -3212,9 +3509,9 @@ pub fn handle_search_points(
                 values: vector.values.clone(),
             };
             let search_limit = if has_filter || indexed_candidates.is_some() {
-                req.limit.saturating_mul(4)
+                result_window.saturating_mul(4)
             } else {
-                req.limit
+                result_window
             };
             let exact_candidate_ids = bounded_filter_candidate_ids_be(
                 &storage,
@@ -3237,7 +3534,7 @@ pub fn handle_search_points(
                     } else {
                         core.search_be(&r, &query, search_limit, Some(&filter_fn))?
                     };
-                    results.truncate(req.limit);
+                    results.truncate(result_window);
                     Ok(results)
                 })
                 .map_err(GraphError::from)?;
@@ -3246,8 +3543,14 @@ pub fn handle_search_points(
                 &filter,
                 using,
                 &query,
-                req.limit,
+                result_window,
                 &mut sparse_results,
+            );
+            apply_sparse_score_threshold_and_offset(
+                &mut sparse_results,
+                req.score_threshold,
+                req.offset,
+                req.limit,
             );
             let mut results = Vec::new();
             for (id, score) in sparse_results {
@@ -3279,6 +3582,8 @@ pub fn handle_search_points(
             SearchVector::Raw(vector) => ("dense".into(), vector.clone()),
             SearchVector::NamedSparse { .. } => unreachable!(),
         };
+        let score_threshold =
+            dense_score_threshold_for_metric(&storage, &vec_name, req.score_threshold);
         let dense_filter_active = has_filter || indexed_candidates.is_some();
         let exact_index_filter_candidates = exact_index_filter_candidates(
             has_filter,
@@ -3286,9 +3591,9 @@ pub fn handle_search_points(
             indexed_candidates.as_ref(),
         );
         let search_limit = if dense_filter_active {
-            req.limit.saturating_mul(4)
+            result_window.saturating_mul(4)
         } else {
-            req.limit
+            result_window
         };
         let selectivity_hint = if has_filter {
             indexed_candidates.as_ref().and_then(|candidates| {
@@ -3348,7 +3653,7 @@ pub fn handle_search_points(
             )
         }
         .map_err(GraphError::from)?;
-        search_results.truncate(req.limit);
+        search_results.truncate(result_window);
         for result in &mut search_results {
             if let Some(distance) = result.distance {
                 result.distance = Some(
@@ -3364,8 +3669,14 @@ pub fn handle_search_points(
             &filter,
             &vec_name,
             &query_vec,
-            req.limit,
+            result_window,
             &mut search_results,
+        );
+        apply_hvector_score_threshold_and_offset(
+            &mut search_results,
+            score_threshold,
+            req.offset,
+            req.limit,
         );
 
         let mut results: Vec<serde_json::Value> = Vec::new();
@@ -3438,7 +3749,9 @@ pub fn handle_search_points(
         let sparse_results = storage
             .named_vectors
             .with_sparse_core(&sp_name, |core| {
-                core.search(&txn, &sp_query, req.limit, Some(&filter_fn))
+                let mut results = core.search(&txn, &sp_query, result_window, Some(&filter_fn))?;
+                results.truncate(result_window);
+                Ok(results)
             })
             .map_err(GraphError::from)?;
         // Convert (u128, f64) → HVector
@@ -3461,9 +3774,9 @@ pub fn handle_search_points(
             }
         };
         let search_limit = if has_filter {
-            req.limit.saturating_mul(4)
+            result_window.saturating_mul(4)
         } else {
-            req.limit
+            result_window
         };
         let total_vectors = indexed_candidates
             .as_ref()
@@ -3537,7 +3850,7 @@ pub fn handle_search_points(
                 )
         }
         .map_err(GraphError::from)?;
-        results.truncate(req.limit);
+        results.truncate(result_window);
         for result in &mut results {
             if let Some(distance) = result.distance {
                 result.distance = Some(
@@ -3551,6 +3864,11 @@ pub fn handle_search_points(
         results
     };
 
+    let score_threshold = pending_dense_query
+        .as_ref()
+        .map_or(req.score_threshold, |(vec_name, _)| {
+            dense_score_threshold_for_metric(&storage, vec_name, req.score_threshold)
+        });
     let mut search_results = search_results;
     if let Some((vec_name, query_vec)) = pending_dense_query {
         fuse_pending_dense_results(
@@ -3558,10 +3876,16 @@ pub fn handle_search_points(
             &filter,
             &vec_name,
             &query_vec,
-            req.limit,
+            result_window,
             &mut search_results,
         );
     }
+    apply_hvector_score_threshold_and_offset(
+        &mut search_results,
+        score_threshold,
+        req.offset,
+        req.limit,
+    );
 
     let mut results: Vec<serde_json::Value> = Vec::new();
 
@@ -3917,6 +4241,7 @@ fn collect_filter_field_keys(filter: &Filter, keys: &mut BTreeSet<String>) {
         .iter()
         .chain(filter.should.iter())
         .chain(filter.must_not.iter())
+        .chain(filter.min_should.iter().flat_map(|ms| ms.conditions.iter()))
     {
         collect_condition_field_keys(condition, keys);
     }
@@ -3926,6 +4251,12 @@ fn collect_condition_field_keys(condition: &Condition, keys: &mut BTreeSet<Strin
     match condition {
         Condition::Field(field) => {
             keys.insert(field.key.clone());
+        }
+        Condition::IsEmpty(cond) => {
+            keys.insert(cond.is_empty.key.clone());
+        }
+        Condition::IsNull(cond) => {
+            keys.insert(cond.is_null.key.clone());
         }
         Condition::Nested(filter) => collect_filter_field_keys(filter, keys),
         Condition::HasId(_) => {}
@@ -6306,6 +6637,10 @@ struct QueryRequest {
     using: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    score_threshold: Option<f32>,
     #[serde(default = "default_true")]
     with_payload: bool,
     #[serde(default)]
@@ -6497,14 +6832,20 @@ fn resolve_hybrid_graph_config(config: &HybridGraphConfig) -> Result<HybridGraph
 /// direction. A walk that never crossed an edge is pure seed echo (PPR returns
 /// the seed mass unchanged), so the list is emptied and the final fusion is
 /// identical to the two-channel result.
-fn run_hybrid_graph_channel<F>(
+///
+/// `admit` gates which PPR-ranked ids may enter the fusion: adjacency is not
+/// filter-aware, so without it a neighbor from another repo (or a deleted
+/// point still referenced by a stale edge) would bypass the request filter.
+fn run_hybrid_graph_channel<F, A>(
     ranked_lists: &[Vec<RankedItem>],
     rrf_k: Option<f64>,
     resolved: &HybridGraphResolved,
     mut neighbors: F,
+    admit: A,
 ) -> (Vec<RankedItem>, serde_json::Value)
 where
     F: FnMut(u128) -> Vec<u128>,
+    A: FnMut(u128) -> bool,
 {
     let preliminary = match rrf_k {
         Some(k) => rrf_fusion_with_k(ranked_lists, k, resolved.seed_count),
@@ -6521,7 +6862,7 @@ where
         ..PprParams::default()
     };
     let mut saw_edges = false;
-    let mut graph_list = personalized_pagerank(
+    let mut graph_list = personalized_pagerank_filtered(
         &seeds,
         |node| {
             let peers = neighbors(node);
@@ -6530,6 +6871,7 @@ where
             }
             peers
         },
+        admit,
         &params,
     );
     if !saw_edges {
@@ -6639,7 +6981,12 @@ pub fn handle_query_points(
         "parse_body",
         parse_start,
     );
+    if let Err(message) = validate_score_threshold(req.score_threshold) {
+        return json_err(response, 400, message);
+    }
     req.limit = clamp_limit(req.limit);
+    req.offset = clamp_offset(req.offset);
+    let result_window = result_window(req.limit, req.offset);
     for p in req.prefetch.iter_mut() {
         p.limit = clamp_limit(p.limit);
     }
@@ -6698,7 +7045,16 @@ pub fn handle_query_points(
         );
         let filter = req.filter.unwrap_or_default();
         let filter_start = Instant::now();
-        let indexed_candidates = indexed_filter_candidates_be(&storage, &r, &filter)?;
+        let ProbedCandidates {
+            candidates: indexed_candidates,
+            probe_estimate,
+            probe_skipped,
+        } = vector_query_indexed_filter_candidates_be_probed(
+            &storage,
+            &r,
+            &filter,
+            filter_count_probe_enabled(),
+        )?;
         record_qdrant_query_stage(
             &name,
             ENDPOINT,
@@ -6780,6 +7136,16 @@ pub fn handle_query_points(
                 candidates.len(),
             );
         }
+        if let Some(estimate) = probe_estimate {
+            record_qdrant_query_count(
+                &name,
+                ENDPOINT,
+                backend,
+                query_kind_label,
+                "filter_candidate_estimate",
+                estimate,
+            );
+        }
         record_qdrant_query_count(
             &name,
             ENDPOINT,
@@ -6823,10 +7189,12 @@ pub fn handle_query_points(
                 return json_err(response, 400, "Query vector must not be empty");
             }
             let using = req.using.as_deref().unwrap_or("dense");
+            let score_threshold =
+                dense_score_threshold_for_metric(&storage, using, req.score_threshold);
             let search_limit = if has_filter || indexed_candidates.is_some() {
-                req.limit.saturating_mul(4)
+                result_window.saturating_mul(4)
             } else {
-                req.limit
+                result_window
             };
             let ef_override = req.params.as_ref().and_then(|p| p.hnsw_ef);
             let filter_fn = |id: u128| -> bool {
@@ -6876,6 +7244,16 @@ pub fn handle_query_points(
                     candidate_ids.len(),
                 );
             }
+            observe_dense_search_plan(
+                &name,
+                select_dense_search_plan(
+                    exact_candidate_ids.is_some(),
+                    exact_index_filter_candidates.is_some(),
+                    probe_skipped,
+                    dense_filter_active,
+                ),
+                probe_estimate,
+            );
             let search_start = Instant::now();
             let mut results = if let Some(candidate_ids) = exact_candidate_ids {
                 storage.named_vectors.dense_search_candidate_ids_exact_be(
@@ -6928,7 +7306,7 @@ pub fn handle_query_points(
                 "search_results_raw",
                 results.len(),
             );
-            results.truncate(req.limit);
+            results.truncate(result_window);
             let score_start = Instant::now();
             for result in &mut results {
                 if let Some(distance) = result.distance {
@@ -6949,7 +7327,20 @@ pub fn handle_query_points(
                 score_start,
             );
             let fuse_start = Instant::now();
-            fuse_pending_dense_results(&name, &filter, using, dense_vec, req.limit, &mut results);
+            fuse_pending_dense_results(
+                &name,
+                &filter,
+                using,
+                dense_vec,
+                result_window,
+                &mut results,
+            );
+            apply_hvector_score_threshold_and_offset(
+                &mut results,
+                score_threshold,
+                req.offset,
+                req.limit,
+            );
             record_qdrant_query_stage(
                 &name,
                 ENDPOINT,
@@ -7011,9 +7402,9 @@ pub fn handle_query_points(
                 }
             };
             let search_limit = if has_filter || indexed_candidates.is_some() {
-                req.limit.saturating_mul(4)
+                result_window.saturating_mul(4)
             } else {
-                req.limit
+                result_window
             };
             let candidate_start = Instant::now();
             let exact_candidate_ids = bounded_filter_candidate_ids_be(
@@ -7056,7 +7447,7 @@ pub fn handle_query_points(
                     } else {
                         core.search_be(&r, sparse_vec, search_limit, Some(&filter_fn))?
                     };
-                    results.truncate(req.limit);
+                    results.truncate(result_window);
                     Ok(results)
                 })
                 .map_err(GraphError::from)?;
@@ -7077,7 +7468,20 @@ pub fn handle_query_points(
                 scored.len(),
             );
             let fuse_start = Instant::now();
-            fuse_pending_sparse_results(&name, &filter, using, sparse_vec, req.limit, &mut scored);
+            fuse_pending_sparse_results(
+                &name,
+                &filter,
+                using,
+                sparse_vec,
+                result_window,
+                &mut scored,
+            );
+            apply_sparse_score_threshold_and_offset(
+                &mut scored,
+                req.score_threshold,
+                req.offset,
+                req.limit,
+            );
             record_qdrant_query_stage(
                 &name,
                 ENDPOINT,
@@ -7124,10 +7528,11 @@ pub fn handle_query_points(
 
         let mut ranked_lists: Vec<Vec<RankedItem>> = Vec::new();
         for pf in &req.prefetch {
+            let channel_window = channel_result_window(pf.limit, result_window, req.offset);
             let search_limit = if has_filter || indexed_candidates.is_some() {
-                pf.limit.saturating_mul(4)
+                channel_window.saturating_mul(4)
             } else {
-                pf.limit
+                channel_window
             };
             let pf_ef = pf.params.as_ref().and_then(|p| p.hnsw_ef);
             let filter_fn = |id: u128| -> bool {
@@ -7229,7 +7634,7 @@ pub fn handle_query_points(
                 "search_results_raw",
                 results.len(),
             );
-            results.truncate(pf.limit);
+            results.truncate(channel_window);
             let score_start = Instant::now();
             for result in &mut results {
                 if let Some(distance) = result.distance {
@@ -7255,7 +7660,7 @@ pub fn handle_query_points(
                 &filter,
                 &pf.using,
                 &pf.query,
-                pf.limit,
+                channel_window,
                 &mut results,
             );
             record_qdrant_query_stage(
@@ -7277,19 +7682,25 @@ pub fn handle_query_points(
             );
         }
 
-        let fused = if ranked_lists.len() > 1 {
-            rrf_fusion(&ranked_lists, req.limit)
+        let mut fused = if ranked_lists.len() > 1 {
+            rrf_fusion(&ranked_lists, result_window)
         } else if ranked_lists.len() == 1 {
             ranked_lists
                 .into_iter()
                 .next()
                 .unwrap_or_default()
                 .into_iter()
-                .take(req.limit)
+                .take(result_window)
                 .collect()
         } else {
             Vec::new()
         };
+        apply_ranked_score_threshold_and_offset(
+            &mut fused,
+            req.score_threshold,
+            req.offset,
+            req.limit,
+        );
 
         record_qdrant_query_count(
             &name,
@@ -7300,10 +7711,12 @@ pub fn handle_query_points(
             fused.len(),
         );
         let response_start = Instant::now();
-        let payload_cache = req
-            .with_payload
-            .then(|| lsm_payload_cache_be(&name, &storage, &r, fused.iter().map(|item| item.id)))
-            .flatten();
+        let payload_cache = if req.with_payload {
+            lsm_payload_cache_be(&name, &storage, &r, fused.iter().map(|item| item.id))
+                .map_err(graph_error_from_backend_error)?
+        } else {
+            None
+        };
         let results: Vec<serde_json::Value> = fused
             .iter()
             .map(|item| {
@@ -7394,10 +7807,12 @@ pub fn handle_query_points(
             return json_err(response, 400, "Query vector must not be empty");
         }
         let using = req.using.as_deref().unwrap_or("dense");
+        let score_threshold =
+            dense_score_threshold_for_metric(&storage, using, req.score_threshold);
         let search_limit = if has_filter {
-            req.limit.saturating_mul(4)
+            result_window.saturating_mul(4)
         } else {
-            req.limit
+            result_window
         };
 
         let ef_override = req.params.as_ref().and_then(|p| p.hnsw_ef);
@@ -7469,7 +7884,7 @@ pub fn handle_query_points(
                 )
         }
         .map_err(GraphError::from)?;
-        results.truncate(req.limit);
+        results.truncate(result_window);
         for result in &mut results {
             if let Some(distance) = result.distance {
                 result.distance = Some(
@@ -7480,7 +7895,20 @@ pub fn handle_query_points(
                 );
             }
         }
-        fuse_pending_dense_results(&name, &filter, using, dense_vec, req.limit, &mut results);
+        fuse_pending_dense_results(
+            &name,
+            &filter,
+            using,
+            dense_vec,
+            result_window,
+            &mut results,
+        );
+        apply_hvector_score_threshold_and_offset(
+            &mut results,
+            score_threshold,
+            req.offset,
+            req.limit,
+        );
 
         return build_query_response(response, &name, &storage, &txn, &results, req.with_payload);
     }
@@ -7511,20 +7939,33 @@ pub fn handle_query_points(
         };
 
         let search_limit = if has_filter {
-            req.limit.saturating_mul(4)
+            result_window.saturating_mul(4)
         } else {
-            req.limit
+            result_window
         };
 
         let mut scored = storage
             .named_vectors
             .with_sparse_core(using, |core| {
                 let mut results = core.search(&txn, sparse_vec, search_limit, Some(&filter_fn))?;
-                results.truncate(req.limit);
+                results.truncate(result_window);
                 Ok(results)
             })
             .map_err(GraphError::from)?;
-        fuse_pending_sparse_results(&name, &filter, using, sparse_vec, req.limit, &mut scored);
+        fuse_pending_sparse_results(
+            &name,
+            &filter,
+            using,
+            sparse_vec,
+            result_window,
+            &mut scored,
+        );
+        apply_sparse_score_threshold_and_offset(
+            &mut scored,
+            req.score_threshold,
+            req.offset,
+            req.limit,
+        );
 
         return build_sparse_query_response(
             response,
@@ -7540,10 +7981,11 @@ pub fn handle_query_points(
     let mut ranked_lists: Vec<Vec<RankedItem>> = Vec::new();
 
     for pf in &req.prefetch {
+        let channel_window = channel_result_window(pf.limit, result_window, req.offset);
         let search_limit = if has_filter {
-            pf.limit.saturating_mul(4)
+            channel_window.saturating_mul(4)
         } else {
-            pf.limit
+            channel_window
         };
 
         let pf_ef = pf.params.as_ref().and_then(|p| p.hnsw_ef);
@@ -7615,7 +8057,7 @@ pub fn handle_query_points(
                 )
         }
         .map_err(GraphError::from)?;
-        results.truncate(pf.limit);
+        results.truncate(channel_window);
         for result in &mut results {
             if let Some(distance) = result.distance {
                 result.distance = Some(
@@ -7626,7 +8068,14 @@ pub fn handle_query_points(
                 );
             }
         }
-        fuse_pending_dense_results(&name, &filter, &pf.using, &pf.query, pf.limit, &mut results);
+        fuse_pending_dense_results(
+            &name,
+            &filter,
+            &pf.using,
+            &pf.query,
+            channel_window,
+            &mut results,
+        );
 
         let ranked: Vec<RankedItem> = results
             .into_iter()
@@ -7639,19 +8088,20 @@ pub fn handle_query_points(
     }
 
     // Apply fusion
-    let fused = if ranked_lists.len() > 1 {
-        rrf_fusion(&ranked_lists, req.limit)
+    let mut fused = if ranked_lists.len() > 1 {
+        rrf_fusion(&ranked_lists, result_window)
     } else if ranked_lists.len() == 1 {
         ranked_lists
             .into_iter()
             .next()
             .unwrap_or_default()
             .into_iter()
-            .take(req.limit)
+            .take(result_window)
             .collect()
     } else {
         Vec::new()
     };
+    apply_ranked_score_threshold_and_offset(&mut fused, req.score_threshold, req.offset, req.limit);
 
     // Build response
     let mut results: Vec<serde_json::Value> = Vec::new();
@@ -7796,7 +8246,16 @@ pub fn handle_hybrid_query_points(
         );
         let filter = req.filter.unwrap_or_default();
         let filter_start = Instant::now();
-        let indexed_candidates = indexed_filter_candidates_be(&storage, &r, &filter)?;
+        let ProbedCandidates {
+            candidates: indexed_candidates,
+            probe_estimate,
+            probe_skipped: _,
+        } = vector_query_indexed_filter_candidates_be_probed(
+            &storage,
+            &r,
+            &filter,
+            filter_count_probe_enabled(),
+        )?;
         record_qdrant_query_stage(
             &name,
             ENDPOINT,
@@ -7813,6 +8272,16 @@ pub fn handle_hybrid_query_points(
                 query_kind_label,
                 "filter_candidates",
                 candidates.len(),
+            );
+        }
+        if let Some(estimate) = probe_estimate {
+            record_qdrant_query_count(
+                &name,
+                ENDPOINT,
+                backend,
+                query_kind_label,
+                "filter_candidate_estimate",
+                estimate,
             );
         }
         let has_filter = !filter.is_empty();
@@ -7844,6 +8313,7 @@ pub fn handle_hybrid_query_points(
         let mut dense_channels: Vec<serde_json::Value> = Vec::new();
         let mut sparse_channels: Vec<serde_json::Value> = Vec::new();
         let mut dense_vectors: HashMap<u128, Vec<f32>> = HashMap::new();
+        let mut request_payload_cache = RequestPayloadCache::default();
 
         for dense in &req.dense {
             if dense.query.is_empty() {
@@ -7861,7 +8331,13 @@ pub fn handle_hybrid_query_points(
             let eff_has_filter = !eff_filter.is_empty();
             let channel_filter_start = Instant::now();
             let eff_indexed_candidates = if dense.filter.is_some() {
-                indexed_filter_candidates_be(&storage, &r, eff_filter)?
+                vector_query_indexed_filter_candidates_be_probed(
+                    &storage,
+                    &r,
+                    eff_filter,
+                    filter_count_probe_enabled(),
+                )?
+                .candidates
             } else {
                 indexed_candidates.clone()
             };
@@ -8057,12 +8533,13 @@ pub fn handle_hybrid_query_points(
             }
             if req.with_channel_points {
                 let response_start = Instant::now();
-                let payload_cache = req
-                    .with_payload
-                    .then(|| {
-                        lsm_payload_cache_be(&name, &storage, &r, results.iter().map(|v| v.id))
-                    })
-                    .flatten();
+                let payload_cache = if req.with_payload {
+                    request_payload_cache
+                        .get_or_load(&name, &storage, &r, results.iter().map(|v| v.id))
+                        .map_err(graph_error_from_backend_error)?
+                } else {
+                    None
+                };
                 let points: Vec<serde_json::Value> = results
                     .iter()
                     .map(|v| {
@@ -8073,7 +8550,7 @@ pub fn handle_hybrid_query_points(
                             v.id,
                             v.distance.unwrap_or(0.0) as f64,
                             req.with_payload,
-                            payload_cache.as_ref(),
+                            payload_cache,
                         )
                     })
                     .collect();
@@ -8132,7 +8609,13 @@ pub fn handle_hybrid_query_points(
             let eff_has_filter = !eff_filter.is_empty();
             let channel_filter_start = Instant::now();
             let eff_indexed_candidates = if sparse.filter.is_some() {
-                indexed_filter_candidates_be(&storage, &r, eff_filter)?
+                vector_query_indexed_filter_candidates_be_probed(
+                    &storage,
+                    &r,
+                    eff_filter,
+                    filter_count_probe_enabled(),
+                )?
+                .candidates
             } else {
                 indexed_candidates.clone()
             };
@@ -8271,12 +8754,13 @@ pub fn handle_hybrid_query_points(
             );
             if req.with_channel_points {
                 let response_start = Instant::now();
-                let payload_cache = req
-                    .with_payload
-                    .then(|| {
-                        lsm_payload_cache_be(&name, &storage, &r, results.iter().map(|(id, _)| *id))
-                    })
-                    .flatten();
+                let payload_cache = if req.with_payload {
+                    request_payload_cache
+                        .get_or_load(&name, &storage, &r, results.iter().map(|(id, _)| *id))
+                        .map_err(graph_error_from_backend_error)?
+                } else {
+                    None
+                };
                 let points: Vec<serde_json::Value> = results
                     .iter()
                     .map(|(id, score)| {
@@ -8287,7 +8771,7 @@ pub fn handle_hybrid_query_points(
                             *id,
                             *score,
                             req.with_payload,
-                            payload_cache.as_ref(),
+                            payload_cache,
                         )
                     })
                     .collect();
@@ -8348,8 +8832,21 @@ pub fn handle_hybrid_query_points(
                 }
                 merge_directions(resolved.direction, out_peers, in_peers)
             };
+            // Same top-level filter the fused result must satisfy; nodes that
+            // no longer exist (deleted points behind stale edges) are dropped.
+            let admit = |id: u128| -> bool {
+                if let Some(pending) = pending_point(&name, id) {
+                    return pending_matches_filter(id, &pending, &filter);
+                }
+                match storage.get_node_be(&r, &id) {
+                    Ok(node) => {
+                        filter.is_empty() || filter.matches_point(Some(id), &node.properties)
+                    }
+                    Err(_) => false,
+                }
+            };
             let (graph_list, summary) =
-                run_hybrid_graph_channel(&ranked_lists, req.rrf_k, resolved, neighbors);
+                run_hybrid_graph_channel(&ranked_lists, req.rrf_k, resolved, neighbors, admit);
             record_qdrant_query_stage(
                 &name,
                 ENDPOINT,
@@ -8368,12 +8865,13 @@ pub fn handle_hybrid_query_points(
             );
             graph_summary = Some(summary);
             if req.with_channel_points {
-                let payload_cache = req
-                    .with_payload
-                    .then(|| {
-                        lsm_payload_cache_be(&name, &storage, &r, graph_list.iter().map(|v| v.id))
-                    })
-                    .flatten();
+                let payload_cache = if req.with_payload {
+                    request_payload_cache
+                        .get_or_load(&name, &storage, &r, graph_list.iter().map(|v| v.id))
+                        .map_err(graph_error_from_backend_error)?
+                } else {
+                    None
+                };
                 let points: Vec<serde_json::Value> = graph_list
                     .iter()
                     .map(|item| {
@@ -8384,7 +8882,7 @@ pub fn handle_hybrid_query_points(
                             item.id,
                             item.score,
                             req.with_payload,
-                            payload_cache.as_ref(),
+                            payload_cache,
                         )
                     })
                     .collect();
@@ -8464,10 +8962,13 @@ pub fn handle_hybrid_query_points(
             fused.len(),
         );
         let response_start = Instant::now();
-        let payload_cache = req
-            .with_payload
-            .then(|| lsm_payload_cache_be(&name, &storage, &r, fused.iter().map(|item| item.id)))
-            .flatten();
+        let payload_cache = if req.with_payload {
+            request_payload_cache
+                .get_or_load(&name, &storage, &r, fused.iter().map(|item| item.id))
+                .map_err(graph_error_from_backend_error)?
+        } else {
+            None
+        };
         let points: Vec<serde_json::Value> = fused
             .iter()
             .map(|item| {
@@ -8478,7 +8979,7 @@ pub fn handle_hybrid_query_points(
                     item.id,
                     item.score,
                     req.with_payload,
-                    payload_cache.as_ref(),
+                    payload_cache,
                 )
             })
             .collect();
@@ -8848,8 +9349,19 @@ pub fn handle_hybrid_query_points(
             }
             merge_directions(resolved.direction, out_peers, in_peers)
         };
+        // Same top-level filter the fused result must satisfy; nodes that no
+        // longer exist (deleted points behind stale edges) are dropped.
+        let admit = |id: u128| -> bool {
+            if let Some(pending) = pending_point(&name, id) {
+                return pending_matches_filter(id, &pending, &filter);
+            }
+            match storage.get_node(&txn, &id) {
+                Ok(node) => filter.is_empty() || filter.matches_point(Some(id), &node.properties),
+                Err(_) => false,
+            }
+        };
         let (graph_list, summary) =
-            run_hybrid_graph_channel(&ranked_lists, req.rrf_k, resolved, neighbors);
+            run_hybrid_graph_channel(&ranked_lists, req.rrf_k, resolved, neighbors, admit);
         graph_summary = Some(summary);
         if req.with_channel_points {
             let points: Vec<serde_json::Value> = graph_list
@@ -9007,12 +9519,43 @@ fn query_point_json_be(
     point
 }
 
+#[derive(Default)]
+struct RequestPayloadCache {
+    payloads: HashMap<u128, serde_json::Value>,
+}
+
+impl RequestPayloadCache {
+    fn get_or_load<I>(
+        &mut self,
+        collection: &str,
+        storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+        r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+        ids: I,
+    ) -> Result<Option<&HashMap<u128, serde_json::Value>>, BackendError>
+    where
+        I: IntoIterator<Item = u128>,
+    {
+        let missing_ids: Vec<u128> = ids
+            .into_iter()
+            .filter(|id| !self.payloads.contains_key(id))
+            .collect();
+        if missing_ids.is_empty() {
+            return Ok(Some(&self.payloads));
+        }
+        let Some(payloads) = lsm_payload_cache_be(collection, storage, r, missing_ids)? else {
+            return Ok(None);
+        };
+        self.payloads.extend(payloads);
+        Ok(Some(&self.payloads))
+    }
+}
+
 fn lsm_payload_cache_be<I>(
     collection: &str,
     storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
     r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
     ids: I,
-) -> Option<HashMap<u128, serde_json::Value>>
+) -> Result<Option<HashMap<u128, serde_json::Value>>, BackendError>
 where
     I: IntoIterator<Item = u128>,
 {
@@ -9042,13 +9585,18 @@ where
         record_qdrant_payload_cache_count(collection, "none", "pending", pending);
         record_qdrant_payload_cache_count(collection, "none", "batched", 0);
         record_qdrant_payload_cache_stage(collection, "none", "empty", started);
-        return Some(HashMap::new());
+        return Ok(Some(HashMap::new()));
     }
 
     let (backend, raw_values) = match (&*storage.backend, r) {
         (AnyBackend::Lsm(writer), AnyRead::Lsm(read)) => {
             match writer.collect_values_many_with(read, Namespace::Nodes, &keys) {
                 Ok(values) => ("lsm", values),
+                Err(error) if error.is_lsm_read_cancelled() => {
+                    tracing::debug!(collection, "cancelled batched LSM payload cache build");
+                    record_qdrant_payload_cache_stage(collection, "lsm", "cancelled", started);
+                    return Err(error);
+                }
                 Err(error) => {
                     tracing::warn!(
                         collection,
@@ -9056,13 +9604,26 @@ where
                         "failed to build batched LSM payload cache"
                     );
                     record_qdrant_payload_cache_stage(collection, "lsm", "error", started);
-                    return None;
+                    return Ok(None);
                 }
             }
         }
         (AnyBackend::LsmReader(reader), AnyRead::LsmReader(snap)) => {
             match reader.collect_values_many_with_at(snap.as_ref(), Namespace::Nodes, &keys) {
                 Ok(values) => ("lsm_reader", values),
+                Err(error) if error.is_lsm_read_cancelled() => {
+                    tracing::debug!(
+                        collection,
+                        "cancelled batched LSM-reader payload cache build"
+                    );
+                    record_qdrant_payload_cache_stage(
+                        collection,
+                        "lsm_reader",
+                        "cancelled",
+                        started,
+                    );
+                    return Err(error);
+                }
                 Err(error) => {
                     tracing::warn!(
                         collection,
@@ -9070,13 +9631,13 @@ where
                         "failed to build batched LSM-reader payload cache"
                     );
                     record_qdrant_payload_cache_stage(collection, "lsm_reader", "error", started);
-                    return None;
+                    return Ok(None);
                 }
             }
         }
         _ => {
             record_qdrant_payload_cache_stage(collection, "other", "unsupported", started);
-            return None;
+            return Ok(None);
         }
     };
     record_qdrant_payload_cache_count(collection, backend, "requested", requested);
@@ -9095,7 +9656,7 @@ where
     }
     record_qdrant_payload_cache_count(collection, backend, "fetched", payloads.len());
     record_qdrant_payload_cache_stage(collection, backend, "ok", started);
-    Some(payloads)
+    Ok(Some(payloads))
 }
 
 /// Build JSON response for dense vector query results.
@@ -9134,9 +9695,12 @@ fn build_query_response_be(
     results: &[crate::helix_engine::vector_core::vector::HVector],
     with_payload: bool,
 ) -> Result<(), GraphError> {
-    let payload_cache = with_payload
-        .then(|| lsm_payload_cache_be(collection, storage, r, results.iter().map(|v| v.id)))
-        .flatten();
+    let payload_cache = if with_payload {
+        lsm_payload_cache_be(collection, storage, r, results.iter().map(|v| v.id))
+            .map_err(graph_error_from_backend_error)?
+    } else {
+        None
+    };
     let mut out: Vec<serde_json::Value> = Vec::new();
     for v in results {
         out.push(query_point_json_be(
@@ -9188,9 +9752,12 @@ fn build_sparse_query_response_be(
     results: &[(u128, f64)],
     with_payload: bool,
 ) -> Result<(), GraphError> {
-    let payload_cache = with_payload
-        .then(|| lsm_payload_cache_be(collection, storage, r, results.iter().map(|(id, _)| *id)))
-        .flatten();
+    let payload_cache = if with_payload {
+        lsm_payload_cache_be(collection, storage, r, results.iter().map(|(id, _)| *id))
+            .map_err(graph_error_from_backend_error)?
+    } else {
+        None
+    };
     let mut out: Vec<serde_json::Value> = Vec::new();
     for &(id, score) in results {
         out.push(query_point_json_be(
@@ -9787,6 +10354,9 @@ mod tests {
     use super::*;
     use crate::helix_engine::graph_core::config::Config;
     use crate::helix_engine::graph_core::graph_core::{HelixGraphEngine, HelixGraphEngineOpts};
+    use crate::helix_engine::storage_core::backend_lsm::{
+        allow_lsm_blocking_cancellable, LsmReadCancellation,
+    };
     use crate::helix_engine::storage_core::filters::{HasIdCondition, MatchValue};
     use crate::helix_engine::storage_core::metadata::STORAGE_METADATA_SIDECAR_FILE;
     use crate::helix_engine::storage_core::storage_methods::StorageMethods;
@@ -9803,10 +10373,10 @@ mod tests {
     use serial_test::serial;
     use tempfile::TempDir;
 
-    struct TestContext {
+    pub(super) struct TestContext {
         _tmp: TempDir,
         graph: std::sync::Arc<HelixGraphEngine>,
-        collections: std::sync::Arc<CollectionManager>,
+        pub(super) collections: std::sync::Arc<CollectionManager>,
         replication: std::sync::Arc<ReplicationManager>,
     }
 
@@ -9814,7 +10384,7 @@ mod tests {
         setup_with_config(Config::default())
     }
 
-    fn setup_with_config(config: Config) -> TestContext {
+    pub(super) fn setup_with_config(config: Config) -> TestContext {
         let tmp = TempDir::new().unwrap();
         let graph_path = tmp.path().join("graph");
         let collections_path = tmp.path().join("data");
@@ -9838,7 +10408,36 @@ mod tests {
         }
     }
 
-    fn make_input(
+    #[test]
+    fn cancelled_lsm_payload_cache_stops_response_hydration() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = ctx
+            .collections
+            .create_collection("cancelled_payload_cache")
+            .unwrap();
+        let read = storage.backend.begin_read().unwrap();
+        let cancellation = LsmReadCancellation::new();
+        cancellation.cancel();
+        let mut response = Response::new();
+
+        let result = allow_lsm_blocking_cancellable(cancellation, || {
+            build_query_response_be(
+                &mut response,
+                "cancelled_payload_cache",
+                &storage,
+                &read,
+                &[HVector::new(1, Vec::new())],
+                true,
+            )
+        });
+
+        assert!(
+            matches!(result, Err(ref error) if error.to_string().contains("LSM read request cancelled")),
+            "cancelled batched payload reads must terminate hydration instead of entering serial fallback"
+        );
+    }
+
+    pub(super) fn make_input(
         ctx: &TestContext,
         method: &str,
         path: &str,
@@ -9903,6 +10502,27 @@ mod tests {
         storage.refresh_metadata_snapshot().unwrap();
     }
 
+    fn create_euclid_collection(ctx: &TestContext, name: &str) {
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "vectors": {"dense": {"size": 3, "distance": "Euclid"}}
+        }))
+        .unwrap();
+        let input = make_input(
+            ctx,
+            "PUT",
+            &format!("/collections/{}", name),
+            body,
+            HashMap::from([("name".into(), name.into())]),
+        );
+        let mut response = Response::new();
+        handle_create_collection(&input, &mut response).unwrap();
+        assert!(
+            response.status == 200 || response.status == 201,
+            "create Euclid collection failed: {}",
+            String::from_utf8_lossy(&response.body)
+        );
+    }
+
     /// Create a single-dense-vector collection on the LSM backend through the
     /// REAL Qdrant create-collection handler (`handle_create_collection` →
     /// `ReplicatedMutation::CreateCollection` → `apply_create_collection`). This
@@ -9913,7 +10533,7 @@ mod tests {
     /// mirrors what the LMDB `create_dense_collection` helper does (the
     /// in-process replication apply path does not refresh the snapshot for
     /// CreateCollection).
-    fn create_dense_collection_lsm(ctx: &TestContext, name: &str) {
+    pub(super) fn create_dense_collection_lsm(ctx: &TestContext, name: &str) {
         let body = sonic_rs::to_vec(&sonic_rs::json!({
             "vectors": {
                 "dense": {"size": 3, "distance": "Cosine"}
@@ -10048,6 +10668,35 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("metadata sidecar is not available"));
+    }
+
+    #[test]
+    fn create_rejects_degenerate_hnsw_m_with_400() {
+        let ctx = setup();
+        let create = |name: &str, m: u64| {
+            let body = sonic_rs::to_vec(&sonic_rs::json!({
+                "vectors": { "dense": { "size": 3, "distance": "cosine" } },
+                "hnsw_config": { "m": m }
+            }))
+            .unwrap();
+            let input = make_input(
+                &ctx,
+                "PUT",
+                &format!("/collections/{name}"),
+                body,
+                HashMap::from([("name".into(), name.into())]),
+            );
+            let mut response = Response::new();
+            handle_create_collection(&input, &mut response).unwrap();
+            response.status
+        };
+
+        assert_eq!(create("bad-m", 1), 400);
+        assert!(ctx.collections.get_collection("bad-m").is_err());
+        assert_eq!(create("huge-m", 129), 400);
+        assert!(ctx.collections.get_collection("huge-m").is_err());
+        let ok = create("good-m", 16);
+        assert!(ok == 200 || ok == 201);
     }
 
     #[test]
@@ -11008,34 +11657,13 @@ mod tests {
     /// must bypass that cache and fall through to the same scan path a
     /// non-empty filter already uses.
     #[test]
-    #[serial]
     fn count_points_exact_true_bypasses_stale_cached_counter() {
         use crate::helix_engine::storage_core::backend::{BackendKind, Namespace, StorageBackend};
         use crate::helix_engine::storage_core::metadata::{
             encode_lsm_counter_value, lsm_counter_key, MetadataCounter,
         };
 
-        struct EnvGuard(&'static str, Option<String>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.1 {
-                        Some(v) => std::env::set_var(self.0, v),
-                        None => std::env::remove_var(self.0),
-                    }
-                }
-            }
-        }
-        fn set_env(key: &'static str, value: &str) -> EnvGuard {
-            let prev = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            EnvGuard(key, prev)
-        }
-
-        let _backend = set_env("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = set_env("HELIX_LSM_IN_MEMORY", "1");
-
-        let ctx = setup();
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
         ctx.collections.create_collection("repo_exact").unwrap();
         let storage = ctx.collections.get_collection("repo_exact").unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
@@ -11117,6 +11745,7 @@ mod tests {
             })],
             must_not: Vec::new(),
             should: Vec::new(),
+            min_should: None,
         };
         let pending_points = vec![
             (
@@ -11212,6 +11841,7 @@ mod tests {
                 range: None,
             })],
             should: Vec::new(),
+            min_should: None,
         };
         let candidates = indexed_filter_candidates(&storage, &txn, &filter)
             .unwrap()
@@ -11276,6 +11906,7 @@ mod tests {
                 range: None,
             })],
             should: Vec::new(),
+            min_should: None,
         };
         let candidates = indexed_filter_candidates(&storage, &txn, &filter)
             .unwrap()
@@ -11286,6 +11917,762 @@ mod tests {
         let mut got: Vec<u128> = candidates.into_iter().collect();
         got.sort();
         assert_eq!(got, vec![1u128, 2u128]);
+    }
+
+    #[test]
+    fn must_not_nested_superset_is_not_subtracted_as_exact() {
+        // `indexed_condition_candidates(Nested)` skips unindexed inner must
+        // clauses, so the nested set {2, 3} is a superset of the real
+        // exclusion {3}. Subtracting it used to drop point 2.
+        let ctx = setup();
+        ctx.collections.create_collection("repo").unwrap();
+        upsert_points(
+            &ctx,
+            "repo",
+            serde_json::json!([
+                {"id": 1, "payload": {"repo": "ce", "branch": "main", "draft": true}},
+                {"id": 2, "payload": {"repo": "ce", "branch": "feature/x", "draft": false}},
+                {"id": 3, "payload": {"repo": "ce", "branch": "feature/x", "draft": true}},
+            ]),
+        );
+        for field in ["repo", "branch"] {
+            let body = sonic_rs::to_vec(&sonic_rs::json!({
+                "field_name": field,
+                "field_schema": "keyword",
+            }))
+            .unwrap();
+            let input = make_input(
+                &ctx,
+                "PUT",
+                "/collections/repo/index",
+                body,
+                HashMap::from([("name".into(), "repo".into())]),
+            );
+            let mut resp = Response::new();
+            handle_create_index(&input, &mut resp).unwrap();
+            assert_eq!(resp.status, 200);
+            wait_for_payload_index_ready(&ctx, "repo", field);
+        }
+
+        let filter: Filter = serde_json::from_value(serde_json::json!({
+            "must": [{"key": "repo", "match": {"value": "ce"}}],
+            "must_not": [{"must": [
+                {"key": "branch", "match": {"value": "feature/x"}},
+                {"key": "draft", "match": {"value": true}}
+            ]}]
+        }))
+        .unwrap();
+        let storage = ctx.collections.get_collection("repo").unwrap();
+        let txn = storage.lmdb_env().unwrap().read_txn().unwrap();
+        let candidates = indexed_filter_candidates(&storage, &txn, &filter)
+            .unwrap()
+            .expect("indexed must=repo should still derive a candidate set");
+        let mut got: Vec<u128> = candidates.into_iter().collect();
+        got.sort();
+        assert_eq!(got, vec![1u128, 2u128, 3u128]);
+        drop(txn);
+
+        let body = sonic_rs::to_vec(&sonic_rs::json!({"filter": filter, "limit": 10})).unwrap();
+        let input = make_input(
+            &ctx,
+            "POST",
+            "/collections/repo/points/scroll",
+            body,
+            HashMap::from([("name".into(), "repo".into())]),
+        );
+        let mut resp = Response::new();
+        handle_scroll_points(&input, &mut resp).unwrap();
+        assert_eq!(resp.status, 200);
+        let json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let mut ids: Vec<String> = json["result"]["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![format_point_id(1), format_point_id(2)]);
+    }
+
+    #[test]
+    fn must_not_text_match_excludes_every_substring_hit() {
+        // The keyword index answers a text match with only the exact hit
+        // ("api") when one exists, so subtracting it as exact used to keep
+        // "api-gateway" even though it contains the excluded text.
+        let ctx = setup();
+        ctx.collections.create_collection("repo").unwrap();
+        upsert_points(
+            &ctx,
+            "repo",
+            serde_json::json!([
+                {"id": 1, "payload": {"repo": "api"}},
+                {"id": 2, "payload": {"repo": "api-gateway"}},
+                {"id": 3, "payload": {"repo": "web"}},
+            ]),
+        );
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "field_name": "repo",
+            "field_schema": "keyword",
+        }))
+        .unwrap();
+        let input = make_input(
+            &ctx,
+            "PUT",
+            "/collections/repo/index",
+            body,
+            HashMap::from([("name".into(), "repo".into())]),
+        );
+        let mut resp = Response::new();
+        handle_create_index(&input, &mut resp).unwrap();
+        assert_eq!(resp.status, 200);
+        wait_for_payload_index_ready(&ctx, "repo", "repo");
+
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "filter": {"must_not": [{"key": "repo", "match": {"text": "api"}}]},
+            "limit": 10
+        }))
+        .unwrap();
+        let input = make_input(
+            &ctx,
+            "POST",
+            "/collections/repo/points/scroll",
+            body,
+            HashMap::from([("name".into(), "repo".into())]),
+        );
+        let mut resp = Response::new();
+        handle_scroll_points(&input, &mut resp).unwrap();
+        assert_eq!(resp.status, 200);
+        let json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let ids: Vec<String> = json["result"]["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec![format_point_id(3)]);
+    }
+
+    /// Regression: a positive `match.text` filter on a keyword-indexed field
+    /// used to resolve candidates to ONLY the exact keyword hits whenever one
+    /// existed, so scroll returned a truncated page with `next_page_offset:
+    /// null` and exact count under-reported — every point whose value merely
+    /// contained the text was silently dropped (prod: text "VectorError" on
+    /// `callee_symbol` counted 5 vs 179 true matches).
+    fn assert_text_match_returns_every_substring_hit(ctx: &TestContext) {
+        ctx.collections.create_collection("graph").unwrap();
+        upsert_points(
+            ctx,
+            "graph",
+            serde_json::json!([
+                {"id": 1, "payload": {"callee_symbol": "VectorError"}},
+                {"id": 2, "payload": {"callee_symbol": "VectorError::VectorCoreError"}},
+                {"id": 3, "payload": {"callee_symbol": "crate::vectorerror::Io"}},
+                {"id": 4, "payload": {"callee_symbol": "Unrelated"}},
+            ]),
+        );
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "field_name": "callee_symbol",
+            "field_schema": "keyword",
+        }))
+        .unwrap();
+        let input = make_input(
+            ctx,
+            "PUT",
+            "/collections/graph/index",
+            body,
+            HashMap::from([("name".into(), "graph".into())]),
+        );
+        let mut resp = Response::new();
+        handle_create_index(&input, &mut resp).unwrap();
+        assert_eq!(resp.status, 200);
+        wait_for_payload_index_ready(ctx, "graph", "callee_symbol");
+
+        let filter = serde_json::json!({
+            "must": [{"key": "callee_symbol", "match": {"text": "VectorError"}}]
+        });
+        let body = sonic_rs::to_vec(&sonic_rs::json!({"filter": filter, "limit": 10})).unwrap();
+        let input = make_input(
+            ctx,
+            "POST",
+            "/collections/graph/points/scroll",
+            body,
+            HashMap::from([("name".into(), "graph".into())]),
+        );
+        let mut resp = Response::new();
+        handle_scroll_points(&input, &mut resp).unwrap();
+        assert_eq!(resp.status, 200);
+        let json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let ids: Vec<String> = json["result"]["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![format_point_id(1), format_point_id(2), format_point_id(3)],
+            "text match must return every substring hit, not just the exact keyword hit"
+        );
+        assert!(json["result"]["next_page_offset"].is_null());
+
+        let body = sonic_rs::to_vec(&sonic_rs::json!({"filter": filter, "exact": true})).unwrap();
+        let input = make_input(
+            ctx,
+            "POST",
+            "/collections/graph/points/count",
+            body,
+            HashMap::from([("name".into(), "graph".into())]),
+        );
+        let mut resp = Response::new();
+        handle_count_points(&input, &mut resp).unwrap();
+        assert_eq!(resp.status, 200);
+        let json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(json["result"]["count"], serde_json::json!(3));
+    }
+
+    #[test]
+    fn text_match_returns_every_substring_hit_lmdb() {
+        assert_text_match_returns_every_substring_hit(&setup());
+    }
+
+    #[test]
+    fn text_match_returns_every_substring_hit_lsm() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        assert_text_match_returns_every_substring_hit(&ctx);
+        let storage = ctx.collections.get_collection("graph").unwrap();
+        assert_eq!(storage.backend.kind(), BackendKind::Lsm);
+    }
+
+    fn text_walk_ctx(ctx: &TestContext) -> std::sync::Arc<HelixGraphStorage> {
+        let storage = ctx.collections.create_collection("tw").unwrap();
+        upsert_points(
+            ctx,
+            "tw",
+            serde_json::json!([
+                {"id": 1, "payload": {"sym": "VectorError", "repo": "a"}},
+                {"id": 2, "payload": {"sym": "VectorError::Io", "repo": "b"}},
+                {"id": 3, "payload": {"sym": "crate::vectorerror::X", "repo": "b"}},
+                {"id": 4, "payload": {"sym": "Unrelated", "repo": "a"}},
+                {"id": 5, "payload": {"sym": "Other", "repo": "b"}},
+            ]),
+        );
+        for field in ["sym", "repo"] {
+            storage
+                .create_payload_index(field, PayloadIndexSchema::Keyword)
+                .unwrap();
+            wait_for_payload_index_ready(ctx, "tw", field);
+        }
+        storage
+    }
+
+    fn text_cond(key: &str, text: &str) -> Condition {
+        use crate::helix_engine::storage_core::filters::MatchText;
+        FieldCondition {
+            key: key.into(),
+            match_cond: Some(MatchCondition::Text(MatchText { text: text.into() })),
+            range: None,
+        }
+        .into()
+    }
+
+    fn keyword_cond(key: &str, value: &str) -> Condition {
+        FieldCondition {
+            key: key.into(),
+            match_cond: Some(MatchCondition::Value(MatchValue {
+                value: serde_json::json!(value),
+            })),
+            range: None,
+        }
+        .into()
+    }
+
+    fn scan_opts<'a>(filter: &'a Filter, limit: usize, offset_id: u128) -> PointScanOptions<'a> {
+        PointScanOptions {
+            collection: "tw",
+            limit,
+            offset_id,
+            filter,
+            with_payload: &WithPayload::All,
+            with_vectors: &WithVectors::None,
+            partition: None,
+            max_scan: None,
+            deadline: None,
+            filter_hash: scan_filter_hash(filter),
+            cursor_generation: None,
+            fuse_pending: false,
+        }
+    }
+
+    fn scan_ids(scan: &PointScanResult) -> Vec<u128> {
+        scan.points.iter().filter_map(point_json_id).collect()
+    }
+
+    #[test]
+    fn must_text_walk_skipped_when_keyword_must_is_selective() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = text_walk_ctx(&ctx);
+        let filter = Filter {
+            must: vec![text_cond("sym", "vectorerror"), keyword_cond("repo", "b")],
+            ..Default::default()
+        };
+        let r = storage.backend.begin_read().unwrap();
+        let scan = execute_point_scan_be(&storage, &r, &scan_opts(&filter, 10, 0)).unwrap();
+        assert!(matches!(scan.plan, PointScanPlan::IndexedCandidates));
+        // repo=b alone (3 ids): the text condition was not walked/intersected
+        // (that would give 2) — the recheck applies it instead.
+        assert_eq!(scan.index_candidates, Some(3));
+        assert_eq!(scan_ids(&scan), vec![2, 3]);
+        assert!(scan.next_offset.is_none());
+    }
+
+    #[test]
+    fn should_branches_prechecked_before_any_text_walk() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = text_walk_ctx(&ctx);
+        let unindexed = keyword_cond("not_indexed", "x");
+        assert!(condition_may_yield_candidates(
+            &storage,
+            &text_cond("sym", "io")
+        ));
+        assert!(!condition_may_yield_candidates(&storage, &unindexed));
+        let nested = Condition::Nested(Filter {
+            should: vec![text_cond("sym", "io"), unindexed.clone()],
+            ..Default::default()
+        });
+        assert!(!condition_may_yield_candidates(&storage, &nested));
+
+        let filter = Filter {
+            should: vec![text_cond("sym", "vectorerror"), unindexed],
+            ..Default::default()
+        };
+        let r = storage.backend.begin_read().unwrap();
+        assert!(indexed_filter_candidates_be(&storage, &r, &filter)
+            .unwrap()
+            .is_none());
+        let scan = execute_point_scan_be(&storage, &r, &scan_opts(&filter, 10, 0)).unwrap();
+        assert!(matches!(scan.plan, PointScanPlan::Primary));
+        assert_eq!(scan_ids(&scan), vec![1, 2, 3]);
+    }
+
+    fn assert_text_walk_cap(storage: &HelixGraphStorage) {
+        let r = storage.backend.begin_read().unwrap();
+        let all = storage
+            .get_nodes_by_payload_text_be(&r, "sym", "vectorerror", 0)
+            .unwrap();
+        assert_eq!(all, Some(vec![1, 2, 3]));
+        assert_eq!(
+            storage
+                .get_nodes_by_payload_text_be(&r, "sym", "vectorerror", 100)
+                .unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            storage
+                .get_nodes_by_payload_text_be(&r, "sym", "vectorerror", 2)
+                .unwrap(),
+            None,
+            "a walk over the cap must fall back to the unindexed plan"
+        );
+    }
+
+    #[test]
+    fn text_walk_cap_returns_none_lsm() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        assert_text_walk_cap(&text_walk_ctx(&ctx));
+    }
+
+    #[test]
+    fn text_walk_cap_returns_none_lmdb() {
+        let ctx = setup();
+        let storage = text_walk_ctx(&ctx);
+        let txn = storage.begin_resize_safe_read_txn().unwrap();
+        assert_eq!(
+            storage
+                .get_nodes_by_payload_text(&txn, "sym", "vectorerror", 0)
+                .unwrap(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            storage
+                .get_nodes_by_payload_text(&txn, "sym", "vectorerror", 2)
+                .unwrap(),
+            None
+        );
+        drop(txn);
+        assert_text_walk_cap(&storage);
+    }
+
+    /// Matching terms with several duplicate ids exercise the LMDB
+    /// `move_between_keys` + `get_duplicates` path and the LSM per-term
+    /// verdict reuse.
+    #[test]
+    fn text_walk_collects_every_dup_of_matching_terms() {
+        for lsm in [false, true] {
+            let ctx = if lsm {
+                setup_with_config(Config::default().with_lsm_in_memory())
+            } else {
+                setup()
+            };
+            let storage = text_walk_ctx(&ctx);
+            upsert_points(
+                &ctx,
+                "tw",
+                serde_json::json!([
+                    {"id": 6, "payload": {"sym": "VectorError", "repo": "a"}},
+                    {"id": 7, "payload": {"sym": "VectorError", "repo": "b"}},
+                    {"id": 8, "payload": {"sym": "Unrelated", "repo": "b"}},
+                ]),
+            );
+            let expected = Some(vec![1, 2, 3, 6, 7]);
+            if !lsm {
+                let txn = storage.begin_resize_safe_read_txn().unwrap();
+                assert_eq!(
+                    storage
+                        .get_nodes_by_payload_text(&txn, "sym", "vectorerror", 0)
+                        .unwrap(),
+                    expected,
+                    "lmdb heed walk"
+                );
+            }
+            let r = storage.backend.begin_read().unwrap();
+            assert_eq!(
+                storage
+                    .get_nodes_by_payload_text_be(&r, "sym", "vectorerror", 0)
+                    .unwrap(),
+                expected,
+                "backend walk (lsm={lsm})"
+            );
+            let filter = Filter {
+                must: vec![text_cond("sym", "VectorError")],
+                ..Default::default()
+            };
+            let scan = execute_point_scan_be(&storage, &r, &scan_opts(&filter, 10, 0)).unwrap();
+            assert_eq!(scan_ids(&scan), vec![1, 2, 3, 6, 7], "scan (lsm={lsm})");
+        }
+    }
+
+    /// A value whose encoding exceeds the raw-key limit is stored under a
+    /// hashed `\xffhxk1` key that cannot be decoded for substring matching:
+    /// the walk must abstain (None) and the query must still be answered
+    /// correctly by the recheck scan.
+    #[test]
+    fn text_walk_abstains_on_hashed_keys_and_recheck_stays_correct() {
+        for lsm in [false, true] {
+            let ctx = if lsm {
+                setup_with_config(Config::default().with_lsm_in_memory())
+            } else {
+                setup()
+            };
+            let storage = text_walk_ctx(&ctx);
+            let long = format!("VectorError::{}", "x".repeat(600));
+            upsert_points(
+                &ctx,
+                "tw",
+                serde_json::json!([{"id": 9, "payload": {"sym": long, "repo": "a"}}]),
+            );
+            if !lsm {
+                let txn = storage.begin_resize_safe_read_txn().unwrap();
+                assert_eq!(
+                    storage
+                        .get_nodes_by_payload_text(&txn, "sym", "vectorerror", 0)
+                        .unwrap(),
+                    None,
+                    "lmdb heed walk must abstain on a hashed key"
+                );
+            }
+            let r = storage.backend.begin_read().unwrap();
+            assert_eq!(
+                storage
+                    .get_nodes_by_payload_text_be(&r, "sym", "vectorerror", 0)
+                    .unwrap(),
+                None,
+                "hashed key must make the walk abstain (lsm={lsm})"
+            );
+            let filter = Filter {
+                must: vec![text_cond("sym", "VectorError")],
+                ..Default::default()
+            };
+            let scan = execute_point_scan_be(&storage, &r, &scan_opts(&filter, 10, 0)).unwrap();
+            assert!(matches!(scan.plan, PointScanPlan::Primary));
+            assert_eq!(scan_ids(&scan), vec![1, 2, 3, 9], "recheck (lsm={lsm})");
+            assert!(scan.next_offset.is_none());
+        }
+    }
+
+    #[test]
+    fn multi_page_text_scroll_returns_every_hit() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = text_walk_ctx(&ctx);
+        let filter = Filter {
+            must: vec![text_cond("sym", "VectorError")],
+            ..Default::default()
+        };
+        let r = storage.backend.begin_read().unwrap();
+        let mut offset = 0u128;
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let scan = execute_point_scan_be(&storage, &r, &scan_opts(&filter, 1, offset)).unwrap();
+            seen.extend(scan_ids(&scan));
+            match scan.next_offset {
+                Some(next) => offset = parse_scroll_offset(Some(&serde_json::json!(next))),
+                None => break,
+            }
+        }
+        assert_eq!(seen, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn scroll_honors_min_should() {
+        let ctx = setup();
+        ctx.collections.create_collection("repo").unwrap();
+        upsert_points(
+            &ctx,
+            "repo",
+            serde_json::json!([
+                {"id": 1, "payload": {"lang": "rust", "kind": "fn", "pub": true}},
+                {"id": 2, "payload": {"lang": "rust", "kind": "struct", "pub": false}},
+                {"id": 3, "payload": {"lang": "go", "kind": "fn", "pub": false}},
+            ]),
+        );
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "filter": {"min_should": {
+                "conditions": [
+                    {"key": "lang", "match": {"value": "rust"}},
+                    {"key": "kind", "match": {"value": "fn"}},
+                    {"key": "pub", "match": {"value": true}}
+                ],
+                "min_count": 2
+            }},
+            "limit": 10
+        }))
+        .unwrap();
+        let input = make_input(
+            &ctx,
+            "POST",
+            "/collections/repo/points/scroll",
+            body,
+            HashMap::from([("name".into(), "repo".into())]),
+        );
+        let mut resp = Response::new();
+        handle_scroll_points(&input, &mut resp).unwrap();
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        let ids: Vec<String> = json["result"]["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec![format_point_id(1)]);
+    }
+
+    #[test]
+    fn range_index_bounds_use_the_stricter_of_inclusive_and_exclusive() {
+        let range = |gte, gt, lte, lt| RangeCondition { gte, gt, lte, lt };
+        assert_eq!(
+            range_lower_bound(&range(Some(10.0), Some(20.0), None, None)),
+            Some((20.0, false))
+        );
+        assert_eq!(
+            range_lower_bound(&range(Some(20.0), Some(10.0), None, None)),
+            Some((20.0, true))
+        );
+        assert_eq!(
+            range_lower_bound(&range(Some(5.0), Some(5.0), None, None)),
+            Some((5.0, false))
+        );
+        assert_eq!(
+            range_lower_bound(&range(None, Some(3.0), None, None)),
+            Some((3.0, false))
+        );
+        assert_eq!(
+            range_upper_bound(&range(None, None, Some(20.0), Some(10.0))),
+            Some((10.0, false))
+        );
+        assert_eq!(
+            range_upper_bound(&range(None, None, Some(10.0), Some(20.0))),
+            Some((10.0, true))
+        );
+        assert_eq!(
+            range_upper_bound(&range(None, None, Some(5.0), Some(5.0))),
+            Some((5.0, false))
+        );
+        assert_eq!(range_upper_bound(&range(None, None, None, None)), None);
+    }
+
+    #[test]
+    fn unsupported_filter_condition_is_rejected_with_400() {
+        let ctx = setup();
+        create_dense_collection(&ctx, "repo");
+        for filter in [
+            serde_json::json!({"must": [{"key": "t", "range": {"gte": "2024-01-01T00:00:00Z"}}]}),
+            serde_json::json!({"must_not": [{"key": "lang", "match": {"phrase": "rust"}}]}),
+            serde_json::json!({"must": [{"nested": {"key": "a", "filter": {}}}]}),
+        ] {
+            let body = sonic_rs::to_vec(&sonic_rs::json!({
+                "vector": {"name": "dense", "vector": [1.0, 0.0, 0.0]},
+                "filter": filter,
+            }))
+            .unwrap();
+            let input = make_input(
+                &ctx,
+                "POST",
+                "/collections/repo/points/search",
+                body,
+                HashMap::from([("name".into(), "repo".into())]),
+            );
+            let mut resp = Response::new();
+            handle_search_points(&input, &mut resp).unwrap();
+            assert_eq!(resp.status, 400, "{filter}");
+        }
+    }
+
+    #[test]
+    fn search_and_query_honor_offset_and_score_threshold() {
+        for lsm in [false, true] {
+            let ctx = if lsm {
+                setup_with_config(Config::default().with_lsm_in_memory())
+            } else {
+                setup()
+            };
+            if lsm {
+                create_dense_collection_lsm(&ctx, "repo");
+            } else {
+                create_dense_collection(&ctx, "repo");
+            }
+            upsert_points(
+                &ctx,
+                "repo",
+                serde_json::json!([
+                    {"id": 1, "vector": {"dense": [1.0, 0.0, 0.0]}, "payload": {"lang": "rust"}},
+                    {"id": 2, "vector": {"dense": [0.9, 0.1, 0.0]}, "payload": {"lang": "rust"}},
+                    {"id": 3, "vector": {"dense": [0.0, 1.0, 0.0]}, "payload": {"lang": "go"}},
+                ]),
+            );
+            let run = |path: &str, body: serde_json::Value| -> Vec<(String, f64)> {
+                let input = make_input(
+                    &ctx,
+                    "POST",
+                    path,
+                    sonic_rs::to_vec(&body).unwrap(),
+                    HashMap::from([("name".into(), "repo".into())]),
+                );
+                let mut resp = Response::new();
+                if path.ends_with("/search") {
+                    handle_search_points(&input, &mut resp).unwrap();
+                } else {
+                    handle_query_points(&input, &mut resp).unwrap();
+                }
+                assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+                let json: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+                let points = json["result"]
+                    .get("points")
+                    .unwrap_or(&json["result"])
+                    .as_array()
+                    .unwrap()
+                    .clone();
+                points
+                    .iter()
+                    .map(|p| {
+                        (
+                            p["id"].as_str().unwrap().to_string(),
+                            p["score"].as_f64().unwrap(),
+                        )
+                    })
+                    .collect()
+            };
+            let ids = |hits: &[(String, f64)]| hits.iter().map(|h| h.0.clone()).collect::<Vec<_>>();
+            let search = "/collections/repo/points/search";
+            let query = "/collections/repo/points/query";
+
+            let page = run(
+                search,
+                serde_json::json!({"vector": {"name": "dense", "vector": [1.0, 0.0, 0.0]}, "limit": 1, "offset": 1}),
+            );
+            assert_eq!(
+                ids(&page),
+                vec![format_point_id(2)],
+                "search offset lsm={lsm}"
+            );
+            let thresholded = run(
+                search,
+                serde_json::json!({"vector": {"name": "dense", "vector": [1.0, 0.0, 0.0]}, "limit": 10, "score_threshold": 0.5}),
+            );
+            assert_eq!(
+                ids(&thresholded),
+                vec![format_point_id(1), format_point_id(2)],
+                "search threshold lsm={lsm}"
+            );
+            assert!(thresholded.iter().all(|h| h.1 >= 0.5));
+
+            let page = run(
+                query,
+                serde_json::json!({"query": [1.0, 0.0, 0.0], "using": "dense", "limit": 1, "offset": 1}),
+            );
+            assert_eq!(
+                ids(&page),
+                vec![format_point_id(2)],
+                "query offset lsm={lsm}"
+            );
+            let thresholded = run(
+                query,
+                serde_json::json!({"query": [1.0, 0.0, 0.0], "using": "dense", "limit": 10, "score_threshold": 0.5}),
+            );
+            assert_eq!(
+                ids(&thresholded),
+                vec![format_point_id(1), format_point_id(2)],
+                "query threshold lsm={lsm}"
+            );
+
+            // Fusion path: threshold/offset apply to the fused score.
+            let fused = run(
+                query,
+                serde_json::json!({
+                    "prefetch": [
+                        {"using": "dense", "query": [1.0, 0.0, 0.0], "limit": 5},
+                        {"using": "dense", "query": [0.9, 0.1, 0.0], "limit": 5}
+                    ],
+                    "query": {"fusion": "rrf"},
+                    "limit": 10
+                }),
+            );
+            assert_eq!(fused.len(), 3, "fusion baseline lsm={lsm}");
+            let page = run(
+                query,
+                serde_json::json!({
+                    "prefetch": [
+                        {"using": "dense", "query": [1.0, 0.0, 0.0], "limit": 5},
+                        {"using": "dense", "query": [0.9, 0.1, 0.0], "limit": 5}
+                    ],
+                    "query": {"fusion": "rrf"},
+                    "limit": 1,
+                    "offset": 1
+                }),
+            );
+            assert_eq!(
+                ids(&page),
+                vec![fused[1].0.clone()],
+                "fusion offset lsm={lsm}"
+            );
+            let cut = fused[1].1;
+            let thresholded = run(
+                query,
+                serde_json::json!({
+                    "prefetch": [
+                        {"using": "dense", "query": [1.0, 0.0, 0.0], "limit": 5},
+                        {"using": "dense", "query": [0.9, 0.1, 0.0], "limit": 5}
+                    ],
+                    "query": {"fusion": "rrf"},
+                    "limit": 10,
+                    "score_threshold": cut
+                }),
+            );
+            assert_eq!(
+                ids(&thresholded),
+                ids(&fused[..2]),
+                "fusion threshold lsm={lsm}"
+            );
+        }
     }
 
     #[test]
@@ -12225,6 +13612,153 @@ mod tests {
     }
 
     #[test]
+    fn lsm_query_broad_filter_skips_materialization_and_still_filters() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        create_collection_with_sparse(&ctx, "query_broad_lsm");
+
+        let points: Vec<serde_json::Value> = (0..12_i64)
+            .map(|i| {
+                let angle = i as f32 * 0.1;
+                serde_json::json!({
+                    "id": i + 1,
+                    "vector": {
+                        "dense": [angle.cos(), angle.sin(), 0.0],
+                        "lex_sparse": {"indices": [7], "values": [1.0]}
+                    },
+                    "payload": {"scope": "all"}
+                })
+            })
+            .collect();
+        upsert_mixed_points(&ctx, "query_broad_lsm", serde_json::Value::Array(points));
+
+        let storage = ctx.collections.get_collection("query_broad_lsm").unwrap();
+        storage.refresh_metadata_snapshot().unwrap();
+        storage
+            .create_payload_index("scope", PayloadIndexSchema::Keyword)
+            .unwrap();
+        wait_for_payload_index_ready(&ctx, "query_broad_lsm", "scope");
+
+        let filter = broad_keyword_filter("scope", "all");
+        let r = storage.backend.begin_read().unwrap();
+        let probed =
+            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &filter, true).unwrap();
+        assert!(probed.probe_skipped);
+        assert!(probed.candidates.is_none());
+        assert_eq!(
+            probed.probe_estimate,
+            Some(vector_query_broad_candidate_cap(12) + 1)
+        );
+
+        let (status, body) = query_points_raw(
+            &ctx,
+            "query_broad_lsm",
+            serde_json::json!({
+                "query": {"indices": [7], "values": [1.0]},
+                "using": "lex_sparse",
+                "limit": 5,
+                "with_payload": true,
+                "filter": {"must": [{"key": "scope", "match": {"value": "all"}}]}
+            }),
+        );
+        assert_eq!(status, 200, "query failed: {body}");
+        let points = body["result"]["points"].as_array().unwrap();
+        assert_eq!(points.len(), 5, "query should still return filtered hits");
+        assert!(points
+            .iter()
+            .all(|point| point["payload"]["scope"] == serde_json::json!("all")));
+    }
+
+    #[test]
+    fn lsm_hybrid_channel_filter_rechecks_when_probe_skips_candidates() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        create_collection_with_sparse(&ctx, "hybrid_channel_lsm");
+
+        let mut points = Vec::new();
+        for id in 1..=12_i64 {
+            let scope = if id <= 2 { "top" } else { "channel" };
+            points.push(serde_json::json!({
+                "id": id,
+                "vector": {
+                    "dense": [1.0 - (id as f32 * 0.01), id as f32 * 0.01, 0.0],
+                    "lex_sparse": {"indices": [7], "values": [1.0]}
+                },
+                "payload": {"scope": scope}
+            }));
+        }
+        upsert_mixed_points(&ctx, "hybrid_channel_lsm", serde_json::Value::Array(points));
+
+        let storage = ctx
+            .collections
+            .get_collection("hybrid_channel_lsm")
+            .unwrap();
+        storage.refresh_metadata_snapshot().unwrap();
+        storage
+            .create_payload_index("scope", PayloadIndexSchema::Keyword)
+            .unwrap();
+        wait_for_payload_index_ready(&ctx, "hybrid_channel_lsm", "scope");
+
+        let channel_filter = broad_keyword_filter("scope", "channel");
+        let r = storage.backend.begin_read().unwrap();
+        let probed =
+            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &channel_filter, true)
+                .unwrap();
+        assert!(probed.probe_skipped);
+        assert!(probed.candidates.is_none());
+
+        let top_filter = broad_keyword_filter("scope", "top");
+        let narrow =
+            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &top_filter, true)
+                .unwrap();
+        assert!(!narrow.probe_skipped);
+        assert_eq!(
+            narrow
+                .candidates
+                .expect("narrow filter should materialize")
+                .len(),
+            2
+        );
+
+        let (status, body) = hybrid_query_points_raw(
+            &ctx,
+            "hybrid_channel_lsm",
+            serde_json::json!({
+                "dense": [{
+                    "using": "dense",
+                    "query": [1.0, 0.0, 0.0],
+                    "limit": 5,
+                    "filter": {"must": [{"key": "scope", "match": {"value": "channel"}}]}
+                }],
+                "sparse": [{
+                    "using": "lex_sparse",
+                    "query": {"indices": [7], "values": [1.0]},
+                    "limit": 5,
+                    "filter": {"must": [{"key": "scope", "match": {"value": "channel"}}]}
+                }],
+                "filter": {"must": [{"key": "scope", "match": {"value": "top"}}]},
+                "limit": 5,
+                "with_payload": true,
+                "with_channel_points": true
+            }),
+        );
+        assert_eq!(status, 200, "hybrid query failed: {body}");
+        let fused_points = body["result"]["points"].as_array().unwrap();
+        assert!(
+            !fused_points.is_empty(),
+            "hybrid query should return channel-filtered hits: {body}"
+        );
+        for point in fused_points {
+            assert_eq!(point["payload"]["scope"], serde_json::json!("channel"));
+        }
+        for group in ["dense", "sparse"] {
+            for channel in body["result"]["channels"][group].as_array().unwrap() {
+                for point in channel["points"].as_array().unwrap() {
+                    assert_eq!(point["payload"]["scope"], serde_json::json!("channel"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn filter_field_keys_reports_nested_fields_for_runaway_scan_logs() {
         let filter = Filter {
             must: vec![Condition::Nested(Filter {
@@ -12805,7 +14339,7 @@ mod tests {
         );
     }
 
-    fn upsert_mixed_points(ctx: &TestContext, name: &str, points: serde_json::Value) {
+    pub(super) fn upsert_mixed_points(ctx: &TestContext, name: &str, points: serde_json::Value) {
         let body = sonic_rs::to_vec(&sonic_rs::json!({ "points": points })).unwrap();
         let input = make_input(
             ctx,
@@ -12844,7 +14378,7 @@ mod tests {
         (resp.status, json)
     }
 
-    fn hybrid_query_points_raw(
+    pub(super) fn hybrid_query_points_raw(
         ctx: &TestContext,
         name: &str,
         body: serde_json::Value,
@@ -13401,6 +14935,93 @@ mod tests {
         let graph = &body["result"]["fusion"]["graph"];
         assert!(graph["seeds"].as_u64().unwrap() >= 1, "graph: {}", graph);
         assert!(graph["returned"].as_u64().unwrap() >= 1, "graph: {}", graph);
+    }
+
+    /// PPR neighbors must satisfy the request filter and still exist: a
+    /// repo-B neighbor and a stale edge to a deleted point must not leak into
+    /// a repo-A-filtered hybrid query through the graph channel.
+    fn assert_graph_channel_respects_filter_and_existence(
+        ctx: &TestContext,
+        name: &str,
+        create: fn(&TestContext, &str),
+    ) {
+        create(ctx, name);
+        upsert_points(
+            ctx,
+            name,
+            serde_json::json!([
+                {"id": "a", "vector": {"dense": [1.0, 0.0, 0.0]}, "payload": {"label": "a", "repo": "A"}},
+                {"id": "c", "vector": {"dense": [0.82, 0.57, 0.0]}, "payload": {"label": "c", "repo": "A"}},
+                {"id": "b", "vector": {"dense": [0.80, 0.60, 0.0]}, "payload": {"label": "b", "repo": "B"}}
+            ]),
+        );
+        let (a, b, c) = (point_uid("a"), point_uid("b"), point_uid("c"));
+        let ghost = point_uid("ghost");
+        let storage = ctx.collections.get_collection(name).unwrap();
+        storage
+            .with_write_backend(|w| {
+                for (from, to) in [(a, b), (c, b), (a, ghost), (c, ghost)] {
+                    storage.upsert_edge_be(
+                        w,
+                        &EdgeUpsert {
+                            id: from ^ to.rotate_left(64),
+                            label: "calls".into(),
+                            from_node: from,
+                            to_node: to,
+                            properties: HashMap::new(),
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        let (status, body) = hybrid_query_points_raw(
+            ctx,
+            name,
+            serde_json::json!({
+                "dense": [{"using": "dense", "query": [1.0, 0.0, 0.0], "limit": 3}],
+                "limit": 5,
+                "with_payload": true,
+                "filter": {"must": [{"key": "repo", "match": {"value": "A"}}]},
+                "graph": {"edge_labels": ["calls"], "seed_count": 2}
+            }),
+        );
+        assert_eq!(
+            status,
+            200,
+            "body: {}",
+            serde_json::to_string_pretty(&body).unwrap()
+        );
+        let points = body["result"]["points"].as_array().unwrap();
+        assert!(!points.is_empty(), "body: {}", body);
+        for point in points {
+            assert_eq!(
+                point["payload"]["repo"], "A",
+                "graph channel leaked a filtered-out or deleted point: {:?}",
+                points
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_query_graph_channel_respects_filter_and_existence() {
+        let ctx = setup();
+        assert_graph_channel_respects_filter_and_existence(
+            &ctx,
+            "hybrid_graph_filter",
+            create_dense_collection,
+        );
+    }
+
+    #[test]
+    fn hybrid_query_graph_channel_respects_filter_and_existence_lsm() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        assert_graph_channel_respects_filter_and_existence(
+            &ctx,
+            "hybrid_graph_filter_lsm",
+            create_dense_collection_lsm,
+        );
     }
 
     #[test]
@@ -14375,6 +15996,315 @@ mod tests {
         assert_eq!(clamp_limit(cap), cap);
     }
 
+    #[test]
+    fn channel_result_window_preserves_zero_offset_prefetch_limit() {
+        assert_eq!(channel_result_window(1, 2, 0), 1);
+    }
+
+    #[test]
+    fn channel_result_window_expands_for_offset() {
+        assert_eq!(channel_result_window(1, 2, 1), 2);
+        assert_eq!(channel_result_window(5, 2, 1), 5);
+    }
+
+    #[test]
+    fn score_threshold_rejects_non_finite_values() {
+        assert_eq!(validate_score_threshold(Some(0.5)), Ok(()));
+        assert_eq!(
+            validate_score_threshold(Some(f32::INFINITY)),
+            Err("score_threshold must be finite")
+        );
+        assert_eq!(
+            validate_score_threshold(Some(f32::NAN)),
+            Err("score_threshold must be finite")
+        );
+    }
+
+    #[test]
+    fn search_points_rejects_parsed_non_finite_score_threshold() {
+        let ctx = setup();
+        create_dense_collection(&ctx, "bad_search_threshold");
+        let input = make_input(
+            &ctx,
+            "POST",
+            "/collections/bad_search_threshold/points/search",
+            br#"{
+                "vector": {"name": "dense", "vector": [1.0, 0.0, 0.0]},
+                "score_threshold": 3.5e38
+            }"#
+            .to_vec(),
+            HashMap::from([("name".into(), "bad_search_threshold".into())]),
+        );
+        let mut response = Response::new();
+
+        handle_search_points(&input, &mut response).unwrap();
+
+        assert_eq!(response.status, 400);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(body["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("score_threshold must be finite"));
+    }
+
+    #[test]
+    fn query_points_rejects_parsed_non_finite_score_threshold() {
+        let ctx = setup();
+        create_dense_collection(&ctx, "bad_query_threshold");
+
+        let (status, body) = query_points_raw(
+            &ctx,
+            "bad_query_threshold",
+            serde_json::json!({
+                "query": [1.0, 0.0, 0.0],
+                "score_threshold": 3.5e38
+            }),
+        );
+
+        assert_eq!(status, 400);
+        assert!(body["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("score_threshold must be finite"));
+    }
+
+    #[test]
+    fn hnsw_config_rejects_m_below_two() {
+        let ctx = setup();
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "vectors": {"dense": {"size": 3, "distance": "Cosine"}},
+            "hnsw_config": {"m": 1}
+        }))
+        .unwrap();
+        let input = make_input(
+            &ctx,
+            "PUT",
+            "/collections/bad_hnsw",
+            body,
+            HashMap::from([("name".into(), "bad_hnsw".into())]),
+        );
+        let mut response = Response::new();
+
+        handle_create_collection(&input, &mut response).unwrap();
+
+        assert_eq!(response.status, 400);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(body["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("hnsw_config.m must be at least 2"));
+    }
+
+    #[test]
+    fn search_points_applies_score_threshold_and_offset() {
+        let ctx = setup();
+        create_dense_collection(&ctx, "score_page");
+        upsert_points(
+            &ctx,
+            "score_page",
+            serde_json::json!([
+                {"id": 1, "vector": {"dense": [1.0, 0.0, 0.0]}, "payload": {}},
+                {"id": 2, "vector": {"dense": [0.9, 0.1, 0.0]}, "payload": {}},
+                {"id": 3, "vector": {"dense": [0.0, 1.0, 0.0]}, "payload": {}}
+            ]),
+        );
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "vector": {"name": "dense", "vector": [1.0, 0.0, 0.0]},
+            "limit": 1,
+            "offset": 1,
+            "score_threshold": 0.9,
+            "with_payload": false
+        }))
+        .unwrap();
+        let input = make_input(
+            &ctx,
+            "POST",
+            "/collections/score_page/points/search",
+            body,
+            HashMap::from([("name".into(), "score_page".into())]),
+        );
+        let mut response = Response::new();
+
+        handle_search_points(&input, &mut response).unwrap();
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let points = body["result"].as_array().unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["id"], format_point_id(2));
+        assert!(points[0]["score"].as_f64().unwrap() >= 0.9);
+    }
+
+    #[test]
+    fn search_points_euclid_score_threshold_keeps_distances_within_threshold() {
+        let ctx = setup();
+        create_euclid_collection(&ctx, "euclid_search_threshold");
+        upsert_points(
+            &ctx,
+            "euclid_search_threshold",
+            serde_json::json!([
+                {"id": "near", "vector": {"dense": [0.5, 0.0, 0.0]}, "payload": {"label": "near"}},
+                {"id": "far", "vector": {"dense": [1.0, 0.0, 0.0]}, "payload": {"label": "far"}}
+            ]),
+        );
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "vector": {"name": "dense", "vector": [0.0, 0.0, 0.0]},
+            "limit": 10,
+            "score_threshold": 0.5,
+            "with_payload": true
+        }))
+        .unwrap();
+        let input = make_input(
+            &ctx,
+            "POST",
+            "/collections/euclid_search_threshold/points/search",
+            body,
+            HashMap::from([("name".into(), "euclid_search_threshold".into())]),
+        );
+        let mut response = Response::new();
+
+        handle_search_points(&input, &mut response).unwrap();
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let points = body["result"].as_array().unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["payload"]["label"], serde_json::json!("near"));
+        let score = points[0]["score"].as_f64().unwrap();
+        assert!((score + 0.5).abs() < 0.000001);
+    }
+
+    #[test]
+    fn query_points_euclid_score_threshold_keeps_distances_within_threshold() {
+        let ctx = setup();
+        create_euclid_collection(&ctx, "euclid_query_threshold");
+        upsert_points(
+            &ctx,
+            "euclid_query_threshold",
+            serde_json::json!([
+                {"id": "near", "vector": {"dense": [0.5, 0.0, 0.0]}, "payload": {"label": "near"}},
+                {"id": "far", "vector": {"dense": [1.0, 0.0, 0.0]}, "payload": {"label": "far"}}
+            ]),
+        );
+
+        let (status, body) = query_points_raw(
+            &ctx,
+            "euclid_query_threshold",
+            serde_json::json!({
+                "query": [0.0, 0.0, 0.0],
+                "using": "dense",
+                "limit": 10,
+                "score_threshold": 0.5,
+                "with_payload": true
+            }),
+        );
+
+        assert_eq!(status, 200, "query failed: {body}");
+        let points = body["result"]["points"].as_array().unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["payload"]["label"], serde_json::json!("near"));
+        let score = points[0]["score"].as_f64().unwrap();
+        assert!((score + 0.5).abs() < 0.000001);
+    }
+
+    #[test]
+    fn search_points_sparse_offset_is_applied_once() {
+        let ctx = setup();
+        create_collection_with_sparse(&ctx, "sparse_page");
+        upsert_mixed_points(
+            &ctx,
+            "sparse_page",
+            serde_json::json!([
+                {
+                    "id": "sparse-a",
+                    "vector": {
+                        "dense": [1.0, 0.0, 0.0],
+                        "lex_sparse": {"indices": [7], "values": [3.0]}
+                    },
+                    "payload": {"rank": 1}
+                },
+                {
+                    "id": "sparse-b",
+                    "vector": {
+                        "dense": [0.0, 1.0, 0.0],
+                        "lex_sparse": {"indices": [7], "values": [2.0]}
+                    },
+                    "payload": {"rank": 2}
+                },
+                {
+                    "id": "sparse-c",
+                    "vector": {
+                        "dense": [0.0, 0.0, 1.0],
+                        "lex_sparse": {"indices": [7], "values": [1.0]}
+                    },
+                    "payload": {"rank": 3}
+                }
+            ]),
+        );
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "vector": {
+                "name": "lex_sparse",
+                "vector": {"indices": [7], "values": [1.0]}
+            },
+            "limit": 1,
+            "offset": 1,
+            "with_payload": true
+        }))
+        .unwrap();
+        let input = make_input(
+            &ctx,
+            "POST",
+            "/collections/sparse_page/points/search",
+            body,
+            HashMap::from([("name".into(), "sparse_page".into())]),
+        );
+        let mut response = Response::new();
+
+        handle_search_points(&input, &mut response).unwrap();
+
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let points = body["result"].as_array().unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["payload"]["rank"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn query_fusion_prefetch_expands_channel_window_for_offset() {
+        let ctx = setup();
+        create_dense_collection(&ctx, "fusion_page");
+        upsert_points(
+            &ctx,
+            "fusion_page",
+            serde_json::json!([
+                {"id": "dense-a", "vector": {"dense": [1.0, 0.0, 0.0]}, "payload": {"rank": 1}},
+                {"id": "dense-b", "vector": {"dense": [0.9, 0.1, 0.0]}, "payload": {"rank": 2}},
+                {"id": "dense-c", "vector": {"dense": [0.0, 1.0, 0.0]}, "payload": {"rank": 3}}
+            ]),
+        );
+
+        let (status, body) = query_points_raw(
+            &ctx,
+            "fusion_page",
+            serde_json::json!({
+                "prefetch": [{
+                    "using": "dense",
+                    "query": [1.0, 0.0, 0.0],
+                    "limit": 1
+                }],
+                "query": {"fusion": "rrf"},
+                "limit": 1,
+                "offset": 1,
+                "with_payload": true
+            }),
+        );
+
+        assert_eq!(status, 200, "query failed: {body}");
+        let points = body["result"]["points"].as_array().unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["payload"]["rank"], serde_json::json!(2));
+    }
+
     /// Helper: create a collection via handle_create_collection using the
     /// provided JSON body and return the resulting SpindleConfig for the
     /// named vector "dense".
@@ -14929,41 +16859,11 @@ mod tests {
     /// backend. Proves the Qdrant REST write path persists vectors+payload to
     /// LSM (via `apply_upsert_points_lsm_chunk`) and the read path reads them
     /// back through the backend seam (`read_borrowed`/`get_node`), not LMDB.
-    ///
-    /// `HELIX_STORAGE_BACKEND=lsm` + `HELIX_LSM_IN_MEMORY=1` are process-global,
-    /// so this is `#[serial]` and restores prior env on drop, exactly like the
-    /// env-mutating LSM test in graph_core/traversal_tests.rs. A *filtered*
-    /// search is used so the dense read takes the backend-seam flat scan
-    /// (`dense_search_with_id_filter_ef` → per-segment `core.backend.read_borrowed`),
-    /// which is the path that observes LSM-stored vectors.
     #[test]
-    #[serial]
     fn qdrant_api_round_trip_on_lsm() {
         use crate::helix_engine::storage_core::backend::BackendKind;
 
-        /// Restore an env var to its prior value on drop so the global
-        /// backend selection never leaks past this test.
-        struct EnvGuard(&'static str, Option<String>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.1 {
-                        Some(v) => std::env::set_var(self.0, v),
-                        None => std::env::remove_var(self.0),
-                    }
-                }
-            }
-        }
-        fn set_env(key: &'static str, value: &str) -> EnvGuard {
-            let prev = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            EnvGuard(key, prev)
-        }
-
-        let _backend = set_env("HELIX_STORAGE_BACKEND", "lsm");
-        let _in_mem = set_env("HELIX_LSM_IN_MEMORY", "1");
-
-        let ctx = setup();
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
         create_dense_collection_lsm(&ctx, "lsm_round_trip");
 
         // The per-collection storage must have selected the in-memory LSM
