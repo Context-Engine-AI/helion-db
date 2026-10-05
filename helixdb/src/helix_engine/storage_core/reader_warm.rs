@@ -1193,15 +1193,15 @@ mod tests {
 
     #[test]
     fn statefulset_identity_comes_from_kubelet_etc_hosts() {
-        let hosts = "# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n10.0.3.7\thelix-lsm-prod-reader-1.helix-lsm-prod-reader-headless.context-engine.svc.cluster.local\thelix-lsm-prod-reader-1\n";
+        let hosts = "# Kubernetes-managed hosts file.\n127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost\n10.0.0.7\thelion-reader-1.helion-reader-headless.helion.svc.cluster.local\thelion-reader-1\n";
         assert_eq!(
-            statefulset_identity(hosts, "helix-lsm-prod-reader-1"),
+            statefulset_identity(hosts, "helion-reader-1"),
             Some((
-                "10.0.3.7".to_string(),
-                "helix-lsm-prod-reader-headless.context-engine.svc.cluster.local".to_string()
+                "10.0.0.7".to_string(),
+                "helion-reader-headless.helion.svc.cluster.local".to_string()
             ))
         );
-        assert_eq!(statefulset_identity(hosts, "helix-lsm-prod-reader-0"), None);
+        assert_eq!(statefulset_identity(hosts, "helion-reader-0"), None);
         assert_eq!(
             statefulset_identity("127.0.0.1 localhost\n", "laptop"),
             None
@@ -1210,19 +1210,19 @@ mod tests {
 
     #[test]
     fn explicit_peer_urls_drop_self_and_support_off() {
-        let selves = ["helix-lsm-prod-reader-0", "10.0.3.6"];
+        let selves = ["helion-reader-0", "10.0.0.6"];
         assert_eq!(explicit_peer_urls(None, &selves), None);
         assert_eq!(explicit_peer_urls(Some("  "), &selves), None);
         assert_eq!(explicit_peer_urls(Some("off"), &selves), Some(Vec::new()));
         let urls = explicit_peer_urls(
-            Some("http://helix-lsm-prod-reader-0.svc:6969, http://helix-lsm-prod-reader-1.svc:6969/,http://10.0.3.6:6969,,http://[fd00::1]:6969"),
+            Some("http://helion-reader-0.svc:6969, http://helion-reader-1.svc:6969/,http://10.0.0.6:6969,,http://[fd00::1]:6969"),
             &selves,
         )
         .unwrap();
         assert_eq!(
             urls,
             vec![
-                "http://helix-lsm-prod-reader-1.svc:6969".to_string(),
+                "http://helion-reader-1.svc:6969".to_string(),
                 "http://[fd00::1]:6969".to_string()
             ]
         );
