@@ -467,7 +467,18 @@ impl<T: Clone, Id> SimpleTransactionalObject<T, Id> {
         store: Arc<dyn TransactionalStorageProtocol<T, Id>>,
         value: T,
     ) -> Result<SimpleTransactionalObject<T, Id>, TransactionalObjectError> {
-        let id = store.write(None, &value).await?;
+        Self::init_after(store, value, None).await
+    }
+
+    /// Like [`init`], but the first version is written as the successor of
+    /// `previous` (so a re-created object starts above the ids a deleted
+    /// predecessor used) instead of at the initial id. `None` is [`init`].
+    pub async fn init_after(
+        store: Arc<dyn TransactionalStorageProtocol<T, Id>>,
+        value: T,
+        previous: Option<Id>,
+    ) -> Result<SimpleTransactionalObject<T, Id>, TransactionalObjectError> {
+        let id = store.write(previous, &value).await?;
         Ok(SimpleTransactionalObject {
             id,
             object: value,

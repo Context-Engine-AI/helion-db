@@ -225,6 +225,7 @@ impl ClosedResultWriter for DbStatusManager {
     fn write_result(&self, result: Result<(), SlateDBError>) {
         let reason = match &result {
             Ok(()) => CloseReason::Clean,
+            Err(SlateDBError::DatabaseMissing) => CloseReason::DatabaseMissing,
             Err(err) => CloseReason::from(crate::Error::from(err.clone()).kind()),
         };
         if self.cell.write(result) {

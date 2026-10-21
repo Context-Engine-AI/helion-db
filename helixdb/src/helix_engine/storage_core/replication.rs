@@ -50,6 +50,10 @@ const PROPOSE_TIMEOUT: Duration = Duration::from_secs(15);
 const LEADER_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const GATEWAY_READER_EVICT_MS: u64 = 5_000;
+/// Replica-shed 503s from one reader inside this window before the gateway
+/// ejects the whole reader; fewer sheds only spill the shed request.
+const GATEWAY_READER_SHED_WINDOW: Duration = Duration::from_secs(10);
+const GATEWAY_READER_SHED_EJECT_COUNT: u32 = 8;
 const GATEWAY_READER_PROXY_TIMEOUT_MS: u64 = 15_000;
 const GATEWAY_WRITER_PROXY_TIMEOUT_MS: u64 = 30_000;
 const GATEWAY_BYPASS_HEADER: &str = "x-helix-gateway-bypass";
@@ -1559,6 +1563,15 @@ impl SegmentReaper {
         let job = guard.queued_jobs.remove(best_idx);
         record_segment_reaper_queue_depth(queue_depth, guard.queued_jobs.len());
         job
+    }
+
+    /// Test-only: nothing queued or running, so no reaper reads are in flight.
+    #[cfg(test)]
+    fn idle(&self) -> bool {
+        self.queued_or_running
+            .lock()
+            .map(|names| names.is_empty())
+            .unwrap_or(true)
     }
 
     fn submit(&self, storage: Arc<HelixGraphStorage>, physical_name: String) {
@@ -4275,6 +4288,14 @@ struct CloudGatewayConfig {
     writer_proxy_timeout: Duration,
     writer_is_local: bool,
     include_writer_for_reads: bool,
+    /// Route collection-scoped reads to a rendezvous-chosen reader so each
+    /// collection is cold-opened and cached on one replica, not all of them.
+    reader_affinity: bool,
+    /// Replica-shed 503s from one reader within [`GATEWAY_READER_SHED_WINDOW`]
+    /// that eject it (`HELIX_GATEWAY_READER_SHED_EJECT_COUNT`; 1 = eject on
+    /// the first shed). Below it, a shed collection-scoped read spills to its
+    /// next-ranked reader and the shedding reader keeps its other collections.
+    reader_shed_eject_count: u32,
     buffer: Option<GatewayBufferConfig>,
 }
 
@@ -4330,6 +4351,8 @@ struct CloudGatewayRouter {
     config: CloudGatewayConfig,
     next_reader: AtomicU64,
     unhealthy_readers: Mutex<HashMap<String, Instant>>,
+    /// Per reader: start of the current shed window and sheds counted in it.
+    reader_sheds: Mutex<HashMap<String, (Instant, u32)>>,
     buffer: Option<Arc<GatewayDurableBuffer>>,
 }
 
@@ -4371,6 +4394,12 @@ impl CloudGatewayConfig {
         let include_writer_for_reads =
             gateway_env_bool("HELIX_GATEWAY_READS_INCLUDE_WRITER", false)
                 || gateway_env_bool("HELIX_CLOUD_READS_INCLUDE_WRITER", false);
+        let reader_affinity = gateway_env_bool("HELIX_GATEWAY_READER_AFFINITY", true);
+        let reader_shed_eject_count = gateway_env_u64(
+            "HELIX_GATEWAY_READER_SHED_EJECT_COUNT",
+            u64::from(GATEWAY_READER_SHED_EJECT_COUNT),
+        )
+        .clamp(1, u64::from(u32::MAX)) as u32;
         let buffer = gateway_buffer_config_from_env();
 
         Some(Self {
@@ -4382,6 +4411,8 @@ impl CloudGatewayConfig {
             writer_proxy_timeout,
             writer_is_local: storage_backend.is_writer(),
             include_writer_for_reads,
+            reader_affinity,
+            reader_shed_eject_count,
             buffer,
         })
     }
@@ -4489,12 +4520,66 @@ fn gateway_retryable_reader_status(status: u16) -> bool {
 /// broken storage for one name) and repeat identically on every replica, so
 /// ejecting the reader for them just drains the healthy pool and shifts all
 /// reads onto the writer.
-fn gateway_ejectable_reader_status(status: u16) -> bool {
-    matches!(status, 429 | 502 | 503 | 504)
+fn gateway_ejectable_reader_response(response: &Response) -> bool {
+    match response.status {
+        429 | 502 | 504 => true,
+        // A reader's 503 is replica-level only when its blocking pool shed the
+        // request (`REPLICA_SHED_HEADER`). Handlers also answer 503 for one
+        // collection (lost metadata sidecar, purge pending); every replica
+        // gives the same answer there, so ejecting would just move all reads
+        // to the writer for the eviction window.
+        503 => gateway_reader_shed_response(response),
+        _ => false,
+    }
+}
+
+/// A reader's blocking pool shed this request (503 + `REPLICA_SHED_HEADER`).
+fn gateway_reader_shed_response(response: &Response) -> bool {
+    response.status == 503
+        && response.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(crate::helix_gateway::async_gateway::REPLICA_SHED_HEADER)
+                && value.trim() == "1"
+        })
 }
 
 fn gateway_retryable_writer_status(status: u16) -> bool {
     matches!(status, 429 | 502 | 503 | 504) || status >= 500
+}
+
+#[derive(Deserialize)]
+struct GatewayAffinityBody {
+    collection: Option<String>,
+}
+
+/// The collection a read is scoped to, with any `_graph` suffix stripped so a
+/// collection and its graph companion share one reader. `None` for
+/// cluster-wide reads (`/collections`, `/v1/collections/list`, ...).
+fn reader_affinity_key(request: &Request) -> Option<String> {
+    let path = request.path.split('?').next().unwrap_or(&request.path);
+    let name = if path.starts_with("/v1/graph/") {
+        serde_json::from_slice::<GatewayAffinityBody>(&request.body)
+            .ok()?
+            .collection?
+    } else if let Some(rest) = path.strip_prefix("/v1/collections/") {
+        // Only `/v1/collections/{name}/...` is scoped; `list`, `stats`, ... are not.
+        rest.split_once('/')?.0.to_string()
+    } else {
+        crate::helix_gateway::inflight::collection_from_path(path)?.to_string()
+    };
+    let base = name.strip_suffix("_graph").unwrap_or(&name);
+    (!base.is_empty()).then(|| base.to_string())
+}
+
+/// Rendezvous (highest-random-weight) score of `reader` for `key`. Each key
+/// ranks readers independently, so adding or ejecting one reader only moves
+/// the keys that rank it first.
+fn reader_rendezvous_weight(key: &str, reader: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = twox_hash::XxHash64::with_seed(0);
+    hasher.write(key.as_bytes());
+    hasher.write_u8(0xFF);
+    hasher.write(reader.as_bytes());
+    hasher.finish()
 }
 
 fn has_gateway_bypass_header(request: &Request) -> bool {
@@ -4514,6 +4599,7 @@ impl CloudGatewayRouter {
             config,
             next_reader: AtomicU64::new(0),
             unhealthy_readers: Mutex::new(HashMap::new()),
+            reader_sheds: Mutex::new(HashMap::new()),
             buffer,
         };
         router.spawn_buffer_replay_worker();
@@ -4571,18 +4657,36 @@ impl CloudGatewayRouter {
             return Some(vec![self.writer_target()]);
         }
 
-        let readers = self.healthy_reader_urls(now);
+        let mut readers = self.healthy_reader_urls(now);
         metrics::gauge!("helix_gateway_healthy_readers").set(readers.len() as f64);
         let mut targets = Vec::new();
         if !readers.is_empty() {
-            let start = self.next_reader.fetch_add(1, Ordering::Relaxed) as usize;
-            for offset in 0..readers.len().min(self.config.max_reader_attempts) {
-                let url = readers[(start + offset) % readers.len()].clone();
-                targets.push(GatewayTarget {
-                    kind: GatewayTargetKind::Reader,
-                    base_url: url,
-                });
+            let affinity_key = if self.config.reader_affinity {
+                reader_affinity_key(request)
+            } else {
+                None
+            };
+            match affinity_key {
+                // Ranked over the CURRENT healthy readers: an ejected preferred
+                // reader's keys fall over to their next-ranked reader.
+                Some(key) => readers.sort_by_cached_key(|url| {
+                    std::cmp::Reverse(reader_rendezvous_weight(&key, url))
+                }),
+                None => {
+                    let start =
+                        self.next_reader.fetch_add(1, Ordering::Relaxed) as usize % readers.len();
+                    readers.rotate_left(start);
+                }
             }
+            targets.extend(
+                readers
+                    .into_iter()
+                    .take(self.config.max_reader_attempts)
+                    .map(|base_url| GatewayTarget {
+                        kind: GatewayTargetKind::Reader,
+                        base_url,
+                    }),
+            );
             if self.config.include_writer_for_reads {
                 targets.push(self.writer_target());
             }
@@ -4591,6 +4695,49 @@ impl CloudGatewayRouter {
             targets.push(self.writer_target());
         }
         Some(targets)
+    }
+
+    /// Count one replica shed from `base_url`; true once the reader shed
+    /// `reader_shed_eject_count` requests inside one shed window, i.e. it is
+    /// overloaded as a whole and should be ejected.
+    fn record_reader_shed(&self, base_url: &str, now: Instant) -> bool {
+        let mut guard = self
+            .reader_sheds
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let entry = guard.entry(base_url.to_string()).or_insert((now, 0));
+        if now.saturating_duration_since(entry.0) >= GATEWAY_READER_SHED_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        if entry.1 >= self.config.reader_shed_eject_count {
+            guard.remove(base_url);
+            return true;
+        }
+        false
+    }
+
+    /// The next-ranked healthy reader for a collection-scoped read that is not
+    /// already in `planned`: where a shed request spills instead of ejecting
+    /// the shedding reader's whole slice.
+    fn spill_target(
+        &self,
+        request: &Request,
+        planned: &[GatewayTarget],
+        now: Instant,
+    ) -> Option<GatewayTarget> {
+        if !self.config.reader_affinity {
+            return None;
+        }
+        let key = reader_affinity_key(request)?;
+        self.healthy_reader_urls(now)
+            .into_iter()
+            .filter(|url| !planned.iter().any(|target| &target.base_url == url))
+            .max_by_key(|url| reader_rendezvous_weight(&key, url))
+            .map(|base_url| GatewayTarget {
+                kind: GatewayTargetKind::Reader,
+                base_url,
+            })
     }
 
     fn mark_reader_unhealthy(&self, base_url: &str, now: Instant) {
@@ -5037,13 +5184,17 @@ impl ReplicationManager {
         let Some(gateway) = &self.cloud_gateway else {
             return Ok(None);
         };
-        let Some(targets) = gateway.target_plan(request, Instant::now()) else {
+        let Some(mut targets) = gateway.target_plan(request, Instant::now()) else {
             return Ok(None);
         };
         let class = route_class(&request.method, &request.path);
 
-        let last_index = targets.len().saturating_sub(1);
-        for (idx, target) in targets.iter().enumerate() {
+        // Indexed (not `iter`) because a shed may insert a spill reader.
+        for idx in 0.. {
+            let Some(target) = targets.get(idx).cloned() else {
+                break;
+            };
+            let target = &target;
             // The production gateway is embedded in the writer process. Serve
             // writer targets locally instead of blocking a gateway thread on
             // an HTTP call back into the same bounded server thread pool.
@@ -5092,8 +5243,33 @@ impl ReplicationManager {
                             return Ok(Some(buffered));
                         }
                     }
+                    let shed = retryable_reader && gateway_reader_shed_response(&response);
+                    // Below the reader-wide shed threshold the reader keeps its
+                    // other collections: this request spills to the next-ranked
+                    // reader when one is free, else continues down the plan.
+                    let spill_only =
+                        shed && !gateway.record_reader_shed(&target.base_url, Instant::now());
+                    let spill = spill_only
+                        .then(|| gateway.spill_target(request, &targets, Instant::now()))
+                        .flatten();
+                    let spilled = spill.is_some();
+                    if let Some(spill) = spill {
+                        targets.insert(idx + 1, spill);
+                    }
+                    let last_index = targets.len().saturating_sub(1);
                     if retryable_reader && idx < last_index {
-                        if gateway_ejectable_reader_status(response.status) {
+                        if spill_only {
+                            metrics::counter!(
+                                "helix_gateway_reader_sheds_total",
+                                "outcome" => if spilled { "spilled" } else { "next_target" }
+                            )
+                            .increment(1);
+                            tracing::debug!(
+                                target = %target.base_url,
+                                spilled,
+                                "cloud gateway reader shed request below the eject threshold; not ejecting"
+                            );
+                        } else if gateway_ejectable_reader_response(&response) {
                             gateway.mark_reader_unhealthy(&target.base_url, Instant::now());
                             metrics::counter!(
                                 "helix_gateway_reader_ejections_total",
@@ -5138,7 +5314,9 @@ impl ReplicationManager {
                             return Ok(Some(buffered));
                         }
                     }
-                    if target.kind == GatewayTargetKind::Reader && idx < last_index {
+                    if target.kind == GatewayTargetKind::Reader
+                        && idx < targets.len().saturating_sub(1)
+                    {
                         gateway.mark_reader_unhealthy(&target.base_url, Instant::now());
                         metrics::counter!(
                             "helix_gateway_reader_ejections_total",
@@ -7169,14 +7347,39 @@ fn apply_upsert_points_lsm_chunk(
     // non-durable write. When disabled, commit fully durable per chunk.
     let run = |w: &mut super::backend_any::AnyWrite<'_>| -> Result<(), GraphError> {
         let mut sparse_buckets: HashMap<String, Vec<(u128, &SparseVector)>> = HashMap::new();
-        for point in points {
-            let existing_node = storage
+        // One multi-get reads every point's node when the chunk's ids are
+        // unique; a repeated id must see its own earlier write, so per point.
+        let mut seen_ids = HashSet::with_capacity(points.len());
+        let mut prefetched_nodes = if points.iter().all(|point| seen_ids.insert(point.id)) {
+            let keys: Vec<Vec<u8>> = points
+                .iter()
+                .map(|point| point.id.to_be_bytes().to_vec())
+                .collect();
+            let values = storage
                 .backend
-                .get_for_update(w, Namespace::Nodes, &point.id.to_be_bytes(), |v| {
-                    v.map(|bytes| SerializedNode::decode_node(bytes, point.id))
-                        .transpose()
-                })
-                .map_err(|e| GraphError::New(e.to_string()))??;
+                .get_for_update_many(w, Namespace::Nodes, &keys)
+                .map_err(|e| GraphError::New(e.to_string()))?;
+            Some(values.into_iter())
+        } else {
+            None
+        };
+        // Counter bumps fold into one merge each after the loop: every per-point
+        // bump re-read the counter key from SlateDB (merges are not pending reads).
+        let mut created_nodes = 0i64;
+        let mut created_vectors = 0i64;
+        for point in points {
+            let existing_raw = match prefetched_nodes.as_mut() {
+                Some(values) => values.next().flatten(),
+                None => storage
+                    .backend
+                    .get_for_update(w, Namespace::Nodes, &point.id.to_be_bytes(), |v| {
+                        v.map(<[u8]>::to_vec)
+                    })
+                    .map_err(|e| GraphError::New(e.to_string()))?,
+            };
+            let existing_node = existing_raw
+                .map(|bytes| SerializedNode::decode_node(&bytes, point.id))
+                .transpose()?;
             let existing_is_point = existing_node
                 .as_ref()
                 .map(|node| node.label == "point")
@@ -7216,7 +7419,14 @@ fn apply_upsert_points_lsm_chunk(
                 label: "point".into(),
                 properties: props,
             };
-            storage.upsert_node_be_with_existing(w, &node_upsert, existing_node.clone())?;
+            if existing_node.is_none() {
+                created_nodes += 1;
+            }
+            storage.upsert_node_be_with_existing_uncounted(
+                w,
+                &node_upsert,
+                existing_node.clone(),
+            )?;
 
             if payload_only_update {
                 continue;
@@ -7238,8 +7448,14 @@ fn apply_upsert_points_lsm_chunk(
             }
 
             if !existing_is_point {
-                storage.adjust_metadata_counter_be(w, MetadataCounter::Vectors, 1)?;
+                created_vectors += 1;
             }
+        }
+        if created_nodes > 0 {
+            storage.adjust_metadata_counter_be(w, MetadataCounter::Nodes, created_nodes)?;
+        }
+        if created_vectors > 0 {
+            storage.adjust_metadata_counter_be(w, MetadataCounter::Vectors, created_vectors)?;
         }
 
         for (name, items) in &sparse_buckets {
@@ -7832,21 +8048,34 @@ fn apply_delete_points(
             let txn_start = metrics_enabled.then(Instant::now);
             let mut staged_tombstones = None;
             storage.with_write_backend(|w| {
+                let t = metrics_enabled.then(Instant::now);
                 staged_tombstones = Some(
                     storage
                         .named_vectors
                         .delete_vectors_batch_with_plan_be(w, &dense_delete_plan)
                         .map_err(GraphError::from)?,
                 );
+                record_delete_step("lsm_dense_delete", t);
+                // One batched sparse delete per chunk: per-id deletes cost one
+                // sequential SlateDB read per point plus one per distinct term
+                // in the chunk.
+                let t = metrics_enabled.then(Instant::now);
+                storage
+                    .named_vectors
+                    .delete_sparse_vectors_be(w, &delete_ids)
+                    .map_err(GraphError::from)?;
+                record_delete_step("lsm_sparse_delete", t);
+                let t = metrics_enabled.then(Instant::now);
                 for id in &delete_ids {
-                    storage
-                        .named_vectors
-                        .delete_sparse_vectors_be(w, *id)
-                        .map_err(GraphError::from)?;
                     storage.drop_node_be(w, id)?;
-                    if existing_point_ids.contains(id) {
-                        storage.adjust_metadata_counter_be(w, MetadataCounter::Vectors, -1)?;
-                    }
+                }
+                record_delete_step("lsm_drop_nodes", t);
+                if !existing_point_ids.is_empty() {
+                    storage.adjust_metadata_counter_be(
+                        w,
+                        MetadataCounter::Vectors,
+                        -(existing_point_ids.len() as i64),
+                    )?;
                 }
                 Ok(())
             })?;
@@ -7980,6 +8209,7 @@ mod tests {
         Config, GraphConfig, RaftConfig, RaftPeerConfig, VectorConfig,
     };
     use crate::helix_engine::storage_core::backend::{LsmRole, LsmStorage};
+    use crate::helix_engine::storage_core::backend_any::AnyBackend;
     use crate::helix_engine::storage_core::storage_methods::StorageMethods;
     use std::sync::Weak;
     use tempfile::TempDir;
@@ -8008,6 +8238,8 @@ mod tests {
             writer_proxy_timeout: Duration::from_secs(30),
             writer_is_local: false,
             include_writer_for_reads,
+            reader_affinity: false,
+            reader_shed_eject_count: GATEWAY_READER_SHED_EJECT_COUNT,
             buffer: None,
         })
     }
@@ -8090,14 +8322,26 @@ mod tests {
 
     #[test]
     fn cloud_gateway_ejects_readers_only_for_replica_scoped_statuses() {
-        assert!(gateway_ejectable_reader_status(429));
-        assert!(gateway_ejectable_reader_status(502));
-        assert!(gateway_ejectable_reader_status(503));
-        assert!(gateway_ejectable_reader_status(504));
+        let status = |code: u16| Response {
+            status: code,
+            ..Response::new()
+        };
+        assert!(gateway_ejectable_reader_response(&status(429)));
+        assert!(gateway_ejectable_reader_response(&status(502)));
+        assert!(gateway_ejectable_reader_response(&status(504)));
         // Collection-scoped: identical on every replica, must not drain the
         // healthy-reader pool.
-        assert!(!gateway_ejectable_reader_status(404));
-        assert!(!gateway_ejectable_reader_status(500));
+        assert!(!gateway_ejectable_reader_response(&status(404)));
+        assert!(!gateway_ejectable_reader_response(&status(500)));
+        // A bare 503 is a handler's collection-scoped answer (lost metadata
+        // sidecar, purge pending): on 2026-10-20 one such collection per
+        // storage-metering sweep ejected both prod readers every ~2 minutes.
+        assert!(!gateway_ejectable_reader_response(&status(503)));
+        // Only a blocking-pool shed marks the 503 as replica-level.
+        let mut shed = status(503);
+        shed.headers
+            .insert("x-helix-replica-shed".to_string(), "1".to_string());
+        assert!(gateway_ejectable_reader_response(&shed));
     }
 
     #[test]
@@ -8162,6 +8406,368 @@ mod tests {
         assert_eq!(plan, vec![reader_target("reader-a"), writer_target()]);
     }
 
+    fn affinity_router_for_tests(readers: usize) -> CloudGatewayRouter {
+        let mut router = gateway_router_for_tests(false);
+        router.config.reader_affinity = true;
+        router.config.reader_urls = (0..readers)
+            .map(|i| format!("http://reader-{i}:8080"))
+            .collect();
+        router
+    }
+
+    fn search_request(collection: &str) -> Request {
+        gateway_request("POST", &format!("/collections/{collection}/points/search"))
+    }
+
+    fn first_reader(router: &CloudGatewayRouter, request: &Request, now: Instant) -> String {
+        router.target_plan(request, now).unwrap()[0]
+            .base_url
+            .clone()
+    }
+
+    fn synthetic_collection(i: usize) -> String {
+        format!(
+            "tenant{}_repo-{:08x}",
+            i % 97,
+            i.wrapping_mul(2_654_435_761)
+        )
+    }
+
+    #[test]
+    fn cloud_gateway_affinity_maps_each_collection_to_one_reader_deterministically() {
+        let router = affinity_router_for_tests(3);
+        // A restarted writer listing the same readers in another order.
+        let mut restarted = affinity_router_for_tests(3);
+        restarted.config.reader_urls.reverse();
+        let now = Instant::now();
+        for i in 0..50 {
+            let request = search_request(&synthetic_collection(i));
+            let plan = router.target_plan(&request, now).unwrap();
+            assert_eq!(plan.len(), 3);
+            assert_eq!(router.target_plan(&request, now).unwrap(), plan);
+            assert_eq!(restarted.target_plan(&request, now).unwrap(), plan);
+        }
+
+        let mut bypass = search_request("repo");
+        bypass.headers.insert(
+            GATEWAY_BYPASS_HEADER.to_string(),
+            GATEWAY_BYPASS_VALUE.to_string(),
+        );
+        assert!(router.target_plan(&bypass, now).is_none());
+    }
+
+    #[test]
+    fn cloud_gateway_affinity_colocates_graph_companion_with_its_collection() {
+        let router = affinity_router_for_tests(3);
+        let now = Instant::now();
+        for i in 0..50 {
+            let base = synthetic_collection(i);
+            let expected = first_reader(&router, &search_request(&base), now);
+            let mut graph_api = gateway_request("POST", "/v1/graph/callers");
+            graph_api.body =
+                format!(r#"{{"collection":"{base}_graph","symbol":"main"}}"#).into_bytes();
+            for request in [
+                search_request(&format!("{base}_graph")),
+                gateway_request(
+                    "POST",
+                    &format!("/collections/{base}_graph/points/scroll?limit=1"),
+                ),
+                gateway_request("GET", &format!("/collections/{base}")),
+                gateway_request("POST", &format!("/v1/collections/{base}/points/scan")),
+                graph_api,
+            ] {
+                assert_eq!(
+                    first_reader(&router, &request, now),
+                    expected,
+                    "{}",
+                    request.path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cloud_gateway_affinity_fails_over_in_rendezvous_order_when_preferred_reader_is_ejected() {
+        let router = affinity_router_for_tests(3);
+        let now = Instant::now();
+        let request = search_request("example-code-collection");
+        let plan = router.target_plan(&request, now).unwrap();
+
+        router.mark_reader_unhealthy(&plan[0].base_url, now);
+        assert_eq!(
+            router.target_plan(&request, now).unwrap(),
+            plan[1..].to_vec()
+        );
+
+        // The preferred reader takes the collection back once its ejection lapses.
+        let later = now + router.config.reader_eviction + Duration::from_millis(1);
+        assert_eq!(router.target_plan(&request, later).unwrap(), plan);
+
+        // Prod shape: one reader attempt, then the writer.
+        let mut prod = affinity_router_for_tests(2);
+        prod.config.max_reader_attempts = 1;
+        prod.config.include_writer_for_reads = true;
+        let plan = prod.target_plan(&request, now).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[1], writer_target());
+        prod.mark_reader_unhealthy(&plan[0].base_url, now);
+        let failover = prod.target_plan(&request, now).unwrap();
+        assert_eq!(failover[0].kind, GatewayTargetKind::Reader);
+        assert_ne!(failover[0], plan[0]);
+        assert_eq!(failover[1], writer_target());
+    }
+
+    #[test]
+    fn cloud_gateway_ejects_a_shedding_reader_only_past_the_reader_wide_threshold() {
+        let mut router = affinity_router_for_tests(2);
+        router.config.reader_shed_eject_count = 3;
+        let now = Instant::now();
+        let reader = "http://reader-0:8080";
+        assert!(!router.record_reader_shed(reader, now));
+        assert!(!router.record_reader_shed(reader, now));
+        assert!(router.record_reader_shed(reader, now));
+        // The count restarts after an ejection decision and after the window.
+        assert!(!router.record_reader_shed(reader, now));
+        assert!(!router.record_reader_shed(reader, now));
+        let later = now + GATEWAY_READER_SHED_WINDOW;
+        assert!(!router.record_reader_shed(reader, later));
+        assert!(!router.record_reader_shed(reader, later));
+        // Other readers keep their own counts.
+        assert!(!router.record_reader_shed("http://reader-1:8080", later));
+
+        router.config.reader_shed_eject_count = 1;
+        assert!(
+            router.record_reader_shed(reader, later),
+            "1 restores eject-on-first-shed"
+        );
+    }
+
+    #[test]
+    fn cloud_gateway_spill_target_is_the_next_ranked_unplanned_reader() {
+        let mut router = affinity_router_for_tests(3);
+        let now = Instant::now();
+        let request = search_request("example-code-collection");
+        let ranked = router.target_plan(&request, now).unwrap();
+
+        router.config.max_reader_attempts = 1;
+        router.config.include_writer_for_reads = true;
+        let plan = router.target_plan(&request, now).unwrap();
+        assert_eq!(plan, vec![ranked[0].clone(), writer_target()]);
+        assert_eq!(
+            router.spill_target(&request, &plan, now),
+            Some(ranked[1].clone())
+        );
+        let spilled = vec![ranked[0].clone(), ranked[1].clone(), writer_target()];
+        assert_eq!(
+            router.spill_target(&request, &spilled, now),
+            Some(ranked[2].clone())
+        );
+
+        router.mark_reader_unhealthy(&ranked[2].base_url, now);
+        assert_eq!(router.spill_target(&request, &spilled, now), None);
+        // Unscoped reads and round-robin routing never spill.
+        assert_eq!(
+            router.spill_target(&gateway_request("GET", "/collections"), &plan, now),
+            None
+        );
+        router.config.reader_affinity = false;
+        assert_eq!(router.spill_target(&request, &plan, now), None);
+    }
+
+    /// Minimal HTTP/1.1 upstream answering every request with `status`, an
+    /// optional replica-shed header, and `body`. Returns its base URL and hit count.
+    fn fake_upstream(status: u16, shed: bool, body: &'static str) -> (String, Arc<AtomicU64>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&hits);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                let shed_header = if shed {
+                    "X-Helix-Replica-Shed: 1\r\n"
+                } else {
+                    ""
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\n{shed_header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        (url, hits)
+    }
+
+    /// A shed collection-scoped read is retried on the next-ranked reader
+    /// without ejecting the shedding reader; eject count 1 keeps the old
+    /// eject-and-fall-back-to-writer behavior.
+    #[test]
+    fn cloud_gateway_spills_a_shed_read_to_the_next_reader_without_ejecting() {
+        let (shedding, shed_hits) = fake_upstream(503, true, "shed");
+        let (healthy, healthy_hits) = fake_upstream(200, false, "from-reader");
+        let (writer, writer_hits) = fake_upstream(200, false, "from-writer");
+        let temp_dir = TempDir::new().unwrap();
+        let config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+        let mut router = affinity_router_for_tests(0);
+        router.config.reader_urls = vec![shedding.clone(), healthy.clone()];
+        router.config.writer_url = writer.clone();
+        router.config.max_reader_attempts = 1;
+        router.config.include_writer_for_reads = true;
+        let now = Instant::now();
+        let request = (0..200)
+            .map(|i| search_request(&synthetic_collection(i)))
+            .find(|request| first_reader(&router, request, now) == shedding)
+            .expect("some collection prefers the shedding reader");
+        let manager = ReplicationManager {
+            collections,
+            config,
+            runtime: None,
+            transport: Arc::new(NoopRaftTransport),
+            cloud_gateway: Some(Arc::new(router)),
+        };
+        let gateway = manager.cloud_gateway.as_ref().unwrap();
+
+        let response = manager
+            .prepare_cloud_gateway_request(&request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"from-reader".to_vec());
+        assert_eq!(shed_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(healthy_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(writer_hits.load(Ordering::SeqCst), 0);
+        assert!(
+            gateway
+                .healthy_reader_urls(Instant::now())
+                .contains(&shedding),
+            "one shed must not eject the reader's whole slice"
+        );
+
+        let mut eager = gateway.config.clone();
+        eager.reader_shed_eject_count = 1;
+        let manager = ReplicationManager {
+            cloud_gateway: Some(Arc::new(CloudGatewayRouter::new(eager))),
+            ..manager
+        };
+        let gateway = manager.cloud_gateway.as_ref().unwrap();
+        let response = manager
+            .prepare_cloud_gateway_request(&request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.body, b"from-writer".to_vec());
+        assert!(!gateway
+            .healthy_reader_urls(Instant::now())
+            .contains(&shedding));
+        assert_eq!(healthy_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cloud_gateway_affinity_spreads_collections_near_evenly() {
+        let mut router = affinity_router_for_tests(2);
+        router.config.reader_urls = (0..2)
+            .map(|i| format!("http://reader-{i}.readers.example.test:6969"))
+            .collect();
+        let now = Instant::now();
+        let on_first = (0..1000)
+            .filter(|i| {
+                first_reader(&router, &search_request(&synthetic_collection(*i)), now)
+                    == router.config.reader_urls[0]
+            })
+            .count();
+        // Binomial(1000, 0.5) has sigma ~16; this guards against a degenerate hash.
+        assert!(
+            (450..=550).contains(&on_first),
+            "reader-0 owns {on_first}/1000"
+        );
+    }
+
+    #[test]
+    fn cloud_gateway_affinity_adding_a_reader_moves_only_its_share() {
+        let now = Instant::now();
+        for n in 2..=4 {
+            let before = affinity_router_for_tests(n);
+            let after = affinity_router_for_tests(n + 1);
+            let new_reader = format!("http://reader-{n}:8080");
+            let mut moved = 0usize;
+            for i in 0..1000 {
+                let request = search_request(&synthetic_collection(i));
+                let old = first_reader(&before, &request, now);
+                let new = first_reader(&after, &request, now);
+                if old != new {
+                    // Existing readers never trade collections among themselves.
+                    assert_eq!(new, new_reader);
+                    moved += 1;
+                }
+            }
+            let expected = 1000 / (n + 1);
+            assert!(
+                moved.abs_diff(expected) <= 60,
+                "{n}->{} readers moved {moved}/1000, expected ~{expected}",
+                n + 1
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_gateway_affinity_keeps_unscoped_reads_round_robin() {
+        let router = affinity_router_for_tests(2);
+        let now = Instant::now();
+        let mut graph_without_collection = gateway_request("POST", "/v1/graph/callers");
+        graph_without_collection.body = br#"{"symbol":"main"}"#.to_vec();
+        for request in [
+            gateway_request("GET", "/collections"),
+            gateway_request("POST", "/v1/collections/list"),
+            gateway_request("POST", "/v1/collections/stats"),
+            graph_without_collection,
+        ] {
+            assert_eq!(reader_affinity_key(&request), None, "{}", request.path);
+            let first = first_reader(&router, &request, now);
+            assert_ne!(
+                first_reader(&router, &request, now),
+                first,
+                "{}",
+                request.path
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_gateway_reader_affinity_defaults_on_and_zero_disables_it() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _writer_url = EnvVarGuard::set("HELIX_GATEWAY_WRITER_URL", "http://writer:8080");
+        let writer = StorageBackendConfig::Lsm {
+            storage: LsmStorage::InMemory,
+            role: LsmRole::Writer,
+        };
+        {
+            let _unset = EnvVarGuard::unset("HELIX_GATEWAY_READER_AFFINITY");
+            assert!(
+                CloudGatewayConfig::from_env(writer)
+                    .unwrap()
+                    .reader_affinity
+            );
+        }
+        let _off = EnvVarGuard::set("HELIX_GATEWAY_READER_AFFINITY", "0");
+        assert!(
+            !CloudGatewayConfig::from_env(writer)
+                .unwrap()
+                .reader_affinity
+        );
+    }
+
     #[test]
     fn cloud_gateway_is_disabled_inside_reader_replicas() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -8208,6 +8814,8 @@ mod tests {
             writer_proxy_timeout: Duration::from_secs(30),
             writer_is_local: false,
             include_writer_for_reads: false,
+            reader_affinity: false,
+            reader_shed_eject_count: GATEWAY_READER_SHED_EJECT_COUNT,
             buffer: Some(GatewayBufferConfig {
                 dir: dir.path().to_path_buf(),
                 max_entries: 8,
@@ -9850,6 +10458,623 @@ mod tests {
         assert!(!any_contains(5), "id 5's dense vector must be gone");
         assert!(any_contains(2), "id 2's dense vector must remain");
         assert!(any_contains(6), "id 6's dense vector must remain");
+    }
+
+    /// Sparse terms for doc `id` of one "file": `terms` distinct ids drawn from
+    /// a shared vocabulary so chunks of one file overlap like real code.
+    fn ce_shaped_sparse(id: u128, terms: usize) -> SparseVector {
+        let vocab = 4 * terms as u32;
+        let mut indices: Vec<u32> = (0..terms as u32)
+            .map(|k| (id as u32 * 37 + k * 3) % vocab) // 3 is coprime with every 4*terms here
+            .collect();
+        indices.sort_unstable();
+        let values = indices.iter().map(|i| 1.0 + (*i % 5) as f32).collect();
+        SparseVector { indices, values }
+    }
+
+    /// LSM collection shaped like a CE code collection: `dense` + `mini` dense
+    /// vectors, the given Idf sparse vectors, and a keyword index on `path`.
+    fn ce_shaped_lsm_collection(
+        temp_dir: &TempDir,
+        ids: std::ops::RangeInclusive<u128>,
+        terms: usize,
+        sparse_names: &[&str],
+    ) -> (Arc<CollectionManager>, Config) {
+        let config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+        let dense = |size| NamedVectorConfig {
+            size,
+            distance: crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+            spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(),
+        };
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: "repo".into(),
+                vectors: HashMap::from([("dense".into(), dense(4)), ("mini".into(), dense(2))]),
+                sparse_vectors: sparse_names
+                    .iter()
+                    .map(|name| {
+                        let config = SparseVectorConfig {
+                            modifier: crate::helix_engine::vector_core::sparse::SparseModifier::Idf,
+                            ..Default::default()
+                        };
+                        (name.to_string(), config)
+                    })
+                    .collect(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreatePayloadIndex {
+                collection: "repo".into(),
+                field_name: "path".into(),
+                schema: PayloadIndexSchema::Keyword,
+            },
+        )
+        .unwrap();
+        let points = ids
+            .map(|id| {
+                let mut v = [0.1f32; 4];
+                v[(id as usize) % 4] = 1.0 + id as f32 * 0.001;
+                ReplicatedPoint {
+                    id,
+                    vectors: HashMap::from([
+                        ("dense".into(), v.to_vec()),
+                        ("mini".into(), vec![1.0, id as f32 * 0.01]),
+                    ]),
+                    sparse_vectors: sparse_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            (
+                                name.to_string(),
+                                ce_shaped_sparse(id + 1000 * i as u128, terms),
+                            )
+                        })
+                        .collect(),
+                    payload: HashMap::from([(
+                        "path".into(),
+                        Value::String(format!("src/file_{}.rs", id % 2)),
+                    )]),
+                }
+            })
+            .collect();
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::UpsertPoints {
+                collection: "repo".into(),
+                points,
+            },
+        )
+        .unwrap();
+        (collections, config)
+    }
+
+    /// LSM node/vector counters (served as points_count) must go down when
+    /// points are deleted, not only up.
+    #[test]
+    fn apply_delete_points_lsm_decrements_node_and_vector_counters() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let (collections, config) =
+            ce_shaped_lsm_collection(&temp_dir, 1..=12, 20, &["lex_sparse"]);
+        let storage = collections.get_collection("repo").unwrap();
+        let counts = || {
+            let stats = storage
+                .with_read_backend(|r| storage.get_metadata_be(r))
+                .unwrap()
+                .stats;
+            (stats.node_count, stats.vector_count)
+        };
+        let delete = |ids: Vec<u128>| {
+            apply_mutation(
+                &collections,
+                &config,
+                &ReplicatedMutation::DeletePoints {
+                    collection: "repo".into(),
+                    ids,
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(counts(), (12, 12));
+        delete(vec![1, 2, 3, 4, 5, 6, 3, 999]);
+        assert_eq!(counts(), (6, 6), "after deleting 6 of 12 points");
+        delete((7..=12).collect());
+        assert_eq!(counts(), (0, 0), "after deleting every point");
+    }
+
+    /// Every sparse vector of a point is deleted, leaving each sparse index
+    /// scoring exactly like an index that only ever held the survivors.
+    #[test]
+    fn apply_delete_points_lsm_matches_fresh_index_for_every_sparse_vector() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let names = ["lex_sparse", "lex_title"];
+        let (deleted_dir, fresh_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let (deleted, config) = ce_shaped_lsm_collection(&deleted_dir, 1..=12, 40, &names);
+        let (fresh, _) = ce_shaped_lsm_collection(&fresh_dir, 7..=12, 40, &names);
+        apply_mutation(
+            &deleted,
+            &config,
+            &ReplicatedMutation::DeletePoints {
+                collection: "repo".into(),
+                ids: vec![1, 2, 3, 4, 5, 6, 3, 999],
+            },
+        )
+        .unwrap();
+
+        let every_term = SparseVector {
+            indices: (0..160).collect(),
+            values: vec![1.0; 160],
+        };
+        let hits = |collections: &CollectionManager, name: &str| {
+            let storage = collections.get_collection("repo").unwrap();
+            let r = storage.backend.begin_read().unwrap();
+            storage
+                .named_vectors
+                .with_sparse_core(name, |core| {
+                    core.search_be::<fn(u128) -> bool>(&r, &every_term, 100, None)
+                })
+                .unwrap()
+        };
+        for name in names {
+            let after_delete = hits(&deleted, name);
+            assert!(
+                !after_delete.is_empty(),
+                "{name}: survivors must still match"
+            );
+            assert!(
+                after_delete.iter().all(|(id, _)| *id >= 7),
+                "{name}: deleted id returned: {after_delete:?}"
+            );
+            assert_eq!(
+                after_delete,
+                hits(&fresh, name),
+                "{name}: Idf scores differ from an index of only the survivors"
+            );
+        }
+    }
+
+    /// A filter delete of one file's points must not pay one sequential SlateDB
+    /// read per distinct sparse term: the sparse df/forward reads are batched
+    /// per chunk, so the round-trip count is independent of terms per point.
+    #[test]
+    fn apply_delete_points_lsm_round_trips_do_not_scale_with_sparse_terms() {
+        use crate::helix_engine::storage_core::backend_lsm::lsm_round_trips_for_test as round_trips;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let delete_round_trips = |terms: usize| {
+            let temp_dir = TempDir::new().unwrap();
+            let (collections, config) =
+                ce_shaped_lsm_collection(&temp_dir, 1..=64, terms, &["lex_sparse"]);
+            let storage = collections.get_collection("repo").unwrap();
+            // A duplicate and a never-inserted id are no-ops.
+            let mut ids: Vec<u128> = (1..=64).collect();
+            ids.extend([5, 9_999]);
+            let before = round_trips();
+            apply_mutation(
+                &collections,
+                &config,
+                &ReplicatedMutation::DeletePoints {
+                    collection: "repo".into(),
+                    ids,
+                },
+            )
+            .unwrap();
+            let spent = round_trips() - before;
+
+            let r = storage.backend.begin_read().unwrap();
+            let every_term = SparseVector {
+                indices: (0..4 * terms as u32).collect(),
+                values: vec![1.0; 4 * terms],
+            };
+            let hits = storage
+                .named_vectors
+                .with_sparse_core("lex_sparse", |core| {
+                    core.search_be::<fn(u128) -> bool>(&r, &every_term, 100, None)
+                })
+                .unwrap();
+            assert!(
+                hits.is_empty(),
+                "deleted points still in sparse search: {hits:?}"
+            );
+            spent
+        };
+        let few_terms = delete_round_trips(20);
+        let many_terms = delete_round_trips(280);
+        assert!(
+            few_terms > 64,
+            "the delete must run on this thread: {few_terms}"
+        );
+        assert!(
+            many_terms <= few_terms + 8,
+            "delete round trips grew with sparse terms per point: {few_terms} (20 terms) vs {many_terms} (280 terms)"
+        );
+    }
+
+    /// A chunk's node reads, sparse forward reads and counter bumps are batched,
+    /// so upsert round trips do not grow with the number of points, while the
+    /// node and vector counters still count each new point once (a repeated id
+    /// in one chunk included).
+    #[test]
+    fn apply_upsert_points_lsm_round_trips_do_not_scale_with_points() {
+        use crate::helix_engine::storage_core::backend_lsm::lsm_round_trips_for_test as round_trips;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let point = |id: u128, path: &str| {
+            let mut v = [0.1f32; 4];
+            v[(id as usize) % 4] = 1.0 + id as f32 * 0.001;
+            ReplicatedPoint {
+                id,
+                vectors: HashMap::from([
+                    ("dense".into(), v.to_vec()),
+                    ("mini".into(), vec![1.0, id as f32 * 0.01]),
+                ]),
+                sparse_vectors: HashMap::from([(
+                    "lex_sparse".to_string(),
+                    ce_shaped_sparse(id, 20),
+                )]),
+                payload: HashMap::from([("path".into(), Value::String(path.to_string()))]),
+            }
+        };
+        // Upsert `ids` into a 64-point collection: (round trips, node/vector counts).
+        let upsert = |ids: Vec<u128>, path: &str| {
+            let temp_dir = TempDir::new().unwrap();
+            let (collections, config) =
+                ce_shaped_lsm_collection(&temp_dir, 1..=64, 20, &["lex_sparse"]);
+            let storage = collections.get_collection("repo").unwrap();
+            let points = ids.iter().map(|id| point(*id, path)).collect();
+            let before = round_trips();
+            apply_mutation(
+                &collections,
+                &config,
+                &ReplicatedMutation::UpsertPoints {
+                    collection: "repo".into(),
+                    points,
+                },
+            )
+            .unwrap();
+            let spent = round_trips() - before;
+            let stats = storage
+                .with_read_backend(|r| storage.get_metadata_be(r))
+                .unwrap()
+                .stats;
+            (spent, (stats.node_count, stats.vector_count))
+        };
+
+        let (fresh8, counts) = upsert((101..=108).collect(), "a.rs");
+        assert_eq!(counts, (72, 72), "8 new points");
+        let (fresh64, counts) = upsert((201..=264).collect(), "a.rs");
+        assert_eq!(counts, (128, 128), "64 new points");
+        let (changed8, counts) = upsert((1..=8).collect(), "b.rs");
+        assert_eq!(counts, (64, 64), "8 changed points");
+        let (changed64, counts) = upsert((1..=64).collect(), "b.rs");
+        assert_eq!(counts, (64, 64), "64 changed points");
+        let mut repeated: Vec<u128> = (301..=310).collect();
+        repeated.extend([305, 7]);
+        let (_, counts) = upsert(repeated, "a.rs");
+        assert_eq!(
+            counts,
+            (74, 74),
+            "10 new points, one repeated, one existing"
+        );
+
+        assert!(fresh8 > 0, "the upsert must run on this thread");
+        // The per-point reads paid 4 round trips per new point and 2 per changed one.
+        assert!(
+            fresh64 <= fresh8 + 8,
+            "upsert round trips grew with new points: {fresh8} (8) vs {fresh64} (64)"
+        );
+        assert!(
+            changed64 <= changed8 + 8,
+            "upsert round trips grew with changed points: {changed8} (8) vs {changed64} (64)"
+        );
+    }
+
+    /// Deterministic unit-ish vectors: xorshift64 so the fixture needs no seed
+    /// plumbing and brute-force ground truth can be recomputed from the ids.
+    fn prod_shaped_vector(id: u128, dim: usize) -> Vec<f32> {
+        let mut state = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..dim)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// LSM collection shaped like a CE code collection on the prod writer at
+    /// reduced scale: `points` dense points sealed into `rounds` Indexed HNSW
+    /// segments by the real optimizer, plus `edges` graph edges among the
+    /// points above `protected_below` (so a delete of `1..=protected_below`
+    /// touches none of them). Returns the ids as point ids.
+    fn prod_shaped_lsm_collection(
+        temp_dir: &TempDir,
+        points: u128,
+        rounds: u128,
+        protected_below: u128,
+        edges: usize,
+    ) -> (Arc<CollectionManager>, Config) {
+        let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        config.vector_config.flat_scan_threshold = Some(16);
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: "repo".into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: 8,
+                        distance: DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        let storage = collections.get_collection("repo").unwrap();
+        let flat_scan_threshold = storage
+            .named_vectors
+            .effective_indexing_threshold(config.vector_flat_scan_threshold());
+        let per_round = points / rounds;
+        for round in 0..rounds {
+            let first = round * per_round + 1;
+            let last = if round + 1 == rounds {
+                points
+            } else {
+                first + per_round - 1
+            };
+            apply_mutation(
+                &collections,
+                &config,
+                &ReplicatedMutation::UpsertPoints {
+                    collection: "repo".into(),
+                    points: (first..=last)
+                        .map(|id| ReplicatedPoint {
+                            id,
+                            vectors: HashMap::from([("dense".into(), prod_shaped_vector(id, 8))]),
+                            sparse_vectors: HashMap::new(),
+                            payload: HashMap::from([(
+                                "path".into(),
+                                Value::String(format!("src/file_{}.rs", id % 50)),
+                            )]),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+            run_index_job(IndexJob {
+                collection: "repo".to_string(),
+                storage: Arc::downgrade(&storage),
+                spaces_to_check: vec!["dense".to_string()],
+                hnsw_config: HNSWConfig::new(Some(8), Some(32), Some(64)),
+                flat_scan_threshold,
+            });
+        }
+        // Settle before measuring: every point sealed into an Indexed segment
+        // and the segment reaper drained, so neither search visibility nor the
+        // backend read counter is perturbed by background optimizer work.
+        let settle_deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let r = storage.backend.begin_read().unwrap();
+            let stats = storage
+                .named_vectors
+                .get_dense_space_stats_be(&r, "dense")
+                .unwrap();
+            drop(r);
+            let all_indexed = stats.indexed_vectors_count == stats.vectors_count;
+            if all_indexed && SEGMENT_REAPER.idle() {
+                break;
+            }
+            assert!(
+                Instant::now() < settle_deadline,
+                "fixture did not settle: indexed {}/{} vectors, reaper idle {}",
+                stats.indexed_vectors_count,
+                stats.vectors_count,
+                SEGMENT_REAPER.idle()
+            );
+            if !all_indexed {
+                run_index_job(IndexJob {
+                    collection: "repo".to_string(),
+                    storage: Arc::downgrade(&storage),
+                    spaces_to_check: vec!["dense".to_string()],
+                    hnsw_config: HNSWConfig::new(Some(8), Some(32), Some(64)),
+                    flat_scan_threshold,
+                });
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        if edges > 0 {
+            let survivors = points - protected_below;
+            let endpoint = |k: usize| protected_below + 1 + (k as u128 % survivors);
+            apply_mutation(
+                &collections,
+                &config,
+                &ReplicatedMutation::IngestBatch {
+                    collection: "repo".into(),
+                    ops: (0..edges)
+                        .map(|i| {
+                            ReplicatedIngestOp::Edge(EdgeUpsert {
+                                id: (1u128 << 64) | i as u128,
+                                label: "calls".into(),
+                                from_node: endpoint(i * 7),
+                                to_node: endpoint(i * 13 + 5),
+                                properties: HashMap::new(),
+                            })
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        }
+        (collections, config)
+    }
+
+    /// Prod shape: a batch delete on a collection whose graph holds many edges.
+    /// Every deleted point used to pay two scans over the ENTIRE OutEdges and
+    /// InEdges namespaces (`drop_node_be` -> `collect_incident_edges` ->
+    /// LSM dup-namespace prefix scan that ignored the prefix), so delete work
+    /// was O(deleted ids x edges) instead of O(deleted ids' own edges).
+    #[test]
+    fn apply_delete_points_lsm_reads_do_not_scale_with_graph_edges() {
+        use crate::helix_engine::storage_core::backend_lsm::dup_scan_rows_for_test;
+        let _guard = ENV_LOCK.lock().unwrap();
+        const POINTS: u128 = 1200;
+        const DELETED: u128 = 300;
+        const EDGES: usize = 6000;
+        let measure = |edges: usize| {
+            let temp_dir = TempDir::new().unwrap();
+            let (collections, config) =
+                prod_shaped_lsm_collection(&temp_dir, POINTS, 3, DELETED, edges);
+            let storage = collections.get_collection("repo").unwrap();
+            let AnyBackend::Lsm(backend) = &*storage.backend else {
+                panic!("fixture must run on the LSM writer backend");
+            };
+            {
+                let r = storage.backend.begin_read().unwrap();
+                let stats = storage
+                    .named_vectors
+                    .get_dense_space_stats_be(&r, "dense")
+                    .unwrap();
+                assert!(
+                    stats.segments_count >= 2,
+                    "fixture must span several segments, got {}",
+                    stats.segments_count
+                );
+            }
+            backend.reset_read_count();
+            let edge_rows_before = dup_scan_rows_for_test();
+            let started = Instant::now();
+            apply_mutation(
+                &collections,
+                &config,
+                &ReplicatedMutation::DeletePoints {
+                    collection: "repo".into(),
+                    ids: (1..=DELETED).collect(),
+                },
+            )
+            .unwrap();
+            let elapsed = started.elapsed();
+            let reads = backend.read_count();
+            let edge_rows = dup_scan_rows_for_test() - edge_rows_before;
+
+            let r = storage.backend.begin_read().unwrap();
+            let stats = storage
+                .named_vectors
+                .get_dense_space_stats_be(&r, "dense")
+                .unwrap();
+            assert_eq!(stats.vectors_count, (POINTS - DELETED) as u64);
+            for id in [1u128, DELETED] {
+                let node = storage
+                    .backend
+                    .get_with(&r, Namespace::Nodes, &id.to_be_bytes(), |v| v.is_some())
+                    .unwrap();
+                assert!(!node, "deleted point {id} must be gone");
+            }
+            if edges > 0 {
+                let edge_id = (1u128 << 64) | (edges as u128 - 1);
+                let kept = storage
+                    .backend
+                    .get_with(&r, Namespace::Edges, &edge_id.to_be_bytes(), |v| {
+                        v.is_some()
+                    })
+                    .unwrap();
+                assert!(kept, "edges among survivors must be untouched");
+            }
+            eprintln!(
+                "delete {DELETED}/{POINTS} points with {edges} survivor edges: {edge_rows} edge rows scanned, {reads} backend reads, {elapsed:?}"
+            );
+            (edge_rows, reads, elapsed)
+        };
+        let (edge_rows_without_edges, ..) = measure(0);
+        let (edge_rows_with_edges, ..) = measure(EDGES);
+        // Each deleted id may probe one row past its own (empty) adjacency per
+        // namespace; anything proportional to EDGES means the scan is unbounded.
+        assert!(
+            edge_rows_with_edges <= edge_rows_without_edges + DELETED as usize * 4,
+            "delete scanned edge rows grew with the graph size: {edge_rows_without_edges} rows with no edges vs {edge_rows_with_edges} with {EDGES} edges"
+        );
+    }
+
+    /// Search after a batch delete: deleted ids never surface and recall@10
+    /// against brute force over the survivors stays at the level the HNSW
+    /// index delivers today (the delete fix does not touch graph repair).
+    #[test]
+    fn apply_delete_points_lsm_keeps_dense_recall_after_delete() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        const POINTS: u128 = 1200;
+        const DELETED: u128 = 300;
+        const QUERIES: u128 = 40;
+        const K: usize = 10;
+        let temp_dir = TempDir::new().unwrap();
+        let (collections, config) = prod_shaped_lsm_collection(&temp_dir, POINTS, 3, DELETED, 0);
+        let storage = collections.get_collection("repo").unwrap();
+
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+        let recall = |live: std::ops::RangeInclusive<u128>| -> f32 {
+            let r = storage.backend.begin_read().unwrap();
+            let mut hits = 0usize;
+            for q in 0..QUERIES {
+                let query = prod_shaped_vector(1_000_000 + q, 8);
+                let mut exact: Vec<(u128, f32)> = live
+                    .clone()
+                    .map(|id| (id, cosine(&query, &prod_shaped_vector(id, 8))))
+                    .collect();
+                exact.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let truth: HashSet<u128> = exact.iter().take(K).map(|(id, _)| *id).collect();
+                let found = storage
+                    .named_vectors
+                    .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                        &r, "dense", &query, K, None, false, None, None,
+                    )
+                    .unwrap();
+                for hit in &found {
+                    assert!(
+                        live.contains(&hit.get_id()),
+                        "deleted point {} surfaced in search",
+                        hit.get_id()
+                    );
+                }
+                hits += found.iter().filter(|h| truth.contains(&h.get_id())).count();
+            }
+            hits as f32 / (QUERIES as usize * K) as f32
+        };
+
+        let before = recall(1..=POINTS);
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::DeletePoints {
+                collection: "repo".into(),
+                ids: (1..=DELETED).collect(),
+            },
+        )
+        .unwrap();
+        let after = recall(DELETED + 1..=POINTS);
+        eprintln!("dense recall@{K}: before delete {before:.3}, after delete {after:.3}");
+        // Floor measured on the pre-fix code with this exact seed and shape.
+        assert!(
+            after >= 0.9 && after + 0.05 >= before,
+            "recall@{K} regressed after delete: {before:.3} -> {after:.3}"
+        );
     }
 
     #[test]

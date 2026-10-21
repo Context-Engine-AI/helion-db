@@ -28,11 +28,11 @@ pub fn handle_ready(input: &HandlerInput, response: &mut Response) -> Result<(),
         return Ok(());
     }
     let collections = &input.collections;
-    let list = collections.list_collections().unwrap_or_default();
     response.status = 200;
+    // Cached catalog count: a probe must never wait on an object-store listing.
     let body = sonic_rs::json!({
         "status": "ready",
-        "collections_on_disk": list.len(),
+        "collections_on_disk": collections.collections_on_disk_cached(),
         "collections_loaded": collections.loaded_count(),
     });
     response.body = sonic_rs::to_vec(&body)?;

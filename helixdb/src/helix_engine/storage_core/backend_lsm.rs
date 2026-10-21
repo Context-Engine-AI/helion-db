@@ -34,8 +34,8 @@ use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::{ObjectStore, ObjectStoreExt};
 use slatedb::{
-    BloomFilterPolicy, CloseReason, Db, DbSnapshot, FilterPolicy, IsolationLevel, MergeOperator,
-    MergeOperatorError, PrefixExtractor, PrefixTarget, WriteBatch,
+    BloomFilterPolicy, CloseReason, Db, DbIterator, DbSnapshot, FilterPolicy, IsolationLevel,
+    KeyValue, MergeOperator, MergeOperatorError, PrefixExtractor, PrefixTarget, WriteBatch,
 };
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Handle, Runtime};
@@ -48,7 +48,7 @@ use super::backend::{
 use super::backend_lmdb::ns_name;
 use super::metadata::{
     apply_lsm_counter_delta, decode_lsm_counter_delta, decode_lsm_counter_value,
-    encode_lsm_counter_value,
+    encode_lsm_counter_delta, encode_lsm_counter_value,
 };
 
 thread_local! {
@@ -58,6 +58,26 @@ thread_local! {
     /// installs this only for read-like routes; durable writer operations
     /// deliberately never receive a token.
     static LSM_READ_CANCELLATION: RefCell<Option<LsmReadCancellation>> = const { RefCell::new(None) };
+    /// Test-only: sequential SlateDB round trips (`block_on_lsm_mapped` calls)
+    /// issued by this thread.
+    #[cfg(test)]
+    static LSM_ROUND_TRIPS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+    /// Test-only: rows pulled by dup-namespace scans on this thread, matching
+    /// or not — the quantity a prefix scan must keep proportional to its hits.
+    #[cfg(test)]
+    static DUP_SCAN_ROWS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Test-only: SlateDB round trips issued by the current thread so far.
+#[cfg(test)]
+pub(crate) fn lsm_round_trips_for_test() -> usize {
+    LSM_ROUND_TRIPS_FOR_TEST.with(Cell::get)
+}
+
+/// Test-only: dup-namespace rows scanned by the current thread so far.
+#[cfg(test)]
+pub(crate) fn dup_scan_rows_for_test() -> usize {
+    DUP_SCAN_ROWS_FOR_TEST.with(Cell::get)
 }
 
 struct LsmReadCancellationInner {
@@ -455,9 +475,19 @@ const ENV_L0_MAX_SSTS: &str = "HELIX_LSM_L0_MAX_SSTS";
 /// default (8).
 const ENV_L0_MAX_SSTS_PER_KEY: &str = "HELIX_LSM_L0_MAX_SSTS_PER_KEY";
 /// Env knob: force an L0 flush after this many durable WAL flushes even when the
-/// memtable has not reached `l0_sst_size_bytes`. Lower values reduce reader WAL
-/// replay/cold-open work for low-write collections. SlateDB requires >= 4096.
+/// memtable has not reached `l0_sst_size_bytes`. Lower values bound the WAL
+/// tail every reader open/refresh must replay. SlateDB's `DbBuilder::build`
+/// rejects values below 4096 (`Invalid`), which would fail every writer open,
+/// so values below 4096 are ignored (SlateDB default).
 const ENV_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: &str = "HELIX_LSM_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH";
+/// Env knob: reader-replica WAL replay prefetch width
+/// (`DbReaderOptions::wal_replay_sst_batch_size`). Each in-flight WAL SST is
+/// one HEAD+GET, so this is the open-time S3 concurrency per collection.
+/// Unset/0 → [`DEFAULT_READER_WAL_REPLAY_BATCH`]; capped at
+/// [`MAX_READER_WAL_REPLAY_BATCH`].
+const ENV_READER_WAL_REPLAY_BATCH: &str = "HELIX_LSM_READER_WAL_REPLAY_BATCH";
+const DEFAULT_READER_WAL_REPLAY_BATCH: usize = 32;
+const MAX_READER_WAL_REPLAY_BATCH: usize = 256;
 /// Env knob: number of parallel L0 flush workers (`l0_flush_parallelism`).
 /// Unset → SlateDB default (4).
 const ENV_L0_FLUSH_PARALLELISM: &str = "HELIX_LSM_L0_FLUSH_PARALLELISM";
@@ -653,15 +683,36 @@ impl HelixCounterMergeOperator {
 impl MergeOperator for HelixCounterMergeOperator {
     fn merge(
         &self,
-        _key: &Bytes,
+        key: &Bytes,
         existing_value: Option<Bytes>,
         operand: Bytes,
     ) -> Result<Bytes, MergeOperatorError> {
-        let value = match existing_value {
-            Some(bytes) => decode_lsm_counter_value(&bytes).map_err(Self::callback_error)?,
-            None => 0,
+        self.merge_batch(key, existing_value, std::slice::from_ref(&operand))
+    }
+
+    /// Operands are signed deltas. SlateDB also calls this with no base value
+    /// to fold a write batch's or a memtable's operands, and stores that fold
+    /// as another operand, so it must keep its sign: flooring it at zero lost
+    /// every decrement. Only a real base value is floored at zero.
+    fn merge_batch(
+        &self,
+        _key: &Bytes,
+        existing_value: Option<Bytes>,
+        operands: &[Bytes],
+    ) -> Result<Bytes, MergeOperatorError> {
+        let mut delta = 0i64;
+        for operand in operands {
+            let next = decode_lsm_counter_delta(operand).map_err(Self::callback_error)?;
+            delta = delta.checked_add(next).ok_or_else(|| {
+                Self::callback_error(GraphError::StorageError(
+                    "metadata counter delta overflow".to_string(),
+                ))
+            })?;
+        }
+        let Some(base) = existing_value else {
+            return Ok(Bytes::copy_from_slice(&encode_lsm_counter_delta(delta)));
         };
-        let delta = decode_lsm_counter_delta(&operand).map_err(Self::callback_error)?;
+        let value = decode_lsm_counter_value(&base).map_err(Self::callback_error)?;
         let next = apply_lsm_counter_delta(value, delta).map_err(Self::callback_error)?;
         Ok(Bytes::copy_from_slice(&encode_lsm_counter_value(next)))
     }
@@ -891,6 +942,20 @@ fn max_open_collections_for_cache() -> usize {
         .max(1)
 }
 
+/// Env knob: divisor for the PER-COLLECTION cache cap, decoupled from the
+/// residency cap. Unset/0 keeps the old coupling (`HELIX_MAX_OPEN_COLLECTIONS`).
+/// Setting it lets an operator raise the open-handle cap without shrinking each
+/// collection's cache share: the cap is `total / divisor` whatever max-open is.
+/// The resident sum can then exceed the total (up to `max_open / divisor` x),
+/// which only grows reclaimable page cache and /cache disk use, not heap.
+const ENV_CACHE_COLLECTION_DIVISOR: &str = "HELIX_LSM_CACHE_COLLECTION_DIVISOR";
+
+fn cache_collection_divisor() -> usize {
+    env_usize_opt(ENV_CACHE_COLLECTION_DIVISOR)
+        .filter(|divisor| *divisor > 0)
+        .unwrap_or_else(max_open_collections_for_cache)
+}
+
 fn cache_max_open_file_handles_default() -> usize {
     let max_open = max_open_collections_for_cache();
     let fd_high = std::env::var("HELIX_MAINTENANCE_FD_HIGH")
@@ -986,7 +1051,40 @@ pub(crate) struct S3StoreConfig<'a> {
     pub(crate) allow_http: bool,
 }
 
-fn build_s3_store(config: &S3StoreConfig<'_>) -> Result<Arc<dyn ObjectStore>, BackendError> {
+/// One S3 client per (bucket, region, endpoint, allow_http) for the whole
+/// process: every writer/reader open and every env-based helper (tombstone
+/// HEAD, prefix probe, purge, catalog LIST) shares it, so a cold open no
+/// longer pays a fresh client build + IRSA credential exchange per call.
+static S3_STORES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(String, Option<String>, Option<String>, bool), Arc<dyn ObjectStore>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn build_s3_store(
+    config: &S3StoreConfig<'_>,
+) -> Result<Arc<dyn ObjectStore>, BackendError> {
+    let key = (
+        config.bucket.to_string(),
+        config.region.map(str::to_string),
+        config.endpoint.map(str::to_string),
+        config.allow_http,
+    );
+    if let Some(store) = S3_STORES
+        .lock()
+        .ok()
+        .and_then(|stores| stores.get(&key).cloned())
+    {
+        return Ok(store);
+    }
+    let store = build_s3_store_uncached(config)?;
+    if let Ok(mut stores) = S3_STORES.lock() {
+        stores.insert(key, Arc::clone(&store));
+    }
+    Ok(store)
+}
+
+fn build_s3_store_uncached(
+    config: &S3StoreConfig<'_>,
+) -> Result<Arc<dyn ObjectStore>, BackendError> {
     let mut builder = AmazonS3Builder::from_env().with_bucket_name(config.bucket);
     if let Some(r) = config.region {
         builder = builder.with_region(r);
@@ -1023,7 +1121,8 @@ fn build_s3_store(config: &S3StoreConfig<'_>) -> Result<Arc<dyn ObjectStore>, Ba
 /// LRU keeps at most `max_open` collections resident, so the sum across resident
 /// per-collection subdirs is `max_open × (total / max_open) ≈ total` — bounded
 /// by the configured total. (Integer division rounds the per-collection cap
-/// down, so the sum is ≤ total, never above.)
+/// down, so the sum is ≤ total, never above.) `HELIX_LSM_CACHE_COLLECTION_DIVISOR`
+/// replaces `max_open` as the divisor when set (see [`ENV_CACHE_COLLECTION_DIVISOR`]).
 fn cache_options_from_env(collection_id: &str) -> Option<ObjectStoreCacheOptions> {
     let dir = std::env::var(ENV_CACHE_DIR).ok()?;
     if dir.trim().is_empty() {
@@ -1057,9 +1156,10 @@ fn cache_options_from_env(collection_id: &str) -> Option<ObjectStoreCacheOptions
         cache_memory_max_pct(),
     );
     // Divide the TOTAL cap across the expected concurrently-open collections so
-    // the per-collection subdirs sum to <= total_cap (see CAP MATH above).
-    // Floored at 1 byte so a huge max_open never yields a zero (no-op) cap.
-    let per_collection_cap = (total_cap / max_open_collections_for_cache()).max(1);
+    // the per-collection subdirs sum to <= total_cap (see CAP MATH above), or
+    // across `HELIX_LSM_CACHE_COLLECTION_DIVISOR` when set.
+    // Floored at 1 byte so a huge divisor never yields a zero (no-op) cap.
+    let per_collection_cap = (total_cap / cache_collection_divisor()).max(1);
     cache.max_cache_size_bytes = Some(per_collection_cap);
     // Evictor sweep cadence. The cache also evicts on write + backpressures.
     // Unset/invalid → SlateDB default; explicit 0 disables recurring sweeps
@@ -1245,25 +1345,36 @@ pub(crate) fn reader_options_from_env(collection_id: &str) -> DbReaderOptions {
     if let Some(interval) = lsm_reader_manifest_poll_interval_from_env() {
         options.manifest_poll_interval = interval;
     }
-    // With the writer change feed enabled, fresh opens take the IDLE tier; the
-    // feed poller promotes changed collections to the serving cadence.
+    // Feed mode with the read-gated sweeper off: fresh opens take the IDLE
+    // tier and only the feed poller promotes changed collections.
     if !reader_cold_open_starts_fast() {
         options.manifest_poll_interval = reader_idle_poll_interval_from_env();
     }
+    options.wal_replay_sst_batch_size = reader_wal_replay_batch_from_env();
     clamp_reader_checkpoint_lifetime(&mut options);
     options
 }
 
+fn reader_wal_replay_batch_from_env() -> usize {
+    env_usize_opt(ENV_READER_WAL_REPLAY_BATCH)
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_READER_WAL_REPLAY_BATCH)
+        .min(MAX_READER_WAL_REPLAY_BATCH)
+}
+
 /// True if a freshly cold-opened reader-replica `DbReader` starts on the fast
-/// (serving) poll tier — i.e. the write-feed is NOT configured, so
-/// [`reader_options_from_env`] (which shares this exact check) has no reason
-/// to cold-open on the idle safety net instead. `HelixGraphStorage` seeds its
-/// `reader_poll_tier_fast` belief from this at construction, so it starts in
-/// sync with the `DbReader`'s actual poll interval rather than always
-/// assuming "fast" (which is wrong — and makes read-gated promotion inert —
-/// whenever the write-feed cold-opens new collections idle).
+/// (serving) poll tier. `HelixGraphStorage` seeds its `reader_poll_tier_fast`
+/// belief from this at construction, so it starts in sync with the
+/// `DbReader`'s actual poll interval ([`reader_options_from_env`] shares this
+/// exact check). Cold opens start fast whenever the read-gated sweeper can
+/// demote them later: a write that lands while the open is still in flight is
+/// skipped by the feed poller (the collection is not resident yet), so an
+/// idle-tier open would serve that stale view for the whole idle interval.
+/// Only the sweeper kill switch (`HELIX_LSM_READER_IDLE_AFTER_MS=0`) with the
+/// write-feed configured keeps the idle-tier cold open, since nothing would
+/// ever demote a fast one there.
 pub(crate) fn reader_cold_open_starts_fast() -> bool {
-    writer_feed_url_from_env().is_none()
+    writer_feed_url_from_env().is_none() || !reader_idle_after_from_env().is_zero()
 }
 
 /// Whether the standalone read-gated poll-tier demotion sweep
@@ -1502,6 +1613,8 @@ pub(crate) fn block_on_lsm_mapped<T, E>(
     future: impl Future<Output = Result<T, E>>,
     map_err: impl FnOnce(E) -> BackendError,
 ) -> Result<T, BackendError> {
+    #[cfg(test)]
+    LSM_ROUND_TRIPS_FOR_TEST.with(|count| count.set(count.get() + 1));
     let allowed = LSM_BLOCKING_ALLOWED.with(Cell::get);
     if tokio::runtime::Handle::try_current().is_ok() {
         if !allowed {
@@ -1592,6 +1705,133 @@ pub(crate) fn logical_key_in_range(key: &[u8], range: &KeyRange) -> bool {
     after_start && before_end
 }
 
+/// Composite-key bounds for one dup-namespace scan over a logical `range`.
+pub(crate) struct DupScanPlan {
+    pub lo: Bound<Vec<u8>>,
+    pub hi: Bound<Vec<u8>>,
+    /// Whole-namespace scans go through SlateDB's prefix scan.
+    pub scan_prefix: Option<Vec<u8>>,
+    /// Set when `range` is `KeyRange::prefix(p)`: lets [`DupScanCursor`] seek
+    /// past rows that cannot match instead of visiting the namespace.
+    pub seek_prefix: Option<Vec<u8>>,
+}
+
+/// Dup rows are keyed `<ns><key_len: u32-BE><key><value>`, so logical keys of
+/// one length form a contiguous region and an exact key is a single slice of
+/// its region. A logical prefix `p` matches the slice `<ns><len><p>..` of every
+/// region with `len >= p.len()`; the scan starts at the first such slice and
+/// the cursor seeks between them. Any other range still scans the namespace
+/// and filters per row.
+pub(crate) fn dup_scan_plan(ns: Namespace<'_>, range: &KeyRange) -> DupScanPlan {
+    let prefix = ns_prefix(ns);
+    let excluded_end = |start: &[u8]| match next_prefix(start) {
+        Some(end) => Bound::Excluded(end),
+        None => Bound::Unbounded,
+    };
+    let scan_prefix = range_covers_all_logical_keys(range).then(|| prefix.clone());
+    match (&range.start, &range.end) {
+        // Keep exact lookups on range scans to avoid extra Bloom-filter reads.
+        (Bound::Included(start), Bound::Included(end)) if start == end => {
+            let lo = dup_key_prefix(ns, start);
+            DupScanPlan {
+                hi: excluded_end(&lo),
+                lo: Bound::Included(lo),
+                scan_prefix,
+                seek_prefix: None,
+            }
+        }
+        (Bound::Included(start), Bound::Excluded(end))
+            if next_prefix(start).as_deref() == Some(end.as_slice()) =>
+        {
+            DupScanPlan {
+                lo: Bound::Included(dup_key_prefix(ns, start)),
+                hi: excluded_end(&prefix),
+                scan_prefix,
+                seek_prefix: Some(start.clone()),
+            }
+        }
+        _ => DupScanPlan {
+            hi: excluded_end(&prefix),
+            lo: Bound::Included(prefix),
+            scan_prefix,
+            seek_prefix: None,
+        },
+    }
+}
+
+/// Drives a dup-namespace iterator, yielding only rows whose logical key lies
+/// in `range`. With a `seek_prefix` the cursor costs O(matching rows + distinct
+/// key lengths) instead of O(namespace): `drop_node_be` scans a node's edges by
+/// prefix once per deleted point, which used to read every edge row in the
+/// collection per point.
+pub(crate) struct DupScanCursor<'a> {
+    iter: DbIterator,
+    ns_prefix: &'a [u8],
+    range: &'a KeyRange,
+    seek_prefix: Option<&'a [u8]>,
+    map_err: fn(slatedb::Error) -> BackendError,
+    visited: usize,
+}
+
+impl<'a> DupScanCursor<'a> {
+    pub(crate) fn new(
+        iter: DbIterator,
+        ns_prefix: &'a [u8],
+        range: &'a KeyRange,
+        seek_prefix: Option<&'a [u8]>,
+        map_err: fn(slatedb::Error) -> BackendError,
+    ) -> Self {
+        Self {
+            iter,
+            ns_prefix,
+            range,
+            seek_prefix,
+            map_err,
+            visited: 0,
+        }
+    }
+
+    /// Rows pulled from the backend so far, matching or not.
+    pub(crate) fn visited(&self) -> usize {
+        self.visited
+    }
+
+    pub(crate) async fn next(&mut self) -> Result<Option<KeyValue>, BackendError> {
+        while let Some(kv) = self.iter.next().await.map_err(self.map_err)? {
+            self.visited += 1;
+            let Some((logical_key, _)) = decode_dup_full_key(kv.key.as_ref(), self.ns_prefix)?
+            else {
+                continue;
+            };
+            if logical_key_in_range(logical_key, self.range) {
+                return Ok(Some(kv));
+            }
+            let Some(prefix) = self.seek_prefix else {
+                continue;
+            };
+            // Rows are sorted, so nothing else in this key-length region can
+            // match: jump to the prefix within it if we landed before the
+            // prefix, otherwise to the prefix in the next region. The scan
+            // began at `<ns><p.len()><p>`, so every row seen here is at least
+            // `p.len()` long and the target is strictly past the current row.
+            let len = logical_key.len() as u32;
+            let region = if logical_key < prefix {
+                Some(len)
+            } else {
+                len.checked_add(1)
+            };
+            let Some(region) = region else {
+                return Ok(None);
+            };
+            let mut target = self.ns_prefix.to_vec();
+            target.extend_from_slice(&region.to_be_bytes());
+            target.extend_from_slice(prefix);
+            self.iter.seek(target).await.map_err(self.map_err)?;
+        }
+        Ok(None)
+    }
+}
+
 /// The collections root prefix for a SlateDB collection path: everything up to
 /// (not including) the final `/<name>` segment (`"helion/my_collection"` ->
 /// `"helion"`, `"my_collection"` -> `""`). Each collection's SlateDB lives at
@@ -1630,7 +1870,7 @@ fn tombstone_collection_name(path: &ObjPath) -> Option<String> {
     (parent.rsplit('/').next() == Some(LSM_DROP_TOMBSTONE_DIR)).then(|| name.to_string())
 }
 
-fn list_drop_tombstones(
+pub(crate) fn list_drop_tombstones(
     rt: &Handle,
     store: &Arc<dyn ObjectStore>,
     root_prefix: &str,
@@ -1665,6 +1905,20 @@ pub(crate) fn list_child_collection_names(
     store: &Arc<dyn ObjectStore>,
     root_prefix: &str,
 ) -> Result<Vec<String>, BackendError> {
+    list_child_collection_catalog(rt, store, root_prefix).map(|catalog| catalog.names)
+}
+
+#[derive(Default)]
+pub(crate) struct CollectionCatalog {
+    pub names: Vec<String>,
+    pub tombstoned: HashSet<String>,
+}
+
+pub(crate) fn list_child_collection_catalog(
+    rt: &Handle,
+    store: &Arc<dyn ObjectStore>,
+    root_prefix: &str,
+) -> Result<CollectionCatalog, BackendError> {
     let root = ObjPath::from(root_prefix);
     let result = block_on_lsm_read(rt, store.list_with_delimiter(Some(&root)))?;
     let tombstoned = list_drop_tombstones(rt, store, root_prefix)?;
@@ -1676,7 +1930,7 @@ pub(crate) fn list_child_collection_names(
         .collect();
     names.sort();
     names.dedup();
-    Ok(names)
+    Ok(CollectionCatalog { names, tombstoned })
 }
 
 /// Open an S3 (or S3-compatible) object store from explicit connection parts and
@@ -1699,8 +1953,25 @@ pub fn list_s3_collection_prefixes(
         endpoint,
         allow_http,
     };
-    let store = build_s3_store(&config)?;
-    list_child_collection_names(&shared_lsm_handle(), &store, root_prefix)
+    list_s3_collection_catalog(&config, root_prefix).map(|catalog| catalog.names)
+}
+
+pub(crate) fn list_s3_collection_catalog(
+    config: &S3StoreConfig<'_>,
+    root_prefix: &str,
+) -> Result<CollectionCatalog, BackendError> {
+    let store = build_s3_store(config)?;
+    list_child_collection_catalog(&shared_lsm_handle(), &store, root_prefix)
+}
+
+/// Collection names with a drop tombstone under `root_prefix`; the S3 twin of
+/// [`list_drop_tombstones`] for a writer that has no `Db` open yet (startup).
+pub(crate) fn list_s3_drop_tombstones(
+    config: &S3StoreConfig<'_>,
+    root_prefix: &str,
+) -> Result<HashSet<String>, BackendError> {
+    let store = build_s3_store(config)?;
+    list_drop_tombstones(&shared_lsm_handle(), &store, root_prefix)
 }
 
 pub(crate) fn read_s3_metadata_sidecar(
@@ -1799,6 +2070,12 @@ pub(crate) fn read_drop_tombstone_with_store(
     store: Arc<dyn ObjectStore>,
     collection_prefix: &str,
 ) -> Result<bool, BackendError> {
+    #[cfg(test)]
+    if std::env::var("HELIX_LSM_TEST_FAIL_TOMBSTONE_READ").is_ok() {
+        return Err(BackendError::Io(
+            "injected test object-store drop tombstone read failure".to_string(),
+        ));
+    }
     let path = drop_tombstone_object_path(collection_prefix);
     block_on_lsm_read(&shared_lsm_handle(), async move {
         match store.head(&path).await {
@@ -1823,6 +2100,116 @@ pub(crate) fn clear_drop_tombstone_with_store(
 }
 
 /// SlateDB-backed storage engine.
+/// Env knob: write-quiet seconds after which a resident WRITER flushes its
+/// memtable to L0. Every reader cold open and checkpoint refresh replays each
+/// WAL SST written since the last L0 flush, and SlateDB flushes only at
+/// `l0_sst_size_bytes` or 4096 WAL flushes (or on close), so trickle-written
+/// collections that stay resident carry tails of hundreds to thousands of WAL
+/// SSTs. Unset/0 disables. Cost: at most one L0 SST + manifest update per
+/// write-quiet period per resident writer collection; a clean memtable
+/// flushes nothing.
+const ENV_IDLE_FLUSH_SECS: &str = "HELIX_LSM_IDLE_FLUSH_SECS";
+
+fn idle_flush_after_from_env() -> Option<std::time::Duration> {
+    env_usize_opt(ENV_IDLE_FLUSH_SECS)
+        .filter(|secs| *secs > 0)
+        .map(|secs| std::time::Duration::from_secs(secs as u64))
+}
+
+/// Write bookkeeping for the idle memtable flush ([`ENV_IDLE_FLUSH_SECS`]).
+struct IdleFlushState {
+    created: std::time::Instant,
+    /// Committed-write generation. Starts one ahead of `flushed` so a WAL tail
+    /// replayed into the memtable at open is flushed after one quiet period.
+    writes: std::sync::atomic::AtomicU64,
+    /// `writes` value covered by the last successful idle flush.
+    flushed: std::sync::atomic::AtomicU64,
+    /// Millis after `created` of the last committed write.
+    last_write_ms: std::sync::atomic::AtomicU64,
+}
+
+impl IdleFlushState {
+    fn new() -> Self {
+        Self {
+            created: std::time::Instant::now(),
+            writes: std::sync::atomic::AtomicU64::new(1),
+            flushed: std::sync::atomic::AtomicU64::new(0),
+            last_write_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.created.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Called after every committed write: `commit`, `commit_buffered`,
+    /// `update_key_transactional`, and `compare_patch_nodes` are this
+    /// backend's only `Db` write paths (`db()` is private to this module).
+    fn note_write(&self) {
+        use std::sync::atomic::Ordering;
+        self.last_write_ms
+            .store(self.elapsed_ms(), Ordering::Release);
+        self.writes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The write generation to flush when writes are unflushed and none landed
+    /// within `quiet`.
+    fn due(&self, quiet: std::time::Duration) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let writes = self.writes.load(Ordering::Acquire);
+        let idle_ms = self
+            .elapsed_ms()
+            .saturating_sub(self.last_write_ms.load(Ordering::Acquire));
+        let quiet_ms = u64::try_from(quiet.as_millis()).unwrap_or(u64::MAX);
+        (writes != self.flushed.load(Ordering::Acquire) && idle_ms >= quiet_ms).then_some(writes)
+    }
+}
+
+/// Background idle flusher for one writer `Db`. Exits once the backend is
+/// dropped (its state `Arc` is gone) or the `Db` is closed or fenced.
+fn spawn_idle_flusher(
+    rt: &Handle,
+    db: Db,
+    state: &Arc<IdleFlushState>,
+    quiet: std::time::Duration,
+) {
+    let state = Arc::downgrade(state);
+    let tick = (quiet / 4).max(std::time::Duration::from_secs(1));
+    rt.spawn(async move {
+        loop {
+            tokio::time::sleep(tick).await;
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if db.status().close_reason.is_some() {
+                return;
+            }
+            let Some(writes) = state.due(quiet) else {
+                continue;
+            };
+            let flushed = db
+                .flush_with_options(slatedb::config::FlushOptions {
+                    flush_type: slatedb::config::FlushType::MemTable,
+                })
+                .await;
+            match flushed {
+                Ok(()) => {
+                    state
+                        .flushed
+                        .store(writes, std::sync::atomic::Ordering::Release);
+                    metrics::counter!("helix_lsm_idle_flush_total", "outcome" => "flushed")
+                        .increment(1);
+                }
+                Err(error) => {
+                    metrics::counter!("helix_lsm_idle_flush_total", "outcome" => "error")
+                        .increment(1);
+                    tracing::debug!(%error, "idle memtable flush failed; retrying next tick");
+                }
+            }
+        }
+    });
+}
+
 pub struct LsmBackend {
     db: RwLock<Db>,
     /// `Handle` to the process-shared LSM runtime (see [`shared_lsm_runtime`]),
@@ -1839,6 +2226,8 @@ pub struct LsmBackend {
     /// barrier, so the barrier knows to publish this collection on the
     /// durable-commit change feed (see [`super::change_feed`]).
     buffered_since_flush: std::sync::atomic::AtomicBool,
+    /// Write bookkeeping for the idle memtable flush ([`ENV_IDLE_FLUSH_SECS`]).
+    idle_flush: Arc<IdleFlushState>,
     /// Test-only counter of backend reads served (one per `get_with` point read,
     /// one per KV yielded by `scan`/`scan_dup_namespace`). Lets tests assert that
     /// an indexed search is HNSW-bounded rather than a full namespace scan. Never
@@ -1879,14 +2268,52 @@ pub struct LsmWrite {
     batch: WriteBatch,
     pending: HashMap<Vec<u8>, Option<Bytes>>,
     has_writes: bool,
+    /// Run when the batch ends: `true` once it committed, `false` when it is
+    /// dropped uncommitted or the commit fails. Lets a writer that published
+    /// in-memory state ahead of the commit take it back on abort.
+    post_txn: Vec<PostTxnHook>,
 }
 impl WriteTxn for LsmWrite {}
+
+/// See [`LsmWrite::on_txn_end`].
+pub(crate) type PostTxnHook = Box<dyn FnOnce(bool) + Send>;
+
+/// Newest first, so undo hooks stacked on one key unwind in order.
+fn run_post_txn(hooks: Vec<PostTxnHook>, committed: bool) {
+    for hook in hooks.into_iter().rev() {
+        hook(committed);
+    }
+}
 
 impl LsmWrite {
     /// The batch's buffered effects (full SlateDB key -> Some(value)|None),
     /// cloned into a read view to give read-your-writes (see `LsmRead`).
     pub(crate) fn pending(&self) -> &HashMap<Vec<u8>, Option<Bytes>> {
         &self.pending
+    }
+
+    /// Register `hook` to run with `true` after this batch commits, or with
+    /// `false` if it is dropped uncommitted or its commit fails.
+    pub(crate) fn on_txn_end(&mut self, hook: PostTxnHook) {
+        self.post_txn.push(hook);
+    }
+
+    /// Detach the batch and its hooks for a commit; what is left drops as an
+    /// empty batch with nothing to run.
+    fn take_for_commit(mut self) -> (WriteBatch, Vec<PostTxnHook>, bool) {
+        (
+            std::mem::replace(&mut self.batch, WriteBatch::new()),
+            std::mem::take(&mut self.post_txn),
+            self.has_writes,
+        )
+    }
+}
+
+impl Drop for LsmWrite {
+    fn drop(&mut self) {
+        // Reached only for a batch that never committed: hooks taken by a
+        // commit leave this empty.
+        run_post_txn(std::mem::take(&mut self.post_txn), false);
     }
 }
 
@@ -1910,6 +2337,10 @@ impl LsmBackend {
     ) -> Result<Self, BackendError> {
         let rt = shared_lsm_handle();
         let db = Self::open_db_for_request(&rt, path, store.clone(), settings.clone())?;
+        let idle_flush = Arc::new(IdleFlushState::new());
+        if let Some(quiet) = idle_flush_after_from_env() {
+            spawn_idle_flusher(&rt, db.clone(), &idle_flush, quiet);
+        }
         Ok(Self {
             db: RwLock::new(db),
             rt,
@@ -1917,6 +2348,7 @@ impl LsmBackend {
             path: path.to_string(),
             settings,
             buffered_since_flush: std::sync::atomic::AtomicBool::new(false),
+            idle_flush,
             #[cfg(test)]
             read_count: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -1946,7 +2378,8 @@ impl LsmBackend {
         let cache = shared_db_cache();
         let mut builder = Db::builder(path, store)
             .with_db_cache(cache)
-            .with_merge_operator(shared_merge_operator());
+            .with_merge_operator(shared_merge_operator())
+            .with_manifest_id_floor(purged_manifest_ceiling(path));
         if let Some(settings) = settings {
             builder = builder.with_settings(settings);
         }
@@ -2004,6 +2437,14 @@ impl LsmBackend {
         #[cfg(test)]
         self.read_count
             .fetch_add(_n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Account the rows one dup-namespace scan pulled from the backend.
+    #[inline(always)]
+    fn note_dup_scan_rows(&self, visited: usize) {
+        self.bump_reads(visited);
+        #[cfg(test)]
+        DUP_SCAN_ROWS_FOR_TEST.with(|count| count.set(count.get() + visited));
     }
 
     /// Open an in-memory SlateDB (for tests). Always cache-less: caching an
@@ -2096,6 +2537,26 @@ impl LsmBackend {
         Ok(out)
     }
 
+    /// Batched [`StorageBackend::get_for_update`]: values buffered in `txn`
+    /// win (read-your-writes); the rest come from ONE multi-get against a fresh
+    /// committed snapshot instead of one SlateDB round trip per key.
+    pub(crate) fn get_for_update_many(
+        &self,
+        txn: &LsmWrite,
+        ns: Namespace<'_>,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
+        let pending = keys
+            .iter()
+            .filter_map(|key| {
+                let full = prefixed(ns, key);
+                txn.pending.get(&full).map(|value| (full, value.clone()))
+            })
+            .collect();
+        let read = self.begin_read_with_pending(pending)?;
+        self.collect_values_many_with(&read, ns, keys)
+    }
+
     pub(crate) fn collect_dup_values_many_with(
         &self,
         txn: &LsmRead,
@@ -2177,6 +2638,7 @@ impl LsmBackend {
                     txn.put(full.as_slice(), next.as_slice())
                         .map_err(map_slatedb_err)?;
                     txn.commit().await.map_err(map_slatedb_err)?;
+                    self.idle_flush.note_write();
                     Ok(result)
                 },
                 |e| e,
@@ -2204,6 +2666,65 @@ impl LsmBackend {
         ))
     }
 
+    /// All-or-none node-row patch with the comparison re-run on transaction conflicts.
+    /// Callers must preserve indexed fields; this is not a general node upsert.
+    pub(crate) fn compare_patch_nodes(
+        &self,
+        ids: &[u128],
+        mut patch: impl FnMut(u128, &[u8]) -> Result<Option<Vec<u8>>, BackendError>,
+    ) -> Result<bool, BackendError> {
+        let db = self.db();
+        for attempt in 0..LSM_METADATA_TXN_MAX_ATTEMPTS {
+            let result = block_on_lsm_mapped(
+                &self.rt,
+                async {
+                    let txn = db
+                        .begin(IsolationLevel::SerializableSnapshot)
+                        .await
+                        .map_err(map_slatedb_err)?;
+                    for id in ids {
+                        let key = prefixed(Namespace::Nodes, &id.to_be_bytes());
+                        let Some(current) =
+                            txn.get(key.as_slice()).await.map_err(map_slatedb_err)?
+                        else {
+                            return Ok(false);
+                        };
+                        let Some(next) = patch(*id, &current)? else {
+                            return Ok(false);
+                        };
+                        txn.put(key.as_slice(), next.as_slice())
+                            .map_err(map_slatedb_err)?;
+                    }
+                    txn.commit().await.map_err(map_slatedb_err)?;
+                    self.idle_flush.note_write();
+                    self.publish_durable_commit();
+                    Ok(true)
+                },
+                |e| e,
+            );
+            match result {
+                Err(error) if Self::is_fenced_conflict(&error) => {
+                    return Err(lsm_fenced_error("node_compare_patch", error.to_string()));
+                }
+                Err(error)
+                    if Self::is_conflict(&error) && attempt + 1 < LSM_METADATA_TXN_MAX_ATTEMPTS =>
+                {
+                    std::thread::yield_now();
+                }
+                Err(error) if Self::is_conflict(&error) => {
+                    return Err(lsm_retryable_cas_error(
+                        "node_compare_patch",
+                        error.to_string(),
+                    ));
+                }
+                other => return other,
+            }
+        }
+        Err(BackendError::Conflict(
+            "node compare-and-patch retry loop exhausted".to_string(),
+        ))
+    }
+
     /// Open SlateDB on AWS S3. `prefix` is the key prefix (a path within the
     /// bucket); `bucket` is the S3 bucket. Credentials and region resolve from
     /// the standard AWS environment (env vars, shared config, or the
@@ -2223,19 +2744,13 @@ impl LsmBackend {
         endpoint: Option<&str>,
         allow_http: bool,
     ) -> Result<Self, BackendError> {
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-        if let Some(r) = region {
-            builder = builder.with_region(r);
-        }
-        if let Some(endpoint) = endpoint {
-            builder = builder.with_endpoint(endpoint);
-        }
-        if allow_http {
-            builder = builder.with_allow_http(true);
-        }
-        builder = apply_s3_timeout(builder);
-        let store = builder.build().map_err(io)?;
-        Self::open_with_store(prefix, Arc::new(store))
+        let store = build_s3_store(&S3StoreConfig {
+            bucket,
+            region,
+            endpoint,
+            allow_http,
+        })?;
+        Self::open_with_store(prefix, store)
     }
 
     /// Purge a collection prefix without opening SlateDB.
@@ -2273,43 +2788,45 @@ impl LsmBackend {
         mut visit: impl FnMut(&[u8], &[u8]) -> bool,
     ) -> Result<(), BackendError> {
         let prefix = ns_prefix(ns);
-        let lo: Bound<Vec<u8>> = Bound::Included(prefix.clone());
-        let hi: Bound<Vec<u8>> = match next_prefix(&prefix) {
-            Some(end) => Bound::Excluded(end),
-            None => Bound::Unbounded,
-        };
-        let scan_prefix = if range_covers_all_logical_keys(&range) {
-            Some(prefix.clone())
-        } else {
-            None
+        let plan = dup_scan_plan(ns, &range);
+        let open_iter = || async {
+            match &plan.scan_prefix {
+                Some(scan_prefix) => {
+                    r.snapshot
+                        .scan_prefix_with_options(scan_prefix.clone(), .., &scan_options)
+                        .await
+                }
+                None => {
+                    r.snapshot
+                        .scan_with_options((plan.lo.clone(), plan.hi.clone()), &scan_options)
+                        .await
+                }
+            }
+            .map_err(io)
         };
 
         if r.pending.is_empty() {
             block_on_lsm_read_mapped(
                 &self.rt,
                 async {
-                    let mut iter = if let Some(scan_prefix) = scan_prefix {
-                        r.snapshot
-                            .scan_prefix_with_options(scan_prefix, .., &scan_options)
-                            .await
-                    } else {
-                        r.snapshot.scan_with_options((lo, hi), &scan_options).await
-                    }
-                    .map_err(io)?;
-                    while let Some(kv) = iter.next().await.map_err(io)? {
-                        self.bump_reads(1);
+                    let mut rows = DupScanCursor::new(
+                        open_iter().await?,
+                        &prefix,
+                        &range,
+                        plan.seek_prefix.as_deref(),
+                        io,
+                    );
+                    while let Some(kv) = rows.next().await? {
                         let (logical_key, logical_value) =
                             match decode_dup_full_key(kv.key.as_ref(), &prefix)? {
                                 Some(parts) => parts,
                                 None => continue,
                             };
-                        if !logical_key_in_range(logical_key, &range) {
-                            continue;
-                        }
                         if !visit(logical_key, logical_value) {
                             break;
                         }
                     }
+                    self.note_dup_scan_rows(rows.visited());
                     Ok::<(), BackendError>(())
                 },
                 |e| e,
@@ -2341,16 +2858,14 @@ impl LsmBackend {
             &self.rt,
             async {
                 let mut pending_iter = pending_rows.into_iter().peekable();
-                let mut iter = if let Some(scan_prefix) = scan_prefix {
-                    r.snapshot
-                        .scan_prefix_with_options(scan_prefix, .., &scan_options)
-                        .await
-                } else {
-                    r.snapshot.scan_with_options((lo, hi), &scan_options).await
-                }
-                .map_err(io)?;
-                while let Some(kv) = iter.next().await.map_err(io)? {
-                    self.bump_reads(1);
+                let mut rows = DupScanCursor::new(
+                    open_iter().await?,
+                    &prefix,
+                    &range,
+                    plan.seek_prefix.as_deref(),
+                    io,
+                );
+                while let Some(kv) = rows.next().await? {
                     let full_key = kv.key.as_ref();
                     while let Some((pending_key, _pending_value)) = pending_iter.peek() {
                         if pending_key.as_slice() >= full_key {
@@ -2362,6 +2877,7 @@ impl LsmBackend {
                             break;
                         };
                         if !visit(&logical_key, &logical_value) {
+                            self.note_dup_scan_rows(rows.visited());
                             return Ok(());
                         }
                     }
@@ -2373,13 +2889,12 @@ impl LsmBackend {
                     else {
                         continue;
                     };
-                    if !logical_key_in_range(logical_key, &range) {
-                        continue;
-                    }
                     if !visit(logical_key, logical_value) {
+                        self.note_dup_scan_rows(rows.visited());
                         return Ok(());
                     }
                 }
+                self.note_dup_scan_rows(rows.visited());
                 for (_full_key, (logical_key, logical_value)) in pending_iter {
                     if !visit(&logical_key, &logical_value) {
                         break;
@@ -2588,6 +3103,12 @@ impl LsmBackend {
         list_child_collection_names(&self.rt, &self.store, root)
     }
 
+    /// Collection names with a live drop tombstone under this writer's root.
+    pub(crate) fn list_drop_tombstones(&self) -> Result<HashSet<String>, BackendError> {
+        let root = collections_root_prefix(&self.path);
+        list_drop_tombstones(&self.rt, &self.store, root)
+    }
+
     pub fn storage_bytes(&self) -> Result<u64, BackendError> {
         let store = Arc::clone(&self.store);
         let prefix = ObjPath::from(self.path.trim_matches('/'));
@@ -2611,6 +3132,44 @@ impl LsmBackend {
     }
 }
 
+/// Highest SlateDB manifest id each purged prefix held, by prefix. A recreate
+/// of the same name in this process starts its manifest ids above it
+/// ([`DbBuilder::with_manifest_id_floor`]), so a reader's late lease append
+/// from the dropped incarnation — which carries that incarnation's `N + 1` —
+/// lands at or below the new database's first id and is never its latest.
+/// Process-local: after a writer restart the window is long gone.
+static LSM_PURGED_MANIFEST_CEILING: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Manifest id of `manifest/<id>.manifest` objects; `None` for anything else.
+fn manifest_id_of(location: &ObjPath) -> Option<u64> {
+    let mut parts = location.parts().collect::<Vec<_>>();
+    let file = parts.pop()?;
+    (parts.last()?.as_ref() == "manifest")
+        .then(|| file.as_ref().strip_suffix(".manifest")?.parse().ok())
+        .flatten()
+}
+
+fn record_purged_manifest_ceiling(path: &str, max_manifest_id: u64) {
+    if max_manifest_id == 0 {
+        return;
+    }
+    if let Ok(mut ceilings) = LSM_PURGED_MANIFEST_CEILING.lock() {
+        let ceiling = ceilings
+            .entry(path.trim_matches('/').to_string())
+            .or_default();
+        *ceiling = (*ceiling).max(max_manifest_id);
+    }
+}
+
+pub(crate) fn purged_manifest_ceiling(path: &str) -> u64 {
+    LSM_PURGED_MANIFEST_CEILING
+        .lock()
+        .ok()
+        .and_then(|ceilings| ceilings.get(path.trim_matches('/')).copied())
+        .unwrap_or(0)
+}
+
 pub(crate) fn purge_prefix_from_store(
     rt: Handle,
     store: Arc<dyn ObjectStore>,
@@ -2623,15 +3182,34 @@ pub(crate) fn purge_prefix_from_store(
         ));
     }
     let prefix = ObjPath::from(path);
+    // `manifest/` goes first so a racing opener gets 404 instead of a manifest
+    // whose SSTs this pass is deleting. A reader that loaded the manifest before
+    // that can still append one more version into the emptied prefix, so the
+    // whole prefix is listed and swept twice; the drop tombstone's grace pass
+    // (`collection_manager`) catches anything appended after the second sweep.
+    let manifest_prefix = prefix.clone().join("manifest");
     block_on_lsm(&rt, async move {
-        let locations: Vec<ObjPath> = store
-            .list(Some(&prefix))
-            .map_ok(|meta| meta.location)
-            .try_collect()
-            .await
-            .map_err(|e| e.to_string())?;
-        for loc in &locations {
-            store.delete(loc).await.map_err(|e| e.to_string())?;
+        for prefix in [&manifest_prefix, &prefix, &prefix] {
+            let locations: Vec<ObjPath> = store
+                .list(Some(prefix))
+                .map_ok(|meta| meta.location)
+                .try_collect()
+                .await
+                .map_err(|e| e.to_string())?;
+            // Recorded before the deletes: a pass that fails midway must not
+            // forget the ids it already removed, or the retry's recreate
+            // (which finds no manifests) would start at 1.
+            record_purged_manifest_ceiling(
+                path,
+                locations
+                    .iter()
+                    .filter_map(manifest_id_of)
+                    .max()
+                    .unwrap_or(0),
+            );
+            for loc in &locations {
+                store.delete(loc).await.map_err(|e| e.to_string())?;
+            }
         }
         Ok::<(), String>(())
     })?;
@@ -2679,32 +3257,36 @@ impl StorageBackend for LsmBackend {
             batch: WriteBatch::new(),
             pending: HashMap::new(),
             has_writes: false,
+            post_txn: Vec::new(),
         })
     }
 
     fn commit(&self, txn: Self::Write<'_>) -> Result<(), BackendError> {
-        if !txn.has_writes {
+        let (batch, hooks, has_writes) = txn.take_for_commit();
+        if !has_writes {
+            run_post_txn(hooks, true);
             return Ok(());
         }
         // `Db::write` returns a `WriteHandle` (durability tracker); we await the
         // batch durably and discard it. Classify fencing/CAS as Conflict.
-        let batch = txn.batch;
         let db = self.db();
-        match block_on_lsm_mapped(&self.rt, db.write(batch.clone()), map_slatedb_err) {
-            Ok(_handle) => {
-                self.publish_durable_commit();
-                Ok(())
-            }
+        let result = match block_on_lsm_mapped(&self.rt, db.write(batch.clone()), map_slatedb_err) {
+            Ok(_handle) => Ok(()),
             Err(error) if Self::is_fenced_conflict(&error) => {
                 let message = lsm_conflict_message(&error).unwrap_or("").to_string();
                 Err(lsm_fenced_error("commit", message))
             }
             Err(error) if Self::is_conflict(&error) => {
-                block_on_lsm_mapped(&self.rt, db.write(batch), map_slatedb_err)
-                    .map(|_handle| self.publish_durable_commit())
+                block_on_lsm_mapped(&self.rt, db.write(batch), map_slatedb_err).map(|_handle| ())
             }
             Err(error) => Err(error),
+        };
+        run_post_txn(hooks, result.is_ok());
+        if result.is_ok() {
+            self.idle_flush.note_write();
+            self.publish_durable_commit();
         }
+        result
     }
 
     /// Group-commit half: apply the batch to the memtable (visible to later
@@ -2714,25 +3296,22 @@ impl StorageBackend for LsmBackend {
     /// wait — see `write_with_options`), so read-your-writes across buffered
     /// commits holds. Durability is provided later by [`flush_durable`].
     fn commit_buffered(&self, txn: Self::Write<'_>) -> Result<(), BackendError> {
-        if !txn.has_writes {
+        let (batch, hooks, has_writes) = txn.take_for_commit();
+        if !has_writes {
+            run_post_txn(hooks, true);
             return Ok(());
         }
-        let batch = txn.batch;
         let db = self.db();
         let options = WriteOptions {
             await_durable: false,
             ..Default::default()
         };
-        match block_on_lsm_mapped(
+        let result = match block_on_lsm_mapped(
             &self.rt,
             db.write_with_options(batch.clone(), &options),
             map_slatedb_err,
         ) {
-            Ok(_handle) => {
-                self.buffered_since_flush
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
+            Ok(_handle) => Ok(()),
             Err(error) if Self::is_fenced_conflict(&error) => {
                 let message = lsm_conflict_message(&error).unwrap_or("").to_string();
                 Err(lsm_fenced_error("commit_buffered", message))
@@ -2746,13 +3325,18 @@ impl StorageBackend for LsmBackend {
                     &self.rt,
                     db.write_with_options(batch, &options),
                     map_slatedb_err,
-                )?;
-                self.buffered_since_flush
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
+                )
+                .map(|_handle| ())
             }
             Err(error) => Err(error),
+        };
+        run_post_txn(hooks, result.is_ok());
+        if result.is_ok() {
+            self.idle_flush.note_write();
+            self.buffered_since_flush
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        result
     }
 
     /// Group-commit barrier: flush the WAL durably to the object store. One
@@ -3002,6 +3586,193 @@ mod tests {
     use super::*;
     use crate::helix_engine::storage_core::backend::{KeyRange, Namespace};
     use serial_test::serial;
+
+    /// SlateDB folds a write batch's (or a memtable's) merge operands with no
+    /// base value and stores the fold as another operand, so the fold must keep
+    /// its sign; only a real base value floors at zero.
+    #[test]
+    fn counter_merge_operator_keeps_signed_operand_folds_and_floors_only_on_a_base() {
+        let op = HelixCounterMergeOperator;
+        let key = Bytes::from_static(b"ctr");
+        let delta = |d: i64| Bytes::copy_from_slice(&encode_lsm_counter_delta(d));
+        let value = |v: u64| Bytes::copy_from_slice(&encode_lsm_counter_value(v));
+
+        let mixed = op.merge_batch(&key, None, &[delta(-1), delta(2)]).unwrap();
+        assert_eq!(decode_lsm_counter_delta(&mixed).unwrap(), 1);
+        let lone = op.merge_batch(&key, None, &[delta(-1)]).unwrap();
+        assert_eq!(decode_lsm_counter_delta(&lone).unwrap(), -1);
+        assert_eq!(
+            op.merge_batch(&key, Some(value(106)), &[mixed, lone.clone(), lone])
+                .unwrap(),
+            value(105)
+        );
+        assert_eq!(
+            op.merge_batch(&key, Some(value(3)), &[delta(-5)]).unwrap(),
+            value(0)
+        );
+        assert_eq!(
+            op.merge(&key, Some(value(10)), delta(-4)).unwrap(),
+            value(6)
+        );
+        // A negative fold that ends up stored as a value reads as zero.
+        let negative = op.merge_batch(&key, None, &[delta(-3)]).unwrap();
+        assert_eq!(decode_lsm_counter_value(&negative).unwrap(), 0);
+
+        // On-disk compatibility: the pre-fix operator decoded every operand as
+        // an i64 delta and every base as a u64, so it applies a new signed fold
+        // correctly, and the non-negative folds it stored are valid deltas.
+        let pre_fix_merge = |base: u64, operand: &Bytes| {
+            apply_lsm_counter_delta(base, decode_lsm_counter_delta(operand).unwrap()).unwrap()
+        };
+        let fold = op.merge_batch(&key, None, &[delta(-4), delta(1)]).unwrap();
+        assert_eq!(pre_fix_merge(106, &fold), 103);
+        assert_eq!(encode_lsm_counter_value(7), encode_lsm_counter_delta(7));
+    }
+
+    #[test]
+    fn lsm_counter_merges_apply_negative_and_mixed_sign_deltas_exactly() {
+        let be = LsmBackend::open_in_memory("counter-merge-signs").unwrap();
+        let key = b"ctr";
+        let read = || {
+            let r = be.begin_read().unwrap();
+            be.get_with(&r, Namespace::Metadata, key, |v| {
+                v.map(|b| decode_lsm_counter_value(b).unwrap())
+            })
+            .unwrap()
+        };
+        let merge = |deltas: &[i64]| {
+            let mut w = be.begin_write().unwrap();
+            for d in deltas {
+                be.merge(
+                    &mut w,
+                    Namespace::Metadata,
+                    key,
+                    &encode_lsm_counter_delta(*d),
+                )
+                .unwrap();
+            }
+            be.commit(w).unwrap();
+        };
+        // Flushing moves folds into SSTs, below later operands and above the base.
+        let flush_memtable = || {
+            block_on_lsm(
+                &be.rt,
+                be.db().flush_with_options(slatedb::config::FlushOptions {
+                    flush_type: slatedb::config::FlushType::MemTable,
+                }),
+            )
+            .unwrap()
+        };
+
+        let mut w = be.begin_write().unwrap();
+        be.put(
+            &mut w,
+            Namespace::Metadata,
+            key,
+            &encode_lsm_counter_value(105),
+        )
+        .unwrap();
+        be.commit(w).unwrap();
+        flush_memtable();
+
+        merge(&[-1]);
+        assert_eq!(read(), Some(104), "a lone negative delta");
+        merge(&[-1, 2]);
+        assert_eq!(read(), Some(105), "a mixed-sign batch");
+        flush_memtable();
+        assert_eq!(read(), Some(105), "after the operands were flushed");
+        merge(&[-3, 1]);
+        flush_memtable();
+        merge(&[-1]);
+        assert_eq!(
+            read(),
+            Some(102),
+            "operands spread across SSTs and memtable"
+        );
+        merge(&[-500]);
+        assert_eq!(read(), Some(0), "a real base still floors at zero");
+    }
+
+    #[test]
+    fn compare_patch_nodes_rechecks_stable_ids_and_rolls_back_the_batch() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        };
+        use std::time::Duration;
+        let backend = Arc::new(LsmBackend::open_in_memory("node-cas-race").unwrap());
+        let mut write = backend.begin_write().unwrap();
+        for id in [10_u128, 11] {
+            backend
+                .put(&mut write, Namespace::Nodes, &id.to_be_bytes(), b"H1")
+                .unwrap();
+        }
+        backend.commit(write).unwrap();
+        let (read_tx, read_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker = {
+            let backend = backend.clone();
+            let attempts = attempts.clone();
+            std::thread::spawn(move || {
+                backend.compare_patch_nodes(&[10, 11], |id, bytes| {
+                    if id == 11 && attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        read_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }
+                    Ok((bytes == b"H1").then(|| b"H1-correct-size".to_vec()))
+                })
+            })
+        };
+        read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // An ordinary WriteBatch update keeps the chunk ID while changing its file snapshot.
+        let mut write = backend.begin_write().unwrap();
+        backend
+            .put(
+                &mut write,
+                Namespace::Nodes,
+                &11_u128.to_be_bytes(),
+                b"H2-new-size-and-metadata",
+            )
+            .unwrap();
+        backend.commit(write).unwrap();
+        resume_tx.send(()).unwrap();
+        assert!(!worker.join().unwrap().unwrap());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "OCC retries must re-run the guard against H2"
+        );
+        let read = backend.begin_read().unwrap();
+        assert_eq!(
+            get_owned(&backend, &read, Namespace::Nodes, &10_u128.to_be_bytes()),
+            Some(b"H1".to_vec()),
+            "first patch was rolled back"
+        );
+        assert_eq!(
+            get_owned(&backend, &read, Namespace::Nodes, &11_u128.to_be_bytes()),
+            Some(b"H2-new-size-and-metadata".to_vec())
+        );
+        assert!(!backend
+            .compare_patch_nodes(&[10, 99], |_, _| Ok(Some(b"changed".to_vec())))
+            .unwrap());
+        let error = backend
+            .compare_patch_nodes(&[10, 11], |id, _| {
+                if id == 11 {
+                    Err(BackendError::Io("injected patch failure".into()))
+                } else {
+                    Ok(Some(b"changed".to_vec()))
+                }
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("injected patch failure"));
+        let read = backend.begin_read().unwrap();
+        assert_eq!(
+            get_owned(&backend, &read, Namespace::Nodes, &10_u128.to_be_bytes()),
+            Some(b"H1".to_vec()),
+            "missing targets and patch errors both roll back"
+        );
+    }
 
     fn get_owned(be: &LsmBackend, r: &LsmRead, ns: Namespace<'_>, k: &[u8]) -> Option<Vec<u8>> {
         be.get_with(r, ns, k, |v| v.map(|b| b.to_vec())).unwrap()
@@ -3301,6 +4072,8 @@ mod tests {
             Ok((b"after-fence".to_vec(), ()))
         })
         .expect_err("fenced metadata transaction must fail closed");
+        be1.compare_patch_nodes(&[10], |_, _| Ok(Some(b"after-fence".to_vec())))
+            .expect_err("fenced node compare-and-patch must also fail closed");
 
         let read = be2.begin_read().unwrap();
         assert_eq!(
@@ -3451,25 +4224,39 @@ mod tests {
     }
 
     /// `reader_cold_open_starts_fast` must agree with `reader_options_from_env`
-    /// (HIGH #2 from the poll-tiering review): with the write-feed URL
-    /// configured, fresh `DbReader` opens take the idle poll interval, so a
-    /// `HelixGraphStorage` seeded from this predicate must start believing
-    /// it's idle too — otherwise read-gated promotion never fires because it
-    /// thinks a freshly-idle-opened collection is already fast.
+    /// (HIGH #2 from the poll-tiering review): `HelixGraphStorage` seeds its
+    /// `reader_poll_tier_fast` belief from this predicate, so it must match the
+    /// interval the cold open actually used. Cold opens start FAST whenever the
+    /// read-gated sweeper can demote them later; only the sweeper kill switch
+    /// (`HELIX_LSM_READER_IDLE_AFTER_MS=0`) with the feed on keeps idle opens.
     #[test]
     #[serial]
     fn reader_cold_open_starts_fast_matches_feed_url_configuration() {
         std::env::remove_var(ENV_WRITER_FEED_URL);
+        std::env::remove_var(ENV_READER_READ_IDLE_AFTER_MS);
         assert!(
             reader_cold_open_starts_fast(),
             "no write-feed configured: cold opens serve at the fast/manifest-poll cadence"
         );
+        {
+            let _idle_after = EnvGuard::set(ENV_READER_READ_IDLE_AFTER_MS, "0");
+            assert!(
+                reader_cold_open_starts_fast(),
+                "no write-feed and no sweeper: nothing would ever promote an idle open"
+            );
+        }
 
         let _guard = EnvGuard::set(ENV_WRITER_FEED_URL, "http://helix:6969");
         assert!(
+            reader_cold_open_starts_fast(),
+            "write-feed configured with the sweeper on: a cold open starts fast so a \
+             write that lands while the open is in flight (skipped by the feed poller \
+             as not-yet-resident) is picked up by the next fast poll, not 300s later"
+        );
+        let _idle_after = EnvGuard::set(ENV_READER_READ_IDLE_AFTER_MS, "0");
+        assert!(
             !reader_cold_open_starts_fast(),
-            "write-feed configured: cold opens must start believing idle, matching \
-             reader_options_from_env's actual idle-tier cold open"
+            "sweeper kill switch: nothing would ever demote, so cold opens stay idle"
         );
     }
 
@@ -3724,22 +4511,56 @@ mod tests {
 
     #[test]
     #[serial]
-    fn reader_options_take_idle_tier_when_feed_enabled() {
+    fn reader_wal_replay_batch_knob_defaults_clamps_and_rejects_zero() {
+        let _unset = EnvGuard::remove(ENV_READER_WAL_REPLAY_BATCH);
+        assert_eq!(
+            reader_options_from_env("helion/c").wal_replay_sst_batch_size,
+            DEFAULT_READER_WAL_REPLAY_BATCH
+        );
+        let _eight = EnvGuard::set(ENV_READER_WAL_REPLAY_BATCH, "8");
+        assert_eq!(
+            reader_options_from_env("helion/c").wal_replay_sst_batch_size,
+            8
+        );
+        let _zero = EnvGuard::set(ENV_READER_WAL_REPLAY_BATCH, "0");
+        assert_eq!(
+            reader_options_from_env("helion/c").wal_replay_sst_batch_size,
+            DEFAULT_READER_WAL_REPLAY_BATCH
+        );
+        let _huge = EnvGuard::set(ENV_READER_WAL_REPLAY_BATCH, "100000");
+        assert_eq!(
+            reader_options_from_env("helion/c").wal_replay_sst_batch_size,
+            MAX_READER_WAL_REPLAY_BATCH
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reader_options_start_fast_when_feed_enabled_unless_sweeper_off() {
         let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
         let _reader_poll = EnvGuard::set(ENV_READER_MANIFEST_POLL_MS, "5000");
         let _feed = EnvGuard::set(ENV_WRITER_FEED_URL, "http://helix:6969");
         let _idle = EnvGuard::set(ENV_READER_IDLE_POLL_MS, "300000");
+        std::env::remove_var(ENV_READER_READ_IDLE_AFTER_MS);
 
-        // Fresh opens take the idle safety net; the serving cadence becomes
-        // the ACTIVE tier the feed poller promotes changed collections to.
+        // Fresh opens serve at the ACTIVE cadence; the read-gated sweeper
+        // demotes them to the idle safety net once they go unread.
         let reader_options = reader_options_from_env("helion/c");
         assert_eq!(
             reader_options.manifest_poll_interval,
-            std::time::Duration::from_secs(300)
+            std::time::Duration::from_secs(5)
         );
         assert_eq!(
             reader_active_poll_interval_from_env(),
             std::time::Duration::from_secs(5)
+        );
+
+        // Sweeper kill switch: a fast open would never be demoted, so the
+        // feed-era idle-tier cold open is kept for that configuration.
+        let _idle_after = EnvGuard::set(ENV_READER_READ_IDLE_AFTER_MS, "0");
+        assert_eq!(
+            reader_options_from_env("helion/c").manifest_poll_interval,
+            std::time::Duration::from_secs(300)
         );
     }
 
@@ -3801,12 +4622,157 @@ mod tests {
         );
     }
 
+    fn object_count(store: &Arc<dyn ObjectStore>, prefix: &str) -> usize {
+        block_on_lsm(&shared_lsm_handle(), async {
+            store
+                .list(Some(&ObjPath::from(prefix)))
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap()
+        .len()
+    }
+
+    fn put_one(be: &LsmBackend, key: &[u8]) {
+        let mut w = be.begin_write().unwrap();
+        be.put(&mut w, Namespace::Nodes, key, b"v").unwrap();
+        be.commit(w).unwrap();
+    }
+
+    /// A resident writer that goes write-quiet flushes its memtable to L0 while
+    /// still open, so a reader cold open no longer replays the WAL tail. It
+    /// does not flush while writes keep arriving inside the quiet period.
+    #[test]
+    #[serial]
+    fn idle_writer_flushes_memtable_to_l0_after_write_quiet_period() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+        let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
+        let _idle = EnvGuard::set(ENV_IDLE_FLUSH_SECS, "1");
+        let path = "idle-flush/busy";
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let be = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let compacted = format!("{path}/compacted");
+
+        for i in 0..8u8 {
+            put_one(&be, &[b'k', i]);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        assert_eq!(
+            object_count(&store, &compacted),
+            0,
+            "writes every 300ms keep the 1s quiet period from elapsing"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while object_count(&store, &compacted) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            object_count(&store, &compacted) > 0,
+            "a write-quiet writer must flush its memtable to an L0 SST without closing"
+        );
+
+        let reader = LsmReader::open_with_store(path, store.clone()).unwrap();
+        for i in 0..8u8 {
+            let got = reader
+                .get_with(Namespace::Nodes, &[b'k', i], |v| v.map(|b| b.to_vec()))
+                .unwrap();
+            assert_eq!(got, Some(b"v".to_vec()));
+        }
+        be.close().unwrap();
+    }
+
+    /// A writer that took over without a clean close (crash, fenced rollout)
+    /// replays the old WAL tail into its memtable; with no new writes it must
+    /// still flush that tail after one quiet period.
+    #[test]
+    #[serial]
+    fn idle_flush_drains_a_wal_tail_replayed_at_open() {
+        let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
+        let path = "idle-flush/replayed";
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let compacted = format!("{path}/compacted");
+        let crashed = {
+            let _idle = EnvGuard::remove(ENV_IDLE_FLUSH_SECS);
+            let be = LsmBackend::open_with_store(path, store.clone()).unwrap();
+            put_one(&be, b"tail-1");
+            put_one(&be, b"tail-2");
+            be
+        };
+        assert_eq!(object_count(&store, &compacted), 0);
+
+        let _idle = EnvGuard::set(ENV_IDLE_FLUSH_SECS, "1");
+        let be = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while object_count(&store, &compacted) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(
+            object_count(&store, &compacted) > 0,
+            "the replayed WAL tail must be flushed to L0 without new writes"
+        );
+        let r = be.begin_read().unwrap();
+        assert_eq!(
+            get_owned(&be, &r, Namespace::Nodes, b"tail-2"),
+            Some(b"v".to_vec())
+        );
+        be.close().unwrap();
+        // Stop the fenced first writer's tasks; its close result is irrelevant.
+        let _ = crashed.close();
+    }
+
+    /// The idle flush is off unless configured, and on a clean memtable it
+    /// writes nothing: reopening an already-flushed collection costs no PUTs.
+    #[test]
+    #[serial]
+    fn idle_flush_is_off_by_default_and_free_on_a_clean_memtable() {
+        let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
+        let path = "idle-flush/clean";
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        {
+            let _idle = EnvGuard::remove(ENV_IDLE_FLUSH_SECS);
+            let be = LsmBackend::open_with_store(path, store.clone()).unwrap();
+            put_one(&be, b"a");
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+            assert_eq!(
+                object_count(&store, &format!("{path}/compacted")),
+                0,
+                "unset knob: no idle flush"
+            );
+            be.close().unwrap();
+        }
+        let _idle = EnvGuard::set(ENV_IDLE_FLUSH_SECS, "1");
+        let be = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let before = object_count(&store, path);
+        std::thread::sleep(std::time::Duration::from_millis(3500));
+        assert_eq!(
+            object_count(&store, path),
+            before,
+            "a clean memtable must not write WAL, SST, or manifest objects"
+        );
+        be.close().unwrap();
+    }
+
+    /// SlateDB's builder rejects `max_wal_flushes_before_l0_flush < 4096`, so a
+    /// sub-4096 knob must be ignored rather than fail every writer open.
+    #[test]
+    #[serial]
+    fn writer_opens_when_wal_flush_bound_is_below_slatedb_minimum() {
+        let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
+        let _wal_flushes = EnvGuard::set(ENV_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH, "256");
+        let backend =
+            LsmBackend::open_with_store("wal-flush-bound-floor", Arc::new(InMemory::new()))
+                .expect("a sub-4096 WAL flush bound must not fail the writer open");
+        backend.close().unwrap();
+    }
+
     #[test]
     #[serial]
     fn lsm_settings_from_env_reflects_read_amplification_knobs() {
         let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
         let _min_filter = EnvGuard::set(ENV_MIN_FILTER_KEYS, "1");
-        let _wal_flushes = EnvGuard::set(ENV_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH, "4096");
+        let _wal_flushes = EnvGuard::set(ENV_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH, "8192");
         let _l0_per_key = EnvGuard::set(ENV_L0_MAX_SSTS_PER_KEY, "4");
         let _l0_parallelism = EnvGuard::set(ENV_L0_FLUSH_PARALLELISM, "2");
 
@@ -3814,7 +4780,7 @@ mod tests {
             lsm_settings_from_env("helion/c").expect("LSM read-amplification knobs -> Settings");
 
         assert_eq!(settings.min_filter_keys, 1);
-        assert_eq!(settings.max_wal_flushes_before_l0_flush, 4096);
+        assert_eq!(settings.max_wal_flushes_before_l0_flush, 8192);
         assert_eq!(settings.l0_max_ssts_per_key, 4);
         assert_eq!(settings.l0_flush_parallelism, 2);
     }
@@ -3991,6 +4957,43 @@ mod tests {
             per * 8 <= ONE_GIB,
             "sum of per-collection caps must not exceed the total cap"
         );
+    }
+
+    /// Raising the residency cap must not shrink each collection's cache share
+    /// once `HELIX_LSM_CACHE_COLLECTION_DIVISOR` pins the divisor.
+    #[test]
+    #[serial]
+    fn cache_collection_divisor_decouples_cap_from_max_open() {
+        const ONE_GIB: usize = 1024 * 1024 * 1024;
+        let _dir = EnvGuard::set(ENV_CACHE_DIR, "/mnt/ssd-cache");
+        let _cap = EnvGuard::set(ENV_CACHE_MAX_BYTES, &ONE_GIB.to_string());
+        let _memory_cap = EnvGuard::set(ENV_CACHE_MEMORY_MAX_PCT, "0");
+        let _open = EnvGuard::set(ENV_MAX_OPEN_COLLECTIONS, "64");
+
+        {
+            let _divisor = EnvGuard::remove(ENV_CACHE_COLLECTION_DIVISOR);
+            let cache = cache_options_from_env("helion/prod").expect("cache dir set -> Some");
+            assert_eq!(cache.max_cache_size_bytes, Some(ONE_GIB / 64));
+        }
+        {
+            let _divisor = EnvGuard::set(ENV_CACHE_COLLECTION_DIVISOR, "0");
+            let cache = cache_options_from_env("helion/prod").expect("cache dir set -> Some");
+            assert_eq!(
+                cache.max_cache_size_bytes,
+                Some(ONE_GIB / 64),
+                "0 keeps the max-open divisor"
+            );
+        }
+        {
+            let _divisor = EnvGuard::set(ENV_CACHE_COLLECTION_DIVISOR, "32");
+            let cache = cache_options_from_env("helion/prod").expect("cache dir set -> Some");
+            assert_eq!(cache.max_cache_size_bytes, Some(ONE_GIB / 32));
+            // The FD budget still divides by the residency cap.
+            let _handle_override = EnvGuard::set(ENV_CACHE_MAX_OPEN_FILES, "0");
+            let _fd_high = EnvGuard::set("HELIX_MAINTENANCE_FD_HIGH", "4096");
+            let cache = cache_options_from_env("helion/prod").expect("cache dir set -> Some");
+            assert_eq!(cache.max_open_file_handles, 2048 / 64);
+        }
     }
 
     #[test]
@@ -4640,6 +5643,142 @@ mod tests {
         );
     }
 
+    /// A logical prefix scan over a dup namespace must read only the rows that
+    /// can match (one probe per key-length region), not the whole namespace:
+    /// `drop_node_be` runs one per deleted point over every edge in the
+    /// collection.
+    #[test]
+    fn lsm_dup_prefix_scan_reads_only_matching_regions() {
+        let be = LsmBackend::open_in_memory("/dup-prefix-scan-test").unwrap();
+        let mut w = be.begin_write().unwrap();
+        // Keys of several lengths, before/inside/after the prefix in each.
+        for (key, value) in [
+            (b"n".as_slice(), b"short".as_slice()),
+            (b"m-long-key", b"before-long"),
+            (b"n1", b"a"),
+            (b"n1", b"b"),
+            (b"n1-suffix", b"c"),
+            (b"n1-suffix-more", b"d"),
+            (b"n2", b"other"),
+            (b"n2-long-key", b"after-long"),
+            (b"zz", b"tail"),
+        ] {
+            be.put_dup(&mut w, Namespace::OutEdges, key, value).unwrap();
+        }
+        for i in 0..200u32 {
+            be.put_dup(&mut w, Namespace::OutEdges, b"n9", &i.to_be_bytes())
+                .unwrap();
+        }
+        be.commit(w).unwrap();
+
+        let r = be.begin_read().unwrap();
+        be.reset_read_count();
+        let mut pairs = Vec::new();
+        be.scan(&r, Namespace::OutEdges, KeyRange::prefix(b"n1"), |k, v| {
+            pairs.push((k.to_vec(), v.to_vec()));
+            true
+        })
+        .unwrap();
+        assert_eq!(
+            pairs,
+            vec![
+                (b"n1".to_vec(), b"a".to_vec()),
+                (b"n1".to_vec(), b"b".to_vec()),
+                (b"n1-suffix".to_vec(), b"c".to_vec()),
+                (b"n1-suffix-more".to_vec(), b"d".to_vec()),
+            ]
+        );
+        // 4 matches plus at most one out-of-range probe per key length visited.
+        assert!(
+            be.read_count() <= 4 + 6,
+            "prefix scan read {} rows for 4 matches",
+            be.read_count()
+        );
+
+        be.reset_read_count();
+        let mut misses = 0;
+        be.scan(&r, Namespace::OutEdges, KeyRange::prefix(b"n5"), |_, _| {
+            misses += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(misses, 0);
+        assert!(
+            be.read_count() <= 6,
+            "empty prefix scan read {} rows",
+            be.read_count()
+        );
+    }
+
+    #[test]
+    fn lsm_exact_dup_scan_limits_reads_and_preserves_pending_changes() {
+        let be = LsmBackend::open_in_memory("/exact-dup-scan-test").unwrap();
+        let mut w = be.begin_write().unwrap();
+        for (key, value) in [
+            (b"".as_slice(), b"empty".as_slice()),
+            (b"n1", b"a"),
+            (b"n1", b"b"),
+            (b"n10", b"longer"),
+            (b"n2", b"other"),
+        ] {
+            be.put_dup(&mut w, Namespace::OutEdges, key, value).unwrap();
+        }
+        be.commit(w).unwrap();
+        let exact = |key: &[u8]| KeyRange {
+            start: Bound::Included(key.to_vec()),
+            end: Bound::Included(key.to_vec()),
+        };
+        let read_values = |r: &LsmRead, key: &[u8]| {
+            let mut values = Vec::new();
+            be.scan(r, Namespace::OutEdges, exact(key), |actual_key, value| {
+                assert_eq!(actual_key, key);
+                values.push(value.to_vec());
+                true
+            })
+            .unwrap();
+            values
+        };
+        let r = be.begin_read().unwrap();
+        be.reset_read_count();
+        assert_eq!(read_values(&r, b"n1"), vec![b"a".to_vec(), b"b".to_vec()]);
+        assert_eq!(be.read_count(), 2);
+        be.reset_read_count();
+        assert!(read_values(&r, b"missing").is_empty());
+        assert_eq!(be.read_count(), 0);
+        assert_eq!(read_values(&r, b""), vec![b"empty".to_vec()]);
+
+        let mut w = be.begin_write().unwrap();
+        be.delete_dup(&mut w, Namespace::OutEdges, b"n1", b"a")
+            .unwrap();
+        be.put_dup(&mut w, Namespace::OutEdges, b"n1", b"c")
+            .unwrap();
+        be.put_dup(&mut w, Namespace::OutEdges, b"n11", b"unrelated")
+            .unwrap();
+        let pending = be.begin_read_with_pending(w.pending().clone()).unwrap();
+        be.reset_read_count();
+        assert_eq!(
+            read_values(&pending, b"n1"),
+            vec![b"b".to_vec(), b"c".to_vec()]
+        );
+        assert_eq!(
+            be.read_count(),
+            2,
+            "pending overlay must not widen the backend scan"
+        );
+        assert_eq!(
+            read_values(&r, b"n1"),
+            vec![b"a".to_vec(), b"b".to_vec()],
+            "pinned reader must keep its original view"
+        );
+        let mut calls = 0;
+        be.scan(&r, Namespace::OutEdges, exact(b"n1"), |_, _| {
+            calls += 1;
+            false
+        })
+        .unwrap();
+        assert_eq!(calls, 1, "visitor early exit is preserved");
+    }
+
     /// `collections_root_prefix` parses the collections root from a SlateDB
     /// collection path (the part before the final `/<name>` segment).
     #[test]
@@ -4748,6 +5887,371 @@ mod tests {
         assert_eq!(live, vec![ObjPath::from("helion/live/manifest/0001")]);
     }
 
+    /// Object store that plays the racing reader: on the first delete after the
+    /// purge's `append_after_lists`-th LIST it appends `zombie` (the reader's
+    /// checkpoint-lease manifest, written from an in-memory copy after that
+    /// LIST), and it records every deleted location in order.
+    #[derive(Debug)]
+    struct RacingReaderStore {
+        inner: Arc<dyn ObjectStore>,
+        zombie: ObjPath,
+        append_after_lists: usize,
+        /// Fail every delete once the purge has issued this many LISTs
+        /// (`usize::MAX`: never): an object-store error mid-purge.
+        fail_deletes_after_lists: usize,
+        lists: std::sync::atomic::AtomicUsize,
+        appended: std::sync::atomic::AtomicBool,
+        deleted: Arc<std::sync::Mutex<Vec<ObjPath>>>,
+    }
+
+    impl std::fmt::Display for RacingReaderStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RacingReaderStore({})", self.inner)
+        }
+    }
+
+    type Boxed<'a, T> =
+        std::pin::Pin<Box<dyn Future<Output = object_store::Result<T>> + Send + 'a>>;
+
+    impl ObjectStore for RacingReaderStore {
+        fn put_opts<'a, 'b, 'c>(
+            &'a self,
+            location: &'b ObjPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> Boxed<'c, object_store::PutResult>
+        where
+            'a: 'c,
+            'b: 'c,
+            Self: 'c,
+        {
+            self.inner.put_opts(location, payload, opts)
+        }
+
+        fn put_multipart_opts<'a, 'b, 'c>(
+            &'a self,
+            location: &'b ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> Boxed<'c, Box<dyn object_store::MultipartUpload>>
+        where
+            'a: 'c,
+            'b: 'c,
+            Self: 'c,
+        {
+            self.inner.put_multipart_opts(location, opts)
+        }
+
+        fn get_opts<'a, 'b, 'c>(
+            &'a self,
+            location: &'b ObjPath,
+            options: object_store::GetOptions,
+        ) -> Boxed<'c, object_store::GetResult>
+        where
+            'a: 'c,
+            'b: 'c,
+            Self: 'c,
+        {
+            self.inner.get_opts(location, options)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            if self.lists.load(std::sync::atomic::Ordering::SeqCst) >= self.fail_deletes_after_lists
+            {
+                return stream::once(async {
+                    Err(object_store::Error::Generic {
+                        store: "RacingReaderStore",
+                        source: "injected delete failure".into(),
+                    })
+                })
+                .boxed();
+            }
+            let deleted = Arc::clone(&self.deleted);
+            let locations = locations
+                .inspect(move |location| {
+                    if let Ok(location) = location {
+                        deleted.lock().unwrap().push(location.clone());
+                    }
+                })
+                .boxed();
+            let inner = Arc::clone(&self.inner);
+            if self.lists.load(std::sync::atomic::Ordering::SeqCst) < self.append_after_lists
+                || self
+                    .appended
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return inner.delete_stream(locations);
+            }
+            let zombie = self.zombie.clone();
+            stream::once(async move {
+                inner
+                    .put(&zombie, Bytes::from_static(b"lease").into())
+                    .await
+                    .unwrap();
+                inner.delete_stream(locations)
+            })
+            .flatten()
+            .boxed()
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list(prefix)
+        }
+
+        fn list_with_delimiter<'a, 'b, 'c>(
+            &'a self,
+            prefix: Option<&'b ObjPath>,
+        ) -> Boxed<'c, object_store::ListResult>
+        where
+            'a: 'c,
+            'b: 'c,
+            Self: 'c,
+        {
+            self.inner.list_with_delimiter(prefix)
+        }
+
+        fn copy_opts<'a, 'b, 'c, 'd>(
+            &'a self,
+            from: &'b ObjPath,
+            to: &'c ObjPath,
+            options: object_store::CopyOptions,
+        ) -> Boxed<'d, ()>
+        where
+            'a: 'd,
+            'b: 'd,
+            'c: 'd,
+            Self: 'd,
+        {
+            self.inner.copy_opts(from, to, options)
+        }
+    }
+
+    fn racing_reader_purge(
+        prefix: &str,
+        append_after_lists: usize,
+    ) -> (Arc<std::sync::Mutex<Vec<ObjPath>>>, Vec<ObjPath>) {
+        let (deleted, left, purged) =
+            racing_reader_purge_opts(prefix, append_after_lists, usize::MAX);
+        purged.unwrap();
+        (deleted, left)
+    }
+
+    /// Like [`racing_reader_purge`], but deletes fail once the purge has issued
+    /// `fail_deletes_after_lists` LISTs, and the purge's result is returned.
+    fn racing_reader_purge_opts(
+        prefix: &str,
+        append_after_lists: usize,
+        fail_deletes_after_lists: usize,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<ObjPath>>>,
+        Vec<ObjPath>,
+        Result<(), BackendError>,
+    ) {
+        let rt = shared_lsm_handle();
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        block_on_lsm(&rt, async {
+            for object in [
+                "compacted/0001.sst",
+                "manifest.boundary",
+                "manifest/00000000000000000001.manifest",
+                "manifest/00000000000000000002.manifest",
+                "wal/0001.sst",
+            ] {
+                inner
+                    .put(
+                        &ObjPath::from(format!("{prefix}/{object}")),
+                        Bytes::from_static(b"x").into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            Ok::<(), String>(())
+        })
+        .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store: Arc<dyn ObjectStore> = Arc::new(RacingReaderStore {
+            inner: Arc::clone(&inner),
+            zombie: ObjPath::from(format!("{prefix}/manifest/00000000000000000003.manifest")),
+            append_after_lists,
+            fail_deletes_after_lists,
+            lists: std::sync::atomic::AtomicUsize::new(0),
+            appended: std::sync::atomic::AtomicBool::new(false),
+            deleted: Arc::clone(&deleted),
+        });
+
+        let purged = purge_prefix_from_store(rt.clone(), store, prefix);
+
+        let left: Vec<ObjPath> = block_on_lsm(&rt, async {
+            inner
+                .list(Some(&ObjPath::from(prefix)))
+                .map_ok(|meta| meta.location)
+                .try_collect()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        (deleted, left, purged)
+    }
+
+    /// A reader's lease append that lands after the purge's LIST must not
+    /// survive the purge as a manifest pointing at deleted SSTs.
+    #[test]
+    #[serial]
+    fn purge_prefix_from_store_sweeps_manifest_appended_during_purge() {
+        let (_, left) = racing_reader_purge("helion/racing", 1);
+        assert!(
+            left.is_empty(),
+            "zombie manifest survived the purge: {left:?}"
+        );
+    }
+
+    /// Same race one pass later: an append that lands after the second LIST
+    /// (during the second sweep) needs the third pass to catch it.
+    #[test]
+    #[serial]
+    fn purge_prefix_from_store_sweeps_manifest_appended_during_second_pass() {
+        let (_, left) = racing_reader_purge("helion/racing-late", 2);
+        assert!(
+            left.is_empty(),
+            "manifest appended during the second sweep survived: {left:?}"
+        );
+    }
+
+    /// A purge that empties `manifest/` and then fails must still remember the
+    /// ids it deleted: the retry worker finds no manifests, so without this the
+    /// recreate would start at 1 and a stale lease append could become latest.
+    #[test]
+    #[serial]
+    fn purge_prefix_from_store_records_manifest_ceiling_before_a_failed_pass() {
+        let prefix = "helion/ceiling-on-failure";
+        let (_, left, purged) = racing_reader_purge_opts(prefix, usize::MAX, 2);
+        assert!(purged.is_err(), "the second pass was meant to fail");
+        assert!(
+            !left.is_empty(),
+            "the failed pass must leave objects behind"
+        );
+        assert_eq!(purged_manifest_ceiling(prefix), 2);
+    }
+
+    fn manifest_ids(rt: &Handle, store: &Arc<dyn ObjectStore>, path: &str) -> Vec<u64> {
+        block_on_lsm(rt, async {
+            store
+                .list(Some(&ObjPath::from(format!("{path}/manifest"))))
+                .map_ok(|meta| meta.location)
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap()
+        .iter()
+        .filter_map(manifest_id_of)
+        .collect()
+    }
+
+    /// Drop + recreate of the same name in one writer process: the new database
+    /// must start its manifest ids above the purged incarnation's, so a late
+    /// lease append from a reader still holding the OLD manifest (its `N + 1`)
+    /// can never become the new database's latest manifest.
+    #[test]
+    #[serial]
+    fn recreated_collection_manifest_ids_start_above_purged_incarnation() {
+        use crate::helix_engine::storage_core::backend_any::AnyBackend;
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+        use object_store::{PutMode, PutOptions};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let rt = shared_lsm_handle();
+        let path = "helion/recreate-floor";
+
+        let old = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let mut w = old.begin_write().unwrap();
+        old.put(&mut w, Namespace::Nodes, b"k", b"old").unwrap();
+        old.commit(w).unwrap();
+        old.close().unwrap();
+        drop(old);
+        let old_ids = manifest_ids(&rt, &store, path);
+        let old_max = *old_ids.iter().max().unwrap();
+        // The reader loaded the manifest just below the latest one...
+        let stale_id = old_max - 1;
+        assert!(old_ids.contains(&stale_id), "old manifest ids: {old_ids:?}");
+        let stale_bytes = block_on_lsm(&rt, async {
+            store
+                .get(&ObjPath::from(format!(
+                    "{path}/manifest/{stale_id:020}.manifest"
+                )))
+                .await
+                .map_err(|error| error.to_string())?
+                .bytes()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        purge_prefix_from_store(rt.clone(), store.clone(), path).unwrap();
+        assert!(manifest_ids(&rt, &store, path).is_empty());
+
+        let new = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let new_ids = manifest_ids(&rt, &store, path);
+        let new_min = *new_ids.iter().min().unwrap();
+        assert!(
+            new_min > old_max,
+            "re-created db must start above the purged ids: old max {old_max}, new {new_ids:?}"
+        );
+        let mut w = new.begin_write().unwrap();
+        new.put(&mut w, Namespace::Nodes, b"k", b"new").unwrap();
+        new.commit(w).unwrap();
+        let latest = *manifest_ids(&rt, &store, path).iter().max().unwrap();
+
+        // ...and its slow lease append (`stale_id + 1`) lands after the recreate.
+        block_on_lsm(&rt, async {
+            store
+                .put_opts(
+                    &ObjPath::from(format!("{path}/manifest/{old_max:020}.manifest")),
+                    stale_bytes.into(),
+                    PutOptions::from(PutMode::Create),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        })
+        .unwrap();
+        assert_eq!(
+            *manifest_ids(&rt, &store, path).iter().max().unwrap(),
+            latest,
+            "the stale append became the re-created database's latest manifest"
+        );
+        let reader =
+            AnyBackend::LsmReader(LsmReader::open_with_store(path, store.clone()).unwrap());
+        let r = reader.begin_read().unwrap();
+        let got = reader
+            .get_with(&r, Namespace::Nodes, b"k", |v| v.map(|b| b.to_vec()))
+            .unwrap();
+        assert_eq!(got, Some(b"new".to_vec()));
+    }
+
+    /// `manifest/` must be deleted before anything else so a concurrent opener
+    /// finds no manifest (404) rather than one whose SSTs are being deleted.
+    #[test]
+    #[serial]
+    fn purge_prefix_from_store_deletes_manifests_first() {
+        let (deleted, _) = racing_reader_purge("helion/ordered", 1);
+        let deleted = deleted.lock().unwrap();
+        assert_eq!(
+            deleted[..2],
+            [
+                ObjPath::from("helion/ordered/manifest/00000000000000000001.manifest"),
+                ObjPath::from("helion/ordered/manifest/00000000000000000002.manifest"),
+            ],
+            "purge order: {deleted:?}"
+        );
+    }
+
     #[test]
     fn lsm_scan_prefix_within_namespace() {
         let be = LsmBackend::open_in_memory("/helion-test-2").unwrap();
@@ -4770,5 +6274,312 @@ mod tests {
         )
         .unwrap();
         assert_eq!(keys, vec![b"app:1".to_vec(), b"app:2".to_vec()]);
+    }
+
+    /// Post-txn hooks run with `true` once the batch commits and with `false`
+    /// when the batch is dropped uncommitted; a commit never leaves a hook
+    /// behind for the drop to run again.
+    #[test]
+    fn post_txn_hooks_distinguish_commit_from_abort() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let be = LsmBackend::open_in_memory("post-txn-hooks").unwrap();
+        let outcome = Arc::new(AtomicU8::new(0));
+        let record = |slot: &Arc<AtomicU8>| -> PostTxnHook {
+            let slot = Arc::clone(slot);
+            Box::new(move |committed| {
+                slot.fetch_add(if committed { 1 } else { 10 }, Ordering::SeqCst);
+            })
+        };
+
+        let mut w = be.begin_write().unwrap();
+        be.put(&mut w, Namespace::Nodes, b"k", b"v").unwrap();
+        w.on_txn_end(record(&outcome));
+        be.commit(w).unwrap();
+        assert_eq!(
+            outcome.load(Ordering::SeqCst),
+            1,
+            "commit runs hooks once with true"
+        );
+
+        let mut w = be.begin_write().unwrap();
+        be.put(&mut w, Namespace::Nodes, b"k2", b"v").unwrap();
+        w.on_txn_end(record(&outcome));
+        drop(w);
+        assert_eq!(
+            outcome.load(Ordering::SeqCst),
+            11,
+            "drop runs hooks with false"
+        );
+
+        let mut w = be.begin_write().unwrap();
+        be.put(&mut w, Namespace::Nodes, b"k3", b"v").unwrap();
+        w.on_txn_end(record(&outcome));
+        be.commit_buffered(w).unwrap();
+        assert_eq!(
+            outcome.load(Ordering::SeqCst),
+            12,
+            "buffered commit runs hooks with true"
+        );
+    }
+
+    /// A commit that fails (fenced by a newer writer) runs its hooks with
+    /// `false`, so a publication made ahead of it is taken back.
+    #[test]
+    #[serial]
+    fn post_txn_hooks_see_false_when_the_commit_fails() {
+        use slatedb::object_store::local::LocalFileSystem;
+        use std::sync::atomic::{AtomicU8, Ordering};
+
+        let data_dir = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(data_dir.path()).unwrap());
+        let path = "helion/post-txn-fenced";
+        let be1 = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let mut first = be1.begin_write().unwrap();
+        be1.put(&mut first, Namespace::Nodes, b"a", b"1").unwrap();
+        be1.commit_buffered(first).unwrap();
+
+        let be2 = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let mut fencer = be2.begin_write().unwrap();
+        be2.put(&mut fencer, Namespace::Nodes, b"b", b"2").unwrap();
+        be2.commit(fencer).unwrap();
+
+        let outcome = Arc::new(AtomicU8::new(0));
+        let mut stale = be1.begin_write().unwrap();
+        be1.put(&mut stale, Namespace::Nodes, b"c", b"3").unwrap();
+        let slot = Arc::clone(&outcome);
+        stale.on_txn_end(Box::new(move |committed| {
+            slot.store(if committed { 1 } else { 2 }, Ordering::SeqCst);
+        }));
+        be1.commit(stale).expect_err("fenced commit must fail");
+        assert_eq!(
+            outcome.load(Ordering::SeqCst),
+            2,
+            "a failed commit must run its hooks with false"
+        );
+    }
+
+    /// Equivalence oracle for the bounded dup scan (`dup_scan_plan` +
+    /// `DupScanCursor`): for random prefix, exact and bounded ranges over keys
+    /// of mixed lengths built from 0x00/0x01/0x61/0xFE/0xFF bytes, `scan` must
+    /// return exactly what the unbounded `KeyRange::all()` scan (the untouched
+    /// code path) returns after the per-row `logical_key_in_range` filter — same
+    /// rows, same order, same early-stop prefix. Rows span two flushed L0 SSTs
+    /// plus the memtable, with committed tombstones over L0 rows and a pending
+    /// write overlay, so the SlateDB `seek` is exercised through every layer the
+    /// writer reads. The reader replica is checked against its own full scan.
+    #[test]
+    fn lsm_dup_scan_matches_full_scan_filter_oracle() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        const ALPHABET: [u8; 5] = [0x00, 0x01, 0x61, 0xFE, 0xFF];
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: usize) -> usize {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                (self.0 % n as u64) as usize
+            }
+            fn bytes(&mut self, len: usize) -> Vec<u8> {
+                (0..len)
+                    .map(|_| ALPHABET[self.below(ALPHABET.len())])
+                    .collect()
+            }
+            fn key(&mut self) -> Vec<u8> {
+                let mut len = self.below(6);
+                if self.below(10) == 0 {
+                    len += 6;
+                }
+                self.bytes(len)
+            }
+            fn value(&mut self) -> Vec<u8> {
+                let len = 1 + self.below(2);
+                self.bytes(len)
+            }
+            fn bound(&mut self) -> Bound<Vec<u8>> {
+                match self.below(3) {
+                    0 => Bound::Unbounded,
+                    1 => Bound::Included(self.key()),
+                    _ => Bound::Excluded(self.key()),
+                }
+            }
+        }
+        let clone_range = |r: &KeyRange| KeyRange {
+            start: r.start.clone(),
+            end: r.end.clone(),
+        };
+        let describe = |r: &KeyRange| format!("{:?}..{:?}", r.start, r.end);
+
+        let namespaces = [Namespace::OutEdges, Namespace::MultiIndex("t")];
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/dup-scan-oracle";
+        let be = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut rows: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::new();
+
+        // Three commits: two flushed to L0 SSTs, the last left in the memtable;
+        // the last also tombstones a slice of the first commit's rows.
+        for round in 0..3 {
+            let mut w = be.begin_write().unwrap();
+            for _ in 0..220 {
+                let (ns_idx, key, value) = (rng.below(namespaces.len()), rng.key(), rng.value());
+                be.put_dup(&mut w, namespaces[ns_idx], &key, &value)
+                    .unwrap();
+                rows.push((ns_idx, key, value));
+            }
+            if round == 2 {
+                for i in (0..rows.len() / 3).step_by(3) {
+                    let (ns_idx, key, value) = &rows[i];
+                    be.delete_dup(&mut w, namespaces[*ns_idx], key, value)
+                        .unwrap();
+                }
+            }
+            be.commit(w).unwrap();
+            if round < 2 {
+                be.flush_durable().unwrap();
+            }
+        }
+
+        // Uncommitted overlay: new rows plus deletes of committed rows.
+        let mut w = be.begin_write().unwrap();
+        for _ in 0..60 {
+            let (ns_idx, key, value) = (rng.below(namespaces.len()), rng.key(), rng.value());
+            be.put_dup(&mut w, namespaces[ns_idx], &key, &value)
+                .unwrap();
+        }
+        for i in (1..rows.len()).step_by(7) {
+            let (ns_idx, key, value) = &rows[i];
+            be.delete_dup(&mut w, namespaces[*ns_idx], key, value)
+                .unwrap();
+        }
+        let committed = be.begin_read().unwrap();
+        let overlaid = be.begin_read_with_pending(w.pending().clone()).unwrap();
+        let reader = LsmReader::open_with_store(path, store).unwrap();
+
+        let mut queries: Vec<KeyRange> = vec![
+            KeyRange::prefix(b""),
+            KeyRange::prefix(&[0xFF]),
+            KeyRange::prefix(&[0xFF, 0xFF]),
+            KeyRange::prefix(&[0x61, 0xFF]),
+            KeyRange::prefix(&[0x00]),
+            KeyRange::prefix(&[
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]),
+            KeyRange::all(),
+        ];
+        for _ in 0..600 {
+            queries.push(match rng.below(4) {
+                0 | 1 => {
+                    let len = rng.below(8);
+                    KeyRange::prefix(&rng.bytes(len))
+                }
+                2 => {
+                    let k = rng.key();
+                    KeyRange {
+                        start: Bound::Included(k.clone()),
+                        end: Bound::Included(k),
+                    }
+                }
+                _ => KeyRange {
+                    start: rng.bound(),
+                    end: rng.bound(),
+                },
+            });
+        }
+
+        let mut reader_rows = 0usize;
+        for ns in namespaces {
+            let scan_all = |scan: &dyn Fn(KeyRange, &mut dyn FnMut(&[u8], &[u8]) -> bool)| {
+                let mut all = Vec::new();
+                scan(KeyRange::all(), &mut |k, v| {
+                    all.push((k.to_vec(), v.to_vec()));
+                    true
+                });
+                all
+            };
+            let writer_committed =
+                |range: KeyRange, visit: &mut dyn FnMut(&[u8], &[u8]) -> bool| {
+                    be.scan(&committed, ns, range, |k, v| visit(k, v)).unwrap()
+                };
+            let writer_overlaid = |range: KeyRange, visit: &mut dyn FnMut(&[u8], &[u8]) -> bool| {
+                be.scan(&overlaid, ns, range, |k, v| visit(k, v)).unwrap()
+            };
+            let replica = |range: KeyRange, visit: &mut dyn FnMut(&[u8], &[u8]) -> bool| {
+                reader.scan_dup_with(ns, range, |k, v| visit(k, v)).unwrap()
+            };
+            let lanes: [(
+                &str,
+                &dyn Fn(KeyRange, &mut dyn FnMut(&[u8], &[u8]) -> bool),
+            ); 3] = [
+                ("writer", &writer_committed),
+                ("writer+pending", &writer_overlaid),
+                ("reader", &replica),
+            ];
+            for (lane, scan) in lanes {
+                let all = scan_all(scan);
+                assert!(all.len() > 100, "{lane} sees only {} rows", all.len());
+                if lane == "reader" {
+                    reader_rows += all.len();
+                }
+                for (i, range) in queries.iter().enumerate() {
+                    let expected: Vec<_> = all
+                        .iter()
+                        .filter(|(k, _)| logical_key_in_range(k, range))
+                        .cloned()
+                        .collect();
+                    let mut actual = Vec::new();
+                    be.reset_read_count();
+                    scan(clone_range(range), &mut |k, v| {
+                        actual.push((k.to_vec(), v.to_vec()));
+                        true
+                    });
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "{lane} ns={ns:?} query #{i} {} differs from full-scan oracle",
+                        describe(range)
+                    );
+                    // A non-empty prefix must seek through L0 SSTs and the
+                    // memtable alike: at most two probes per key length (12
+                    // lengths here) on top of its hits, never the namespace.
+                    if lane == "writer" {
+                        if let (Bound::Included(p), Bound::Excluded(end)) =
+                            (&range.start, &range.end)
+                        {
+                            if !p.is_empty() && next_prefix(p).as_deref() == Some(end.as_slice()) {
+                                assert!(
+                                    be.read_count() <= expected.len() + 2 * 12,
+                                    "{lane} ns={ns:?} query #{i} {} read {} rows for {} hits",
+                                    describe(range),
+                                    be.read_count(),
+                                    expected.len()
+                                );
+                            }
+                        }
+                    }
+                    // Early stop must hand back the same leading rows.
+                    let limit = i % 4;
+                    let mut limited = Vec::new();
+                    scan(clone_range(range), &mut |k, v| {
+                        limited.push((k.to_vec(), v.to_vec()));
+                        limited.len() < limit
+                    });
+                    let want = &expected[..expected.len().min(limit.max(1))];
+                    assert_eq!(
+                        limited,
+                        if expected.is_empty() {
+                            vec![]
+                        } else {
+                            want.to_vec()
+                        },
+                        "{lane} ns={ns:?} query #{i} {} early-stop differs",
+                        describe(range)
+                    );
+                }
+            }
+        }
+        assert!(reader_rows > 0);
+        drop(w);
     }
 }

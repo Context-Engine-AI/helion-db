@@ -306,6 +306,8 @@ Distance computation uses SIMD-accelerated kernels (`simd.rs`): NEON on aarch64,
 
 **Mmap sidecar** (`mmap_vectors.rs`): a flat mmap file stored alongside the LMDB env. Provides O(1) f32 vector reads without LMDB transaction overhead. Used during HNSW search for raw vector access during rescore.
 
+On LSM, a pod with no local sidecar and no published sidecar blob rebuilds it from the segment's vector rows. The rebuilt file puts each row at its persisted ordinal (the segment's `Ordinals` rows), because reader replicas and reopened writers resolve ordinals from the store. Deleted ordinals become dead slots. If the persisted ordinals cannot describe the rows (a row without an ordinal, an ordinal without a row, a shared ordinal, or mostly dead slots), no sidecar is built and the segment serves vectors from its rows. The refusal is logged and counted as `helix_lsm_sidecar_materialize_total{outcome="refused"}`. A rebuild refused because rows and ordinals differ is retried once straight away (`outcome="retried"`), because a write landing between a reader's two scans can cause that. After a refusal, a reader tries again only after 20 miss TTLs. A writer never starts an empty sidecar for a segment that already has persisted ordinals. Before its first append it restores or rebuilds that layout, waiting up to 5 s for a materialization permit rather than deferring. It also checks that its local file or restored blob covers every persisted ordinal. A crash between the LSM commit and the sidecar's header flush leaves the file short, so a short file is discarded and rebuilt (`outcome="short_file"`). If no sidecar attaches, or attaching, checking, or appending fails, the insert still succeeds and the row is stored without a slot. Once a row is stored that way with no sidecar attached, the writer stops attaching one to that segment until it restarts. A row without a slot gets a reserved ordinal of 2^62 or more. That ordinal is past the end of every sidecar, so every pod scores the row from the LSM, and an upsert moves the id off any stale slot a reader still holds. Rebuilds give these rows no slot. The offset above 2^62 records how many slots the id's old ordinal needed, so a rebuild never ends before a slot another pod may still map. Flat search scores rows past a pod's sidecar from their rows (rows written after the sidecar was built, or stored without a slot). `helix_lsm_sidecar_past_end_rows` records how many each query scored this way, by `role`. Existing files and blobs keep their format. Sidecars rebuilt before this layout rule may hold rows in id order. Set `HELIX_LSM_SIDECAR_VERIFY=1` (off by default) to spot-check up to 64 slots, spread across the file, of every exact sidecar a pod attaches from disk or a restored blob, against their rows. The check runs on the first read or write that attaches the sidecar, under a materialization permit, not when the segment opens. A mismatching file is discarded and rebuilt from rows, and the writer republishes the blob behind it. A check that fails to run keeps the file. Outcomes are counted in `helix_lsm_sidecar_verify_total` (`ok`, `mismatch`, `error`, `republished`). Known gap: a rebuild sizes the file to the highest live ordinal. If the ids holding the highest ordinals were deleted, the writer's later appends can reuse ordinals that an older, longer sidecar on another pod still maps to deleted rows. That pod then serves the deleted rows' vectors for the new ids until that pod drops the file. Closing this needs a persisted ordinal high-water mark.
+
 **PreparedIndex / split-phase build**: HNSW construction happens entirely outside the write transaction. Vectors are extracted under a read lock (`RoTxn`), the index is built without holding any lock, then the result is committed under a short write lock (`RwTxn`). This avoids blocking concurrent upserts during index builds.
 
 **Background optimizer thread**: seal/build/merge operations run asynchronously. The write path (upsert) returns immediately after appending to the mutable tail. The optimizer seals full tail segments, builds HNSW, and merges segments when the count exceeds the cap — all without blocking ingest.
@@ -610,6 +612,18 @@ Truncate to limit, convert to public scores via core.public_score()
   v
 For each result: load node from nodes_db, emit {id, score, payload}
 ```
+
+On the LSM writer and read replicas, exact closed numeric ranges (for example,
+`gte: 50, lte: 50`) bound the existing range scan to that logical index key's
+duplicate-value prefix, without enabling additional Bloom-filter reads.
+Candidate lookup and count probes keep the same results without visiting unrelated
+index entries. Other bounded numeric ranges still scan the namespace and filter
+logical keys. This needs no index rebuild or storage-format change.
+
+Exact candidate-ID scoring resolves each ID in its newest visible segment before
+applying per-segment top-k. A current vector that misses that segment's top-k still
+suppresses its older copies, so stale embeddings cannot win the final merge.
+Resolved IDs are not probed in older segments; existing vectors need no rewrite.
 
 ### Search (sparse)
 

@@ -663,6 +663,14 @@ fn graph_error_status(error: &GraphError) -> u16 {
         // missing collection as `GraphError::New(format!("Collection '{}' not
         // found", name))` — no dedicated variant either. Same string fallback.
         GraphError::New(msg) if msg.contains("Collection") && msg.contains("not found") => 404,
+        // A reader whose collection was dropped and purged under it fails reads
+        // with SlateDB `DatabaseMissing`, stringified by handlers without the
+        // "Collection ... not found" wording (the legacy gateway already 404s it).
+        GraphError::New(msg) | GraphError::StorageError(msg)
+            if msg.contains("database does not exist") =>
+        {
+            404
+        }
         _ => 500,
     }
 }
@@ -861,6 +869,13 @@ fn resize_admission_backpressure_response(
     )
 }
 
+/// Marks a 503 as replica-level load shedding (blocking-pool admission), as
+/// opposed to the collection-scoped 503s handlers return for one collection
+/// (lost metadata sidecar, purge pending). The cloud gateway only ejects a
+/// reader for the former: a collection-scoped 503 is identical on every
+/// replica, and ejecting for it drains the healthy pool onto the writer.
+pub(crate) const REPLICA_SHED_HEADER: &str = "X-Helix-Replica-Shed";
+
 fn blocking_overload_response(class: RouteClass, cap: usize) -> HelixResponse {
     metrics::counter!(
         "helix_blocking_admission_rejected_total",
@@ -877,6 +892,9 @@ fn blocking_overload_response(class: RouteClass, cap: usize) -> HelixResponse {
         "X-Helix-Route-Class".to_string(),
         class.as_label().to_string(),
     );
+    response
+        .headers
+        .insert(REPLICA_SHED_HEADER.to_string(), "1".to_string());
     response
         .headers
         .insert("X-Helix-Blocking-Cap".to_string(), cap.to_string());
@@ -1013,6 +1031,9 @@ async fn acquire_blocking_admission(
             let mut response = HelixResponse::new();
             response.status = 503;
             response.body = b"Helix blocking capacity closed".to_vec();
+            response
+                .headers
+                .insert(REPLICA_SHED_HEADER.to_string(), "1".to_string());
             Err(response)
         }
     }
@@ -1371,35 +1392,14 @@ async fn handle(
             observe_http_request(&method, &path, response.status().as_u16(), request_started);
             return response;
         }
-        // Match `handle_ready` without dispatching through the blocking router.
-        // This still performs an S3-backed catalog read, so share the bounded
-        // read pool and cancel the side-effect-free list if kubelet disconnects.
-        let blocking_guard = match acquire_blocking_admission(RouteClass::Probe).await {
-            Ok(guard) => guard,
-            Err(response) => {
-                drop(body);
-                observe_http_request(&method, &path, response.status, request_started);
-                return http_response(response);
-            }
-        };
-        let cancellation = route_has_cancellable_lsm_read(&method, &path, class)
-            .then(LsmReadCancellation::new)
-            .expect("readiness catalog listing must be cancellable");
-        let worker_cancellation = cancellation.clone();
-        let mut cancel_on_drop = CancelLsmReadOnDrop::new(cancellation);
-        let collections_for_list = Arc::clone(&state.collections);
-        let collections_on_disk = tokio::task::spawn_blocking(move || {
-            let _blocking_guard = blocking_guard;
-            allow_lsm_blocking_cancellable(worker_cancellation, || {
-                collections_for_list.list_collections()
-            })
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .map(|names| names.len())
-        .unwrap_or(0);
-        cancel_on_drop.disarm();
+        // Match `handle_ready` without dispatching through the blocking router
+        // or touching the object store: the catalog count is a cached snapshot
+        // refreshed off the probe path, so kubelet never queues behind S3 or
+        // the read admission pool.
+        let collections_on_disk = state
+            .collections
+            .collections_on_disk_cached()
+            .map_or_else(|| "null".to_string(), |count| count.to_string());
         let collections_loaded = state.collections.loaded_count();
         drop(body);
         observe_http_request(&method, &path, 200, request_started);
@@ -1753,6 +1753,26 @@ fn http_response(response: HelixResponse) -> HttpResponse<Body> {
         builder = builder.header(name, value);
     }
     builder.body(Body::from(response.body)).unwrap()
+}
+
+#[cfg(test)]
+mod replica_shed_header_tests {
+    use super::{blocking_overload_response, REPLICA_SHED_HEADER};
+    use crate::helix_gateway::thread_pool::thread_pool::RouteClass;
+
+    // The writer's gateway ejects a reader on 503 only when this marker is set.
+    #[test]
+    fn blocking_overload_marks_the_503_as_replica_shed() {
+        let response = blocking_overload_response(RouteClass::Search, 64);
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response
+                .headers
+                .get(REPLICA_SHED_HEADER)
+                .map(String::as_str),
+            Some("1")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2139,6 +2159,26 @@ mod segment_circuit_breaker_tests {
                 "io error: Generic S3 error: request failed: 503 Slow Down".into()
             )),
             500
+        );
+        // A reader whose collection was dropped and purged underneath it fails
+        // reads with SlateDB `DatabaseMissing`; handlers stringify the
+        // `BackendError` into `GraphError::New`. Prod body, verbatim:
+        // "io error: Data error: database does not exist".
+        let database_missing = crate::helix_engine::storage_core::backend::BackendError::Io(
+            slatedb::Error::data("database does not exist".to_string()).to_string(),
+        )
+        .to_string();
+        assert_eq!(
+            database_missing,
+            "io error: Data error: database does not exist"
+        );
+        assert_eq!(
+            graph_error_status(&GraphError::New(database_missing.clone())),
+            404
+        );
+        assert_eq!(
+            graph_error_status(&GraphError::StorageError(database_missing)),
+            404
         );
         assert_eq!(
             graph_error_status(&GraphError::New("Lock poisoned: x".into())),

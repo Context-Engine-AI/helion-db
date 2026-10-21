@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -26,17 +26,23 @@ use super::backend::{
 use super::backend_lmdb::{LmdbBackend, LmdbRead, LmdbWrite};
 use super::backend_lsm::{
     cache_root_from_env, cache_subtree_for_lsm_path, clear_s3_drop_tombstone,
-    list_s3_collection_prefixes, persist_s3_drop_tombstone, read_s3_drop_tombstone,
-    read_s3_metadata_sidecar, s3_collection_prefix_exists, LsmBackend, LsmRead, LsmWrite,
-    S3StoreConfig,
+    list_s3_collection_catalog, persist_s3_drop_tombstone, read_s3_drop_tombstone,
+    read_s3_metadata_sidecar, s3_collection_prefix_exists, CollectionCatalog, LsmBackend, LsmRead,
+    LsmWrite, S3StoreConfig,
 };
 #[cfg(test)]
-use super::backend_lsm::{list_child_collection_names, purge_prefix_from_store, shared_lsm_handle};
+use super::backend_lsm::{
+    list_child_collection_catalog, purge_prefix_from_store, shared_lsm_handle,
+};
 use super::backend_lsm_reader::LsmReader;
 
 fn unhealthy_lsm_writer_close_reason_from(reason: Option<CloseReason>) -> Option<CloseReason> {
     match reason {
-        reason @ Some(CloseReason::Fenced | CloseReason::Panic) => reason,
+        // `DatabaseMissing`: a reader's collection was dropped underneath it; the
+        // dead handle must be evicted so the next open sees the drop tombstone.
+        reason @ Some(CloseReason::Fenced | CloseReason::Panic | CloseReason::DatabaseMissing) => {
+            reason
+        }
         Some(CloseReason::Clean) | None => None,
         Some(_) => None,
     }
@@ -168,9 +174,9 @@ impl AnyBackend {
         #[cfg(test)]
         if let Some(store) = lsm_test_object_store() {
             if config.is_reader() {
-                return Err(BackendError::Unsupported(
-                    "test object-store override does not support LSM reader replicas".to_string(),
-                ));
+                return Ok(AnyBackend::LsmReader(LsmReader::open_with_store(
+                    &prefix, store,
+                )?));
             }
             return Ok(AnyBackend::Lsm(LsmBackend::open_with_store(
                 &prefix, store,
@@ -350,6 +356,17 @@ impl AnyBackend {
         }
     }
 
+    /// Names of collections with a live object-store drop tombstone, via the
+    /// retained store handle (one LIST). A reader replica's sweep evicts loaded
+    /// collections the writer has dropped; LMDB has no tombstones.
+    pub(crate) fn list_lsm_drop_tombstones(&self) -> Result<HashSet<String>, BackendError> {
+        match self {
+            AnyBackend::Lmdb(_) => Ok(HashSet::new()),
+            AnyBackend::Lsm(b) => b.list_drop_tombstones(),
+            AnyBackend::LsmReader(b) => b.list_drop_tombstones(),
+        }
+    }
+
     pub(crate) fn lsm_storage_bytes(&self) -> Result<Option<u64>, BackendError> {
         match self {
             AnyBackend::Lmdb(_) => Ok(None),
@@ -378,14 +395,20 @@ impl AnyBackend {
 pub fn list_collection_prefixes_from_env(
     config: StorageBackendConfig,
 ) -> Result<Vec<String>, BackendError> {
+    list_collection_catalog_from_env(config).map(|catalog| catalog.names)
+}
+
+pub(crate) fn list_collection_catalog_from_env(
+    config: StorageBackendConfig,
+) -> Result<CollectionCatalog, BackendError> {
     if config.is_lsm_in_memory() {
-        return Ok(Vec::new());
+        return Ok(CollectionCatalog::default());
     }
     let root = std::env::var("HELIX_LSM_PREFIX").unwrap_or_else(|_| "helion".to_string());
     let root = root.trim_matches('/').to_string();
     #[cfg(test)]
     if let Some(store) = lsm_test_object_store() {
-        return list_child_collection_names(&shared_lsm_handle(), &store, &root);
+        return list_child_collection_catalog(&shared_lsm_handle(), &store, &root);
     }
     let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
         BackendError::Io(
@@ -395,13 +418,45 @@ pub fn list_collection_prefixes_from_env(
     let region = std::env::var("HELIX_LSM_REGION").ok();
     let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
     let allow_http = env_flag("HELIX_LSM_ALLOW_HTTP");
-    list_s3_collection_prefixes(
-        &bucket,
-        &root,
-        region.as_deref(),
-        endpoint.as_deref(),
+    let store_config = S3StoreConfig {
+        bucket: &bucket,
+        region: region.as_deref(),
+        endpoint: endpoint.as_deref(),
         allow_http,
-    )
+    };
+    list_s3_collection_catalog(&store_config, &root)
+}
+
+/// Collection names with a persisted drop tombstone under the configured root
+/// (writer startup: schedule the grace sweeps a previous process never ran).
+/// Empty for in-memory LSM; errors are for the caller to log, never fatal.
+pub(crate) fn list_lsm_drop_tombstones_from_env(
+    config: StorageBackendConfig,
+) -> Result<HashSet<String>, BackendError> {
+    if !config.is_lsm() || config.is_lsm_in_memory() {
+        return Ok(HashSet::new());
+    }
+    let root = std::env::var("HELIX_LSM_PREFIX").unwrap_or_else(|_| "helion".to_string());
+    let root = root.trim_matches('/').to_string();
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return super::backend_lsm::list_drop_tombstones(&shared_lsm_handle(), &store, &root);
+    }
+    let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
+        BackendError::Io(
+            "HELIX_STORAGE_BACKEND=lsm drop tombstone listing requires HELIX_LSM_BUCKET"
+                .to_string(),
+        )
+    })?;
+    let region = std::env::var("HELIX_LSM_REGION").ok();
+    let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
+    let config = S3StoreConfig {
+        bucket: &bucket,
+        region: region.as_deref(),
+        endpoint: endpoint.as_deref(),
+        allow_http: env_flag("HELIX_LSM_ALLOW_HTTP"),
+    };
+    super::backend_lsm::list_s3_drop_tombstones(&config, &root)
 }
 
 pub fn read_metadata_sidecar_from_lsm_env(
@@ -438,7 +493,7 @@ pub(crate) fn lsm_collection_prefix_exists_from_env(
     collection_path: &Path,
     config: StorageBackendConfig,
 ) -> Result<bool, BackendError> {
-    if !config.is_lsm() || config.is_lsm_in_memory() || config.is_reader() {
+    if !config.is_lsm() || config.is_lsm_in_memory() {
         return Ok(false);
     }
     let prefix = collection_lsm_path(collection_path);
@@ -492,11 +547,13 @@ pub(crate) fn persist_lsm_drop_tombstone_from_env(
     persist_s3_drop_tombstone(&config, &prefix)
 }
 
+/// Readers probe tombstones too (one HEAD per cold open): a dropped collection
+/// must 404 on a replica instead of reopening a manifest the purge is racing.
 pub(crate) fn lsm_drop_tombstone_exists_from_env(
     collection_path: &Path,
     config: StorageBackendConfig,
 ) -> Result<bool, BackendError> {
-    if !config.is_lsm() || config.is_lsm_in_memory() || config.is_reader() {
+    if !config.is_lsm() || config.is_lsm_in_memory() {
         return Ok(false);
     }
     let prefix = collection_lsm_path(collection_path);
@@ -628,6 +685,24 @@ impl<'s> AnyWrite<'s> {
             AnyWrite::Lsm(w) => Some(w.pending()),
         }
     }
+
+    /// Register `hook` to run with `true` after this batch commits, or with
+    /// `false` if it is dropped uncommitted or its commit fails. LSM only:
+    /// the in-memory sidecar state it exists to roll back is LSM-only.
+    pub(crate) fn on_txn_end(
+        &mut self,
+        hook: super::backend_lsm::PostTxnHook,
+    ) -> Result<(), BackendError> {
+        match self {
+            AnyWrite::Lmdb(_) => Err(BackendError::Unsupported(
+                "post-txn hooks are LSM-only".to_string(),
+            )),
+            AnyWrite::Lsm(w) => {
+                w.on_txn_end(hook);
+                Ok(())
+            }
+        }
+    }
 }
 
 impl<'s> AnyRead<'s> {
@@ -713,6 +788,37 @@ pub(crate) fn lsm_cache_root_from_env() -> Option<PathBuf> {
 }
 
 impl AnyBackend {
+    /// Batched `get_for_update` (read-your-writes over `w`), aligned with
+    /// `keys`: one multi-get on the LSM writer, per-key reads elsewhere.
+    pub(crate) fn get_for_update_many(
+        &self,
+        w: &AnyWrite<'_>,
+        ns: Namespace<'_>,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let values = match (self, w) {
+            (AnyBackend::Lsm(writer), AnyWrite::Lsm(write)) => {
+                writer.get_for_update_many(write, ns, keys)?
+            }
+            _ => keys
+                .iter()
+                .map(|key| self.get_for_update(w, ns, key, |v| v.map(<[u8]>::to_vec)))
+                .collect::<Result<_, _>>()?,
+        };
+        // Callers zip values with keys; a short read would silently drop rows.
+        if values.len() != keys.len() {
+            return Err(BackendError::Io(format!(
+                "batched read returned {} values for {} keys",
+                values.len(),
+                keys.len()
+            )));
+        }
+        Ok(values)
+    }
+
     /// Wrap an existing heed read txn as a borrowed read handle (LMDB only).
     ///
     /// Lets a call site that still threads a heed `&RoTxn` read through the
@@ -1533,6 +1639,10 @@ mod tests {
         assert_eq!(
             unhealthy_lsm_writer_close_reason_from(Some(CloseReason::Panic)),
             Some(CloseReason::Panic)
+        );
+        assert_eq!(
+            unhealthy_lsm_writer_close_reason_from(Some(CloseReason::DatabaseMissing)),
+            Some(CloseReason::DatabaseMissing)
         );
         assert_eq!(unhealthy_lsm_writer_close_reason_from(None), None);
         assert_eq!(

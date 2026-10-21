@@ -128,6 +128,7 @@ fn backend_label(kind: BackendKind) -> &'static str {
 ///   * `PUT  /collections/{name}/points`           — upsert
 ///   * `POST /collections/{name}/points/delete`    — delete by ids/filter
 ///   * `POST /collections/{name}/points/payload`   — payload patch
+///   * `POST /collections/{name}/points/repair-file-size` — guarded snapshot repair
 ///
 /// Other write routes (`/index`, snapshot ops, ingest stream) take different
 /// code paths and intentionally bypass this admission layer.
@@ -145,6 +146,7 @@ pub fn point_mutation_collection<'a>(method: &str, path: &'a str) -> Option<&'a 
         ("PUT", "/points") => Some(name),
         ("POST", "/points/delete") => Some(name),
         ("POST", "/points/payload") => Some(name),
+        ("POST", "/points/repair-file-size") => Some(name),
         _ => None,
     }
 }
@@ -185,6 +187,10 @@ mod tests {
 
     #[test]
     fn detects_payload_patch_route() {
+        assert_eq!(
+            point_mutation_collection("POST", "/collections/foo/points/repair-file-size"),
+            Some("foo")
+        );
         assert_eq!(
             point_mutation_collection("POST", "/collections/foo/points/payload"),
             Some("foo")

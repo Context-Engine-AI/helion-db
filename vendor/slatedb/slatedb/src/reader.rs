@@ -553,24 +553,20 @@ impl Reader {
         values: &mut [Option<KeyValue>],
         fallback_to_point_get: &mut [bool],
     ) -> Result<(), SlateDBError> {
-        let mut groups = BTreeMap::<ulid::Ulid, (crate::db_state::SsTableView, Vec<usize>)>::new();
+        let mut groups = BTreeMap::<usize, Vec<usize>>::new();
         for key_idx in key_indices.iter().copied() {
             if resolved[key_idx] || fallback_to_point_get[key_idx] {
                 continue;
             }
 
-            for sst in sorted_run.tables_covering_point_key(unique_keys[key_idx].as_ref()) {
-                groups
-                    .entry(sst.id)
-                    .or_insert_with(|| (sst.clone(), Vec::new()))
-                    .1
-                    .push(key_idx);
+            for sst_idx in sorted_run.point_table_idx_covering_key(unique_keys[key_idx].as_ref()) {
+                groups.entry(sst_idx).or_default().push(key_idx);
             }
         }
 
-        for (_, (sst, group_key_indices)) in groups {
+        for (sst_idx, group_key_indices) in groups {
             self.resolve_rows_from_sst_for_keys(
-                &sst,
+                &sorted_run.sst_views[sst_idx],
                 &group_key_indices,
                 unique_keys,
                 max_seq,
@@ -2346,6 +2342,173 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
+        Ok(())
+    }
+
+    async fn multiget_boundary_reader(
+        newest: ValueDeletable,
+        with_merge: bool,
+    ) -> Result<(TestDbState, Reader), SlateDBError> {
+        let mut state = TestDbState::new().await;
+        let newest_sst = state
+            .build_sst(vec![
+                RowEntry::new(Bytes::from_static(b"shared"), newest, 20, None, None),
+                TestEntry::value(b"z", b"outside_projection", 20).to_row_entry(),
+            ])
+            .await?;
+        let oldest_sst = state
+            .build_sst(vec![
+                TestEntry::value(b"shared", b"base", 10).to_row_entry(),
+                TestEntry::value(b"z", b"outside_base", 10).to_row_entry(),
+            ])
+            .await?;
+        // View IDs are independent of physical objects and cannot encode version precedence.
+        Arc::make_mut(&mut state.core.tree)
+            .compacted
+            .push(SortedRun {
+                id: 0,
+                sst_views: vec![
+                    SsTableView::new_projected(
+                        Ulid::from_parts(1000, 999),
+                        newest_sst,
+                        Some(BytesRange::from_slice(
+                            b"shared".as_ref()..=b"shared".as_ref(),
+                        )),
+                    ),
+                    SsTableView::new(Ulid::from_parts(1000, 1), oldest_sst),
+                ],
+            });
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let reader = build_reader(&state, DbStats::new(&recorder), with_merge).await;
+        Ok((state, reader))
+    }
+
+    #[tokio::test]
+    async fn multiget_boundary_update_matches_point_read_with_duplicate_keys(
+    ) -> Result<(), SlateDBError> {
+        let (state, reader) =
+            multiget_boundary_reader(ValueDeletable::Value(Bytes::from_static(b"new")), false)
+                .await?;
+        let options = ReadOptions::default();
+        let point = reader
+            .get_key_value_with_options(b"shared", &options, &state, None, None)
+            .await?;
+        assert_eq!(
+            point.as_ref().map(|row| row.value.as_ref()),
+            Some(b"new".as_ref())
+        );
+
+        let result = reader
+            .multi_get_key_value_with_options(
+                &[
+                    Bytes::from_static(b"shared"),
+                    Bytes::from_static(b"missing"),
+                    Bytes::from_static(b"shared"),
+                ],
+                &options,
+                &state,
+                None,
+            )
+            .await?;
+
+        assert_eq!(result, vec![point.clone(), None, point]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiget_boundary_tombstone_does_not_resurrect_value() -> Result<(), SlateDBError> {
+        let (state, reader) = multiget_boundary_reader(ValueDeletable::Tombstone, false).await?;
+        let options = ReadOptions::default();
+        let point = reader
+            .get_key_value_with_options(b"shared", &options, &state, None, None)
+            .await?;
+        assert_eq!(point, None);
+
+        let result = reader
+            .multi_get_key_value_with_options(
+                &[Bytes::from_static(b"shared")],
+                &options,
+                &state,
+                None,
+            )
+            .await?;
+
+        assert_eq!(result, vec![None]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiget_boundary_merge_keeps_newest_operand() -> Result<(), SlateDBError> {
+        let (state, reader) =
+            multiget_boundary_reader(ValueDeletable::Merge(Bytes::from_static(b"head")), true)
+                .await?;
+        let options = ReadOptions::default();
+        let point = reader
+            .get_key_value_with_options(b"shared", &options, &state, None, None)
+            .await?;
+        assert_ne!(
+            point.as_ref().map(|row| row.value.as_ref()),
+            Some(b"base".as_ref())
+        );
+        assert!(point.is_some());
+
+        let result = reader
+            .multi_get_key_value_with_options(
+                &[Bytes::from_static(b"shared")],
+                &options,
+                &state,
+                None,
+            )
+            .await?;
+
+        assert_eq!(result, vec![point]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiget_boundary_snapshot_keeps_visible_older_version() -> Result<(), SlateDBError> {
+        let (state, reader) = multiget_boundary_reader(ValueDeletable::Tombstone, false).await?;
+        let options = ReadOptions::default();
+        let point = reader
+            .get_key_value_with_options(b"shared", &options, &state, None, Some(15))
+            .await?;
+        assert_eq!(
+            point.as_ref().map(|row| row.value.as_ref()),
+            Some(b"base".as_ref())
+        );
+
+        let result = reader
+            .multi_get_key_value_with_options(
+                &[Bytes::from_static(b"shared")],
+                &options,
+                &state,
+                Some(15),
+            )
+            .await?;
+
+        assert_eq!(result, vec![point]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multiget_boundary_projection_excludes_physical_rows() -> Result<(), SlateDBError> {
+        let (state, reader) =
+            multiget_boundary_reader(ValueDeletable::Value(Bytes::from_static(b"new")), false)
+                .await?;
+        let options = ReadOptions::default();
+        let point = reader
+            .get_key_value_with_options(b"z", &options, &state, None, None)
+            .await?;
+        assert_eq!(
+            point.as_ref().map(|row| row.value.as_ref()),
+            Some(b"outside_base".as_ref())
+        );
+
+        let result = reader
+            .multi_get_key_value_with_options(&[Bytes::from_static(b"z")], &options, &state, None)
+            .await?;
+
+        assert_eq!(result, vec![point]);
         Ok(())
     }
 

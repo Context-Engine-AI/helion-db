@@ -189,6 +189,7 @@ pub struct DbBuilder<P: Into<Path>> {
     filter_policies: Vec<Arc<dyn FilterPolicy>>,
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
+    manifest_id_floor: u64,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -197,6 +198,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         Self {
             path,
             main_object_store,
+            manifest_id_floor: 0,
             settings: Settings::default(),
             wal_object_store: None,
             db_cache: default_db_cache(),
@@ -228,6 +230,17 @@ impl<P: Into<Path>> DbBuilder<P> {
     }
 
     /// Sets the database settings.
+    /// When the path holds no database yet, write its first manifest with id
+    /// `floor + 1` instead of 1. Pass the highest manifest id a deleted previous
+    /// incarnation of this path used: a late conditional append from a stale
+    /// copy of that incarnation's manifest then lands at or below the new
+    /// database's first id and can never become its latest. Ignored when the
+    /// database already exists; `0` keeps the default.
+    pub fn with_manifest_id_floor(mut self, floor: u64) -> Self {
+        self.manifest_id_floor = floor;
+        self
+    }
+
     pub fn with_settings(mut self, settings: Settings) -> Self {
         if self.compactor_builder.is_some() && settings.compactor_options.is_some() {
             warn!("compactor_builder and settings.compactor_options both set; compactor_builder will take precedence");
@@ -564,8 +577,13 @@ impl<P: Into<Path>> DbBuilder<P> {
                 if let Some(extractor) = &self.segment_extractor {
                     state.segment_extractor_name = Some(extractor.name().to_string());
                 }
-                StoredManifest::create_new_db(manifest_store.clone(), state, system_clock.clone())
-                    .await?
+                StoredManifest::create_new_db_after(
+                    manifest_store.clone(),
+                    state,
+                    system_clock.clone(),
+                    self.manifest_id_floor,
+                )
+                .await?
             }
         };
 

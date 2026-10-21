@@ -433,6 +433,10 @@ pub enum CloseReason {
 
     /// One or more background tasks panicked.
     Panic,
+
+    /// The database's manifest disappeared from object storage while this
+    /// instance was open (the database was dropped underneath it).
+    DatabaseMissing,
 }
 
 /// Represents the kind of public errors that can be returned to the user.

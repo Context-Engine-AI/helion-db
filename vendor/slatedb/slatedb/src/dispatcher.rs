@@ -127,7 +127,7 @@ use futures::{
     stream::{BoxStream, FuturesUnordered},
     FutureExt, StreamExt,
 };
-use log::error;
+use log::{error, info};
 use parking_lot::Mutex;
 use tokio::{runtime::Handle, task::JoinHandle};
 use tokio_util::{sync::CancellationToken, task::JoinMap};
@@ -344,12 +344,23 @@ impl<T: Send + std::fmt::Debug> MessageDispatcher<T> {
         let run_unwind_result = AssertUnwindSafe(self.run()).catch_unwind().await;
         let (run_result, run_maybe_panic) = split_unwind_result(name.clone(), run_unwind_result);
         if let Err(ref err) = run_result {
-            error!(
-                "background task panicked unexpectedly. [task_name={}, error={:?}, panic={:?}]",
-                name,
-                err,
-                run_maybe_panic.map(|p| panic_string(&p))
-            );
+            // HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): a reader
+            // whose database was dropped underneath it is the normal
+            // eviction path — not a failure.  Log at info instead of error so
+            // expected drops don't look like panics.
+            if matches!(err, SlateDBError::DatabaseMissing) {
+                info!(
+                    "background task stopped: database dropped. [task_name={}]",
+                    name,
+                );
+            } else {
+                error!(
+                    "background task panicked unexpectedly. [task_name={}, error={:?}, panic={:?}]",
+                    name,
+                    err,
+                    run_maybe_panic.map(|p| panic_string(&p))
+                );
+            }
         }
         fail_point!(fp_registry.clone(), "executor-wrapper-before-write", |_| {
             panic!("failpoint: executor-wrapper-before-write");

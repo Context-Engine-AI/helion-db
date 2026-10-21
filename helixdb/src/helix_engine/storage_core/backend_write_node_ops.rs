@@ -293,6 +293,16 @@ impl HelixGraphStorage {
             .chain(in_edges.iter())
             .map(|edge| edge.id)
             .collect::<std::collections::HashSet<_>>();
+        // `r` predates this batch: skip edges an earlier op in it already
+        // deleted (e.g. the other endpoint's drop), or they count twice.
+        let mut removed_edges = 0i64;
+        for edge_id in &removed_edge_ids {
+            let live = self
+                .backend
+                .get_for_update(w, Namespace::Edges, &edge_id.to_be_bytes(), |v| v.is_some())
+                .map_err(|e| GraphError::New(e.to_string()))?;
+            removed_edges += i64::from(live);
+        }
 
         // Delete all related edge data: edge bytes + BOTH adjacency sides. The
         // adjacency deletes remove ONLY this edge's packed dup value
@@ -380,12 +390,8 @@ impl HelixGraphStorage {
             }
             self.adjust_metadata_counter_be(w, MetadataCounter::Nodes, -1)?;
         }
-        if !removed_edge_ids.is_empty() {
-            self.adjust_metadata_counter_be(
-                w,
-                MetadataCounter::Edges,
-                -(removed_edge_ids.len() as i64),
-            )?;
+        if removed_edges > 0 {
+            self.adjust_metadata_counter_be(w, MetadataCounter::Edges, -removed_edges)?;
         }
 
         Ok(())
@@ -1215,5 +1221,56 @@ mod tests {
             .get_with(&r, Namespace::SecondaryIndex("k"), &key, |v| v.is_some())
             .unwrap();
         assert!(!present, "secondary index entry must be removed");
+    }
+
+    /// Dropping both endpoints of an edge in ONE batch removes that edge from
+    /// `edge_count` exactly once: the second drop's incident-edge snapshot
+    /// predates the batch and still lists the edge the first drop deleted.
+    #[test]
+    #[serial_test::serial]
+    fn lsm_drop_both_endpoints_in_one_batch_decrements_edge_count_once() {
+        use super::super::upsert::EdgeUpsert;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
+        assert_eq!(storage.backend.kind(), BackendKind::Lsm);
+        let edge_count = || {
+            storage
+                .with_read_backend(|r| storage.get_metadata_be(r))
+                .unwrap()
+                .stats
+                .edge_count
+        };
+        let edge = |id: u128, from_node: u128, to_node: u128| EdgeUpsert {
+            id,
+            label: "CALLS".to_string(),
+            from_node,
+            to_node,
+            properties: Default::default(),
+        };
+
+        // n1->n2 is shared by the two dropped nodes, n2->n3 has one dropped
+        // endpoint, n3->n4 survives (so a double count cannot hide at zero).
+        let mut w = storage.backend.begin_write().unwrap();
+        for n in 1..=4u128 {
+            storage
+                .create_node_be(&mut w, "Sym", [], None, Some(n))
+                .unwrap();
+        }
+        for (id, from, to) in [(0xE1, 1, 2), (0xE2, 2, 3), (0xE3, 3, 4)] {
+            storage.upsert_edge_be(&mut w, &edge(id, from, to)).unwrap();
+        }
+        storage.backend.commit(w).unwrap();
+        assert_eq!(edge_count(), 3);
+
+        let mut w = storage.backend.begin_write().unwrap();
+        storage.drop_node_be(&mut w, &1).unwrap();
+        storage.drop_node_be(&mut w, &2).unwrap();
+        storage.backend.commit(w).unwrap();
+        assert_eq!(edge_count(), 1, "only n3->n4 remains");
     }
 }

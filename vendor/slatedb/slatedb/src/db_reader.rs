@@ -865,7 +865,7 @@ impl DbReaderInner {
         );
 
         let replay_options = WalReplayOptions {
-            sst_batch_size: 4,
+            sst_batch_size: reader_options.wal_replay_sst_batch_size.max(1),
             max_memtable_bytes: reader_options.max_memtable_bytes as usize,
             sst_iter_options,
             // Skip entries that we already have in `imm_memtable` (that might be above last_l0_seq).
@@ -1010,6 +1010,25 @@ impl ManifestPoller {
         self.report_active_checkpoints();
     }
 
+    /// Load the latest manifest for a reader-side write. A reader must never
+    /// append a manifest from a stale in-memory copy once the database has been
+    /// dropped: `PutMode::Create` into an emptied `manifest/` prefix would
+    /// succeed and resurrect a manifest that points at deleted SSTs. A missing
+    /// manifest is therefore the typed `DatabaseMissing`, so callers bail.
+    async fn load_manifest(&self) -> Result<StoredManifest, SlateDBError> {
+        match StoredManifest::load(
+            Arc::clone(&self.inner.manifest_store),
+            self.inner.system_clock.clone(),
+        )
+        .await
+        {
+            Err(SlateDBError::LatestTransactionalObjectVersionMissing) => {
+                Err(SlateDBError::DatabaseMissing)
+            }
+            result => result,
+        }
+    }
+
     async fn delete_released_checkpoints(
         &mut self,
         manifest: &mut StoredManifest,
@@ -1059,6 +1078,10 @@ impl ManifestPoller {
                 return Ok(());
             }
 
+            // WAL replay may have run since this tick loaded `manifest`; refresh
+            // right before the lease append so a drop in between is seen as
+            // `DatabaseMissing` rather than re-created as a new manifest version.
+            *manifest = self.load_manifest().await?;
             let ids = live.iter().map(|(id, _)| *id).collect::<Vec<_>>();
             match manifest
                 .refresh_checkpoints(&ids, self.inner.options.checkpoint_lifetime)
@@ -1118,11 +1141,7 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 
     async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
         assert!(matches!(message, DbReaderMessage::PollManifest));
-        let mut manifest = StoredManifest::load(
-            Arc::clone(&self.inner.manifest_store),
-            self.inner.system_clock.clone(),
-        )
-        .await?;
+        let mut manifest = self.load_manifest().await?;
 
         self.delete_released_checkpoints(&mut manifest).await?;
 
@@ -1148,11 +1167,6 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
         _messages: BoxStream<'async_trait, DbReaderMessage>,
         _result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
-        let mut manifest = StoredManifest::load(
-            Arc::clone(&self.inner.manifest_store),
-            self.inner.system_clock.clone(),
-        )
-        .await?;
         let checkpoint_ids = self.generations.keys().copied().collect::<Vec<_>>();
         if !checkpoint_ids.is_empty() {
             let live_generations = self
@@ -1169,6 +1183,19 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
             for generation in live_generations {
                 generation.drain().await;
             }
+            // Load only after the drain: in-flight reads can take seconds, and a
+            // drop (or drop + recreate) meanwhile must not get an append from a
+            // stale copy.
+            let mut manifest = match self.load_manifest().await {
+                Ok(manifest) => manifest,
+                // The database was dropped underneath us: there is no manifest to
+                // release our checkpoints from, and appending one would resurrect it.
+                Err(SlateDBError::DatabaseMissing) => {
+                    self.inner.db_stats.reader_active_checkpoints.set(0);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
             info!(
                 "deleting reader established checkpoints for shutdown [checkpoint_ids={:?}]",
                 checkpoint_ids
@@ -1891,7 +1918,7 @@ fn has_not_found_object_store_error(err: &(dyn std::error::Error + 'static)) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckpointState, ReaderGeneration, ReplayMemtables};
+    use super::{CheckpointState, ManifestPoller, ReaderGeneration, ReplayMemtables};
     use crate::clock::MonotonicClock;
     use crate::config::{
         CheckpointOptions, CheckpointScope, FlushOptions, FlushType, MergeOptions, PutOptions,
@@ -1973,6 +2000,126 @@ mod tests {
         );
     }
 
+    /// HELION LOCAL PATCH: `wal_replay_sst_batch_size` only widens the WAL
+    /// prefetch window; replay order and results are identical at every width
+    /// (1 serialises, 16 exceeds the WAL count), and 0 is treated as 1.
+    #[tokio::test]
+    async fn reader_wal_replay_results_are_identical_for_every_prefetch_batch_size() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_wal_replay_batch");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        // One flush per put leaves one WAL SST per key, none of it in L0. The
+        // writer stays open: closing it would flush the memtable to L0 and
+        // leave the readers nothing to replay.
+        for i in 0..12u32 {
+            db.put(format!("key{i:02}").as_bytes(), format!("v{i}").as_bytes())
+                .await
+                .unwrap();
+            db.flush().await.unwrap();
+        }
+
+        assert_eq!(DbReaderOptions::default().wal_replay_sst_batch_size, 4);
+        for batch in [0usize, 1, 4, 16] {
+            let reader = DbReader::open(
+                path.clone(),
+                Arc::clone(&object_store),
+                None,
+                DbReaderOptions {
+                    wal_replay_sst_batch_size: batch,
+                    ..DbReaderOptions::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("batch {batch}: {error}"));
+            for i in 0..12u32 {
+                assert_eq!(
+                    reader.get(format!("key{i:02}").as_bytes()).await.unwrap(),
+                    Some(Bytes::from(format!("v{i}"))),
+                    "batch {batch} key {i}"
+                );
+            }
+            reader.close().await.unwrap();
+        }
+        db.close().await.unwrap();
+    }
+
+    /// REVIEW REPRO: a database re-created at a purged path restarts WAL ids at
+    /// 1, so a reader whose on-disk object cache still holds the dropped
+    /// incarnation's `wal/<id>.sst` must not replay that content into the new one.
+    #[tokio::test]
+    async fn reader_wal_cache_does_not_serve_a_recreated_databases_reused_wal_ids() {
+        use futures::TryStreamExt;
+        use object_store::ObjectStoreExt;
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_reader_wal_cache_recreate_{}",
+            Uuid::new_v4()
+        ));
+        let cache_dir = tempfile::Builder::new()
+            .prefix("dbreader_wal_cache_recreate_")
+            .tempdir()
+            .unwrap();
+        let cached_reader_options = || {
+            let mut options = DbReaderOptions::default();
+            options.object_store_cache_options.root_folder = Some(cache_dir.path().to_path_buf());
+            options.object_store_cache_options.scan_interval = None;
+            options
+        };
+
+        // Incarnation 1: `k` lives only in the WAL tail; a cached reader replays it.
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"k", b"old").await.unwrap();
+        db.flush().await.unwrap();
+        let reader = DbReader::builder(path.clone(), Arc::clone(&object_store))
+            .with_options(cached_reader_options())
+            .with_db_cache_disabled()
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"k").await.unwrap(),
+            Some(Bytes::from_static(b"old"))
+        );
+        reader.close().await.unwrap();
+
+        // Drop: the writer purges every object under the path.
+        db.close().await.unwrap();
+        let objects: Vec<Path> = object_store
+            .list(Some(&path))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        for location in objects {
+            object_store.delete(&location).await.unwrap();
+        }
+
+        // Incarnation 2 at the same path: same WAL ids, different content.
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .build()
+            .await
+            .unwrap();
+        db.put(b"k", b"new").await.unwrap();
+        db.flush().await.unwrap();
+        let reader = DbReader::builder(path.clone(), Arc::clone(&object_store))
+            .with_options(cached_reader_options())
+            .with_db_cache_disabled()
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"k").await.unwrap(),
+            Some(Bytes::from_static(b"new")),
+            "reader replayed the dropped incarnation's cached WAL"
+        );
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn empty_database_reader_returns_typed_database_missing() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -1990,6 +2137,223 @@ mod tests {
 
         assert_eq!(error.kind(), crate::ErrorKind::Data);
         assert_eq!(error.code(), Some(crate::ErrorCode::DatabaseMissing));
+    }
+
+    async fn delete_manifest_objects(object_store: &Arc<dyn ObjectStore>, path: &Path) {
+        use futures::TryStreamExt;
+        use object_store::ObjectStoreExt;
+        let manifests: Vec<Path> = object_store
+            .list(Some(&path.clone().join("manifest")))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(!manifests.is_empty(), "test needs a manifest to purge");
+        for location in manifests {
+            object_store.delete(&location).await.unwrap();
+        }
+    }
+
+    // A reader whose database is dropped between loading the manifest and its
+    // lease append must not re-create a manifest from its in-memory copy: that
+    // manifest would point at purged SSTs and resurrect the dropped database.
+    #[tokio::test]
+    async fn lease_refresh_bails_when_manifest_was_purged_after_load() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_db_reader_lease_after_purge_{}",
+            Uuid::new_v4()
+        ));
+        let clock = Arc::new(MockSystemClock::new());
+        let mut test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        test_provider.system_clock = clock.clone();
+        let manifest_store = test_provider.manifest_store();
+        let table_store = test_provider.table_store();
+        let stored_manifest = StoredManifest::create_new_db(
+            Arc::clone(&manifest_store),
+            ManifestCore::new(),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let inner = Arc::new(
+            DbReaderInner::new(
+                Arc::clone(&manifest_store),
+                table_store,
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_millis(100),
+                    checkpoint_lifetime: Duration::from_millis(1000),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+                None,
+                clock.clone(),
+                test_provider.rand.clone(),
+                slatedb_common::metrics::MetricsRecorderHelper::noop(),
+                stored_manifest,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut poller = ManifestPoller::new(Arc::clone(&inner));
+
+        // The poll tick loaded the manifest, then the database was dropped.
+        let mut stale = StoredManifest::load(Arc::clone(&manifest_store), clock.clone())
+            .await
+            .unwrap();
+        delete_manifest_objects(&object_store, &path).await;
+        clock.advance(Duration::from_millis(501)).await;
+
+        let result = poller.refresh_live_checkpoints(&mut stale).await;
+        assert!(
+            matches!(result, Err(SlateDBError::DatabaseMissing)),
+            "lease refresh must bail on a dropped database, got {result:?}"
+        );
+        assert!(
+            manifest_store.list_manifests(..).await.unwrap().is_empty(),
+            "lease refresh must not re-create a manifest for a dropped database"
+        );
+    }
+
+    // Drop + immediate recreate of the same path (Context Engine's reindex) while
+    // a reader is closing with a read in flight: cleanup must not append a
+    // manifest from a copy it loaded before that read drained. Such an append
+    // carries the dropped incarnation's state at an id above the new
+    // database's, so it would become the re-created database's latest manifest.
+    #[tokio::test]
+    async fn close_cleanup_does_not_append_stale_manifest_into_recreated_database() {
+        use crate::dispatcher::MessageHandler;
+        use futures::StreamExt;
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_db_reader_cleanup_recreate_{}",
+            Uuid::new_v4()
+        ));
+        let clock = Arc::new(MockSystemClock::new());
+        let mut test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        test_provider.system_clock = clock.clone();
+        let manifest_store = test_provider.manifest_store();
+        let table_store = test_provider.table_store();
+        let stored_manifest = StoredManifest::create_new_db(
+            Arc::clone(&manifest_store),
+            ManifestCore::new(),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let inner = Arc::new(
+            DbReaderInner::new(
+                Arc::clone(&manifest_store),
+                table_store,
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_millis(100),
+                    checkpoint_lifetime: Duration::from_millis(1000),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+                None,
+                clock.clone(),
+                test_provider.rand.clone(),
+                slatedb_common::metrics::MetricsRecorderHelper::noop(),
+                stored_manifest,
+            )
+            .await
+            .unwrap(),
+        );
+        let mut poller = ManifestPoller::new(Arc::clone(&inner));
+        let generation = Arc::clone(&inner.state.read().generation);
+        let in_flight_read = generation.acquire().unwrap();
+        let cleanup = tokio::spawn(async move {
+            poller
+                .cleanup(futures::stream::empty().boxed(), Ok(()))
+                .await
+        });
+        // Cleanup is now parked on the drain of `in_flight_read`.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        delete_manifest_objects(&object_store, &path).await;
+        let recreated = StoredManifest::create_new_db(
+            Arc::clone(&manifest_store),
+            ManifestCore::new(),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        let recreated_id = recreated.id();
+        drop(in_flight_read);
+        cleanup.await.unwrap().unwrap();
+
+        let ids = manifest_store
+            .list_manifests(..)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|manifest| manifest.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            vec![recreated_id],
+            "reader close appended a stale manifest into the re-created database"
+        );
+    }
+
+    // A reader polling a dropped database closes with `DatabaseMissing`, not
+    // `Panic`: the owner evicts it quietly instead of treating it as a crash.
+    #[tokio::test]
+    async fn poller_on_dropped_database_closes_with_database_missing() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_db_reader_dropped_database_{}",
+            Uuid::new_v4()
+        ));
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"k", b"v").await.unwrap();
+        db.close().await.unwrap();
+        let reader = DbReader::open(
+            path.clone(),
+            Arc::clone(&object_store),
+            None,
+            DbReaderOptions {
+                manifest_poll_interval: Duration::from_millis(100),
+                checkpoint_lifetime: Duration::from_millis(1000),
+                ..DbReaderOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        delete_manifest_objects(&object_store, &path).await;
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(reason) = reader.status().close_reason {
+                    return reason;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("poller must notice the dropped database");
+        assert_ne!(
+            closed,
+            CloseReason::Panic,
+            "a dropped database is not a crash"
+        );
+        assert_eq!(format!("{closed:?}"), "DatabaseMissing");
+        assert!(
+            test_provider
+                .manifest_store()
+                .list_manifests(..)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a dropped database must stay dropped"
+        );
+        // Like any instance closed by its poller, `close` reports the exit error.
+        let close_error = reader.close().await.err().expect("close reports the exit");
+        assert_eq!(close_error.code(), Some(crate::ErrorCode::DatabaseMissing));
     }
 
     #[tokio::test]

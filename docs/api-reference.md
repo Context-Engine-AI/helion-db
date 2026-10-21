@@ -29,7 +29,11 @@ Response:
 }
 ```
 
-Fields: `collections_on_disk` (int) -- total collection dirs; `collections_loaded` (int) -- currently open in memory.
+Fields: `collections_on_disk` (int or null) -- last successful background catalog
+count, null until the first refresh completes; `collections_loaded` (int) --
+currently open in memory. Readiness and metrics do not wait for an object-store
+listing. A failed or pending refresh retains the previous count; the
+`helix_collections_on_disk` metric is updated only when a cached count exists.
 
 ### `GET /healthz`, `GET /livez`, `GET /readyz`
 
@@ -392,6 +396,27 @@ Response: `{"status":"ok"}`
 
 Note: filter-based set_payload is not yet supported; use `points` IDs.
 
+### `POST /collections/{name}/points/repair-file-size` (Helion extension)
+
+Repairs only `metadata.file_size_bytes` on explicitly selected numeric chunk IDs.
+The request requires `points` (1–50,000 distinct u64 IDs), `expected_file_hash`,
+`file_size_bytes` (u64), and `filter` (the existing file/tenant filter). Every
+current row must exist, match that hash and filter, have a known numeric size,
+and not be pending prune. Hash checking, current-row merge, and commit share one
+transaction: SlateDB serializable snapshot on LSM, or a heed write transaction
+on LMDB. A conflict re-evaluates the guard, never reuses prepared old payloads.
+
+Success: `{"status":"ok","result":{"status":"completed","affected":2}}`.
+Missing/mismatched targets return HTTP 409 and change **no** points. Storage
+errors fail the request; vectors, IDs, and other metadata are not rewritten.
+LSM rejects repairs when the size field or whole metadata object is indexed
+(HTTP 400), rather than leaving that index stale. Unknown/absent legacy sizes
+are not backfilled.
+
+Deploy a server supporting this route before enabling callers. Old servers return 404; callers
+must not fall back to the unconditional payload endpoint. This is not a bulk
+scan, migration, or replacement for normal content-change reconciliation.
+
 ### `POST /collections/{name}/points/count`
 
 Return point count, optionally filtered.
@@ -448,10 +473,13 @@ Response:
 Qdrant-compatible scroll calls are bounded by
 `HELIX_QDRANT_SCROLL_SCAN_BUDGET_MIN`,
 `HELIX_QDRANT_SCROLL_SCAN_BUDGET_MULTIPLIER`,
-`HELIX_QDRANT_SCROLL_SCAN_BUDGET_MAX`, and
-`HELIX_QDRANT_SCROLL_SCAN_BUDGET_MS`; when a filtered page uses its budget
-before the collection is exhausted, Helion returns the next offset so clients
-can continue without one unindexed filter monopolizing the shard.
+`HELIX_QDRANT_SCROLL_SCAN_BUDGET_MAX`, and a wall-clock budget per plan:
+`HELIX_QDRANT_SCROLL_SCAN_BUDGET_MS` (250 ms by default) for filters with no
+payload index and `HELIX_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS` (2,000 ms by
+default) for pages served from
+payload-index candidates; when a filtered page uses its budget before the
+collection is exhausted, Helion returns the next offset so clients can continue
+without one unindexed filter monopolizing the shard.
 
 ### `POST /v1/collections/{name}/points/scan`
 

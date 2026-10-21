@@ -7,6 +7,7 @@ use heed3::{
     types::{Bytes, U128},
     Env, RoTxn, RwTxn, WithTls,
 };
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 
 use crate::helix_engine::storage_core::backend::{
@@ -496,23 +497,24 @@ impl CacheEpoch {
     };
 }
 
-/// Map of cached per-term values valid for exactly one epoch token.
+/// Admission-order cache valid for exactly one epoch token; `insert` enforces
+/// the term cap. Reads and replacements keep their position (not access LRU).
 struct EpochCache<V> {
     epoch: Option<u128>,
-    entries: HashMap<u32, V>,
+    entries: LruCache<u32, V>,
 }
 
 impl<V> EpochCache<V> {
     fn new() -> Self {
         Self {
             epoch: None,
-            entries: HashMap::new(),
+            entries: LruCache::unbounded(),
         }
     }
 
     fn get(&self, epoch: CacheEpoch, term_id: u32) -> Option<&V> {
         if epoch.token.is_some() && self.epoch == epoch.token {
-            self.entries.get(&term_id)
+            self.entries.peek(&term_id)
         } else {
             None
         }
@@ -520,9 +522,9 @@ impl<V> EpochCache<V> {
 
     /// Insert `value` read at epoch token `epoch` (callers validate unpinned
     /// fills first). A different epoch replaces the whole map (entries from
-    /// another snapshot generation are never mixed); returns true when
-    /// existing entries were discarded. A `None` token is non-cacheable and
-    /// leaves the cache untouched.
+    /// another snapshot generation are never mixed); returns true only for a
+    /// full epoch clear. Capacity evicts one oldest admission instead. A `None`
+    /// token is non-cacheable and leaves the cache untouched.
     fn insert(&mut self, epoch: Option<u128>, term_id: u32, value: V, max_terms: usize) -> bool {
         if epoch.is_none() {
             return false;
@@ -532,11 +534,16 @@ impl<V> EpochCache<V> {
             cleared = !self.entries.is_empty();
             self.entries.clear();
             self.epoch = epoch;
-        } else if self.entries.len() >= max_terms && !self.entries.contains_key(&term_id) {
-            self.entries.clear();
-            cleared = true;
         }
-        self.entries.insert(term_id, value);
+        if let Some(cached) = self.entries.peek_mut(&term_id) {
+            *cached = value;
+            return cleared;
+        }
+        if self.entries.len() >= max_terms {
+            self.entries.pop_lru();
+            metrics::counter!("helix_sparse_cache_evictions_total").increment(1);
+        }
+        self.entries.put(term_id, value);
         cleared
     }
 }
@@ -947,7 +954,7 @@ impl SparseVectorCore {
 
     fn invalidate_term_metadata_cache(&self, term_id: u32) {
         if let Ok(mut cache) = self.term_metadata_cache.write() {
-            cache.entries.remove(&term_id);
+            cache.entries.pop(&term_id);
         }
     }
 
@@ -1247,6 +1254,19 @@ impl SparseVectorCore {
             .get_for_update(w, self.fwd_ns(), &doc_id.to_be_bytes(), |opt| {
                 opt.map(|b| b.to_vec())
             })
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    /// Batched `get_for_update` (read-your-writes over `w`), aligned with
+    /// `keys`: one multi-get on the LSM writer, per-key reads elsewhere.
+    fn get_for_update_many_be(
+        &self,
+        w: &AnyWrite<'_>,
+        ns: Namespace<'_>,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, VectorError> {
+        self.backend
+            .get_for_update_many(w, ns, keys)
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))
     }
 
@@ -1983,8 +2003,17 @@ impl SparseVectorCore {
         let mut diff_idx: Vec<usize> = Vec::new();
         let mut unchanged_count = 0usize;
         let mut total_input_terms = 0usize;
-        for (idx, &(doc_id, sparse)) in items.iter().enumerate() {
+        for &(_, sparse) in items {
             sparse.validate()?;
+        }
+        // Doc ids are unique here (duplicates took the fallback above), so one
+        // multi-get reads every forward entry the per-doc reads would.
+        let fwd_keys: Vec<Vec<u8>> = items
+            .iter()
+            .map(|(doc_id, _)| doc_id.to_be_bytes().to_vec())
+            .collect();
+        let fwd_values = self.get_for_update_many_be(w, self.fwd_ns(), &fwd_keys)?;
+        for ((idx, &(doc_id, sparse)), existing) in items.iter().enumerate().zip(fwd_values) {
             total_input_terms += sparse.indices.len();
             let new_terms: Vec<(u32, f32)> = sparse
                 .indices
@@ -1992,7 +2021,7 @@ impl SparseVectorCore {
                 .zip(sparse.values.iter())
                 .map(|(&i, &v)| (i, v))
                 .collect();
-            match self.fwd_get_be(w, doc_id)? {
+            match existing {
                 None => fresh.push((doc_id, new_terms)),
                 Some(existing) => {
                     let old_terms = decode_forward(&existing)?;
@@ -2064,15 +2093,35 @@ impl SparseVectorCore {
             self.set_doc_count_be(w, doc_count + fresh_count as u64)?;
             record_sparse_batch_step("fresh_doc_count", step_started);
 
+            // Every touched term's df and max in ONE multi-get (batch writes
+            // first) instead of two sequential SlateDB reads per distinct term:
+            // ~1k terms per CE batch, each a cold block fetch on big collections.
             let step_started = Instant::now();
-            for (term_id, delta) in df_deltas {
-                self.adjust_term_df_be(w, term_id, delta)?;
+            let term_ids: Vec<u32> = df_deltas.keys().copied().collect();
+            let meta_keys: Vec<Vec<u8>> = term_ids
+                .iter()
+                .map(|&term_id| meta_term_key(term_id).to_vec())
+                .chain(
+                    term_ids
+                        .iter()
+                        .map(|&term_id| meta_max_key(term_id).to_vec()),
+                )
+                .collect();
+            let mut df_raw = self.get_for_update_many_be(w, self.meta_ns(), &meta_keys)?;
+            let max_raw = df_raw.split_off(term_ids.len());
+            for (&term_id, raw) in term_ids.iter().zip(df_raw) {
+                let current = Self::decode_term_df_raw(term_id, raw)? as i64;
+                let delta = df_deltas[&term_id];
+                self.set_term_df_be(w, term_id, (current + delta).max(0) as u64)?;
             }
             record_sparse_batch_step("fresh_term_df", step_started);
 
             let step_started = Instant::now();
-            for (term_id, candidate) in max_candidates {
-                self.maybe_raise_term_max_be(w, term_id, candidate)?;
+            for (&term_id, raw) in term_ids.iter().zip(max_raw) {
+                let candidate = max_candidates[&term_id];
+                if candidate.is_finite() && candidate > Self::decode_term_max_raw(term_id, raw)? {
+                    self.set_term_max_be(w, term_id, candidate)?;
+                }
             }
             record_sparse_batch_step("fresh_term_max", step_started);
 
@@ -2488,6 +2537,64 @@ impl SparseVectorCore {
             self.adjust_term_df_be(w, term_id, -1)?;
         }
         Ok(())
+    }
+
+    /// [`Self::delete_be`] for many docs in one write batch, leaving exactly
+    /// the state the sequential calls would (df and doc_count saturate at 0
+    /// either way). The forward entries and the df of every touched term are
+    /// each read in ONE multi-get instead of one sequential SlateDB read per
+    /// doc plus one per distinct term in the batch (repeats hit the batch's
+    /// pending writes). Returns how many docs had a sparse vector.
+    pub fn delete_batch_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        doc_ids: &[u128],
+    ) -> Result<usize, VectorError> {
+        let mut seen_docs = HashSet::with_capacity(doc_ids.len());
+        let doc_ids: Vec<u128> = doc_ids
+            .iter()
+            .copied()
+            .filter(|id| seen_docs.insert(*id))
+            .collect();
+        let fwd_keys: Vec<Vec<u8>> = doc_ids.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+        let fwd_values = self.get_for_update_many_be(w, self.fwd_ns(), &fwd_keys)?;
+
+        let mut df_decrements: HashMap<u32, u64> = HashMap::new();
+        let mut deleted = 0usize;
+        for (&doc_id, fwd_data) in doc_ids.iter().zip(fwd_values) {
+            let Some(fwd_data) = fwd_data else {
+                continue;
+            };
+            let terms = decode_forward(&fwd_data)?;
+            let mut doc_terms = HashSet::with_capacity(terms.len());
+            for &(term_id, value) in &terms {
+                self.inv_delete_dup_be(w, &inv_key(term_id), &encode_posting(doc_id, value))?;
+                if doc_terms.insert(term_id) {
+                    *df_decrements.entry(term_id).or_insert(0) += 1;
+                }
+            }
+            self.fwd_delete_be(w, doc_id)?;
+            deleted += 1;
+        }
+        if deleted == 0 {
+            return Ok(0);
+        }
+
+        self.bump_cache_epoch_be(w)?;
+        let doc_count = self.get_doc_count_be(w)?;
+        self.set_doc_count_be(w, doc_count.saturating_sub(deleted as u64))?;
+
+        let (term_ids, decrements): (Vec<u32>, Vec<u64>) = df_decrements.into_iter().unzip();
+        let df_keys: Vec<Vec<u8>> = term_ids
+            .iter()
+            .map(|term_id| meta_term_key(*term_id).to_vec())
+            .collect();
+        let current = self.get_for_update_many_be(w, self.meta_ns(), &df_keys)?;
+        for ((term_id, decrement), raw) in term_ids.into_iter().zip(decrements).zip(current) {
+            let df = Self::decode_term_df_raw(term_id, raw)?;
+            self.set_term_df_be(w, term_id, df.saturating_sub(decrement))?;
+        }
+        Ok(deleted)
     }
 
     /// Drain the in-memory `pending_df_delta` and `pending_max` buffers
@@ -3802,6 +3909,219 @@ mod tests {
         (backend, core)
     }
 
+    /// `terms` distinct term ids from a shared vocabulary, like chunks of one file.
+    fn file_chunk_doc(id: u128, terms: u32) -> SparseVector {
+        let vocab = 4 * terms;
+        let mut indices: Vec<u32> = (0..terms)
+            .map(|k| (id as u32 * 37 + k * 3) % vocab)
+            .collect();
+        indices.sort_unstable();
+        let values = indices
+            .iter()
+            .map(|i| 1.0 + (*i % 5) as f32 + id as f32 * 0.01)
+            .collect();
+        SparseVector { indices, values }
+    }
+
+    type SparseState = (u64, Vec<u64>, Vec<Vec<(u128, f64)>>, Vec<bool>);
+
+    /// doc_count, df of every vocab term, Idf-scored hits, forward presence.
+    fn sparse_state(core: &SparseVectorCore, backend: &AnyBackend, vocab: u32) -> SparseState {
+        let r = backend.begin_read().unwrap();
+        let queries = [
+            SparseVector {
+                indices: (0..vocab).collect(),
+                values: vec![1.0; vocab as usize],
+            },
+            SparseVector {
+                indices: vec![0, 3, 6, 9, 30],
+                values: vec![1.0, 0.5, 2.0, 1.0, 3.0],
+            },
+        ];
+        (
+            core.get_doc_count_read_be(&r).unwrap(),
+            (0..vocab)
+                .map(|term| core.get_term_df_read_be(&r, term).unwrap())
+                .collect(),
+            queries
+                .iter()
+                .map(|q| {
+                    core.search_be::<fn(u128) -> bool>(&r, q, 100, None)
+                        .unwrap()
+                })
+                .collect(),
+            (1..=40)
+                .map(|id| core.get_doc_vector_be(&r, id).unwrap().is_some())
+                .collect(),
+        )
+    }
+
+    /// Every raw Fwd/Inv/Meta row of `core` except the (random) cache epoch.
+    fn sparse_raw_rows(core: &SparseVectorCore, backend: &AnyBackend) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let r = backend.begin_read().unwrap();
+        let mut rows = Vec::new();
+        for ns in [core.fwd_ns(), core.inv_ns(), core.meta_ns()] {
+            backend
+                .scan(
+                    &r,
+                    ns,
+                    crate::helix_engine::storage_core::backend::KeyRange::all(),
+                    |k, v| {
+                        if k != META_CACHE_EPOCH_KEY {
+                            rows.push((k.to_vec(), v.to_vec()));
+                        }
+                        true
+                    },
+                )
+                .unwrap();
+        }
+        rows
+    }
+
+    #[test]
+    fn delete_batch_be_matches_sequential_deletes_and_a_fresh_index_on_lmdb_and_lsm() {
+        const TERMS: u32 = 40;
+        let insert = |backend: &AnyBackend,
+                      core: &SparseVectorCore,
+                      ids: std::ops::RangeInclusive<u128>| {
+            let docs: Vec<(u128, SparseVector)> =
+                ids.map(|id| (id, file_chunk_doc(id, TERMS))).collect();
+            let items: Vec<(u128, &SparseVector)> = docs.iter().map(|(id, d)| (*id, d)).collect();
+            let mut w = backend.begin_write().unwrap();
+            core.upsert_batch_be(&mut w, &items).unwrap();
+            backend.commit(w).unwrap();
+        };
+        // A duplicate and a never-inserted id must be no-ops, as for delete_be.
+        let mut to_delete: Vec<u128> = (1..=25).collect();
+        to_delete.extend([3, 999]);
+        let mut lmdb_envs = Vec::new();
+        let mut make = |lsm: bool, name: &str| {
+            if lsm {
+                return make_lsm_core(name, SparseModifier::Idf);
+            }
+            let (tmp, env) = setup();
+            let core = make_core(&env, name, SparseModifier::Idf);
+            let backend = test_backend(&env);
+            lmdb_envs.push((tmp, env));
+            (backend, core)
+        };
+
+        for lsm in [false, true] {
+            let (batch_backend, batch) = make(lsm, "batch");
+            let (seq_backend, seq) = make(lsm, "seq");
+            let (fresh_backend, fresh) = make(lsm, "fresh");
+            insert(&batch_backend, &batch, 1..=40);
+            insert(&seq_backend, &seq, 1..=40);
+            insert(&fresh_backend, &fresh, 26..=40);
+
+            let mut w = batch_backend.begin_write().unwrap();
+            assert_eq!(batch.delete_batch_be(&mut w, &to_delete).unwrap(), 25);
+            batch_backend.commit(w).unwrap();
+            let mut w = seq_backend.begin_write().unwrap();
+            for id in &to_delete {
+                seq.delete_be(&mut w, *id).unwrap();
+            }
+            seq_backend.commit(w).unwrap();
+
+            assert_eq!(
+                sparse_raw_rows(&batch, &batch_backend),
+                sparse_raw_rows(&seq, &seq_backend),
+                "lsm={lsm}: batched delete wrote different rows than sequential delete_be"
+            );
+            let state = sparse_state(&batch, &batch_backend, 4 * TERMS);
+            assert_eq!(state.0, 15, "lsm={lsm}: doc_count");
+            assert_eq!(
+                state,
+                sparse_state(&seq, &seq_backend, 4 * TERMS),
+                "lsm={lsm}: batched delete diverged from sequential delete_be"
+            );
+            assert_eq!(
+                state,
+                sparse_state(&fresh, &fresh_backend, 4 * TERMS),
+                "lsm={lsm}: batched delete diverged from an index of only the survivors"
+            );
+            for hits in &state.2 {
+                assert!(!hits.is_empty(), "lsm={lsm}: survivors must still match");
+                assert!(
+                    hits.iter().all(|(id, _)| *id > 25),
+                    "lsm={lsm}: deleted id returned: {hits:?}"
+                );
+            }
+        }
+    }
+
+    /// delete_batch_be must read the batch's own earlier writes (fresh and
+    /// changed upserts, a prior delete_be, a re-insert) exactly as the
+    /// sequential delete_be path does within one write batch.
+    #[test]
+    fn delete_batch_be_reads_same_batch_writes_like_sequential_deletes_on_lmdb_and_lsm() {
+        const TERMS: u32 = 40;
+        // Same vocabulary, different term set and values: a diff upsert.
+        let changed = |id: u128| file_chunk_doc(id + 500, TERMS);
+        let mut lmdb_envs = Vec::new();
+        let mut make = |lsm: bool, name: &str| {
+            if lsm {
+                return make_lsm_core(name, SparseModifier::Idf);
+            }
+            let (tmp, env) = setup();
+            let core = make_core(&env, name, SparseModifier::Idf);
+            let backend = test_backend(&env);
+            lmdb_envs.push((tmp, env));
+            (backend, core)
+        };
+
+        for lsm in [false, true] {
+            let mut states = Vec::new();
+            for batched in [true, false] {
+                let (backend, core) = make(lsm, if batched { "ryw_batch" } else { "ryw_seq" });
+                let docs: Vec<(u128, SparseVector)> =
+                    (1..=20).map(|id| (id, file_chunk_doc(id, TERMS))).collect();
+                let items: Vec<(u128, &SparseVector)> =
+                    docs.iter().map(|(id, d)| (*id, d)).collect();
+                let mut w = backend.begin_write().unwrap();
+                core.upsert_batch_be(&mut w, &items).unwrap();
+                backend.commit(w).unwrap();
+
+                let delete = |w: &mut AnyWrite<'_>, ids: &[u128]| {
+                    if batched {
+                        core.delete_batch_be(w, ids).unwrap();
+                    } else {
+                        for id in ids {
+                            core.delete_be(w, *id).unwrap();
+                        }
+                    }
+                };
+                let mut w = backend.begin_write().unwrap();
+                core.upsert_be(&mut w, 21, &file_chunk_doc(21, TERMS))
+                    .unwrap();
+                core.upsert_be(&mut w, 2, &changed(2)).unwrap();
+                core.delete_be(&mut w, 5).unwrap();
+                delete(&mut w, &[1, 2, 21, 5, 3, 3, 999]);
+                core.upsert_be(&mut w, 3, &changed(3)).unwrap();
+                delete(&mut w, &[3, 4, 3, 999]);
+                core.upsert_be(&mut w, 6, &changed(6)).unwrap();
+                backend.commit(w).unwrap();
+                states.push((
+                    sparse_raw_rows(&core, &backend),
+                    sparse_state(&core, &backend, 4 * TERMS),
+                ));
+            }
+            assert_eq!(
+                states[0], states[1],
+                "lsm={lsm}: batched delete diverged from sequential delete_be in one batch"
+            );
+            let (_, (doc_count, _, hits, _)) = &states[0];
+            assert_eq!(*doc_count, 15, "lsm={lsm}: docs 6..=20 survive");
+            for hits in hits {
+                assert!(!hits.is_empty(), "lsm={lsm}: survivors must still match");
+                assert!(
+                    hits.iter().all(|(id, _)| (6..=20).contains(id)),
+                    "lsm={lsm}: deleted id returned: {hits:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn unique_term_ids_preserves_first_seen_order() {
         assert_eq!(unique_term_ids(&[7, 3, 7, 1, 3, 9]), vec![7, 3, 1, 9]);
@@ -3883,6 +4203,75 @@ mod tests {
             )
             .unwrap();
         assert_eq!(new_term_results, vec![(2, 7.0)]);
+    }
+
+    /// A fresh upsert_batch_be over committed terms plus same-batch writes must
+    /// leave the rows sequential upsert_be calls would, and on LSM read the
+    /// term df/max metadata in O(1) round trips, not two per distinct term.
+    #[test]
+    fn upsert_batch_be_batches_term_metadata_reads_like_sequential_upserts_on_lmdb_and_lsm() {
+        use crate::helix_engine::storage_core::backend_lsm::lsm_round_trips_for_test;
+        const TERMS: u32 = 40;
+        // Values rise with id: committed docs 11..=30 and pending doc 10 hold
+        // every shared term's max above batch docs 1..=9 (no raise), while
+        // batch doc 40 raises them, so a wrong stored-max read changes rows.
+        let doc = |id: u128| (id, file_chunk_doc(id, TERMS));
+        let committed: Vec<(u128, SparseVector)> = (11..=30).map(doc).collect();
+        let (pending_id, pending_doc) = doc(10);
+        let batch: Vec<(u128, SparseVector)> = (1..=9).chain([40]).map(doc).collect();
+        let mut lmdb_envs = Vec::new();
+        let mut make = |lsm: bool, name: &str| {
+            if lsm {
+                return make_lsm_core(name, SparseModifier::Idf);
+            }
+            let (tmp, env) = setup();
+            let core = make_core(&env, name, SparseModifier::Idf);
+            let backend = test_backend(&env);
+            lmdb_envs.push((tmp, env));
+            (backend, core)
+        };
+
+        for lsm in [false, true] {
+            let mut states = Vec::new();
+            for batched in [true, false] {
+                let (backend, core) = make(lsm, if batched { "meta_batch" } else { "meta_seq" });
+                let mut w = backend.begin_write().unwrap();
+                for (id, doc) in &committed {
+                    core.upsert_be(&mut w, *id, doc).unwrap();
+                }
+                backend.commit(w).unwrap();
+
+                let mut w = backend.begin_write().unwrap();
+                // Doc 10's df/max writes are pending in the batch when the batch reads them.
+                core.upsert_be(&mut w, pending_id, &pending_doc).unwrap();
+                if batched {
+                    let items: Vec<(u128, &SparseVector)> =
+                        batch.iter().map(|(id, d)| (*id, d)).collect();
+                    let before = lsm_round_trips_for_test();
+                    assert_eq!(core.upsert_batch_be(&mut w, &items).unwrap(), 10);
+                    let round_trips = lsm_round_trips_for_test() - before;
+                    if lsm {
+                        // Two multi-gets (forward, term metadata) plus a few fixed
+                        // reads; per-doc and per-term reads paid >= 10 + 2 x 160.
+                        assert!(round_trips <= 16, "lsm round trips: {round_trips}");
+                    }
+                } else {
+                    for (id, doc) in &batch {
+                        core.upsert_be(&mut w, *id, doc).unwrap();
+                    }
+                }
+                backend.commit(w).unwrap();
+                states.push((
+                    sparse_raw_rows(&core, &backend),
+                    sparse_state(&core, &backend, 4 * TERMS),
+                ));
+            }
+            assert_eq!(
+                states[0], states[1],
+                "lsm={lsm}: batched term metadata diverged from sequential upsert_be"
+            );
+            assert_eq!(states[0].1 .0, 31, "lsm={lsm}: doc_count");
+        }
     }
 
     #[test]
@@ -5561,6 +5950,213 @@ mod tests {
             core.posting_cache.read().unwrap().entries.len(),
             core.term_metadata_cache.read().unwrap().entries.len(),
         )
+    }
+
+    fn sparse_cache_metric_count(rendered: &str, metric: &str) -> u64 {
+        let prefix = format!("{metric} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn capacity_eviction_retains_oldest_admission_survivors() {
+        let at = |token| CacheEpoch {
+            token,
+            pinned: true,
+            reader_generation: 0,
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut cache = EpochCache::new();
+            for term in 1..=3 {
+                assert!(!cache.insert(Some(5), term, term * 10, 3));
+            }
+            // Reads must not promote an entry: this is admission-order, not access LRU.
+            assert_eq!(cache.get(at(Some(5)), 1), Some(&10));
+            let cleared = cache.insert(Some(5), 4, 40, 3);
+            assert_eq!(cache.entries.len(), 3);
+            assert!(!cleared, "single eviction is not an epoch clear");
+            assert_eq!(cache.get(at(Some(5)), 1), None);
+            assert_eq!(cache.get(at(Some(5)), 2), Some(&20));
+            assert_eq!(cache.get(at(Some(5)), 3), Some(&30));
+            assert_eq!(cache.get(at(Some(5)), 4), Some(&40));
+
+            assert!(!cache.insert(Some(5), 2, 25, 3));
+            assert_eq!(cache.entries.len(), 3);
+            assert_eq!(cache.get(at(Some(5)), 2), Some(&25));
+            assert_eq!(
+                sparse_cache_metric_count(&handle.render(), "helix_sparse_cache_evictions_total"),
+                1,
+                "replacement must not evict"
+            );
+            assert!(!cache.insert(Some(5), 5, 50, 3));
+            assert_eq!(cache.get(at(Some(5)), 2), None);
+            assert_eq!(cache.get(at(Some(5)), 3), Some(&30));
+            assert_eq!(cache.entries.len(), 3);
+
+            assert!(cache.insert(Some(6), 9, 90, 3));
+            assert_eq!(cache.entries.len(), 1);
+            for term in 3..=5 {
+                assert_eq!(cache.get(at(Some(6)), term), None);
+            }
+            assert_eq!(cache.get(at(Some(5)), 9), None);
+            assert_eq!(cache.get(at(Some(6)), 9), Some(&90));
+            assert!(!cache.insert(None, 10, 100, 3));
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(cache.get(at(None), 9), None);
+            assert_eq!(cache.get(at(Some(6)), 10), None);
+            assert_eq!(cache.get(at(Some(6)), 9), Some(&90));
+        });
+        assert_eq!(
+            sparse_cache_metric_count(&handle.render(), "helix_sparse_cache_evictions_total"),
+            2
+        );
+    }
+
+    #[test]
+    fn capacity_eviction_releases_only_victim_posting_allocation() {
+        let mut cache = EpochCache::new();
+        let postings: Vec<_> = (1u128..=3)
+            .map(|id| Arc::new(vec![(id, 1.0f32); 1024]))
+            .collect();
+        let weak: Vec<_> = postings.iter().map(Arc::downgrade).collect();
+        for (term, postings) in (1..=3).zip(postings) {
+            cache.insert(Some(5), term, postings, 3);
+        }
+        cache.insert(Some(5), 4, Arc::new(vec![(4, 1.0); 1024]), 3);
+        assert_eq!(cache.entries.len(), 3);
+        assert!(weak[0].upgrade().is_none());
+        assert!(weak[1].upgrade().is_some());
+        assert!(weak[2].upgrade().is_some());
+        cache.insert(Some(6), 9, Arc::new(Vec::new()), 3);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(weak.iter().all(|postings| postings.upgrade().is_none()));
+    }
+
+    #[test]
+    fn capacity_eviction_pinned_reader_avoids_survivor_loads() {
+        let (_wb, _wc, reader_backend, reader_core, doc) = reader_replica_fixture("capacity");
+        let AnyBackend::LsmReader(reader) = &*reader_backend else {
+            unreachable!()
+        };
+        let pinned = AnyRead::LsmReader(Some(reader.begin_snapshot().unwrap()));
+        let epoch = reader_core.read_cache_epoch_be(&pinned).unwrap();
+        assert!(epoch.pinned);
+        let posting_cap = sparse_posting_cache_max_terms();
+        let metadata_cap = sparse_term_metadata_cache_max_terms();
+        assert!(posting_cap > 30 && metadata_cap > 30);
+        let posting_terms: Vec<u32> = (0..posting_cap as u32).collect();
+        let metadata_terms: Vec<u32> = (0..metadata_cap as u32).collect();
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let loads = || {
+            let rendered = handle.render();
+            [
+                sparse_cache_metric_count(&rendered, "helix_sparse_posting_cache_misses_total"),
+                sparse_cache_metric_count(&rendered, "helix_sparse_posting_prefetch_batches_total"),
+                sparse_cache_metric_count(
+                    &rendered,
+                    "helix_sparse_term_metadata_prefetch_values_total{kind=\"df_max\"}",
+                ),
+                sparse_cache_metric_count(
+                    &rendered,
+                    "helix_sparse_term_metadata_prefetch_batches_total{kind=\"df_max\"}",
+                ),
+            ]
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let mut postings = reader_core
+                .cached_postings_many_be(&pinned, epoch, &posting_terms)
+                .unwrap();
+            let mut metadata = reader_core
+                .term_metadata_many_read_be(&pinned, epoch, &metadata_terms)
+                .unwrap();
+            assert_eq!(
+                sparse_cache_sizes(&reader_core),
+                (posting_cap, metadata_cap)
+            );
+            let expected = reader_core
+                .search_be::<fn(u128) -> bool>(&pinned, &doc, 10, None)
+                .unwrap();
+            assert_eq!(expected.len(), 2);
+            assert_eq!(
+                loads(),
+                [posting_cap as u64, 1, (metadata_cap * 2) as u64, 1]
+            );
+
+            assert!(reader_core
+                .cached_postings_be(&pinned, epoch, u32::MAX)
+                .unwrap()
+                .is_empty());
+            let new_metadata = reader_core
+                .term_metadata_many_read_be(&pinned, epoch, &[u32::MAX])
+                .unwrap();
+            assert_eq!(new_metadata[&u32::MAX], (0, 0.0));
+            let before = loads();
+            assert_eq!(
+                before,
+                [
+                    (posting_cap + 1) as u64,
+                    1,
+                    (metadata_cap * 2 + 2) as u64,
+                    2
+                ]
+            );
+            let revisited_postings = reader_core
+                .cached_postings_many_be(&pinned, epoch, &posting_terms[1..])
+                .unwrap();
+            let revisited_metadata = reader_core
+                .term_metadata_many_read_be(&pinned, epoch, &metadata_terms[1..])
+                .unwrap();
+            let actual = reader_core
+                .search_be::<fn(u128) -> bool>(&pinned, &doc, 10, None)
+                .unwrap();
+            let after = loads();
+            let delta: [u64; 4] = std::array::from_fn(|i| after[i] - before[i]);
+            println!(
+                "sparse_capacity_survivor_revisit posting_terms={} metadata_terms={} \
+                 posting_scans={} posting_batches={} df_max_value_reads={} df_max_batches={}",
+                posting_cap - 1,
+                metadata_cap - 1,
+                delta[0],
+                delta[1],
+                delta[2],
+                delta[3]
+            );
+            postings.remove(&0);
+            metadata.remove(&0);
+            assert_eq!(revisited_postings, postings);
+            assert_eq!(revisited_metadata, metadata);
+            assert_eq!(actual, expected);
+            assert_eq!(delta, [0; 4], "same-snapshot survivors must stay warm");
+            assert_eq!(
+                sparse_cache_sizes(&reader_core),
+                (posting_cap, metadata_cap)
+            );
+            let postings_cache = reader_core.posting_cache.read().unwrap();
+            let metadata_cache = reader_core.term_metadata_cache.read().unwrap();
+            assert!(postings_cache.get(epoch, 0).is_none());
+            assert!(metadata_cache.get(epoch, 0).is_none());
+            assert!(postings_cache.get(epoch, u32::MAX).is_some());
+            assert!(metadata_cache.get(epoch, u32::MAX).is_some());
+        });
+        let rendered = handle.render();
+        assert_eq!(
+            sparse_cache_metric_count(&rendered, "helix_sparse_cache_evictions_total"),
+            2
+        );
+        assert_eq!(
+            sparse_cache_metric_count(&rendered, "helix_sparse_posting_cache_clears_total"),
+            0
+        );
+        assert_eq!(
+            sparse_cache_metric_count(&rendered, "helix_sparse_term_metadata_cache_clears_total"),
+            0
+        );
     }
 
     #[test]

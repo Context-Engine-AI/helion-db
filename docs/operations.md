@@ -86,7 +86,11 @@ The resulting binary is `target/release/helix-container`.
 | `HELIX_QDRANT_SCROLL_SCAN_BUDGET_MIN` | `1024` | Minimum points inspected by one filtered Qdrant-compatible scroll call before yielding a continuation offset |
 | `HELIX_QDRANT_SCROLL_SCAN_BUDGET_MULTIPLIER` | `64` | Filtered scroll effort multiplier: `limit * multiplier`, clamped by min/max |
 | `HELIX_QDRANT_SCROLL_SCAN_BUDGET_MAX` | `4096` | Max points inspected by one filtered Qdrant-compatible scroll call before yielding; set `0` to disable |
-| `HELIX_QDRANT_SCROLL_SCAN_BUDGET_MS` | `250` | Wall-clock budget for one filtered Qdrant-compatible scroll call; set `0` to disable |
+| `HELIX_QDRANT_SCROLL_SCAN_BUDGET_MS` | `250` | Wall-clock budget for one filtered Qdrant-compatible scroll call whose filter has no payload index (primary scan); set `0` to disable |
+| `HELIX_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS` | `2000` | Wall-clock budget for one filtered scroll page served from payload-index candidates (long enough to return a cold ~100-hit set whole, so scroll agrees with count); set `0` to disable |
+| `HELIX_LSM_READER_WAL_REPLAY_BATCH` | `32` | Reader WAL replay prefetch width per collection; unset or `0` uses 32, values above 256 are capped at 256. Wider replay raises object-store request concurrency; WAL reads still bypass the on-disk object cache |
+| `HELIX_LSM_IDLE_FLUSH_SECS` | disabled | Opt-in writer memtable flush after this many write-quiet seconds; unset or `0` keeps it disabled. A clean memtable produces no flush |
+| `HELIX_LSM_CACHE_COLLECTION_DIVISOR` | `HELIX_MAX_OPEN_COLLECTIONS` | Opt-in divisor for each collection's object-cache share; unset or `0` retains the existing residency-cap coupling. A smaller divisor can make aggregate disk/page-cache use exceed the configured total |
 | `HELIX_SEARCH_BLOCKING_CAP` | unset | Reserved blocking execution slots for client search routes (`/points/search`, `/points/query`, `/points/hybrid_query`, and native graph reads). Use this to prevent status/count/scroll traffic from starving user searches |
 | `HELIX_SCAN_BLOCKING_CAP` | unset | Reserved blocking execution slots for scan-style enumeration (`/points/scroll` and native `/v1/collections/{name}/points/scan`) |
 | `HELIX_READ_BLOCKING_CAP` | unset | Blocking execution slots for low-priority read probes such as collection info, count, and facet. Keep this lower than search in SaaS so background/status reads shed before client search does |
@@ -123,6 +127,18 @@ stderr. Watch `helix_dense_search_segments`, `helix_dense_segment_search_duratio
 identify segment fanout pressure before p99 search latency regresses.
 `helix_segment_ids_high_water` should plateau for stable collections; if it keeps
 climbing while segment count is bounded, segment-name reuse or reaping is broken.
+
+Sparse caches are bounded per vector space by `HELIX_SPARSE_POSTING_CACHE_MAX_TERMS`
+(default `2048`) and `HELIX_SPARSE_TERM_METADATA_CACHE_MAX_TERMS` (default `8192`).
+At capacity, admitting a new term evicts only the oldest admitted term; reads and
+replacements do not promote entries (this is not access LRU). Epoch changes still
+invalidate the entire cache, with snapshot/token/reader-generation guards unchanged.
+`helix_sparse_cache_evictions_total` counts single capacity evictions across both
+caches; `helix_sparse_posting_cache_clears_total` and
+`helix_sparse_term_metadata_cache_clears_total` count full epoch clears. These caps
+limit terms, not bytes: retained posting lists and admission-order bookkeeping can
+increase steady-state heap residency, so watch existing memory-pressure signals.
+No reindex, eager warm fetches, or new object-store read path is introduced.
 
 PageRank and community detection are materialized in-process for normal API
 requests and invalidated on successful graph/data writes. Use request

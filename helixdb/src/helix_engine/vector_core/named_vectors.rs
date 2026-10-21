@@ -123,6 +123,13 @@ impl DenseDeletePlan {
 #[derive(Debug, Default)]
 pub struct StagedDeleteTombstones {
     by_segment: Vec<(String, Vec<u128>)>,
+    /// Exact levels where each id was deleted, for post-commit cache invalidation.
+    /// Always filled (levels are recorded regardless of shared-cache mode).
+    id_levels: std::collections::HashMap<u128, Vec<usize>>,
+    /// Hard-deleted ids by the segment that owned them, so only that segment
+    /// guards them against stale-snapshot cache refills. Empty when ownership
+    /// is unknown (stale-plan fallback), in which case every segment guards.
+    hard_deleted_by_segment: Vec<(String, Vec<u128>)>,
 }
 
 impl StagedDeleteTombstones {
@@ -457,19 +464,22 @@ fn unique_candidate_ids(candidate_ids: Vec<u128>) -> Vec<u128> {
         .collect()
 }
 
-fn exact_candidate_ids_present_in_segment(
+fn take_candidate_ids_present_in_segment(
     core: &VectorCore,
     r: &AnyRead<'_>,
-    candidate_ids: &[u128],
+    candidate_ids: &mut Vec<u128>,
 ) -> Result<Vec<u128>, VectorError> {
     let mut routed = Vec::new();
-    for &id in candidate_ids {
+    for &id in candidate_ids.iter() {
         match core.get_vector(r, id, 0, false) {
             Ok(_) => routed.push(id),
             Err(VectorError::VectorNotFound(_)) => {}
             Err(err) => return Err(err),
         }
     }
+    // Resolve every current copy, even when it falls outside this segment's top-k.
+    let present: HashSet<_> = routed.iter().copied().collect();
+    candidate_ids.retain(|id| !present.contains(id));
     Ok(routed)
 }
 
@@ -1917,49 +1927,13 @@ impl NamedVectorManager {
         config: &NamedVectorConfig,
         hnsw_config: HNSWConfig,
         space: &mut DenseVectorSpaceMetadata,
-        cores: &HashMap<String, VectorCore>,
+        _cores: &HashMap<String, VectorCore>,
     ) -> Result<(String, VectorCore), VectorError> {
+        // LSM writer never reuses segment names to avoid reader serving stale
+        // vectors from retired cores. Always allocate next_segment_id and increment.
+        // The LMDB path (allocate_dense_core_locked) still reuses names safely via
+        // the deferred dirty-segment reaper protocol.
         loop {
-            let dirty_names: Vec<String> = self
-                .dirty_retired_segments
-                .read()
-                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?
-                .iter()
-                .cloned()
-                .collect();
-            let reserved_names: Vec<&str> = cores
-                .keys()
-                .map(String::as_str)
-                .chain(dirty_names.iter().map(String::as_str))
-                .collect();
-            let reserved_ids = reserved_segment_ids(space, logical_name, reserved_names);
-
-            for id in 0..space.next_segment_id {
-                if reserved_ids.contains(&id) {
-                    continue;
-                }
-                let physical_name = next_segment_name(logical_name, id);
-                let core = self.create_dense_core_attached_lsm(
-                    data_dir,
-                    &physical_name,
-                    config,
-                    hnsw_config.clone(),
-                )?;
-                let is_empty = {
-                    let read = core
-                        .backend
-                        .begin_read()
-                        .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
-                    core.is_empty(&read)?
-                };
-                if is_empty {
-                    self.observe_segment_ids_high_water(logical_name, space);
-                    return Ok((physical_name, core));
-                }
-                let _ = self.mark_dirty_retired_segment(physical_name)?;
-                break;
-            }
-
             let id = space.next_segment_id;
             space.next_segment_id += 1;
             let physical_name = next_segment_name(logical_name, id);
@@ -1980,6 +1954,8 @@ impl NamedVectorManager {
                 self.observe_segment_ids_high_water(logical_name, space);
                 return Ok((physical_name, core));
             }
+            // Rare: a fresh segment opened dirty backend state (orphaned from a
+            // previous writer crash). Mark it dirty and allocate the next ID.
             let _ = self.mark_dirty_retired_segment(physical_name)?;
         }
     }
@@ -2353,20 +2329,124 @@ impl NamedVectorManager {
                 }
             }
         }
+
+        // Build set of all valid physical names from NEW metadata (before any locks)
+        let new_valid_names: HashSet<String> = dense_spaces_meta
+            .values()
+            .flat_map(|space| space.segments.iter().map(|seg| seg.physical_name.clone()))
+            .collect();
+
+        // Build set of valid names from PREVIOUS metadata (before swap)
+        let prev_valid_names: HashSet<String> = {
+            let dense_spaces = self
+                .dense_spaces
+                .read()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+            dense_spaces
+                .values()
+                .flat_map(|space| space.segments.iter().map(|seg| seg.physical_name.clone()))
+                .collect()
+        };
+
+        // Cores for newly listed segments go in BEFORE the swap, so a search that
+        // snapshots the new view always finds them; stale cores are removed only after
+        // the swap (and only once absent from two consecutive views, below).
         if !opened_cores.is_empty() {
             let mut cores = self
                 .cores
                 .write()
                 .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
-            for (physical_name, core) in opened_cores {
+            for (physical_name, core) in opened_cores.drain(..) {
                 cores.entry(physical_name).or_insert(core);
             }
         }
+
         *self
             .dense_spaces
             .write()
             .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))? =
             dense_spaces_meta.clone();
+
+        // Identify segments to prune: absent from BOTH previous and new metadata.
+        // This delays removal by one refresh, mirroring the safe ordering at lines 5677-5698
+        // where the writer publishes the merged segment, then prunes retired sources.
+        // Only prune within logical spaces present in the new metadata (to avoid pruning
+        // everything on an empty or default metadata read), and only segment IDs below
+        // each space's next_segment_id (to avoid pruning ahead of allocation).
+        let stale_names: Vec<String> = {
+            let cores = self
+                .cores
+                .read()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+
+            // Build map of logical_name -> next_segment_id from new metadata
+            let next_ids: HashMap<&str, u64> = dense_spaces_meta
+                .iter()
+                .map(|(name, space)| (name.as_str(), space.next_segment_id))
+                .collect();
+
+            cores
+                .keys()
+                .filter(|name| {
+                    // Parse logical name from physical name (format: {logical}__seg_{id:06})
+                    let logical_name = if let Some(idx) = name.rfind("__seg_") {
+                        &name[..idx]
+                    } else {
+                        // No __seg_ suffix, treat the whole name as logical (e.g., segment 0)
+                        name.as_str()
+                    };
+
+                    // Only consider pruning if logical space exists in new metadata
+                    if let Some(&next_id) = next_ids.get(logical_name) {
+                        // Extract segment ID from physical name using the helper
+                        if let Some(seg_id) = segment_id_from_name(logical_name, name) {
+                            // Prune only if below next_segment_id and absent from both metadatas
+                            seg_id < next_id
+                                && !new_valid_names.contains(*name)
+                                && !prev_valid_names.contains(*name)
+                        } else {
+                            false // unparseable name, don't prune
+                        }
+                    } else {
+                        false // logical space not in new metadata, don't prune
+                    }
+                })
+                .cloned()
+                .collect()
+        };
+
+        if stale_names.is_empty() {
+            return Ok(());
+        }
+
+        // Take the write lock only to remove; cleanup I/O runs after it is released.
+        let mut removed_cores = Vec::new();
+        {
+            let mut cores = self
+                .cores
+                .write()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+
+            // Remove stale cores, collecting them for cleanup outside the lock
+            for name in &stale_names {
+                if let Some(core) = cores.remove(name) {
+                    removed_cores.push((name.clone(), core));
+                }
+            }
+        } // Release write lock before cleanup I/O
+
+        // Cleanup (unlink mmap sidecar, clear caches, drop) after releasing the lock
+        for (name, core) in removed_cores {
+            let _ = core.unlink_mmap_sidecar();
+            core.clear_caches();
+            tracing::debug!(
+                collection = %self.collection_name,
+                segment = %name,
+                "reader reconcile: removed stale core not in current or previous metadata"
+            );
+            drop(core);
+        }
+
         Ok(())
     }
 
@@ -4015,7 +4095,7 @@ impl NamedVectorManager {
             return Ok(Vec::new());
         }
 
-        let candidate_ids = unique_candidate_ids(candidate_ids.into_iter().collect());
+        let mut candidate_ids = unique_candidate_ids(candidate_ids.into_iter().collect());
         if candidate_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -4043,6 +4123,9 @@ impl NamedVectorManager {
         let mut combined: Vec<(u32, HVector)> = Vec::with_capacity(k * segment_infos.len());
 
         for (segment_name, _) in dense_segments_by_recency(name, &segment_infos) {
+            if candidate_ids.is_empty() {
+                break;
+            }
             let Some(core) = cores.get(segment_name) else {
                 note_missing_segment(&self.collection_name, name, segment_name, "exact_id_search");
                 continue;
@@ -4050,7 +4133,7 @@ impl NamedVectorManager {
             let rank = recency_ranks.get(segment_name).copied().unwrap_or(u32::MAX);
             let rd = core.backend.read_borrowed(txn);
             let segment_candidate_ids =
-                exact_candidate_ids_present_in_segment(core, &rd, &candidate_ids)?;
+                take_candidate_ids_present_in_segment(core, &rd, &mut candidate_ids)?;
             if segment_candidate_ids.is_empty() {
                 continue;
             }
@@ -4083,7 +4166,7 @@ impl NamedVectorManager {
             return Ok(Vec::new());
         }
 
-        let candidate_ids = unique_candidate_ids(candidate_ids.into_iter().collect());
+        let mut candidate_ids = unique_candidate_ids(candidate_ids.into_iter().collect());
         if candidate_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -4132,6 +4215,9 @@ impl NamedVectorManager {
             .into_iter()
             .enumerate()
         {
+            if candidate_ids.is_empty() {
+                break;
+            }
             let Some(core) = cores.get(segment_name) else {
                 note_missing_segment(&self.collection_name, name, segment_name, "exact_id_search");
                 continue;
@@ -4139,7 +4225,7 @@ impl NamedVectorManager {
             let rank = recency_ranks.get(segment_name).copied().unwrap_or(u32::MAX);
             let candidate_start = Instant::now();
             let segment_candidate_ids =
-                exact_candidate_ids_present_in_segment(core, r, &candidate_ids)?;
+                take_candidate_ids_present_in_segment(core, r, &mut candidate_ids)?;
             metrics::histogram!(
                 "helix_named_vector_exact_search_stage_ms",
                 "collection" => self.collection_name.clone(),
@@ -7531,9 +7617,9 @@ impl NamedVectorManager {
         &self,
         w: &mut AnyWrite<'_>,
         ids: &[u128],
-    ) -> Result<(), VectorError> {
+    ) -> Result<std::collections::HashMap<u128, Vec<usize>>, VectorError> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(std::collections::HashMap::new());
         }
         let active_segment_names: HashSet<String> = {
             let dense_spaces = self
@@ -7554,6 +7640,7 @@ impl NamedVectorManager {
             .cores
             .read()
             .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+        let mut merged_id_levels = std::collections::HashMap::new();
         for segment_name in active_segment_names {
             let Some(core) = cores.get(&segment_name) else {
                 continue;
@@ -7565,10 +7652,17 @@ impl NamedVectorManager {
                 }
             }
             if !owned.is_empty() {
-                core.delete_vectors_batch_be(w, &owned)?;
+                let id_levels = core.delete_vectors_batch_be(w, &owned)?;
+                // Merge id_levels from this segment
+                for (id, levels) in id_levels {
+                    merged_id_levels
+                        .entry(id)
+                        .or_insert_with(Vec::new)
+                        .extend(levels);
+                }
             }
         }
-        Ok(())
+        Ok(merged_id_levels)
     }
 
     /// Plan dense deletes with a read transaction so the expensive
@@ -7785,8 +7879,12 @@ impl NamedVectorManager {
 
         if active_segments != plan.active_segments {
             metrics::counter!("helix_delete_dense_plan_stale_total").increment(1);
-            self.delete_vectors_batch_be(w, &plan.ids)?;
-            return Ok(StagedDeleteTombstones::default());
+            let id_levels = self.delete_vectors_batch_be(w, &plan.ids)?;
+            return Ok(StagedDeleteTombstones {
+                by_segment: Vec::new(),
+                id_levels,
+                hard_deleted_by_segment: Vec::new(),
+            });
         }
 
         let cores = self
@@ -7799,8 +7897,20 @@ impl NamedVectorManager {
             let Some(core) = cores.get(segment_name) else {
                 metrics::counter!("helix_delete_dense_plan_stale_total").increment(1);
                 drop(cores);
-                self.delete_vectors_batch_be(w, &plan.ids)?;
-                return Ok(StagedDeleteTombstones::default());
+                // Merge fallback id_levels into staged so tombstones from
+                // earlier segments in this loop iteration are preserved.
+                let id_levels = self.delete_vectors_batch_be(w, &plan.ids)?;
+                for (id, levels) in id_levels {
+                    staged
+                        .id_levels
+                        .entry(id)
+                        .or_insert_with(Vec::new)
+                        .extend(levels);
+                }
+                // The fallback deletes from any active segment, so ownership
+                // is unknown: an empty list makes every segment guard.
+                staged.hard_deleted_by_segment.clear();
+                return Ok(staged);
             };
             if tombstones_enabled {
                 let ids = core.tombstone_delete_batch_be(w, owned)?;
@@ -7808,7 +7918,18 @@ impl NamedVectorManager {
                     staged.by_segment.push((segment_name.clone(), ids));
                 }
             } else {
-                core.delete_vectors_batch_be(w, owned)?;
+                let id_levels = core.delete_vectors_batch_be(w, owned)?;
+                staged
+                    .hard_deleted_by_segment
+                    .push((segment_name.clone(), owned.clone()));
+                // Merge id_levels from this segment into the staged result
+                for (id, levels) in id_levels {
+                    staged
+                        .id_levels
+                        .entry(id)
+                        .or_insert_with(Vec::new)
+                        .extend(levels);
+                }
             }
         }
         Ok(staged)
@@ -7816,14 +7937,18 @@ impl NamedVectorManager {
 
     /// Post-commit companion of `delete_vectors_batch_with_plan_be`: applies
     /// the staged tombstones to each segment core's in-memory set and records
-    /// the metric. Call only after the staging write batch committed.
+    /// the metric. Also performs post-commit shared-cache invalidation at the
+    /// exact levels where ids were deleted. Call only after the staging write
+    /// batch committed.
     pub fn apply_delete_tombstones(&self, staged: &StagedDeleteTombstones) {
-        if staged.is_empty() {
+        if staged.is_empty() && staged.id_levels.is_empty() {
             return;
         }
         let Ok(cores) = self.cores.read() else {
             return;
         };
+
+        // Apply tombstones to in-memory sets (only filled when tombstones enabled)
         let mut applied = 0u64;
         for (segment_name, ids) in &staged.by_segment {
             if let Some(core) = cores.get(segment_name) {
@@ -7837,6 +7962,28 @@ impl NamedVectorManager {
                 "collection" => self.collection_name.clone(),
             )
             .increment(applied);
+        }
+
+        // Post-commit cache invalidation at exact levels (runs regardless of tombstone mode).
+        // A read during the delete can re-cache both the vector and its sidecar ordinal from
+        // the still-committed row, so both are dropped once the delete is durable. Only the
+        // segment that owned an id guards it against later stale-snapshot refills (every
+        // segment when the stale-plan fallback left ownership unknown).
+        if !staged.id_levels.is_empty() {
+            let all_ids: Vec<u128> = staged.id_levels.keys().copied().collect();
+            for (segment_name, core) in cores.iter() {
+                let guarded: &[u128] = if staged.hard_deleted_by_segment.is_empty() {
+                    &all_ids
+                } else {
+                    staged
+                        .hard_deleted_by_segment
+                        .iter()
+                        .find(|(owner, _)| owner == segment_name)
+                        .map(|(_, ids)| ids.as_slice())
+                        .unwrap_or(&[])
+                };
+                core.apply_hard_deletes_post_commit(guarded, &staged.id_levels);
+            }
         }
     }
 
@@ -7987,14 +8134,14 @@ impl NamedVectorManager {
     pub fn delete_sparse_vectors_be(
         &self,
         w: &mut AnyWrite<'_>,
-        id: u128,
+        ids: &[u128],
     ) -> Result<(), VectorError> {
         let cores = self
             .sparse_cores
             .read()
             .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
         for core in cores.values() {
-            core.delete_be(w, id)?;
+            core.delete_batch_be(w, ids)?;
         }
         Ok(())
     }
@@ -10168,6 +10315,63 @@ mod tests {
     }
 
     #[test]
+    fn exact_candidate_search_does_not_resurrect_a_newer_segment_loser() {
+        let (storage, _tmp) = setup_storage();
+        create_dense(&storage, "dense");
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        let env = storage.lmdb_env().unwrap();
+        let mut txn = env.write_txn().unwrap();
+        let segment = storage
+            .named_vectors
+            .dense_insert(
+                env,
+                &mut txn,
+                "dense",
+                &[1.0, 0.0, 0.0],
+                5,
+                HashMap::new(),
+                hnsw.clone(),
+                1,
+            )
+            .unwrap()
+            .unwrap();
+        storage
+            .named_vectors
+            .build_dense_segment(&mut txn, "dense", &segment)
+            .unwrap();
+        txn.commit().unwrap();
+
+        let mut txn = env.write_txn().unwrap();
+        for (id, vector) in [(5, [0.0, 1.0, 0.0]), (6, [0.9, 0.1, 0.0])] {
+            storage
+                .named_vectors
+                .dense_append_to_mutable(
+                    env,
+                    &mut txn,
+                    "dense",
+                    &vector,
+                    id,
+                    HashMap::new(),
+                    hnsw.clone(),
+                    1_000_000,
+                )
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let txn = env.read_txn().unwrap();
+        let results = storage
+            .named_vectors
+            .dense_search_candidate_ids_exact(&txn, "dense", &[1.0, 0.0, 0.0], 1, [5, 6], Some(1.0))
+            .unwrap();
+        assert_eq!(
+            results.iter().map(HVector::get_id).collect::<Vec<_>>(),
+            [6],
+            "id 5's stale close vector must not win when its current vector loses top-k"
+        );
+    }
+
+    #[test]
     fn exact_candidate_segment_routing_keeps_only_present_ids() {
         let (storage, _tmp) = setup_storage();
         create_dense(&storage, "dense");
@@ -10177,11 +10381,11 @@ mod tests {
         let cores = storage.named_vectors.cores.read().unwrap();
         let core = cores.get("dense__seg_000002").unwrap();
         let rd = core.backend.read_borrowed(&txn);
-        let routed =
-            exact_candidate_ids_present_in_segment(core, &rd, &[1u128, 2u128, 3u128, 404u128])
-                .unwrap();
+        let mut candidates = vec![1u128, 2u128, 3u128, 404u128];
+        let routed = take_candidate_ids_present_in_segment(core, &rd, &mut candidates).unwrap();
 
         assert_eq!(routed, [2u128]);
+        assert_eq!(candidates, [1, 3, 404]);
     }
 
     #[test]
@@ -11176,6 +11380,74 @@ mod tests {
         (backend, manager, dir)
     }
 
+    #[test]
+    fn exact_candidate_lsm_does_not_resurrect_a_newer_segment_loser() {
+        let (backend, manager, dir) = setup_lsm_manager_with_flat_segment(
+            "exact_candidate_recency",
+            "dense__seg_000000",
+            &[(5, [1.0, 0.0, 0.0])],
+        );
+        let newest = "dense__seg_000001";
+        let core = manager
+            .create_dense_core_attached_lsm(
+                dir.path(),
+                newest,
+                &NamedVectorConfig {
+                    size: 3,
+                    distance: DistanceMetric::Cosine,
+                    spindle: SpindleConfig::default(),
+                },
+                HNSWConfig::new(Some(8), Some(32), Some(64)),
+            )
+            .unwrap();
+        let mut write = backend.begin_write().unwrap();
+        for (id, vector) in [(5, [0.0, 1.0, 0.0]), (6, [0.9, 0.1, 0.0])] {
+            core.insert_flat_be(&mut write, &vector, Some(id), None)
+                .unwrap();
+        }
+        backend.commit(write).unwrap();
+        manager
+            .cores
+            .write()
+            .unwrap()
+            .insert(newest.to_string(), core);
+        manager
+            .dense_spaces
+            .write()
+            .unwrap()
+            .get_mut("dense")
+            .unwrap()
+            .segments
+            .push(DenseVectorSegmentMetadata {
+                physical_name: newest.to_string(),
+                role: DenseVectorSegmentRole::Mutable,
+            });
+        let AnyBackend::Lsm(lsm) = backend.as_ref() else {
+            panic!("expected LSM fixture")
+        };
+        let read = backend.begin_read().unwrap();
+        lsm.reset_read_count();
+        let results = manager
+            .dense_search_candidate_ids_exact_be(
+                &read,
+                "dense",
+                &[1.0, 0.0, 0.0],
+                1,
+                [5, 6],
+                Some(1.0),
+            )
+            .unwrap();
+        eprintln!(
+            "exact candidate recency backend reads: {}",
+            lsm.read_count()
+        );
+        assert_eq!(
+            results.iter().map(HVector::get_id).collect::<Vec<_>>(),
+            [6],
+            "a current vector excluded by top-k must still suppress its stale copy"
+        );
+    }
+
     /// flag OFF (the default): the with-plan execute path must be
     /// byte-identical to today — rows are hard-deleted, and no
     /// delete-tombstone bookkeeping (durable key or in-memory set) happens at
@@ -11965,5 +12237,1691 @@ mod tests {
             .lock()
             .expect("registry lock not poisoned");
         assert!(set.contains(&(col.to_string(), vec.to_string(), seg_other.to_string())));
+    }
+
+    #[test]
+    fn lsm_allocation_never_reuses_segment_names() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("lsm_no_reuse-{nanos}"))
+                .expect("open in-memory LSM backend"),
+        ));
+        let manager = NamedVectorManager::new("test_collection".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+
+        // Allocate segment 0
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let cores_empty = HashMap::new();
+        let (name_0, _core_0) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        assert_eq!(name_0, "dense__seg_000000");
+        assert_eq!(space.next_segment_id, 1);
+
+        // Add segment 0 to metadata
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: name_0.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+
+        // Remove segment 0 from metadata (simulate it was merged and removed)
+        space.segments.retain(|s| s.physical_name != name_0);
+
+        // Allocate a new segment — must return segment 1, NOT reuse 0
+        let (name_1, _core_1) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        assert_eq!(
+            name_1, "dense__seg_000001",
+            "LSM must never reuse segment 0"
+        );
+        assert_eq!(space.next_segment_id, 2);
+
+        // Simulate writer restart: next_segment_id is persisted and reloaded
+        let space_after_restart = DenseVectorSpaceMetadata {
+            next_segment_id: space.next_segment_id,
+            segments: vec![DenseVectorSegmentMetadata {
+                physical_name: name_1.clone(),
+                role: DenseVectorSegmentRole::Indexed,
+            }],
+        };
+        let cores_after = HashMap::new();
+
+        // Allocate another segment — must continue from next_segment_id=2
+        let (name_2, _core_2) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw,
+                &mut space_after_restart.clone(),
+                &cores_after,
+            )
+            .unwrap();
+        assert_eq!(
+            name_2, "dense__seg_000002",
+            "LSM must continue monotonic allocation after restart"
+        );
+    }
+
+    #[test]
+    fn reader_refresh_removes_cores_absent_from_metadata() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("reader_stale_removal-{nanos}"))
+                .expect("open in-memory LSM backend"),
+        ));
+        let manager = NamedVectorManager::new("test_collection".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+
+        // Create two cores: segment 0 and segment 1
+        let core_0 = manager
+            .create_dense_core_attached_lsm(dir.path(), "dense__seg_000000", &config, hnsw.clone())
+            .unwrap();
+        let core_1 = manager
+            .create_dense_core_attached_lsm(dir.path(), "dense__seg_000001", &config, hnsw.clone())
+            .unwrap();
+
+        {
+            let mut w = backend.begin_write().unwrap();
+            core_0
+                .insert_flat_be(&mut w, &[1.0, 0.0, 0.0], Some(1), None)
+                .unwrap();
+            core_1
+                .insert_flat_be(&mut w, &[0.0, 1.0, 0.0], Some(2), None)
+                .unwrap();
+            backend.commit(w).unwrap();
+        }
+
+        // Reader state: both cores open
+        manager
+            .cores
+            .write()
+            .unwrap()
+            .insert("dense__seg_000000".to_string(), core_0);
+        manager
+            .cores
+            .write()
+            .unwrap()
+            .insert("dense__seg_000001".to_string(), core_1);
+        manager
+            .configs
+            .write()
+            .unwrap()
+            .insert("dense".to_string(), config.clone());
+        assert_eq!(manager.cores.read().unwrap().len(), 2);
+
+        // Metadata update: segment 0 removed (merged), only segment 1 remains
+        let mut new_metadata = HashMap::new();
+        new_metadata.insert(
+            "dense".to_string(),
+            DenseVectorSpaceMetadata {
+                next_segment_id: 2,
+                segments: vec![DenseVectorSegmentMetadata {
+                    physical_name: "dense__seg_000001".to_string(),
+                    role: DenseVectorSegmentRole::Indexed,
+                }],
+            },
+        );
+        let mut configs = HashMap::new();
+        configs.insert("dense".to_string(), config);
+
+        // Reader refresh with new metadata
+        manager
+            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &new_metadata, hnsw)
+            .unwrap();
+
+        // Verify: segment 0 core removed, segment 1 core retained
+        let cores = manager.cores.read().unwrap();
+        assert_eq!(cores.len(), 1, "reader must remove stale core");
+        assert!(cores.contains_key("dense__seg_000001"));
+        assert!(
+            !cores.contains_key("dense__seg_000000"),
+            "stale core must be removed"
+        );
+    }
+
+    #[test]
+    fn reader_refresh_empty_metadata_does_not_prune_all_cores() {
+        // Issue B-LOW: an empty or default metadata read must not prune every core.
+        // Only prune within logical spaces present in the new metadata, and only segment
+        // IDs below next_segment_id.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("empty_meta_{nanos}")).unwrap(),
+        ));
+        let manager = NamedVectorManager::new("test_collection".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(16), Some(32));
+
+        // Allocate and publish segment 0
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let cores_empty = HashMap::new();
+        let (name_0, _core_0) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: name_0.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+
+        // Populate manager's view
+        let mut configs = HashMap::new();
+        configs.insert("dense".to_string(), config.clone());
+        let mut metadata = HashMap::new();
+        metadata.insert("dense".to_string(), space.clone());
+        manager
+            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &metadata, hnsw.clone())
+            .unwrap();
+        assert!(manager.cores.read().unwrap().contains_key(&name_0));
+
+        // Refresh with EMPTY metadata (simulating a read that decodes to default)
+        let empty_metadata = HashMap::new();
+        manager
+            .refresh_dense_view_from_metadata_lsm(
+                dir.path(),
+                &configs,
+                &empty_metadata,
+                hnsw.clone(),
+            )
+            .unwrap();
+
+        // VERIFY FIX: core must NOT be pruned (because logical space "dense" is absent from new metadata)
+        assert!(
+            manager.cores.read().unwrap().contains_key(&name_0),
+            "Empty metadata refresh must not prune cores from spaces absent in new metadata"
+        );
+    }
+
+    #[test]
+    fn reader_refresh_prune_ordering_race_safe() {
+        // Issue B-HIGH: pruning under cores write lock BEFORE dense_spaces swap causes a race.
+        // A concurrent search holding pre-merge dense_spaces snapshot, queued behind cores.write(),
+        // finds its source cores pruned after release. Fix: swap dense_spaces FIRST, delay prune
+        // by one refresh (only prune names absent from BOTH previous and current metadata).
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("prune_race_{nanos}")).unwrap(),
+        ));
+        let manager = NamedVectorManager::new("test_collection".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(16), Some(32));
+
+        // Writer: allocate segment 0, publish, then retire (simulating a merge)
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let cores_empty = HashMap::new();
+        let (name_0, _core_0) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: name_0.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+
+        // Reader sees segment 0
+        let mut configs = HashMap::new();
+        configs.insert("dense".to_string(), config.clone());
+        let mut metadata = HashMap::new();
+        metadata.insert("dense".to_string(), space.clone());
+        manager
+            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &metadata, hnsw.clone())
+            .unwrap();
+        assert!(manager.cores.read().unwrap().contains_key(&name_0));
+
+        // Simulate search holding pre-merge dense_spaces snapshot:
+        // Snapshot the current metadata BEFORE the refresh that retires segment 0
+        let pre_merge_metadata = manager.dense_spaces.read().unwrap().clone();
+        assert!(pre_merge_metadata
+            .get("dense")
+            .unwrap()
+            .segments
+            .iter()
+            .any(|s| s.physical_name == name_0));
+
+        // Writer retires segment 0 (removes from metadata)
+        space.segments.retain(|s| s.physical_name != name_0);
+        metadata.insert("dense".to_string(), space.clone());
+
+        // First refresh: segment 0 is absent from NEW metadata but present in PREVIOUS metadata.
+        // Fix: it must NOT be pruned yet (delayed by one refresh).
+        manager
+            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &metadata, hnsw.clone())
+            .unwrap();
+        assert!(
+            manager.cores.read().unwrap().contains_key(&name_0),
+            "First refresh after retire must NOT prune (delayed by one refresh)"
+        );
+
+        // Second refresh: segment 0 is absent from BOTH previous and current metadata.
+        // Now it's safe to prune.
+        manager
+            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &metadata, hnsw)
+            .unwrap();
+        assert!(
+            !manager.cores.read().unwrap().contains_key(&name_0),
+            "Second refresh must prune core absent from both previous and current metadata"
+        );
+    }
+
+    #[test]
+    fn reader_delayed_pruning_and_writer_monotonic_allocation() {
+        // Issue B: Two-part fix preventing stale-core bugs:
+        // (a) Writer monotonic allocation: allocate_dense_core_locked_lsm never reuses
+        //     retired segment names (next_segment_id increments).
+        // (b) Reader delayed pruning: refresh_dense_view_from_metadata_lsm delays pruning
+        //     by one refresh cycle to prevent search snapshots from racing with core pruning.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("monotonic_{nanos}"))
+                .expect("open in-memory LSM backend"),
+        ));
+        let writer_manager = NamedVectorManager::new("test_collection".to_string());
+        writer_manager.attach_backend(Arc::clone(&backend));
+
+        let reader_manager = NamedVectorManager::new("test_collection".to_string());
+        reader_manager.attach_backend(Arc::clone(&backend));
+
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+
+        // Writer allocates segment 0
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let cores_empty = HashMap::new();
+        let (name_0, core_0) = writer_manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        writer_manager
+            .cores
+            .write()
+            .unwrap()
+            .insert(name_0.clone(), core_0);
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: name_0.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+
+        // Reader sees segment 0 in metadata and opens it
+        let mut reader_configs = HashMap::new();
+        reader_configs.insert("dense".to_string(), config.clone());
+        let mut reader_metadata = HashMap::new();
+        reader_metadata.insert("dense".to_string(), space.clone());
+        reader_manager
+            .refresh_dense_view_from_metadata_lsm(
+                dir.path(),
+                &reader_configs,
+                &reader_metadata,
+                hnsw.clone(),
+            )
+            .unwrap();
+        assert!(
+            reader_manager.cores.read().unwrap().contains_key(&name_0),
+            "Reader must open segment 0 after initial refresh"
+        );
+
+        // Writer retires segment 0 (removes from metadata)
+        space.segments.retain(|s| s.physical_name != name_0);
+        reader_metadata.insert("dense".to_string(), space.clone());
+
+        // VERIFY FIX (b): First refresh after retirement - core should NOT be pruned yet
+        reader_manager
+            .refresh_dense_view_from_metadata_lsm(
+                dir.path(),
+                &reader_configs,
+                &reader_metadata,
+                hnsw.clone(),
+            )
+            .unwrap();
+        assert!(
+            reader_manager.cores.read().unwrap().contains_key(&name_0),
+            "FIX (b) First refresh: core must NOT be pruned (delayed by one refresh)"
+        );
+
+        // VERIFY FIX (b): Second refresh - now pruning is safe
+        reader_manager
+            .refresh_dense_view_from_metadata_lsm(
+                dir.path(),
+                &reader_configs,
+                &reader_metadata,
+                hnsw.clone(),
+            )
+            .unwrap();
+        assert!(
+            !reader_manager.cores.read().unwrap().contains_key(&name_0),
+            "FIX (b) Second refresh: reader must drop core absent from both previous and current metadata"
+        );
+
+        // VERIFY FIX (a): Writer allocates a NEW segment with a DIFFERENT name
+        let (name_new, _core_new) = writer_manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw,
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        assert_ne!(
+            name_new, name_0,
+            "FIX (a) Writer must not reuse retired segment name (monotonic allocation)"
+        );
+        assert!(
+            space.next_segment_id > 0,
+            "FIX (a) next_segment_id must increment (was 0, now {})",
+            space.next_segment_id
+        );
+
+        // All guarantees proven:
+        // (a) Writer allocated a different name (name_new != name_0, next_segment_id incremented)
+        // (b) Reader delayed pruning by one refresh (first refresh kept core, second dropped it)
+    }
+
+    #[test]
+    fn shared_cache_post_commit_invalidation_via_plan_flow() {
+        // Issue A end-to-end: prod flow (plan → delete_vectors_batch_with_plan_be → commit →
+        // apply_delete_tombstones) must invalidate shared cache entries post-commit, catching
+        // any re-cached entries from concurrent reads between pre-commit pop and commit.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use crate::helix_engine::vector_core::shared_cache::SharedVectorCaches;
+        use std::num::NonZeroUsize;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("plan_cache_{nanos}")).unwrap(),
+        ));
+        let manager = NamedVectorManager::new("test_collection".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+
+        let shared = Arc::new(SharedVectorCaches::new(
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+        ));
+
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(16), Some(32));
+
+        // Allocate segment and attach shared cache
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let cores_empty = HashMap::new();
+        let (seg_name, mut core) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        core.shared_caches = Some(Arc::clone(&shared));
+        manager
+            .cores
+            .write()
+            .unwrap()
+            .insert(seg_name.clone(), core);
+
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: seg_name.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+        manager
+            .dense_spaces
+            .write()
+            .unwrap()
+            .insert("dense".to_string(), space.clone());
+
+        // Insert id 1
+        let mut w = backend.begin_write().unwrap();
+        let vec = vec![1.0f32, 0.0, 0.0];
+        manager
+            .cores
+            .read()
+            .unwrap()
+            .get(&seg_name)
+            .unwrap()
+            .insert_flat_be(&mut w, &vec, Some(1), None)
+            .unwrap();
+        backend.commit(w).unwrap();
+
+        // Read (populates cache)
+        let r = backend.begin_read().unwrap();
+        let cached = manager
+            .cores
+            .read()
+            .unwrap()
+            .get(&seg_name)
+            .unwrap()
+            .get_vector(&r, 1, 0, true)
+            .unwrap();
+        // Verify vector exists (exact value depends on normalization)
+        assert!(cached.get_data()[0] > 0.0);
+        drop(r);
+
+        // Delete via prod flow: plan → delete_with_plan_be → apply_delete_tombstones
+        let r2 = backend.begin_read().unwrap();
+        let plan = manager.plan_delete_vectors_batch_be(&r2, &[1]).unwrap();
+        drop(r2);
+
+        let mut w2 = backend.begin_write().unwrap();
+        let staged = manager
+            .delete_vectors_batch_with_plan_be(&mut w2, &plan)
+            .unwrap();
+        // A read before the delete commits re-caches the still-committed row.
+        let mid = backend.begin_read().unwrap();
+        let _ = manager
+            .cores
+            .read()
+            .unwrap()
+            .get(&seg_name)
+            .unwrap()
+            .get_vector(&mid, 1, 0, true);
+        drop(mid);
+        backend.commit(w2).unwrap();
+
+        // Post-commit: apply_delete_tombstones must invalidate cache at exact levels
+        manager.apply_delete_tombstones(&staged);
+
+        // Verify: get_vector must miss (not return cached value)
+        let r3 = backend.begin_read().unwrap();
+        assert!(
+            manager
+                .cores
+                .read()
+                .unwrap()
+                .get(&seg_name)
+                .unwrap()
+                .get_vector(&r3, 1, 0, true)
+                .is_err(),
+            "Post-commit invalidation failed: get_vector returned cached entry after delete"
+        );
+    }
+
+    #[test]
+    fn hard_delete_allows_immediate_reinsertion() {
+        // Issue A follow-up: with tombstones OFF (hard-delete path), verify that
+        // by_segment (tombstones) remains empty, so re-inserted IDs remain visible.
+        // Flow: insert id → delete id → verify by_segment is empty → re-insert same id → must be visible.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("hard_del_{nanos}")).unwrap(),
+        ));
+        let manager = NamedVectorManager::new("test_collection".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+
+        // Allocate dense space
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let cores_empty = HashMap::new();
+        let (name, core) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        manager.cores.write().unwrap().insert(name.clone(), core);
+
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: name.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+        manager
+            .dense_spaces
+            .write()
+            .unwrap()
+            .insert("dense".to_string(), space.clone());
+
+        // Insert id=1
+        let vec_a = vec![1.0f32, 0.0, 0.0];
+        let mut w1 = backend.begin_write().unwrap();
+        manager
+            .cores
+            .read()
+            .unwrap()
+            .get(&name)
+            .unwrap()
+            .insert_flat_be(&mut w1, &vec_a, Some(1), None)
+            .unwrap();
+        backend.commit(w1).unwrap();
+
+        // Verify id=1 is readable
+        let r1 = backend.begin_read().unwrap();
+        assert!(
+            manager
+                .cores
+                .read()
+                .unwrap()
+                .get(&name)
+                .unwrap()
+                .get_vector(&r1, 1, 0, true)
+                .is_ok(),
+            "Initial insert: id=1 must be visible"
+        );
+        drop(r1);
+
+        // Hard-delete id=1
+        let r_plan = backend.begin_read().unwrap();
+        let plan = manager.plan_delete_vectors_batch_be(&r_plan, &[1]).unwrap();
+        drop(r_plan);
+
+        let mut w2 = backend.begin_write().unwrap();
+        let staged = manager
+            .delete_vectors_batch_with_plan_be(&mut w2, &plan)
+            .unwrap();
+        backend.commit(w2).unwrap();
+
+        // CRITICAL CHECK: with tombstones OFF (hard-delete), by_segment must be empty
+        // to ensure re-inserted ids won't be hidden by in-memory tombstone sets
+        assert!(
+            staged.by_segment.is_empty(),
+            "Hard-delete path must not populate by_segment (found {} entries). \
+             This would hide re-inserted IDs via in-memory tombstone sets.",
+            staged.by_segment.len()
+        );
+        manager.apply_delete_tombstones(&staged);
+
+        // Verify delete worked
+        let r_check = backend.begin_read().unwrap();
+        assert!(
+            manager
+                .cores
+                .read()
+                .unwrap()
+                .get(&name)
+                .unwrap()
+                .get_vector(&r_check, 1, 0, true)
+                .is_err(),
+            "After hard-delete: id=1 must be absent"
+        );
+        drop(r_check);
+
+        // Re-insert id=1 with a different vector
+        let vec_b = vec![0.0f32, 1.0, 0.0];
+        let mut w3 = backend.begin_write().unwrap();
+        manager
+            .cores
+            .read()
+            .unwrap()
+            .get(&name)
+            .unwrap()
+            .insert_flat_be(&mut w3, &vec_b, Some(1), None)
+            .unwrap();
+        backend.commit(w3).unwrap();
+
+        // VERIFY: id=1 must be visible after re-insertion
+        let r2 = backend.begin_read().unwrap();
+        assert!(
+            manager
+                .cores
+                .read()
+                .unwrap()
+                .get(&name)
+                .unwrap()
+                .get_vector(&r2, 1, 0, true)
+                .is_ok(),
+            "After re-insert: id=1 must be visible (hard-delete must not leave tombstones)"
+        );
+        // get_vector ignores tombstones, so check the set search consults directly.
+        assert!(!manager
+            .cores
+            .read()
+            .unwrap()
+            .get(&name)
+            .unwrap()
+            .is_delete_tombstoned(1));
+    }
+
+    #[test]
+    fn shared_cache_post_commit_drops_stale_sidecar_ordinal() {
+        // Prod hard-delete flow on a sidecar-backed core: a read between the delete
+        // and its commit re-caches the row's sidecar ordinal; the post-commit hook
+        // must drop it, or get_vector serves the deleted vector from the hvec file.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use crate::helix_engine::vector_core::hnsw::HNSW;
+        use crate::helix_engine::vector_core::spindle::{SpindleConfig, SpindleMode};
+        use crate::helix_engine::vector_core::vector_core::HNSWConfig;
+        use std::num::NonZeroUsize;
+
+        const SEG: &str = "dense__seg_000001";
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("post_commit_ordinal-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        ));
+        let manager = NamedVectorManager::new("post_commit_ordinal".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+        let mut configs = HashMap::new();
+        configs.insert(
+            "dense".to_string(),
+            NamedVectorConfig {
+                size: 4,
+                distance: DistanceMetric::Cosine,
+                spindle: SpindleConfig {
+                    mode: SpindleMode::None,
+                    ..SpindleConfig::default()
+                },
+            },
+        );
+        let mut meta = HashMap::new();
+        meta.insert(
+            "dense".to_string(),
+            DenseVectorSpaceMetadata {
+                next_segment_id: 2,
+                segments: vec![DenseVectorSegmentMetadata {
+                    physical_name: SEG.to_string(),
+                    role: DenseVectorSegmentRole::Mutable,
+                }],
+            },
+        );
+        // A data dir gives the core an hvec sidecar, so reads resolve through ordinals.
+        let dir = TempDir::new().unwrap();
+        manager
+            .refresh_dense_view_from_metadata_lsm(
+                dir.path(),
+                &configs,
+                &meta,
+                HNSWConfig::new(Some(8), Some(16), Some(32)),
+            )
+            .unwrap();
+        let shared = Arc::new(super::super::shared_cache::SharedVectorCaches::new(
+            NonZeroUsize::new(4096).unwrap(),
+            NonZeroUsize::new(4096).unwrap(),
+            NonZeroUsize::new(4096).unwrap(),
+        ));
+        manager
+            .cores
+            .write()
+            .unwrap()
+            .get_mut(SEG)
+            .unwrap()
+            .shared_caches = Some(shared);
+
+        let read_7 = || {
+            let cores = manager.cores.read().unwrap();
+            let r = backend.begin_read().unwrap();
+            cores
+                .get(SEG)
+                .unwrap()
+                .get_vector(&r, 7, 0, true)
+                .map(|v| v.get_data().to_vec())
+        };
+        {
+            let cores = manager.cores.read().unwrap();
+            let mut w = backend.begin_write().unwrap();
+            cores
+                .get(SEG)
+                .unwrap()
+                .insert_flat_be(&mut w, &[1.0, 0.0, 0.0, 0.0], Some(7), None)
+                .unwrap();
+            backend.commit(w).unwrap();
+        }
+        assert!(read_7().is_ok());
+
+        let plan = {
+            let r = backend.begin_read().unwrap();
+            manager.plan_delete_vectors_batch_be(&r, &[7]).unwrap()
+        };
+        let mut w = backend.begin_write().unwrap();
+        let staged = manager
+            .delete_vectors_batch_with_plan_be(&mut w, &plan)
+            .unwrap();
+        assert!(
+            read_7().is_ok(),
+            "row is still committed before the delete commits"
+        );
+        backend.commit(w).unwrap();
+        manager.apply_delete_tombstones(&staged);
+
+        let after = read_7();
+        assert!(
+            after.is_err(),
+            "deleted id served after commit + post-commit hook: {:?}",
+            after
+        );
+    }
+
+    #[test]
+    fn reader_refresh_publishes_core_before_listing_segment() {
+        // A search holding cores.read() must never see a segment listed in
+        // dense_spaces whose core is not yet in `cores` (it would be skipped).
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use crate::helix_engine::vector_core::spindle::{SpindleConfig, SpindleMode};
+        use crate::helix_engine::vector_core::vector_core::HNSWConfig;
+
+        const SEG_A: &str = "dense__seg_000001";
+        const SEG_B: &str = "dense__seg_000002";
+        let meta = |names: &[&str]| {
+            let mut m = HashMap::new();
+            m.insert(
+                "dense".to_string(),
+                DenseVectorSpaceMetadata {
+                    next_segment_id: 3,
+                    segments: names
+                        .iter()
+                        .map(|n| DenseVectorSegmentMetadata {
+                            physical_name: n.to_string(),
+                            role: DenseVectorSegmentRole::Mutable,
+                        })
+                        .collect(),
+                },
+            );
+            m
+        };
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("publish_order-{}", uuid::Uuid::new_v4())).unwrap(),
+        ));
+        let manager = NamedVectorManager::new("publish_order".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+        let mut configs = HashMap::new();
+        configs.insert(
+            "dense".to_string(),
+            NamedVectorConfig {
+                size: 4,
+                distance: DistanceMetric::Cosine,
+                spindle: SpindleConfig {
+                    mode: SpindleMode::None,
+                    ..SpindleConfig::default()
+                },
+            },
+        );
+        let hnsw = HNSWConfig::new(Some(8), Some(16), Some(32));
+        let dir = TempDir::new().unwrap();
+        manager
+            .refresh_dense_view_from_metadata_lsm(
+                dir.path(),
+                &configs,
+                &meta(&[SEG_A]),
+                hnsw.clone(),
+            )
+            .unwrap();
+
+        let mut listed_without_core = false;
+        std::thread::scope(|s| {
+            let in_flight_search = manager.cores.read().unwrap();
+            let refresh = s.spawn(|| {
+                manager
+                    .refresh_dense_view_from_metadata_lsm(
+                        dir.path(),
+                        &configs,
+                        &meta(&[SEG_A, SEG_B]),
+                        hnsw.clone(),
+                    )
+                    .unwrap()
+            });
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_millis(500) {
+                let listed = manager
+                    .dense_spaces
+                    .read()
+                    .unwrap()
+                    .get("dense")
+                    .is_some_and(|sp| sp.segments.iter().any(|seg| seg.physical_name == SEG_B));
+                if listed {
+                    listed_without_core = !in_flight_search.contains_key(SEG_B);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            drop(in_flight_search);
+            refresh.join().unwrap();
+        });
+        assert!(
+            !listed_without_core,
+            "dense_spaces listed {SEG_B} before its core was published"
+        );
+        assert!(manager.cores.read().unwrap().contains_key(SEG_B));
+    }
+
+    // ── Reviewer probes (P1, P1b, P2, P3) ──
+    //
+    // Regression tests for deleted-vector resurrection through cache fills.
+    // Run with tombstones OFF (prod mode) and shared caches both on and off.
+
+    const PROBE_SEG: &str = "dense__seg_000001";
+
+    fn probe_rig(shared_on: bool, dir: &Path, backend: &Arc<AnyBackend>) -> NamedVectorManager {
+        let manager = NamedVectorManager::new("probe".to_string());
+        manager.attach_backend(Arc::clone(backend));
+        let mut configs = HashMap::new();
+        configs.insert(
+            "dense".to_string(),
+            NamedVectorConfig {
+                size: 4,
+                distance: DistanceMetric::Cosine,
+                spindle: SpindleConfig {
+                    mode: SpindleMode::None,
+                    ..SpindleConfig::default()
+                },
+            },
+        );
+        let mut meta = HashMap::new();
+        meta.insert(
+            "dense".to_string(),
+            DenseVectorSpaceMetadata {
+                next_segment_id: 2,
+                segments: vec![DenseVectorSegmentMetadata {
+                    physical_name: PROBE_SEG.to_string(),
+                    role: DenseVectorSegmentRole::Mutable,
+                }],
+            },
+        );
+        manager
+            .refresh_dense_view_from_metadata_lsm(
+                dir,
+                &configs,
+                &meta,
+                HNSWConfig::new(Some(8), Some(16), Some(32)),
+            )
+            .unwrap();
+        if shared_on {
+            use crate::helix_engine::vector_core::shared_cache::SharedVectorCaches;
+            use std::num::NonZeroUsize;
+            let shared = Arc::new(SharedVectorCaches::new(
+                NonZeroUsize::new(4096).unwrap(),
+                NonZeroUsize::new(4096).unwrap(),
+                NonZeroUsize::new(4096).unwrap(),
+            ));
+            manager
+                .cores
+                .write()
+                .unwrap()
+                .get_mut(PROBE_SEG)
+                .unwrap()
+                .shared_caches = Some(shared);
+        }
+        manager
+    }
+
+    fn probe_backend() -> Arc<AnyBackend> {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("probe-{}", uuid::Uuid::new_v4())).unwrap(),
+        ))
+    }
+
+    fn probe_insert(m: &NamedVectorManager, b: &AnyBackend, rows: &[(u128, [f32; 4])]) {
+        let cores = m.cores.read().unwrap();
+        let mut w = b.begin_write().unwrap();
+        for (id, v) in rows {
+            cores
+                .get(PROBE_SEG)
+                .unwrap()
+                .insert_flat_be(&mut w, v, Some(*id), None)
+                .unwrap();
+        }
+        b.commit(w).unwrap();
+    }
+
+    fn probe_get(
+        m: &NamedVectorManager,
+        r: &AnyRead<'_>,
+        id: u128,
+    ) -> Result<Vec<f32>, VectorError> {
+        let cores = m.cores.read().unwrap();
+        cores
+            .get(PROBE_SEG)
+            .unwrap()
+            .get_vector(r, id, 0, true)
+            .map(|v| v.get_data().to_vec())
+    }
+
+    fn probe_search_ids(m: &NamedVectorManager, b: &AnyBackend) -> Vec<u128> {
+        let r = b.begin_read().unwrap();
+        m.dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+            &r,
+            "dense",
+            &[1.0, 0.0, 0.0, 0.0],
+            10,
+            None,
+            false,
+            None,
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.get_id())
+        .collect()
+    }
+
+    /// delete -> commit -> post-commit hook. `between` runs after the delete
+    /// is staged but before commit.
+    fn probe_delete_with_hook(
+        m: &NamedVectorManager,
+        b: &AnyBackend,
+        ids: &[u128],
+        between: impl FnOnce(),
+    ) {
+        let _lock = TOMBSTONE_ENV_LOCK.lock().unwrap();
+        let _unset = EnvVarGuard::unset("HELIX_LSM_DELETE_TOMBSTONES");
+        let plan = {
+            let r = b.begin_read().unwrap();
+            m.plan_delete_vectors_batch_be(&r, ids).unwrap()
+        };
+        let mut w = b.begin_write().unwrap();
+        let staged = m.delete_vectors_batch_with_plan_be(&mut w, &plan).unwrap();
+        assert!(
+            staged.by_segment.is_empty(),
+            "tombstones must be OFF (prod mode)"
+        );
+        between();
+        b.commit(w).unwrap();
+        m.apply_delete_tombstones(&staged);
+    }
+
+    fn p1(shared_on: bool) {
+        let b = probe_backend();
+        let dir = TempDir::new().unwrap();
+        let m = probe_rig(shared_on, dir.path(), &b);
+        probe_insert(
+            &m,
+            &b,
+            &[(7, [1.0, 0.0, 0.0, 0.0]), (8, [0.0, 1.0, 0.0, 0.0])],
+        );
+        assert!(probe_get(&m, &b.begin_read().unwrap(), 7).is_ok());
+        probe_delete_with_hook(&m, &b, &[7], || {});
+        let after = probe_get(&m, &b.begin_read().unwrap(), 7);
+        let hits = probe_search_ids(&m, &b);
+        assert!(
+            after.is_err() && !hits.contains(&7),
+            "P1 shared={shared_on}: deleted id served: get={after:?} search={hits:?}"
+        );
+    }
+
+    fn p1b(shared_on: bool) {
+        let b = probe_backend();
+        let dir = TempDir::new().unwrap();
+        let m = probe_rig(shared_on, dir.path(), &b);
+        probe_insert(
+            &m,
+            &b,
+            &[(7, [1.0, 0.0, 0.0, 0.0]), (8, [0.0, 1.0, 0.0, 0.0])],
+        );
+        assert!(probe_get(&m, &b.begin_read().unwrap(), 7).is_ok());
+        probe_delete_with_hook(&m, &b, &[7], || {
+            // concurrent fresh read in the pre-commit window
+            assert!(probe_get(&m, &b.begin_read().unwrap(), 7).is_ok());
+        });
+        let after = probe_get(&m, &b.begin_read().unwrap(), 7);
+        let hits = probe_search_ids(&m, &b);
+        assert!(
+            after.is_err() && !hits.contains(&7),
+            "P1b shared={shared_on}: deleted id served: get={after:?} search={hits:?}"
+        );
+    }
+
+    fn p2(shared_on: bool) {
+        let b = probe_backend();
+        let dir = TempDir::new().unwrap();
+        let m = probe_rig(shared_on, dir.path(), &b);
+        probe_insert(
+            &m,
+            &b,
+            &[(7, [1.0, 0.0, 0.0, 0.0]), (8, [0.0, 1.0, 0.0, 0.0])],
+        );
+        assert!(probe_get(&m, &b.begin_read().unwrap(), 7).is_ok());
+        let old = b.begin_read().unwrap();
+        probe_delete_with_hook(&m, &b, &[7], || {});
+        // snapshot-isolated read of the old snapshot AFTER the hook
+        let _old_read = probe_get(&m, &old, 7);
+        drop(old);
+        let after = probe_get(&m, &b.begin_read().unwrap(), 7);
+        let hits = probe_search_ids(&m, &b);
+        assert!(
+            after.is_err() && !hits.contains(&7),
+            "P2 shared={shared_on}: deleted id served: get={after:?} search={hits:?}"
+        );
+    }
+
+    fn p3(shared_on: bool) {
+        let b = probe_backend();
+        let dir = TempDir::new().unwrap();
+        {
+            let m = probe_rig(shared_on, dir.path(), &b);
+            probe_insert(
+                &m,
+                &b,
+                &[(7, [1.0, 0.0, 0.0, 0.0]), (8, [0.0, 1.0, 0.0, 0.0])],
+            );
+            m.cores
+                .read()
+                .unwrap()
+                .get(PROBE_SEG)
+                .unwrap()
+                .flush_mmap()
+                .unwrap();
+        }
+        // Restart: ordinal map not loaded.
+        let m = probe_rig(shared_on, dir.path(), &b);
+        let old = b.begin_read().unwrap();
+        probe_delete_with_hook(&m, &b, &[7], || {});
+        // Old-snapshot read of a DIFFERENT live id triggers the full ordinal load.
+        let _old_read = probe_get(&m, &old, 8);
+        drop(old);
+        let after = probe_get(&m, &b.begin_read().unwrap(), 7);
+        let hits = probe_search_ids(&m, &b);
+        assert!(
+            after.is_err() && !hits.contains(&7),
+            "P3 shared={shared_on}: deleted id served: get7={after:?} search={hits:?}"
+        );
+    }
+
+    #[test]
+    fn probe_p1_shared_on() {
+        p1(true)
+    }
+    #[test]
+    fn probe_p1_shared_off() {
+        p1(false)
+    }
+    #[test]
+    fn probe_p1b_shared_on() {
+        p1b(true)
+    }
+    #[test]
+    fn probe_p1b_shared_off() {
+        p1b(false)
+    }
+    #[test]
+    fn probe_p2_shared_on() {
+        p2(true)
+    }
+    #[test]
+    fn probe_p2_shared_off() {
+        p2(false)
+    }
+    #[test]
+    fn probe_p3_shared_on() {
+        p3(true)
+    }
+    #[test]
+    fn probe_p3_shared_off() {
+        p3(false)
+    }
+
+    /// P4: a re-insert of a hard-deleted id is staged while a pre-delete
+    /// snapshot reads the id; after commit a fresh read must serve V2.
+    fn p4(shared_on: bool) {
+        let b = probe_backend();
+        let dir = TempDir::new().unwrap();
+        let m = probe_rig(shared_on, dir.path(), &b);
+        probe_insert(
+            &m,
+            &b,
+            &[(7, [1.0, 0.0, 0.0, 0.0]), (8, [0.0, 1.0, 0.0, 0.0])],
+        );
+        let old = b.begin_read().unwrap();
+        probe_delete_with_hook(&m, &b, &[7], || {});
+        let mut w = b.begin_write().unwrap();
+        m.cores
+            .read()
+            .unwrap()
+            .get(PROBE_SEG)
+            .unwrap()
+            .insert_flat_be(&mut w, &[0.0, 0.0, 1.0, 0.0], Some(7), None)
+            .unwrap();
+        let _old_read = probe_get(&m, &old, 7);
+        b.commit(w).unwrap();
+        drop(old);
+        let after = probe_get(&m, &b.begin_read().unwrap(), 7);
+        assert_eq!(
+            after.as_deref().ok(),
+            Some(&[0.0f32, 0.0, 1.0, 0.0][..]),
+            "P4 shared={shared_on}: re-inserted id must serve V2: after={after:?}"
+        );
+    }
+
+    #[test]
+    fn probe_p4_shared_on() {
+        p4(true)
+    }
+    #[test]
+    fn probe_p4_shared_off() {
+        p4(false)
+    }
+
+    /// P5 (sidecar variant): a re-insert of a hard-deleted id that is staged
+    /// and then ABORTED must leave no trace — not in caches (guard) and not
+    /// in the sidecar ordinal map (publication retracted on abort), so a
+    /// fresh read and search see the id as deleted.
+    fn p5(shared_on: bool) {
+        let b = probe_backend();
+        let dir = TempDir::new().unwrap();
+        let m = probe_rig(shared_on, dir.path(), &b);
+        probe_insert(
+            &m,
+            &b,
+            &[(7, [1.0, 0.0, 0.0, 0.0]), (8, [0.0, 1.0, 0.0, 0.0])],
+        );
+        let old = b.begin_read().unwrap();
+        probe_delete_with_hook(&m, &b, &[7], || {});
+        {
+            let mut w = b.begin_write().unwrap();
+            m.cores
+                .read()
+                .unwrap()
+                .get(PROBE_SEG)
+                .unwrap()
+                .insert_flat_be(&mut w, &[0.0, 0.0, 1.0, 0.0], Some(7), None)
+                .unwrap();
+            drop(w); // abort: never committed
+        }
+        let _old_read = probe_get(&m, &old, 7);
+        drop(old);
+        let after = probe_get(&m, &b.begin_read().unwrap(), 7);
+        let hits = probe_search_ids(&m, &b);
+        assert!(
+            after.is_err() && !hits.contains(&7),
+            "P5 shared={shared_on}: deleted id served after aborted re-insert: get={after:?} search={hits:?}"
+        );
+    }
+
+    #[test]
+    fn probe_p5_shared_on() {
+        p5(true)
+    }
+    #[test]
+    fn probe_p5_shared_off() {
+        p5(false)
+    }
+
+    // ── M7: stale-plan merge preserves earlier segments' tombstones ──
+
+    #[test]
+    fn stale_plan_merge_preserves_earlier_segments_tombstones() {
+        // Verify 8a5deaf2: when a segment is missing from the plan (stale),
+        // the fallback must merge id_levels into the existing staged result
+        // rather than replacing it.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+
+        let _lock = TOMBSTONE_ENV_LOCK.lock().unwrap();
+        let _unset = EnvVarGuard::unset("HELIX_LSM_DELETE_TOMBSTONES");
+
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("stale-merge-{}", uuid::Uuid::new_v4())).unwrap(),
+        ));
+        let manager = NamedVectorManager::new("stale_merge".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(16), Some(32));
+
+        // Create TWO segments, insert one id into each.
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let cores_empty = HashMap::new();
+        let (seg_a, core_a) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        let mut cores_a = HashMap::new();
+        cores_a.insert(seg_a.clone(), core_a);
+        let (seg_b, core_b) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_a,
+            )
+            .unwrap();
+        {
+            let mut cores = manager.cores.write().unwrap();
+            for (k, v) in cores_a {
+                cores.insert(k, v);
+            }
+            cores.insert(seg_b.clone(), core_b);
+        }
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: seg_a.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: seg_b.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+        manager
+            .dense_spaces
+            .write()
+            .unwrap()
+            .insert("dense".to_string(), space.clone());
+
+        // Insert id=1 into seg_a, id=2 into seg_b.
+        {
+            let cores = manager.cores.read().unwrap();
+            let mut w = backend.begin_write().unwrap();
+            cores
+                .get(&seg_a)
+                .unwrap()
+                .insert_flat_be(&mut w, &[1.0, 0.0, 0.0], Some(1), None)
+                .unwrap();
+            cores
+                .get(&seg_b)
+                .unwrap()
+                .insert_flat_be(&mut w, &[0.0, 1.0, 0.0], Some(2), None)
+                .unwrap();
+            backend.commit(w).unwrap();
+        }
+
+        // Plan against the current layout.
+        let plan = {
+            let r = backend.begin_read().unwrap();
+            manager.plan_delete_vectors_batch_be(&r, &[1, 2]).unwrap()
+        };
+
+        // Simulate stale plan: remove seg_b from the active segments view
+        // so the plan's active_segments won't match the current layout.
+        {
+            let mut ds = manager.dense_spaces.write().unwrap();
+            let sp = ds.get_mut("dense").unwrap();
+            sp.segments.retain(|s| s.physical_name != seg_b);
+            sp.segments.push(DenseVectorSegmentMetadata {
+                physical_name: format!("{seg_b}_replaced"),
+                role: DenseVectorSegmentRole::Indexed,
+            });
+        }
+
+        // Execute with stale plan — should fall back and still produce id_levels
+        // for BOTH ids (the fix in 8a5deaf2).
+        let mut w = backend.begin_write().unwrap();
+        let staged = manager
+            .delete_vectors_batch_with_plan_be(&mut w, &plan)
+            .unwrap();
+        backend.commit(w).unwrap();
+        manager.apply_delete_tombstones(&staged);
+
+        // Verify: id_levels must contain entries for both ids.
+        assert!(
+            staged.id_levels.contains_key(&1) || staged.id_levels.contains_key(&2),
+            "stale-plan fallback must produce id_levels for deleted ids; got {:?}",
+            staged.id_levels.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Two Indexed segments on one in-memory LSM backend, id 1 in `seg_a`
+    /// and id 2 in `seg_b`. Returns (backend, manager, dir, seg_a, seg_b).
+    fn two_segment_manager() -> (Arc<AnyBackend>, NamedVectorManager, TempDir, String, String) {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("two-seg-{}", uuid::Uuid::new_v4())).unwrap(),
+        ));
+        let manager = NamedVectorManager::new("two_seg".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(16), Some(32));
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let (seg_a, core_a) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let mut cores_a = HashMap::new();
+        cores_a.insert(seg_a.clone(), core_a);
+        let (seg_b, core_b) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw,
+                &mut space,
+                &cores_a,
+            )
+            .unwrap();
+        {
+            let mut cores = manager.cores.write().unwrap();
+            cores.extend(cores_a);
+            cores.insert(seg_b.clone(), core_b);
+        }
+        for name in [&seg_a, &seg_b] {
+            space.segments.push(DenseVectorSegmentMetadata {
+                physical_name: name.clone(),
+                role: DenseVectorSegmentRole::Indexed,
+            });
+        }
+        manager
+            .dense_spaces
+            .write()
+            .unwrap()
+            .insert("dense".to_string(), space);
+        {
+            let cores = manager.cores.read().unwrap();
+            let mut w = backend.begin_write().unwrap();
+            cores
+                .get(&seg_a)
+                .unwrap()
+                .insert_flat_be(&mut w, &[1.0, 0.0, 0.0], Some(1), None)
+                .unwrap();
+            cores
+                .get(&seg_b)
+                .unwrap()
+                .insert_flat_be(&mut w, &[0.0, 1.0, 0.0], Some(2), None)
+                .unwrap();
+            backend.commit(w).unwrap();
+        }
+        (backend, manager, dir, seg_a, seg_b)
+    }
+
+    /// M7: with tombstones ON, a plan whose later segment's core has gone
+    /// (stale) falls back to the physical delete; the tombstones the earlier
+    /// segment already staged in this batch must survive into the result so
+    /// `apply_delete_tombstones` records them.
+    #[test]
+    fn stale_plan_fallback_keeps_earlier_segment_tombstones_when_tombstones_on() {
+        let _lock = TOMBSTONE_ENV_LOCK.lock().unwrap();
+        let _on = EnvVarGuard::set("HELIX_LSM_DELETE_TOMBSTONES", "1");
+        let (backend, manager, _dir, seg_a, seg_b) = two_segment_manager();
+
+        // Deterministic segment order: seg_a stages first, seg_b is stale.
+        let plan = DenseDeletePlan {
+            ids: vec![1, 2],
+            active_segments: [seg_a.clone(), seg_b.clone()].into_iter().collect(),
+            by_segment: vec![(seg_a.clone(), vec![1]), (seg_b.clone(), vec![2])],
+        };
+        manager.cores.write().unwrap().remove(&seg_b);
+
+        let mut w = backend.begin_write().unwrap();
+        let staged = manager
+            .delete_vectors_batch_with_plan_be(&mut w, &plan)
+            .unwrap();
+        backend.commit(w).unwrap();
+        manager.apply_delete_tombstones(&staged);
+
+        assert_eq!(
+            staged.by_segment,
+            vec![(seg_a.clone(), vec![1u128])],
+            "seg_a's staged tombstone must survive the stale-plan fallback"
+        );
+        assert!(
+            staged.id_levels.contains_key(&1),
+            "fallback id_levels must be merged in: {:?}",
+            staged.id_levels
+        );
+        let cores = manager.cores.read().unwrap();
+        assert!(
+            cores.get(&seg_a).unwrap().is_delete_tombstoned(1),
+            "post-commit apply must record seg_a's tombstone"
+        );
+    }
+
+    /// Only the segment that owned a hard-deleted id guards it: a stale
+    /// snapshot can only refill that segment's caches with the deleted
+    /// vector, and guarding every segment is what made the guard D x C.
+    #[test]
+    fn hard_delete_guards_only_the_owning_segment() {
+        let _lock = TOMBSTONE_ENV_LOCK.lock().unwrap();
+        let _off = EnvVarGuard::unset("HELIX_LSM_DELETE_TOMBSTONES");
+        let (backend, manager, _dir, seg_a, seg_b) = two_segment_manager();
+
+        let plan = {
+            let r = backend.begin_read().unwrap();
+            manager.plan_delete_vectors_batch_be(&r, &[1]).unwrap()
+        };
+        let mut w = backend.begin_write().unwrap();
+        let staged = manager
+            .delete_vectors_batch_with_plan_be(&mut w, &plan)
+            .unwrap();
+        backend.commit(w).unwrap();
+        manager.apply_delete_tombstones(&staged);
+
+        let cores = manager.cores.read().unwrap();
+        assert!(
+            cores.get(&seg_a).unwrap().is_cache_fill_blocked(1),
+            "owning segment must guard the deleted id"
+        );
+        assert!(
+            !cores.get(&seg_b).unwrap().is_cache_fill_blocked(1),
+            "a segment that never held the id must not guard it"
+        );
+        assert!(
+            !cores.get(&seg_b).unwrap().is_cache_fill_blocked(2),
+            "the other segment's live id stays unguarded"
+        );
+    }
+
+    /// Tombstones OFF, stale core hit after an earlier segment already
+    /// hard-deleted its share: the fallback's physical delete may remove ids
+    /// from any active segment, so ownership is unknown and every segment
+    /// must guard, not only the segments the loop visited first.
+    #[test]
+    fn stale_plan_fallback_guards_every_segment_when_tombstones_off() {
+        let _lock = TOMBSTONE_ENV_LOCK.lock().unwrap();
+        let _off = EnvVarGuard::unset("HELIX_LSM_DELETE_TOMBSTONES");
+        let (backend, manager, dir, seg_a, seg_b) = two_segment_manager();
+
+        // A third active segment, absent from the plan, that holds id 2.
+        let mut space = manager
+            .dense_spaces
+            .read()
+            .unwrap()
+            .get("dense")
+            .unwrap()
+            .clone();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let (seg_c, core_c) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                HNSWConfig::new(Some(8), Some(16), Some(32)),
+                &mut space,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let mut w = backend.begin_write().unwrap();
+        core_c
+            .insert_flat_be(&mut w, &[0.0, 0.0, 1.0], Some(2), None)
+            .unwrap();
+        backend.commit(w).unwrap();
+        manager.cores.write().unwrap().insert(seg_c.clone(), core_c);
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: seg_c.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+        manager
+            .dense_spaces
+            .write()
+            .unwrap()
+            .insert("dense".to_string(), space);
+
+        // seg_a deletes its share first; seg_b's core is gone (stale plan).
+        let plan = DenseDeletePlan {
+            ids: vec![1, 2],
+            active_segments: [seg_a.clone(), seg_b.clone(), seg_c.clone()]
+                .into_iter()
+                .collect(),
+            by_segment: vec![(seg_a.clone(), vec![1]), (seg_b.clone(), vec![2])],
+        };
+        manager.cores.write().unwrap().remove(&seg_b);
+
+        let mut w = backend.begin_write().unwrap();
+        let staged = manager
+            .delete_vectors_batch_with_plan_be(&mut w, &plan)
+            .unwrap();
+        backend.commit(w).unwrap();
+        manager.apply_delete_tombstones(&staged);
+
+        let cores = manager.cores.read().unwrap();
+        let core_c = cores.get(&seg_c).unwrap();
+        let r = backend.begin_read().unwrap();
+        assert!(
+            !core_c.contains_id(&r, 2).unwrap(),
+            "the fallback must have hard-deleted id 2 from seg_c"
+        );
+        assert!(
+            core_c.is_cache_fill_blocked(2),
+            "a segment the fallback deleted from must guard the id"
+        );
+        assert!(cores.get(&seg_a).unwrap().is_cache_fill_blocked(1));
     }
 }

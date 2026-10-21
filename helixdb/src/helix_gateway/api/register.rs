@@ -207,6 +207,11 @@ pub fn register_api_routes(router: &mut HelixRouter) {
     );
     router.add_pattern_route(
         "POST",
+        "/collections/{name}/points/repair-file-size",
+        qdrant::handle_repair_file_size,
+    );
+    router.add_pattern_route(
+        "POST",
         "/collections/{name}/points/count",
         qdrant::handle_count_points,
     );

@@ -1038,6 +1038,13 @@ pub struct DbReaderOptions {
     /// Optional metrics reporting level for standalone readers. Defaults to
     /// [`MetricLevel::default`] when unset.
     pub metric_level: Option<MetricLevel>,
+
+    /// HELION LOCAL PATCH: how many WAL SSTs the reader opens concurrently while
+    /// replaying the WAL tail on open and on each checkpoint refresh. Replay
+    /// applies entries in WAL order regardless; this only bounds the prefetch
+    /// window, so each in-flight WAL costs one object-store HEAD+GET. Values
+    /// below 1 are treated as 1. Defaults to 4 (upstream behaviour).
+    pub wal_replay_sst_batch_size: usize,
 }
 
 impl Default for DbReaderOptions {
@@ -1049,6 +1056,7 @@ impl Default for DbReaderOptions {
             object_store_cache_options: ObjectStoreCacheOptions::default(),
             skip_wal_replay: false,
             metric_level: None,
+            wal_replay_sst_batch_size: 4,
         }
     }
 }

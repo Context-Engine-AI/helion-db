@@ -102,6 +102,13 @@ Local LSM examples are available under `deploy/lsm-cloud/` for Docker Compose,
 MinIO, and Minikube. Kubernetes tuning examples are configuration templates,
 not credentials or production manifests.
 
+Filtered scroll uses a 250 ms default budget for unindexed scans and 2 seconds
+for payload-index candidates. LSM reader WAL replay prefetch defaults to 32
+objects per collection (capped at 256); idle flushing and an independent cache
+divisor remain opt-in. See [Operations](docs/operations.md) for the controls and
+[API reference](docs/api-reference.md) for cached readiness counts and the
+guarded file-size repair extension.
+
 ## Workspace
 
 - `helixdb`: graph/vector engine, query compiler, storage, and protocol types

@@ -176,25 +176,42 @@ impl StoredManifest {
         store: Arc<ManifestStore>,
         manifest: Manifest,
         clock: Arc<dyn SystemClock>,
+        id_floor: u64,
     ) -> Result<Self, SlateDBError> {
         // Preserve original behavior: write via ManifestStore (object-store path and semantics)
-        let inner = SimpleTransactionalObject::<Manifest>::init(
+        let inner = SimpleTransactionalObject::<Manifest>::init_after(
             Arc::clone(&store.inner)
                 as Arc<dyn TransactionalStorageProtocol<Manifest, MonotonicId>>,
             manifest.clone(),
+            (id_floor > 0).then(|| MonotonicId::new(id_floor)),
         )
         .await?;
         Ok(Self { inner, clock })
     }
 
     /// Create the initial manifest for a new database.
+    #[cfg(test)]
     pub(crate) async fn create_new_db(
         store: Arc<ManifestStore>,
         core: ManifestCore,
         clock: Arc<dyn SystemClock>,
     ) -> Result<Self, SlateDBError> {
+        Self::create_new_db_after(store, core, clock, 0).await
+    }
+
+    /// Create the initial manifest for a new database with id `id_floor + 1`
+    /// instead of 1 (`id_floor == 0` is [`create_new_db`]). A database
+    /// re-created at a path whose previous incarnation was deleted passes that
+    /// incarnation's highest manifest id, so a late conditional append from a
+    /// stale copy of the old manifest can never become this database's latest.
+    pub(crate) async fn create_new_db_after(
+        store: Arc<ManifestStore>,
+        core: ManifestCore,
+        clock: Arc<dyn SystemClock>,
+        id_floor: u64,
+    ) -> Result<Self, SlateDBError> {
         let manifest = Manifest::initial(core);
-        Self::init(store, manifest, clock).await
+        Self::init(store, manifest, clock, id_floor).await
     }
 
     /// Store a new manifest (for a new cloned database).
@@ -203,7 +220,7 @@ impl StoredManifest {
         manifest: Manifest,
         clock: Arc<dyn SystemClock>,
     ) -> Result<Self, SlateDBError> {
-        Self::init(clone_manifest_store, manifest, clock).await
+        Self::init(clone_manifest_store, manifest, clock, 0).await
     }
 
     /// Load the current manifest from the supplied manifest store. If there is no db at the
@@ -667,7 +684,7 @@ mod tests {
     use crate::error;
     use crate::error::SlateDBError;
     use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
-    use crate::manifest::ManifestCore;
+    use crate::manifest::{Manifest, ManifestCore};
     use crate::retrying_object_store::RetryingObjectStore;
     use crate::test_utils::FlakyObjectStore;
     use chrono::Timelike;
@@ -676,7 +693,9 @@ mod tests {
     use slatedb_common::clock::{DefaultSystemClock, SystemClock};
     use slatedb_common::DbRand;
     use slatedb_txn_obj::object_store::ObjectStoreBoundaryObject;
-    use slatedb_txn_obj::{BoundaryObject, MonotonicId, TransactionalObject};
+    use slatedb_txn_obj::{
+        BoundaryObject, MonotonicId, TransactionalObject, TransactionalStorageProtocol,
+    };
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -722,6 +741,35 @@ mod tests {
         let version = ms.read_latest_manifest().await.unwrap().id;
 
         assert_eq!(version, 2);
+    }
+
+    /// A re-created database starts above a deleted predecessor's ids, so the
+    /// predecessor's stale `floor + 1` append can never become its latest.
+    #[tokio::test]
+    async fn test_create_new_db_after_starts_above_floor_and_fences_stale_append() {
+        let ms = new_memory_manifest_store();
+        let sm = StoredManifest::create_new_db_after(
+            ms.clone(),
+            ManifestCore::new(),
+            Arc::new(DefaultSystemClock::new()),
+            5,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sm.id(), 6);
+
+        let stale = ms
+            .inner
+            .write(
+                Some(MonotonicId::new(5)),
+                &Manifest::initial(ManifestCore::new()),
+            )
+            .await;
+        assert!(matches!(
+            stale,
+            Err(slatedb_txn_obj::TransactionalObjectError::ObjectVersionExists)
+        ));
+        assert_eq!(ms.read_latest_manifest().await.unwrap().id, 6);
     }
 
     #[tokio::test]

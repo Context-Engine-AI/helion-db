@@ -51,7 +51,8 @@ use super::backend::{
     BackendError, BackendKind, KeyRange, Namespace, StorageBackend, StorageBackendConfig,
 };
 use super::backend_any::{
-    read_metadata_sidecar_from_lsm_env, AnyBackend, AnyRead, AnyWrite, LSM_READER_READONLY,
+    lsm_collection_prefix_exists_from_env, read_metadata_sidecar_from_lsm_env, AnyBackend, AnyRead,
+    AnyWrite, LSM_READER_READONLY,
 };
 use super::storage_methods::{BasicStorageMethods, DBMethods};
 use super::upsert::{EdgeUpsert, NodeUpsert};
@@ -1149,8 +1150,8 @@ pub struct HelixGraphStorage {
     /// = fast/serving tier, `false` = idle tier. Seeded at construction from
     /// [`backend_lsm::reader_cold_open_starts_fast`] — the SAME predicate
     /// [`backend_lsm::reader_options_from_env`] uses to pick the actual
-    /// cold-open poll interval, so this starts in sync with reality (with the
-    /// write-feed configured, a fresh open cold-opens IDLE, not fast). Every
+    /// cold-open poll interval, so this starts in sync with reality (only the
+    /// write-feed with the sweeper kill switch cold-opens IDLE). Every
     /// successful tier change — read-gated promotion/demotion AND the
     /// write-feed poller's own promote/demote — flows through
     /// `set_reader_poll_tier_fast` as the single source of truth, so this is
@@ -4122,12 +4123,33 @@ impl HelixGraphStorage {
         match read_metadata_sidecar_from_lsm_env(path, storage_backend) {
             Ok(Some(bytes)) => {
                 let sidecar: StorageMetadataSidecar = sonic_rs::from_slice(&bytes)?;
-                Self::persist_metadata_sidecar_bytes_at_path(path, &bytes)?;
+                // Readers: skip local persist to avoid `create_dir_all` that
+                // creates a local registry dir for every name ever queried,
+                // leaving dirs that survive drops (bug b).
+                if !storage_backend.is_reader() {
+                    Self::persist_metadata_sidecar_bytes_at_path(path, &bytes)?;
+                }
                 let _ = fs::remove_file(Self::metadata_sidecar_miss_path(path));
                 Ok(Some(sidecar))
             }
             Ok(None) => {
                 Self::remember_lsm_metadata_sidecar_miss(path);
+                // No S3 sidecar is not proof of a drop: collections untouched
+                // since sidecars moved to S3 never uploaded one. A reader drops
+                // its local copy only once the prefix itself is gone (one LIST,
+                // at most once per miss TTL); deleting the file keeps the
+                // remembered-miss path above from serving it again. Writers keep
+                // the local fallback: a just-created sidecar lands in S3 later.
+                if storage_backend.is_reader()
+                    && local_sidecar.is_some()
+                    && matches!(
+                        lsm_collection_prefix_exists_from_env(path, storage_backend),
+                        Ok(false)
+                    )
+                {
+                    let _ = fs::remove_file(Self::metadata_sidecar_path(path));
+                    return Ok(None);
+                }
                 Ok(local_sidecar)
             }
             Err(err) if local_sidecar.is_some() => {
@@ -7311,6 +7333,7 @@ mod tests {
     #[test]
     #[serial]
     fn count_probe_aborts_at_cap() {
+        use super::super::backend_any::AnyBackend;
         use super::super::metadata::PayloadIndexSchema;
         use crate::protocol::value::Value;
 
@@ -7377,6 +7400,58 @@ mod tests {
                 .unwrap(),
             50,
             "an uncapped range count must see every entry"
+        );
+
+        let AnyBackend::Lsm(lsm) = storage.backend.as_ref() else {
+            panic!("fixture must use LSM");
+        };
+        lsm.reset_read_count();
+        assert_eq!(
+            storage
+                .count_nodes_by_payload_range_be(
+                    &r,
+                    "rank",
+                    Some((50.0, true)),
+                    Some((50.0, true)),
+                    10
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            lsm.read_count(),
+            1,
+            "exact count must not scan unrelated ranks"
+        );
+        lsm.reset_read_count();
+        assert_eq!(
+            storage
+                .get_nodes_by_payload_range_be(&r, "rank", Some((50.0, true)), Some((50.0, true)))
+                .unwrap(),
+            vec![50]
+        );
+        assert_eq!(
+            lsm.read_count(),
+            1,
+            "exact lookup must not scan unrelated ranks"
+        );
+        lsm.reset_read_count();
+        assert_eq!(
+            storage
+                .count_nodes_by_payload_range_be(
+                    &r,
+                    "rank",
+                    Some((51.0, true)),
+                    Some((51.0, true)),
+                    10
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            lsm.read_count(),
+            0,
+            "absent exact keys must not scan the index"
         );
     }
 

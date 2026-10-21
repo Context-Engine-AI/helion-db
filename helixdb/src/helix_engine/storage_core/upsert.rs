@@ -58,6 +58,22 @@ impl HelixGraphStorage {
         upsert: &NodeUpsert,
         existing: Option<Node>,
     ) -> Result<Node, GraphError> {
+        let created = existing.is_none();
+        let node = self.upsert_node_be_with_existing_uncounted(w, upsert, existing)?;
+        if created {
+            self.adjust_metadata_counter_be(w, MetadataCounter::Nodes, 1)?;
+        }
+        Ok(node)
+    }
+
+    /// [`Self::upsert_node_be_with_existing`] without the Nodes counter bump, so
+    /// a batch caller can fold its creations into one counter merge.
+    pub(crate) fn upsert_node_be_with_existing_uncounted(
+        &self,
+        w: &mut AnyWrite<'_>,
+        upsert: &NodeUpsert,
+        existing: Option<Node>,
+    ) -> Result<Node, GraphError> {
         let node = Node {
             id: upsert.id,
             label: upsert.label.clone(),
@@ -152,10 +168,6 @@ impl HelixGraphStorage {
         self.backend
             .put(w, Namespace::Nodes, &node.id.to_be_bytes(), &encoded_node)
             .map_err(|e| GraphError::New(e.to_string()))?;
-
-        if existing.is_none() {
-            self.adjust_metadata_counter_be(w, MetadataCounter::Nodes, 1)?;
-        }
 
         Ok(node)
     }

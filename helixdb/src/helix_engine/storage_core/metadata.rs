@@ -49,11 +49,14 @@ pub fn encode_lsm_counter_value(value: u64) -> [u8; 8] {
     value.to_le_bytes()
 }
 
+/// A value SlateDB folded with no base carries a signed delta sum (see
+/// `HelixCounterMergeOperator::merge_batch`), so a negative one reads as zero.
+/// Real counts never reach 2^63, so u64 values decode unchanged.
 pub fn decode_lsm_counter_value(bytes: &[u8]) -> Result<u64, GraphError> {
     let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
         GraphError::StorageError(format!("invalid LSM counter value length {}", bytes.len()))
     })?;
-    Ok(u64::from_le_bytes(bytes))
+    Ok(i64::from_le_bytes(bytes).max(0) as u64)
 }
 
 pub fn encode_lsm_counter_delta(delta: i64) -> [u8; 8] {

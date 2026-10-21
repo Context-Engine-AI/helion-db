@@ -12,9 +12,8 @@
 //! - One `SharedVectorCaches` per pod, held in an `Arc` by `StorageCore`
 //!   and handed to every `VectorCore` at construction.
 //! - Keys are `(namespace_id: u64, point_id: u128, level: u32)`.
-//!   `namespace_id = stable_hash(collection, vector_name)` so two
-//!   collections (or two named vectors in the same collection) with
-//!   overlapping `point_id`s never collide.
+//!   `namespace_id` is process-unique per VectorCore (monotonic counter),
+//!   so no cross-collection or stale-recreate cache conflation occurs.
 //! - Caps are **global**: `HELIX_NEIGHBOR_CACHE_CAP` now means "total
 //!   entries across all collections" instead of "entries per segment".
 //!   Defaults are raised accordingly in the compiled code and the k8s
@@ -23,9 +22,9 @@
 //!   so at 16 concurrent searches they usually fan out to distinct
 //!   shards. Worst case: collision → tiny critical section (one LRU
 //!   put/get) → minimal tail latency.
-//! - `invalidate_namespace(ns)` walks all shards to drop that tenant's
-//!   entries. Rare (collection drop / VectorCore destructor); O(N_total)
-//!   but still cheap because LRU is just a HashMap + DLL.
+//! - Dropped cores' entries become unreachable (unique namespace) and
+//!   are evicted naturally by LRU. `invalidate_namespace` is unused in
+//!   production but kept for test utilities.
 //!
 //! ## Correctness traps avoided
 //!
@@ -56,9 +55,8 @@ pub const SHARDS: usize = 16;
 
 /// Pod-global cache key.
 ///
-/// - `namespace`: `stable_hash(collection_name, vector_name)`. Stable
-///   across process restarts so metrics derived from key distribution
-///   are comparable.
+/// - `namespace`: Per-VectorCore unique counter assigned at construction.
+///   Ensures cross-collection and stale-recreate cache isolation.
 /// - `id`: the point's `u128` id (shared with the graph engine).
 /// - `level`: HNSW level. `u32` keeps the struct size predictable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -108,8 +106,9 @@ impl SharedVectorCaches {
     }
 
     /// Drop every entry belonging to `namespace` across all four caches.
-    /// Called on collection drop / VectorCore teardown so stale entries
-    /// never outlive the data they reference.
+    /// Clears all cache entries for the given namespace.
+    /// With per-core unique namespaces, this is unused in production (HELIX_SHARED_VECTOR_CACHES=1)
+    /// — VectorCore uses namespace switching (O(1)) instead of walking shards (O(N)).
     pub fn invalidate_namespace(&self, namespace: u64) {
         self.neighbor.invalidate_namespace(namespace);
         self.vector.invalidate_namespace(namespace);
@@ -196,11 +195,12 @@ impl<V: Clone> ShardedLru<V> {
     }
 }
 
-/// Derive a stable, process-portable `namespace_id` for a `(collection,
-/// vector)` pair. Uses `DefaultHasher` (SipHash) so the mapping is stable
-/// within a process and collision-resistant; not persisted.
+/// Legacy namespace_id derivation (superseded by per-VectorCore unique counters).
+/// Used only for RED regression test verification — proves that the old approach
+/// (namespace_id(segment_name, "")) caused cross-collection conflation.
+#[cfg(test)]
 #[inline]
-pub fn namespace_id(collection: &str, vector: &str) -> u64 {
+pub(crate) fn namespace_id(collection: &str, vector: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     collection.hash(&mut h);
     // Delimiter so "ab" + "c" ≠ "a" + "bc".

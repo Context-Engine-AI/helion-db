@@ -29,12 +29,17 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering as AtomicOrdering},
         Arc, Condvar, Mutex, RwLock as StdRwLock,
     },
 };
 
 use lru::LruCache;
+
+/// Process-unique cache namespace counter. Each VectorCore construction increments
+/// this to get a unique namespace, preventing cross-collection and stale-recreate
+/// cache conflation under HELIX_SHARED_VECTOR_CACHES=1.
+static NEXT_CACHE_NAMESPACE: AtomicU64 = AtomicU64::new(1);
 
 /// Global semaphore that limits concurrent HNSW builds.
 /// Each build loads all vectors + adjacency into memory (~150MB per 16k×768d segment).
@@ -437,6 +442,37 @@ const DENSE_DELETE_READ_SNAPSHOT_CHUNK_ENV: &str = "HELIX_DENSE_DELETE_READ_SNAP
 #[cfg(test)]
 static DENSE_DELETE_READ_SNAPSHOT_OPENS_FOR_TEST: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Two-phase test hook for `ensure_sidecar_ordinals_loaded`. A test arms the
+/// hook by setting `_ARMED` to `true`. When the function reaches the point
+/// between the scan and the generation check it sets `_FIRED` to `true` and
+/// spins until `_FIRED` is cleared by the test thread.
+#[cfg(test)]
+static ORDINAL_LOAD_POST_SCAN_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static ORDINAL_LOAD_POST_SCAN_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Write-path materializers that found another writer elected and entered
+/// the wait-for-it branch (never attempt the slot lock).
+#[cfg(test)]
+static WRITE_PATH_SIDECAR_WAITERS_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Elected write-path materializers that dropped the slot lock to wait for
+/// a permit lock-free.
+#[cfg(test)]
+static WRITE_PATH_PERMIT_WAITS_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Two-phase hook (same protocol as `ORDINAL_LOAD_POST_SCAN_*`) at the top
+/// of `materialize_exact_hvec_sidecar_from_lsm_rows`, before its row scan.
+#[cfg(test)]
+static MATERIALIZE_PRE_COLLECT_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static MATERIALIZE_PRE_COLLECT_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 fn dense_delete_read_snapshot_chunk_from_raw(raw: Option<&str>) -> usize {
     raw.and_then(|value| value.trim().parse::<usize>().ok())
@@ -1360,7 +1396,9 @@ pub struct VectorCore {
     mmap_store: StdRwLock<Option<super::mmap_vectors::MmapBackend>>,
     /// In-process id -> sidecar ordinal map. When present, HNSW scoring avoids
     /// a SlateDB point-get for every neighbor before reading the mmap row.
-    mmap_ordinals: StdRwLock<Option<SidecarOrdinals>>,
+    /// `Arc` so a write batch's abort hook can retract a publication after
+    /// `insert_flat_be` has returned (see `retract_sidecar_ordinal_on_abort`).
+    mmap_ordinals: Arc<StdRwLock<Option<SidecarOrdinals>>>,
     /// Graph out-edges index from the owning collection's storage core.
     ///
     /// Populated when the VectorCore is constructed for a segment that lives
@@ -1395,14 +1433,15 @@ pub struct VectorCore {
     nav_cache_root: StdRwLock<Option<(u128, usize)>>,
     /// Pod-global sharded cache handle. When `Some`, all cache ops route
     /// here keyed by `(namespace, id, level)` instead of the private LRUs
-    /// above. `namespace` is derived from the owning segment's physical
-    /// name so two cores on the same collection share cache entries where
-    /// their id spaces overlap (rare) without stomping each other.
-    shared_caches: Option<std::sync::Arc<super::shared_cache::SharedVectorCaches>>,
+    /// above. `namespace` is process-unique per VectorCore instance, so
+    /// no cross-collection or stale-recreate cache conflation occurs.
+    pub(crate) shared_caches: Option<std::sync::Arc<super::shared_cache::SharedVectorCaches>>,
     /// Namespace id for `shared_caches` keys. Unused when `shared_caches`
-    /// is `None`. Stable across process restarts (SipHash of the physical
-    /// segment name) so cache-age metrics stay comparable.
-    cache_namespace: u64,
+    /// is `None`. Process-unique (monotonic counter) so dropped/recreated
+    /// cores cannot read stale entries. Atomic so clear/rebuild can switch
+    /// to a fresh namespace (O(1), no shard walk). Trade-off: reopened
+    /// collection starts with cold shared cache (SlateDB block cache stays warm).
+    cache_namespace: AtomicU64,
     /// Set by read-only scan/search paths when an LMDB externalized-vector
     /// marker points to missing mmap sidecar bytes. The index worker uses this
     /// to run a bounded write-side purge only on affected segment cores.
@@ -1429,6 +1468,14 @@ pub struct VectorCore {
     /// any time, so the cached miss expires after
     /// [`lsm_sidecar_miss_ttl_secs`] and the next read re-probes.
     lsm_sidecar_miss_cached_at_secs: AtomicU64,
+    /// Writer only: set under the `mmap_store` lock once the write path stores
+    /// a row without a sidecar slot. No sidecar attaches for the rest of the
+    /// process, so none can be built from a snapshot missing a row this writer
+    /// has not committed yet.
+    sidecar_rows_only: AtomicBool,
+    /// Writer only: the constructor attached an exact file from disk without
+    /// checking it covers the persisted ordinals; the first append checks.
+    sidecar_unchecked: AtomicBool,
     /// In-memory set of ids tombstone-deleted on this segment
     /// (`HELIX_LSM_DELETE_TOMBSTONES`): the row is still physically present
     /// (repair is deferred to the next merge of this segment), so every
@@ -1438,6 +1485,39 @@ pub struct VectorCore {
     /// unconditionally (not gated on the env flag) so a flag flip to OFF
     /// after deletes exist does not resurrect them in search.
     delete_tombstones: StdRwLock<HashSet<u128>>,
+    /// Monotonic counter bumped after every delete-side cache invalidation
+    /// pass (in `remove_cached_sidecar_ordinals`). Readers capture the value
+    /// before a scan; if it moves before the result is installed the scan
+    /// predates a delete and the result must be discarded. Used by
+    /// `ensure_sidecar_ordinals_loaded` to avoid resurrecting deleted ordinals.
+    delete_generation: AtomicU64,
+    /// Write-path reason code for the last sidecar attach failure. Meaningful
+    /// only immediately after `ensure_lsm_mmap_sidecar_with_lock_observer`
+    /// returns `Ok(false)` with `for_write=true`.
+    last_write_sidecar_miss: AtomicU8,
+    /// Floor for the next rebuild's slot count, set from a short-file's
+    /// physical count before it is dropped. Reset to 0 after a successful
+    /// rebuild.
+    ///
+    // shortcut: PVC (persistent-volume) loss drops this floor too, since
+    // it lives in memory only. A persisted high-water ordinal key would
+    // survive PVC loss but adds write-amp for a scenario that also loses
+    // the sidecar file itself; upgrade if PVC-loss ordinal reuse is
+    // observed in production.
+    sidecar_rebuild_min_slots: AtomicU64,
+    /// Per-segment election: only one writer materializes at a time so N
+    /// concurrent writers to one segment consume at most 1 permit.
+    sidecar_materializing: AtomicBool,
+    /// Ids recently hard-deleted (tombstones OFF). Read-side cache fills
+    /// consult it so a read on a snapshot that predates the delete cannot
+    /// refill caches with the deleted vector. See [`HardDeleteGuard`].
+    hard_delete_guard: StdRwLock<HardDeleteGuard>,
+    /// `hard_delete_guard`'s size, for the lock-free empty fast path.
+    hard_delete_guard_count: AtomicUsize,
+    /// Cached length of `delete_tombstones` for a single-atomic fast path
+    /// in `is_delete_tombstoned`; the common case (empty set, tombstones OFF)
+    /// avoids taking the RwLock entirely.
+    delete_tombstones_count: AtomicUsize,
 }
 
 /// Unix-epoch seconds, floored to 1 so `0` stays reserved for "no cached miss".
@@ -1457,6 +1537,18 @@ fn lsm_sidecar_miss_ttl_secs() -> u64 {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(30)
 }
+
+/// Opt-in (`HELIX_LSM_SIDECAR_VERIFY=1`) spot check of each exact sidecar a pod
+/// opens from disk or a published blob. Sidecars rebuilt from rows before
+/// e3ec18de hold rows in id order, while the store's ordinals follow insert order.
+fn lsm_sidecar_verify_enabled() -> bool {
+    std::env::var("HELIX_LSM_SIDECAR_VERIFY")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// Ordinal slots sampled per verified sidecar, spread across the file.
+const SIDECAR_VERIFY_SAMPLE: usize = 64;
 
 fn lsm_sidecar_miss_expired(cached_at_secs: u64, now_secs: u64, ttl_secs: u64) -> bool {
     ttl_secs > 0 && now_secs.saturating_sub(cached_at_secs) >= ttl_secs
@@ -1495,12 +1587,145 @@ impl SidecarMaterializePermit {
             .ok()
             .map(|_| Self { counter })
     }
+
+    /// Write path: wait a bounded time instead of deferring, so a briefly busy
+    /// cap does not send a segment's writes to rows for the whole process.
+    fn acquire_within(timeout: std::time::Duration) -> Option<Self> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(permit) = Self::try_acquire() {
+                return Some(permit);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
 }
 
 impl Drop for SidecarMaterializePermit {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, AtomicOrdering::Release);
     }
+}
+
+/// RAII guard for the per-segment `sidecar_materializing` flag: clears the
+/// flag on drop so a panic cannot leave a segment permanently blocked.
+struct SidecarMaterializingGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> SidecarMaterializingGuard<'a> {
+    fn try_elect(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_ok()
+            .then(|| Self { flag })
+    }
+}
+
+impl Drop for SidecarMaterializingGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, AtomicOrdering::Release);
+    }
+}
+
+/// How long a hard-deleted id stays guarded: at least one window, at most
+/// two. It only has to outlive the longest read snapshot that fills caches —
+/// interactive queries run seconds; segment builds and merges on the writer
+/// read their snapshot for minutes.
+const HARD_DELETE_GUARD_WINDOW_SECS: u64 = 600;
+
+/// Ids hard-deleted in roughly the last two [`HARD_DELETE_GUARD_WINDOW_SECS`].
+///
+/// Two generations: deletes land in `current`; once a window has passed,
+/// `current` becomes `previous` and the old `previous` is dropped, so an id
+/// is guarded for 1–2 windows and memory is bounded by the deletes of the
+/// last two windows (~32 B each). Rotation is lazy — on the next guard
+/// insert or the next guarded lookup — and once both sets are empty the
+/// count atomic restores the lock-free fast path in `is_cache_fill_blocked`.
+/// Nothing un-guards an id: a re-insert publishes its own ordinal and
+/// invalidates its own cache entries, and its reads are served from storage
+/// until the guard expires.
+#[derive(Default)]
+struct HardDeleteGuard {
+    current: HashSet<u128>,
+    previous: HashSet<u128>,
+    /// Unix seconds of the last rotation (0 = never).
+    rotated_at_secs: u64,
+}
+
+impl HardDeleteGuard {
+    fn rotation_due(&self, now_secs: u64) -> bool {
+        now_secs.saturating_sub(self.rotated_at_secs) >= HARD_DELETE_GUARD_WINDOW_SECS
+    }
+
+    fn rotate_if_due(&mut self, now_secs: u64) {
+        if self.rotation_due(now_secs) {
+            self.previous = std::mem::take(&mut self.current);
+            self.rotated_at_secs = now_secs;
+        }
+    }
+
+    fn contains(&self, id: u128) -> bool {
+        self.current.contains(&id) || self.previous.contains(&id)
+    }
+
+    fn len(&self) -> usize {
+        self.current.len() + self.previous.len()
+    }
+}
+
+/// A refused rebuild would re-scan the whole segment on every retry, so a
+/// reader backs off for this many miss TTLs instead of one.
+const SIDECAR_REFUSAL_BACKOFF_TTLS: u64 = 20;
+
+/// Can be transient on a reader (a write landing between its two scans), so
+/// a rebuild refused for it is retried once at once.
+const SIDECAR_ROWS_ORDINALS_DIFFER: &str = "rows and persisted ordinals differ";
+
+/// Longest a write-path rebuild waits for a materialization permit. The
+/// wait never holds the segment's slot lock, so searches are not blocked.
+const SIDECAR_WRITE_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ordinals from here up mark a row the writer stored without a sidecar
+/// slot. They are past the end of every sidecar, so each pod scores the row
+/// from the LSM, and an upsert moves the id off any stale slot a reader holds.
+/// The offset above the base is how many slots the id's old ordinal needed
+/// (0 = none), so a rebuild never ends before a slot some pod may still map.
+const ROW_ONLY_SIDECAR_ORDINAL: u64 = 1 << 62;
+
+/// Slots a sidecar needs to cover a persisted ordinal.
+fn sidecar_slots_needed(ordinal: u64) -> u64 {
+    if ordinal >= ROW_ONLY_SIDECAR_ORDINAL {
+        ordinal - ROW_ONLY_SIDECAR_ORDINAL
+    } else {
+        ordinal + 1
+    }
+}
+
+/// Reason codes stored in `VectorCore::last_write_sidecar_miss`.
+const PIN_REASON_PERMIT_TIMEOUT: u8 = 1;
+const PIN_REASON_REFUSED: u8 = 2;
+const PIN_REASON_CACHED_MISS: u8 = 3;
+const PIN_REASON_MISSING: u8 = 4;
+
+fn pin_reason_label(code: u8) -> &'static str {
+    match code {
+        PIN_REASON_PERMIT_TIMEOUT => "permit_timeout",
+        PIN_REASON_REFUSED => "refused",
+        PIN_REASON_CACHED_MISS => "cached_miss",
+        PIN_REASON_MISSING => "missing",
+        _ => "unknown",
+    }
+}
+
+/// Outcome of rebuilding a segment sidecar from its LSM rows.
+enum RowRebuild {
+    Built(super::mmap_vectors::MmapBackend, HashMap<u128, u64>),
+    NoRows,
+    /// The persisted ordinals cannot describe the rows; reads stay on rows.
+    Refused(&'static str),
 }
 
 impl VectorCore {
@@ -1567,7 +1792,7 @@ impl VectorCore {
             },
             mmap_sidecar_stem: None,
             mmap_store: StdRwLock::new(None), // legacy path — no mmap
-            mmap_ordinals: StdRwLock::new(None),
+            mmap_ordinals: Arc::new(StdRwLock::new(None)),
             graph_out_edges_db: None, // legacy path — no graph
             neighbor_cache: Mutex::new(LruCache::new(neighbor_cache_cap())),
             vector_cache: Mutex::new(LruCache::new(vector_cache_cap())),
@@ -1575,12 +1800,21 @@ impl VectorCore {
             nav_vector_cache: Mutex::new(LruCache::new(nav_cache_cap())),
             nav_cache_root: StdRwLock::new(None),
             shared_caches: None,
-            cache_namespace: 0,
+            cache_namespace: AtomicU64::new(0),
             externalized_marker_repair_needed: AtomicBool::new(false),
             backend,
             physical_name: String::new(),
             lsm_sidecar_miss_cached_at_secs: AtomicU64::new(0),
+            sidecar_rows_only: AtomicBool::new(false),
+            sidecar_unchecked: AtomicBool::new(false),
             delete_tombstones: StdRwLock::new(HashSet::new()),
+            delete_generation: AtomicU64::new(0),
+            last_write_sidecar_miss: AtomicU8::new(0),
+            sidecar_rebuild_min_slots: AtomicU64::new(0),
+            sidecar_materializing: AtomicBool::new(false),
+            hard_delete_guard: StdRwLock::new(HardDeleteGuard::default()),
+            hard_delete_guard_count: AtomicUsize::new(0),
+            delete_tombstones_count: AtomicUsize::new(0),
         })
     }
 
@@ -1603,7 +1837,7 @@ impl VectorCore {
             },
             mmap_sidecar_stem: None,
             mmap_store: StdRwLock::new(None),
-            mmap_ordinals: StdRwLock::new(None),
+            mmap_ordinals: Arc::new(StdRwLock::new(None)),
             graph_out_edges_db: None,
             neighbor_cache: Mutex::new(LruCache::new(neighbor_cache_cap())),
             vector_cache: Mutex::new(LruCache::new(vector_cache_cap())),
@@ -1611,12 +1845,21 @@ impl VectorCore {
             nav_vector_cache: Mutex::new(LruCache::new(nav_cache_cap())),
             nav_cache_root: StdRwLock::new(None),
             shared_caches: None,
-            cache_namespace: 0,
+            cache_namespace: AtomicU64::new(0),
             externalized_marker_repair_needed: AtomicBool::new(false),
             backend,
             physical_name: String::new(),
             lsm_sidecar_miss_cached_at_secs: AtomicU64::new(0),
+            sidecar_rows_only: AtomicBool::new(false),
+            sidecar_unchecked: AtomicBool::new(false),
             delete_tombstones: StdRwLock::new(HashSet::new()),
+            delete_generation: AtomicU64::new(0),
+            last_write_sidecar_miss: AtomicU8::new(0),
+            sidecar_rebuild_min_slots: AtomicU64::new(0),
+            sidecar_materializing: AtomicBool::new(false),
+            hard_delete_guard: StdRwLock::new(HardDeleteGuard::default()),
+            hard_delete_guard_count: AtomicUsize::new(0),
+            delete_tombstones_count: AtomicUsize::new(0),
         })
     }
 
@@ -1632,18 +1875,22 @@ impl VectorCore {
     ) -> Result<Self, VectorError> {
         let mmap_sidecar_stem = data_dir.map(|dir| dir.join(name));
         let (mmap_store, mmap_ordinals) = if let Some(stem) = mmap_sidecar_stem.as_ref() {
-            Self::open_lsm_mmap_sidecar(&backend, name, stem, &spindle, false)?
+            let (store, ordinals, _) =
+                Self::open_lsm_mmap_sidecar(&backend, name, stem, &spindle, false, 0)?;
+            (store, ordinals)
         } else {
             (None, None)
         };
+        let sidecar_unchecked = !backend.is_reader_replica()
+            && mmap_store
+                .as_ref()
+                .is_some_and(super::mmap_vectors::MmapBackend::is_exact);
 
         let shared_caches = if shared_caches_enabled() {
             Some(shared_caches_handle())
         } else {
             None
         };
-        let cache_namespace = super::shared_cache::namespace_id(name, "");
-
         Ok(Self {
             vectors_db: None,
             vector_data_db: None,
@@ -1655,7 +1902,7 @@ impl VectorCore {
             spindle,
             mmap_sidecar_stem,
             mmap_store: StdRwLock::new(mmap_store),
-            mmap_ordinals: StdRwLock::new(mmap_ordinals.map(SidecarOrdinals::Complete)),
+            mmap_ordinals: Arc::new(StdRwLock::new(mmap_ordinals.map(SidecarOrdinals::Complete))),
             graph_out_edges_db: None,
             neighbor_cache: Mutex::new(LruCache::new(neighbor_cache_cap())),
             vector_cache: Mutex::new(LruCache::new(vector_cache_cap())),
@@ -1663,12 +1910,23 @@ impl VectorCore {
             nav_vector_cache: Mutex::new(LruCache::new(nav_cache_cap())),
             nav_cache_root: StdRwLock::new(None),
             shared_caches,
-            cache_namespace,
+            cache_namespace: AtomicU64::new(
+                NEXT_CACHE_NAMESPACE.fetch_add(1, AtomicOrdering::Relaxed),
+            ),
             externalized_marker_repair_needed: AtomicBool::new(false),
             backend,
             physical_name: name.to_string(),
             lsm_sidecar_miss_cached_at_secs: AtomicU64::new(0),
+            sidecar_rows_only: AtomicBool::new(false),
+            sidecar_unchecked: AtomicBool::new(sidecar_unchecked),
             delete_tombstones: StdRwLock::new(HashSet::new()),
+            delete_generation: AtomicU64::new(0),
+            last_write_sidecar_miss: AtomicU8::new(0),
+            sidecar_rebuild_min_slots: AtomicU64::new(0),
+            sidecar_materializing: AtomicBool::new(false),
+            hard_delete_guard: StdRwLock::new(HardDeleteGuard::default()),
+            hard_delete_guard_count: AtomicUsize::new(0),
+            delete_tombstones_count: AtomicUsize::new(0),
         })
     }
 
@@ -1678,10 +1936,12 @@ impl VectorCore {
         stem: &Path,
         spindle: &SpindleConfig,
         allow_backend_materialization: bool,
+        min_slots: usize,
     ) -> Result<
         (
             Option<super::mmap_vectors::MmapBackend>,
             Option<HashMap<u128, u64>>,
+            Option<&'static str>,
         ),
         VectorError,
     > {
@@ -1701,7 +1961,11 @@ impl VectorCore {
                     let _ = fs::remove_file(&hspn_path);
                     let _ = fs::remove_file(&hvs8_path);
                     let _ = fs::remove_file(&hvec_path);
-                    return Ok((Some(super::mmap_vectors::MmapBackend::Hvtq(store)), None));
+                    return Ok((
+                        Some(super::mmap_vectors::MmapBackend::Hvtq(store)),
+                        None,
+                        None,
+                    ));
                 }
                 Err(_) => {
                     let _ = fs::remove_file(&hvtq_path);
@@ -1716,38 +1980,53 @@ impl VectorCore {
                         if allow_backend_materialization {
                             let _ = fs::remove_file(&hspn_path);
                         } else {
-                            return Ok((None, None));
+                            return Ok((None, None, None));
                         }
                     } else {
                         let _ = fs::remove_file(&hvs8_path);
                         let _ = fs::remove_file(&hvec_path);
-                        return Ok((Some(super::mmap_vectors::MmapBackend::Hspn(store)), None));
+                        return Ok((
+                            Some(super::mmap_vectors::MmapBackend::Hspn(store)),
+                            None,
+                            None,
+                        ));
                     }
                 }
                 Err(_) if compact_spindle && allow_backend_materialization => {
                     let _ = fs::remove_file(&hspn_path);
                 }
-                Err(_) => return Ok((None, None)),
+                Err(_) => return Ok((None, None, None)),
             }
         }
 
+        let mut refused = None;
+        let mut rebuild_min_slots = min_slots;
         if compact_spindle && allow_backend_materialization {
-            if let Some((store, ordinals)) = Self::materialize_spindle_sidecar_from_lsm_rows(
+            match Self::materialize_spindle_sidecar_from_lsm_rows(
                 backend,
                 physical_name,
                 &hspn_path,
                 spindle,
+                rebuild_min_slots,
             )? {
-                let _ = fs::remove_file(&hvs8_path);
-                let _ = fs::remove_file(&hvec_path);
-                return Ok((Some(store), Some(ordinals)));
+                RowRebuild::Built(store, ordinals) => {
+                    let _ = fs::remove_file(&hvs8_path);
+                    let _ = fs::remove_file(&hvec_path);
+                    return Ok((Some(store), Some(ordinals), None));
+                }
+                RowRebuild::Refused(reason) => refused = Some(reason),
+                RowRebuild::NoRows => {}
             }
         }
 
         if hvs8_path.exists() {
             match super::mmap_vectors::MmapQuantizedStore::open(&hvs8_path) {
                 Ok(store) => {
-                    return Ok((Some(super::mmap_vectors::MmapBackend::Hvs8(store)), None));
+                    return Ok((
+                        Some(super::mmap_vectors::MmapBackend::Hvs8(store)),
+                        None,
+                        None,
+                    ));
                 }
                 Err(_) => {
                     let _ = fs::remove_file(&hvs8_path);
@@ -1759,46 +2038,257 @@ impl VectorCore {
             Self::restore_hvec_sidecar_blob(backend, physical_name, &hvec_path)?;
         }
 
+        let mut republish = false;
         if hvec_path.exists() {
             match super::mmap_vectors::MmapVectorStore::open(&hvec_path) {
+                // Leave the check to the first read, which runs it under a permit.
+                Ok(_) if !allow_backend_materialization && lsm_sidecar_verify_enabled() => {
+                    return Ok((None, None, None));
+                }
                 Ok(store) => {
                     if store.count() == 0 {
                         if allow_backend_materialization {
                             let _ = fs::remove_file(&hvec_path);
                         } else {
-                            return Ok((None, None));
+                            return Ok((None, None, None));
                         }
+                    } else if lsm_sidecar_verify_enabled()
+                        && !Self::hvec_sidecar_matches_rows(backend, physical_name, &store)
+                    {
+                        tracing::warn!(
+                            sidecar = %hvec_path.display(),
+                            "sidecar slots do not match their rows; rebuilding from rows"
+                        );
+                        drop(store);
+                        let _ = fs::remove_file(&hvec_path);
+                        republish = true;
                     } else {
                         let ordinals = if allow_backend_materialization {
                             Self::load_hvec_sidecar_ordinals_blob(backend, physical_name)?
                         } else {
                             None
                         };
-                        return Ok((
-                            Some(super::mmap_vectors::MmapBackend::Hvec(store)),
-                            ordinals,
-                        ));
+                        // Sealed segments publish their map and take no appends.
+                        // Without one, a writer appends next, so the file must
+                        // cover the store's ordinals.
+                        if ordinals.is_some()
+                            || !allow_backend_materialization
+                            || backend.is_reader_replica()
+                            || Self::sidecar_covers_persisted_ordinals(
+                                backend,
+                                physical_name,
+                                store.count(),
+                            )?
+                        {
+                            return Ok((
+                                Some(super::mmap_vectors::MmapBackend::Hvec(store)),
+                                ordinals,
+                                None,
+                            ));
+                        }
+                        tracing::warn!(
+                            sidecar = %hvec_path.display(),
+                            "persisted ordinals run past the sidecar's end; rebuilding from rows"
+                        );
+                        metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "short_file")
+                            .increment(1);
+                        rebuild_min_slots = rebuild_min_slots.max(store.count() as usize);
+                        drop(store);
+                        let _ = fs::remove_file(&hvec_path);
                     }
                 }
                 Err(_) if allow_backend_materialization => {
                     let _ = fs::remove_file(&hvec_path);
                 }
-                Err(_) => return Ok((None, None)),
+                Err(_) => return Ok((None, None, None)),
             }
         }
 
         if allow_backend_materialization && spindle.mode == SpindleMode::None {
-            if let Some((store, ordinals)) = Self::materialize_exact_hvec_sidecar_from_lsm_rows(
+            match Self::materialize_exact_hvec_sidecar_from_lsm_rows(
                 backend,
                 physical_name,
                 &hvec_path,
                 spindle,
+                rebuild_min_slots,
             )? {
-                return Ok((Some(store), Some(ordinals)));
+                RowRebuild::Built(store, ordinals) => {
+                    if republish {
+                        Self::republish_hvec_sidecar_blob(backend, physical_name, &hvec_path)?;
+                    }
+                    return Ok((Some(store), Some(ordinals), None));
+                }
+                RowRebuild::Refused(reason) => refused = Some(reason),
+                RowRebuild::NoRows => {}
             }
         }
 
-        Ok((None, None))
+        Ok((None, None, refused))
+    }
+
+    /// Compare sampled sidecar slots with their decoded level-0 rows, where
+    /// the persisted ordinals place them. A failed check keeps the file: it is
+    /// what every pod served before the check existed.
+    fn hvec_sidecar_matches_rows(
+        backend: &AnyBackend,
+        physical_name: &str,
+        store: &super::mmap_vectors::MmapVectorStore,
+    ) -> bool {
+        let outcome = match Self::sampled_hvec_slots_match_rows(backend, physical_name, store) {
+            Ok(true) => "ok",
+            Ok(false) => "mismatch",
+            Err(error) => {
+                tracing::warn!(segment = physical_name, %error, "sidecar check failed; keeping the sidecar");
+                "error"
+            }
+        };
+        metrics::counter!("helix_lsm_sidecar_verify_total", "outcome" => outcome).increment(1);
+        outcome != "mismatch"
+    }
+
+    fn sampled_hvec_slots_match_rows(
+        backend: &AnyBackend,
+        physical_name: &str,
+        store: &super::mmap_vectors::MmapVectorStore,
+    ) -> Result<bool, VectorError> {
+        let r = backend
+            .begin_read()
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        // Every `step`-th slotted entry, so the sample spans the segment
+        // without holding the whole ordinal map.
+        let step = store.count().div_ceil(SIDECAR_VERIFY_SAMPLE as u64).max(1);
+        let mut sampled = Vec::with_capacity(SIDECAR_VERIFY_SAMPLE);
+        let mut slotted = 0u64;
+        let mut scan_err = None;
+        backend
+            .scan(
+                &r,
+                Namespace::Segment {
+                    physical_name,
+                    db: SegmentDb::Ordinals,
+                },
+                KeyRange::all(),
+                |key, value| {
+                    let (Ok(id_bytes), Ok(ordinal)) =
+                        (<[u8; 16]>::try_from(key), Self::ordinal_from_bytes(value))
+                    else {
+                        scan_err = Some(VectorError::InvalidVectorData);
+                        return false;
+                    };
+                    if ordinal < store.count() {
+                        if slotted % step == 0 {
+                            sampled.push((u128::from_be_bytes(id_bytes), ordinal));
+                        }
+                        slotted += 1;
+                    }
+                    true
+                },
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        if let Some(err) = scan_err {
+            return Err(err);
+        }
+        for (id, ordinal) in sampled {
+            let row = backend
+                .get_with(
+                    &r,
+                    Namespace::Segment {
+                        physical_name,
+                        db: SegmentDb::Vectors,
+                    },
+                    &Self::vector_key(id, 0),
+                    |opt| opt.map(|bytes| bytes.to_vec()),
+                )
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            let Some(row) = row.filter(|row| !Self::is_vector_marker(row)) else {
+                continue;
+            };
+            if store.get(ordinal) != Some(decode_vector(&row)?.as_slice()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether a sidecar of `count` slots covers every persisted ordinal. One
+    /// at or past the end means the file lost appends (a crash between the LSM
+    /// commit and its header flush), and appending to it would hand out
+    /// ordinals other ids already hold.
+    fn sidecar_covers_persisted_ordinals(
+        backend: &AnyBackend,
+        physical_name: &str,
+        count: u64,
+    ) -> Result<bool, VectorError> {
+        let r = backend
+            .begin_read()
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        let mut covered = true;
+        let mut scan_err = None;
+        backend
+            .scan(
+                &r,
+                Namespace::Segment {
+                    physical_name,
+                    db: SegmentDb::Ordinals,
+                },
+                KeyRange::all(),
+                |_, value| match Self::ordinal_from_bytes(value) {
+                    Ok(ordinal) => {
+                        covered = sidecar_slots_needed(ordinal) <= count;
+                        covered
+                    }
+                    Err(err) => {
+                        scan_err = Some(err);
+                        false
+                    }
+                },
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        match scan_err {
+            Some(err) => Err(err),
+            None => Ok(covered),
+        }
+    }
+
+    /// Writer only: replace a published blob behind a sidecar that failed
+    /// verification with the rebuild, so other pods stop restoring it.
+    fn republish_hvec_sidecar_blob(
+        backend: &AnyBackend,
+        physical_name: &str,
+        hvec_path: &Path,
+    ) -> Result<(), VectorError> {
+        if !matches!(backend, AnyBackend::Lsm(_)) {
+            return Ok(());
+        }
+        let ns = Namespace::Segment {
+            physical_name,
+            db: SegmentDb::VectorData,
+        };
+        let r = backend
+            .begin_read()
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        let published = backend
+            .get_with(&r, ns, HVEC_SIDECAR_BLOB_KEY, |opt| opt.is_some())
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        drop(r);
+        if !published {
+            return Ok(());
+        }
+        let bytes = fs::read(hvec_path)
+            .map_err(|e| VectorError::VectorCoreError(format!("hvec blob read failed: {e}")))?;
+        let mut w = backend
+            .begin_write()
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        backend
+            .put(&mut w, ns, HVEC_SIDECAR_BLOB_KEY, &bytes)
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        backend
+            .commit(w)
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        tracing::warn!(sidecar = %hvec_path.display(), "republished sidecar blob rebuilt from rows");
+        metrics::counter!("helix_lsm_sidecar_verify_total", "outcome" => "republished")
+            .increment(1);
+        Ok(())
     }
 
     /// Create a VectorCore with namespaced database names for multi-vector support.
@@ -1925,18 +2415,15 @@ impl VectorCore {
             None
         };
 
-        // Shared-cache wire-up: only the "with_dir" path has a physical
-        // segment name, so this is where we derive the namespace id and
-        // (if enabled) grab the pod-global cache handle. When the flag
-        // is off, `shared_caches` stays None and the private LRUs above
-        // handle everything — exactly the pre-PR behavior.
+        // Shared-cache wire-up: Per-VectorCore unique namespace is assigned at
+        // construction (AtomicU64 counter). If HELIX_SHARED_VECTOR_CACHES=1, grab
+        // the pod-global cache handle; otherwise `shared_caches` stays None and
+        // the private LRUs handle everything.
         let shared_caches = if shared_caches_enabled() {
             Some(shared_caches_handle())
         } else {
             None
         };
-        let cache_namespace = super::shared_cache::namespace_id(name, "");
-
         Ok(Self {
             vectors_db,
             vector_data_db,
@@ -1948,7 +2435,7 @@ impl VectorCore {
             spindle,
             mmap_sidecar_stem,
             mmap_store: StdRwLock::new(mmap_store),
-            mmap_ordinals: StdRwLock::new(None),
+            mmap_ordinals: Arc::new(StdRwLock::new(None)),
             graph_out_edges_db,
             neighbor_cache: Mutex::new(LruCache::new(neighbor_cache_cap())),
             vector_cache: Mutex::new(LruCache::new(vector_cache_cap())),
@@ -1956,12 +2443,23 @@ impl VectorCore {
             nav_vector_cache: Mutex::new(LruCache::new(nav_cache_cap())),
             nav_cache_root: StdRwLock::new(None),
             shared_caches,
-            cache_namespace,
+            cache_namespace: AtomicU64::new(
+                NEXT_CACHE_NAMESPACE.fetch_add(1, AtomicOrdering::Relaxed),
+            ),
             externalized_marker_repair_needed: AtomicBool::new(false),
             backend,
             physical_name: name.to_string(),
             lsm_sidecar_miss_cached_at_secs: AtomicU64::new(0),
+            sidecar_rows_only: AtomicBool::new(false),
+            sidecar_unchecked: AtomicBool::new(false),
             delete_tombstones: StdRwLock::new(HashSet::new()),
+            delete_generation: AtomicU64::new(0),
+            last_write_sidecar_miss: AtomicU8::new(0),
+            sidecar_rebuild_min_slots: AtomicU64::new(0),
+            sidecar_materializing: AtomicBool::new(false),
+            hard_delete_guard: StdRwLock::new(HardDeleteGuard::default()),
+            hard_delete_guard_count: AtomicUsize::new(0),
+            delete_tombstones_count: AtomicUsize::new(0),
         })
     }
 
@@ -2134,10 +2632,23 @@ impl VectorCore {
     }
 
     fn build_sidecar_ordinal_map(point_ids: &[u128]) -> Result<HashMap<u128, u64>, VectorError> {
+        Self::build_sidecar_ordinal_map_with_floor(point_ids, 0)
+    }
+
+    fn build_sidecar_ordinal_map_with_floor(
+        point_ids: &[u128],
+        min_slots: usize,
+    ) -> Result<HashMap<u128, u64>, VectorError> {
+        let start = min_slots as u64;
         let mut ordinals = HashMap::with_capacity(point_ids.len());
-        for (ordinal, id) in point_ids.iter().enumerate() {
-            let ordinal = u64::try_from(ordinal)
-                .map_err(|_| VectorError::VectorCoreError("sidecar ordinal exceeds u64".into()))?;
+        for (i, id) in point_ids.iter().enumerate() {
+            let ordinal = start
+                .checked_add(u64::try_from(i).map_err(|_| {
+                    VectorError::VectorCoreError("sidecar ordinal exceeds u64".into())
+                })?)
+                .ok_or_else(|| {
+                    VectorError::VectorCoreError("sidecar ordinal exceeds u64".into())
+                })?;
             ordinals.insert(*id, ordinal);
         }
         Ok(ordinals)
@@ -2151,6 +2662,21 @@ impl VectorCore {
     fn record_lsm_sidecar_miss(&self) {
         self.lsm_sidecar_miss_cached_at_secs
             .store(unix_secs_now_nonzero(), AtomicOrdering::Relaxed);
+    }
+
+    /// Like a miss, but expiry (`cached_at + ttl`) is pushed out by stamping
+    /// the miss in the future.
+    fn record_lsm_sidecar_refusal(&self, stem: &Path, reason: &'static str) {
+        tracing::warn!(
+            sidecar = %stem.display(),
+            reason,
+            "sidecar rebuild refused; serving this segment's vectors from rows"
+        );
+        let backoff = lsm_sidecar_miss_ttl_secs().saturating_mul(SIDECAR_REFUSAL_BACKOFF_TTLS - 1);
+        self.lsm_sidecar_miss_cached_at_secs.store(
+            unix_secs_now_nonzero().saturating_add(backoff),
+            AtomicOrdering::Relaxed,
+        );
     }
 
     /// True while a cached "sidecar missing" probe is still authoritative. On
@@ -2185,18 +2711,139 @@ impl VectorCore {
         true
     }
 
+    /// Point-id → sidecar ordinal rows persisted for one segment.
+    fn scan_persisted_sidecar_ordinals(
+        backend: &AnyBackend,
+        read: &AnyRead<'_>,
+        physical_name: &str,
+    ) -> Result<HashMap<u128, u64>, VectorError> {
+        let mut loaded = HashMap::new();
+        let mut scan_err: Option<VectorError> = None;
+        backend
+            .scan(
+                read,
+                Namespace::Segment {
+                    physical_name,
+                    db: SegmentDb::Ordinals,
+                },
+                KeyRange::all(),
+                |key, value| {
+                    let Ok(id_bytes) = <[u8; 16]>::try_from(key) else {
+                        scan_err = Some(VectorError::InvalidVectorData);
+                        return false;
+                    };
+                    match Self::ordinal_from_bytes(value) {
+                        Ok(ordinal) => {
+                            loaded.insert(u128::from_be_bytes(id_bytes), ordinal);
+                            true
+                        }
+                        Err(err) => {
+                            scan_err = Some(err);
+                            false
+                        }
+                    }
+                },
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        match scan_err {
+            Some(err) => Err(err),
+            None => Ok(loaded),
+        }
+    }
+
+    /// Lay rebuilt sidecar rows out at their persisted ordinals. Reader replicas
+    /// (and a reopened writer) resolve ordinals from the store, so a sidecar
+    /// rebuilt from rows must match it slot for slot. `None` slots are dead
+    /// (deleted) ordinals that no id maps to. Row-only ordinals
+    /// ([`ROW_ONLY_SIDECAR_ORDINAL`]) get no slot and stay scored from rows.
+    /// `Err(reason)` means the persisted ordinals cannot describe these rows,
+    /// so the segment serves from rows.
+    fn layout_rows_by_persisted_ordinals<T>(
+        rows: Vec<(u128, T)>,
+        persisted: &HashMap<u128, u64>,
+        min_slots: usize,
+    ) -> Result<Result<(Vec<Option<T>>, HashMap<u128, u64>), &'static str>, VectorError> {
+        if persisted.is_empty() {
+            let point_ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            let ordinals = Self::build_sidecar_ordinal_map_with_floor(&point_ids, min_slots)?;
+            let slot_count = ordinals
+                .values()
+                .copied()
+                .max()
+                .map(|o| o as usize + 1)
+                .unwrap_or(0)
+                .max(min_slots);
+            let mut slots: Vec<Option<T>> =
+                std::iter::repeat_with(|| None).take(slot_count).collect();
+            for (id, row) in rows {
+                if let Some(&ordinal) = ordinals.get(&id) {
+                    if (ordinal as usize) < slots.len() {
+                        slots[ordinal as usize] = Some(row);
+                    }
+                }
+            }
+            return Ok(Ok((slots, ordinals)));
+        }
+        let slots_needed = persisted
+            .values()
+            .map(|&ordinal| sidecar_slots_needed(ordinal))
+            .max()
+            .unwrap_or(0);
+        // A file that is mostly dead slots, or a corrupt ordinal, is not worth
+        // building. When min_slots (the short-file floor) exceeds the 16x
+        // ceiling, clamp to the ceiling: the floor records a past file's size,
+        // not an invariant, and refusing the rebuild pins the segment to rows.
+        let ceiling = rows.len().saturating_mul(16).max(4096);
+        let slot_count = match usize::try_from(slots_needed) {
+            Ok(count) => {
+                if min_slots > ceiling.max(count) {
+                    metrics::counter!("helix_lsm_sidecar_rebuild_floor_clamped_total").increment(1);
+                }
+                count.max(min_slots).min(ceiling.max(count))
+            }
+            _ => return Ok(Err("persisted ordinals are mostly dead or out of range")),
+        };
+        if slot_count > ceiling {
+            return Ok(Err("persisted ordinals are mostly dead or out of range"));
+        }
+        // Every row needs its ordinal (flat search walks ordinals only), and
+        // every ordinal its row.
+        if rows.len() != persisted.len() {
+            return Ok(Err(SIDECAR_ROWS_ORDINALS_DIFFER));
+        }
+        let mut slots: Vec<Option<T>> = std::iter::repeat_with(|| None).take(slot_count).collect();
+        for (id, row) in rows {
+            let Some(&ordinal) = persisted.get(&id) else {
+                return Ok(Err(SIDECAR_ROWS_ORDINALS_DIFFER));
+            };
+            if ordinal >= ROW_ONLY_SIDECAR_ORDINAL {
+                continue;
+            }
+            let slot = &mut slots[ordinal as usize];
+            if slot.is_some() {
+                return Ok(Err("two ids share a persisted ordinal"));
+            }
+            *slot = Some(row);
+        }
+        Ok(Ok((slots, persisted.clone())))
+    }
+
     fn collect_exact_hvec_rows_from_lsm(
         backend: &AnyBackend,
         physical_name: &str,
         spindle: &SpindleConfig,
-    ) -> Result<Vec<(u128, Vec<f32>)>, VectorError> {
+    ) -> Result<(Vec<(u128, Vec<f32>)>, HashMap<u128, u64>), VectorError> {
         if backend.kind() != BackendKind::Lsm || spindle.mode != SpindleMode::None {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), HashMap::new()));
         }
 
         let r = backend
             .begin_read()
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        // Ordinals first: on an unpinned reader handle a row written between the
+        // two scans then lacks an ordinal (refusal) or lands on a slot no live
+        // ordinal points at; it never puts a stale vector at a live ordinal.
+        let persisted = Self::scan_persisted_sidecar_ordinals(backend, &r, physical_name)?;
         let mut encoded_rows = Vec::new();
         let id_start = VECTOR_PREFIX.len();
         let id_end = id_start + std::mem::size_of::<u128>();
@@ -2233,7 +2880,7 @@ impl VectorCore {
             rows.push((id, decode_vector(&encoded)?));
         }
         rows.sort_unstable_by_key(|(id, _)| *id);
-        Ok(rows)
+        Ok((rows, persisted))
     }
 
     fn compact_spindle_sidecar_supported(spindle: &SpindleConfig) -> bool {
@@ -2244,14 +2891,16 @@ impl VectorCore {
         backend: &AnyBackend,
         physical_name: &str,
         spindle: &SpindleConfig,
-    ) -> Result<Vec<(u128, Vec<u8>)>, VectorError> {
+    ) -> Result<(Vec<(u128, Vec<u8>)>, HashMap<u128, u64>), VectorError> {
         if backend.kind() != BackendKind::Lsm || !Self::compact_spindle_sidecar_supported(spindle) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), HashMap::new()));
         }
 
         let r = backend
             .begin_read()
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        // Ordinals first; see `collect_exact_hvec_rows_from_lsm`.
+        let persisted = Self::scan_persisted_sidecar_ordinals(backend, &r, physical_name)?;
         let mut rows = Vec::new();
         let id_start = VECTOR_PREFIX.len();
         let id_end = id_start + std::mem::size_of::<u128>();
@@ -2284,7 +2933,7 @@ impl VectorCore {
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
 
         rows.sort_unstable_by_key(|(id, _)| *id);
-        Ok(rows)
+        Ok((rows, persisted))
     }
 
     fn materialize_exact_hvec_sidecar_from_lsm_rows(
@@ -2292,22 +2941,40 @@ impl VectorCore {
         physical_name: &str,
         hvec_path: &Path,
         spindle: &SpindleConfig,
-    ) -> Result<Option<(super::mmap_vectors::MmapBackend, HashMap<u128, u64>)>, VectorError> {
-        let rows = Self::collect_exact_hvec_rows_from_lsm(backend, physical_name, spindle)?;
-        if rows.is_empty() {
-            return Ok(None);
+        min_slots: usize,
+    ) -> Result<RowRebuild, VectorError> {
+        // Test hook: the short-file check that set `min_slots` and this row
+        // scan read different snapshots; a test commits deletes in between.
+        #[cfg(test)]
+        if MATERIALIZE_PRE_COLLECT_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+            MATERIALIZE_PRE_COLLECT_FIRED.store(true, std::sync::atomic::Ordering::Release);
+            while MATERIALIZE_PRE_COLLECT_FIRED.load(std::sync::atomic::Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
         }
-        let point_ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        let slices = rows
+        let (rows, persisted) =
+            Self::collect_exact_hvec_rows_from_lsm(backend, physical_name, spindle)?;
+        if rows.is_empty() {
+            return Ok(RowRebuild::NoRows);
+        }
+        let (slots, ordinals) =
+            match Self::layout_rows_by_persisted_ordinals(rows, &persisted, min_slots)? {
+                Ok(layout) => layout,
+                Err(reason) => return Ok(RowRebuild::Refused(reason)),
+            };
+        // Dead slots are unreachable; they repeat any live row.
+        let Some(filler) = slots.iter().flatten().next().map(Vec::as_slice) else {
+            return Ok(RowRebuild::NoRows);
+        };
+        let slices = slots
             .iter()
-            .map(|(_, row)| row.as_slice())
+            .map(|slot| slot.as_deref().unwrap_or(filler))
             .collect::<Vec<_>>();
         let store = super::mmap_vectors::MmapVectorStore::create_from_slices(hvec_path, &slices)?;
-        let ordinals = Self::build_sidecar_ordinal_map(&point_ids)?;
-        Ok(Some((
+        Ok(RowRebuild::Built(
             super::mmap_vectors::MmapBackend::Hvec(store),
             ordinals,
-        )))
+        ))
     }
 
     fn materialize_spindle_sidecar_from_lsm_rows(
@@ -2315,41 +2982,112 @@ impl VectorCore {
         physical_name: &str,
         hspn_path: &Path,
         spindle: &SpindleConfig,
-    ) -> Result<Option<(super::mmap_vectors::MmapBackend, HashMap<u128, u64>)>, VectorError> {
-        let rows = Self::collect_spindle_encoded_rows_from_lsm(backend, physical_name, spindle)?;
+        min_slots: usize,
+    ) -> Result<RowRebuild, VectorError> {
+        let (rows, persisted) =
+            Self::collect_spindle_encoded_rows_from_lsm(backend, physical_name, spindle)?;
         if rows.is_empty() {
-            return Ok(None);
+            return Ok(RowRebuild::NoRows);
         }
-        let point_ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        let slices = rows
+        let (slots, ordinals) =
+            match Self::layout_rows_by_persisted_ordinals(rows, &persisted, min_slots)? {
+                Ok(layout) => layout,
+                Err(reason) => return Ok(RowRebuild::Refused(reason)),
+            };
+        // Dead slots are unreachable; they repeat any live row.
+        let Some(filler) = slots.iter().flatten().next().map(Vec::as_slice) else {
+            return Ok(RowRebuild::NoRows);
+        };
+        let slices = slots
             .iter()
-            .map(|(_, row)| row.as_slice())
+            .map(|slot| slot.as_deref().unwrap_or(filler))
             .collect::<Vec<_>>();
         let store = super::mmap_vectors::MmapSpindleStore::create_from_encoded(hspn_path, &slices)?;
-        let ordinals = Self::build_sidecar_ordinal_map(&point_ids)?;
-        Ok(Some((
+        Ok(RowRebuild::Built(
             super::mmap_vectors::MmapBackend::Hspn(store),
             ordinals,
-        )))
+        ))
     }
 
-    pub(crate) fn ensure_exact_hvec_sidecar_for_write(
-        &self,
-        dim: usize,
-    ) -> Result<(), VectorError> {
-        if self.backend.kind() != BackendKind::Lsm || dim == 0 {
-            return Ok(());
+    fn has_persisted_sidecar_ordinals(&self) -> Result<bool, VectorError> {
+        let r = self
+            .backend
+            .begin_read()
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        Ok(!self.ns_empty_be(&r, SegmentDb::Ordinals)?)
+    }
+
+    /// Attach the exact sidecar a write-path append needs. Never fails the
+    /// insert: `false` means this row must be stored without a slot, because
+    /// the attached file could not be checked.
+    pub(crate) fn ensure_exact_hvec_sidecar_for_write(&self, dim: usize) -> bool {
+        if self.backend.kind() != BackendKind::Lsm
+            || dim == 0
+            || self.sidecar_rows_only.load(AtomicOrdering::Acquire)
+        {
+            return true;
         }
         let Some(stem) = self.mmap_sidecar_stem.as_ref() else {
-            return Ok(());
+            return true;
         };
-        if self
-            .mmap_store
-            .read()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|_| ()))
-            .is_some()
-        {
+        match self.attach_exact_hvec_sidecar_for_write(stem, dim) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    sidecar = %stem.display(),
+                    %error,
+                    "sidecar unavailable for this write; storing the row without a slot"
+                );
+                metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "error")
+                    .increment(1);
+                false
+            }
+        }
+    }
+
+    fn attach_exact_hvec_sidecar_for_write(
+        &self,
+        stem: &Path,
+        dim: usize,
+    ) -> Result<(), VectorError> {
+        if self.has_mmap_sidecar() {
+            if !self.sidecar_unchecked.load(AtomicOrdering::Acquire) {
+                return Ok(());
+            }
+            let mut slot = self
+                .mmap_store
+                .write()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+            if let Some(store) = slot.as_ref() {
+                if Self::sidecar_covers_persisted_ordinals(
+                    &self.backend,
+                    &self.physical_name,
+                    store.count(),
+                )? {
+                    self.sidecar_unchecked.store(false, AtomicOrdering::Release);
+                    return Ok(());
+                }
+                tracing::warn!(
+                    sidecar = %store.path().display(),
+                    "persisted ordinals run past the sidecar's end; rebuilding from rows"
+                );
+                metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "short_file")
+                    .increment(1);
+                // Floor the next rebuild at the old file's physical count so
+                // no new ordinal lands at or below an existing slot.
+                let old_count = store.count();
+                self.sidecar_rebuild_min_slots
+                    .fetch_max(old_count as u64, AtomicOrdering::Relaxed);
+                let path = store.path().to_path_buf();
+                *slot = None;
+                let _ = fs::remove_file(path);
+            }
+            self.sidecar_unchecked.store(false, AtomicOrdering::Release);
+        }
+        // A fresh file's first append would reuse ordinal 0, which a persisted
+        // id may hold. Restore or rebuild the persisted layout instead.
+        if self.has_persisted_sidecar_ordinals()? {
+            self.ensure_lsm_mmap_sidecar_with_lock_observer(|| {}, true)?;
             return Ok(());
         }
 
@@ -2481,9 +3219,13 @@ impl VectorCore {
     }
 
     #[inline]
-    fn invalidate_neighbor_cache_entry(&self, id: u128, level: usize) {
+    pub(crate) fn invalidate_neighbor_cache_entry(&self, id: u128, level: usize) {
         if let Some(shared) = self.shared_caches.as_ref() {
-            let key = super::shared_cache::CacheKey::new(self.cache_namespace, id, level);
+            let key = super::shared_cache::CacheKey::new(
+                self.cache_namespace.load(AtomicOrdering::Relaxed),
+                id,
+                level,
+            );
             shared.neighbor.pop(&key);
             shared.nav_neighbor.pop(&key);
             return;
@@ -2497,9 +3239,13 @@ impl VectorCore {
     }
 
     #[inline]
-    fn invalidate_vector_cache_entry(&self, id: u128, level: usize) {
+    pub(crate) fn invalidate_vector_cache_entry(&self, id: u128, level: usize) {
         if let Some(shared) = self.shared_caches.as_ref() {
-            let key = super::shared_cache::CacheKey::new(self.cache_namespace, id, level);
+            let key = super::shared_cache::CacheKey::new(
+                self.cache_namespace.load(AtomicOrdering::Relaxed),
+                id,
+                level,
+            );
             shared.vector.pop(&key);
             shared.nav_vector.pop(&key);
             return;
@@ -2514,12 +3260,17 @@ impl VectorCore {
 
     #[inline]
     fn clear_neighbor_cache(&self) {
-        // When shared, clearing on `self` is intentionally a no-op: the
-        // pod-global cache is cleared via `invalidate_namespace` at
-        // collection drop, and individual segment clears would stomp
-        // peer cores sharing the same namespace. Other cores' entries
-        // survive LRU eviction instead.
+        // When shared, switch to a fresh namespace (O(1), no shard walk).
+        // Old entries become unreachable and are evicted naturally by LRU.
         if self.shared_caches.is_some() {
+            self.cache_namespace.store(
+                NEXT_CACHE_NAMESPACE.fetch_add(1, AtomicOrdering::Relaxed),
+                AtomicOrdering::Relaxed,
+            );
+            // Reset nav_cache_root too (it caches entry-point state)
+            if let Ok(mut root) = self.nav_cache_root.write() {
+                *root = None;
+            }
             return;
         }
         if let Ok(mut cache) = self.neighbor_cache.lock() {
@@ -2535,7 +3286,12 @@ impl VectorCore {
 
     #[inline]
     fn clear_vector_cache(&self) {
+        // When shared, switch to a fresh namespace (O(1), no shard walk).
         if self.shared_caches.is_some() {
+            self.cache_namespace.store(
+                NEXT_CACHE_NAMESPACE.fetch_add(1, AtomicOrdering::Relaxed),
+                AtomicOrdering::Relaxed,
+            );
             return;
         }
         if let Ok(mut cache) = self.vector_cache.lock() {
@@ -2549,7 +3305,11 @@ impl VectorCore {
     #[inline]
     fn cache_vector(&self, id: u128, level: usize, data: &[f32]) {
         if let Some(shared) = self.shared_caches.as_ref() {
-            let key = super::shared_cache::CacheKey::new(self.cache_namespace, id, level);
+            let key = super::shared_cache::CacheKey::new(
+                self.cache_namespace.load(AtomicOrdering::Relaxed),
+                id,
+                level,
+            );
             if level > 0 {
                 shared.nav_vector.put(key, data.to_vec());
             }
@@ -2579,8 +3339,13 @@ impl VectorCore {
         level: usize,
         data: &[f32],
     ) {
-        if Self::can_use_global_vector_cache(read_context) {
+        if Self::can_use_global_vector_cache(read_context) && !self.is_cache_fill_blocked(id) {
             self.cache_vector(id, level, data);
+            // A delete may have guarded `id` between the check and the
+            // insert, with its own invalidation landing before our entry.
+            if self.is_cache_fill_blocked(id) {
+                self.invalidate_vector_cache_entry(id, level);
+            }
         }
     }
 
@@ -3277,7 +4042,7 @@ impl VectorCore {
         // segments are waiting to merge into HVS8.
         let should_append_raw_sidecar = !self.spindle.is_enabled() || self.spindle.keep_original;
         if level == 0 && should_append_raw_sidecar {
-            self.ensure_exact_hvec_sidecar_for_write(data.len())?;
+            self.ensure_exact_hvec_sidecar_for_write(data.len());
             if let Ok(mut slot) = self.mmap_store.write() {
                 if let Some(store) = slot.as_mut() {
                     if store.dim() == data.len() {
@@ -3291,7 +4056,7 @@ impl VectorCore {
                                 &ordinal.to_le_bytes(),
                             )
                             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
-                        self.cache_sidecar_ordinal(id, ordinal);
+                        self.publish_sidecar_ordinal(id, ordinal);
                     }
                 }
             }
@@ -3449,7 +4214,7 @@ impl VectorCore {
                 &ordinal.to_le_bytes(),
             )
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
-        self.cache_sidecar_ordinal(id, ordinal);
+        self.publish_sidecar_ordinal(id, ordinal);
         self.put_vector_marker(txn, id, 0)?;
         Ok(true)
     }
@@ -4187,12 +4952,21 @@ impl VectorCore {
         }
 
         if self.backend.kind() == BackendKind::Lsm && !self.spindle.is_enabled() {
-            self.ensure_exact_hvec_sidecar_for_write(data.len())?;
+            let may_append = self.ensure_exact_hvec_sidecar_for_write(data.len());
+            let mut slotted = false;
+            let mut append_failed = false;
             if let Ok(mut slot) = self.mmap_store.write() {
+                let mut appended = None;
                 if let Some(store) = slot.as_mut() {
-                    if store.dim() == data.len() {
-                        let ordinal = store.append(data)?;
-                        store.refresh_read_mmap()?;
+                    if may_append && store.dim() == data.len() {
+                        appended = Some(store.append(data).and_then(|ordinal| {
+                            store.refresh_read_mmap()?;
+                            Ok(ordinal)
+                        }));
+                    }
+                }
+                match appended {
+                    Some(Ok(ordinal)) => {
                         self.backend
                             .put(
                                 w,
@@ -4201,9 +4975,58 @@ impl VectorCore {
                                 &ordinal.to_le_bytes(),
                             )
                             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
-                        self.cache_sidecar_ordinal(id, ordinal);
+                        let prior = self.publish_sidecar_ordinal(id, ordinal);
+                        self.retract_sidecar_ordinal_on_abort(w, id, ordinal, prior)?;
+                        slotted = true;
                     }
+                    Some(Err(error)) => {
+                        tracing::warn!(
+                            segment = %self.physical_name,
+                            %error,
+                            "sidecar append failed; storing rows without slots"
+                        );
+                        metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "error")
+                            .increment(1);
+                        *slot = None;
+                        append_failed = true;
+                    }
+                    None => {}
                 }
+                // Under the same lock the attach paths check: no sidecar can
+                // now be built from a snapshot missing this uncommitted row.
+                if slot.is_none() && self.mmap_sidecar_stem.is_some() {
+                    let reason = if append_failed {
+                        "append_error"
+                    } else {
+                        pin_reason_label(self.last_write_sidecar_miss.load(AtomicOrdering::Relaxed))
+                    };
+                    self.pin_to_rows(reason);
+                }
+            }
+            // No slot took the row. Its ordinal still moves the id off any
+            // stale slot a reader holds and keeps it in flat search.
+            if !slotted && self.mmap_sidecar_stem.is_some() {
+                let prior = self
+                    .backend
+                    .get_for_update(
+                        w,
+                        self.seg_ns(SegmentDb::Ordinals),
+                        &id.to_be_bytes(),
+                        |opt| opt.map(Self::ordinal_from_bytes),
+                    )
+                    .map_err(|e| VectorError::VectorCoreError(e.to_string()))?
+                    .transpose()?;
+                let ordinal = ROW_ONLY_SIDECAR_ORDINAL + prior.map_or(0, sidecar_slots_needed);
+                self.backend
+                    .put(
+                        w,
+                        self.seg_ns(SegmentDb::Ordinals),
+                        &id.to_be_bytes(),
+                        &ordinal.to_le_bytes(),
+                    )
+                    .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+                let prior = self.publish_sidecar_ordinal(id, ordinal);
+                self.retract_sidecar_ordinal_on_abort(w, id, ordinal, prior)?;
             }
         }
 
@@ -4348,8 +5171,17 @@ impl VectorCore {
     /// If the deleted vector is the entry point, it is replaced by the
     /// highest-level survivor (see `replacement_entry_point`).
     pub fn delete_vector(&self, txn: &mut RwTxn, id: u128) -> Result<(), VectorError> {
-        self.clear_neighbor_cache();
-        self.clear_vector_cache();
+        if self.shared_caches.is_some() {
+            let r = self.backend.read_borrowed(&*txn);
+            let max_level = self.get_highest_level(&r, id).unwrap_or(MAX_HNSW_LEVEL);
+            for level in 0..=max_level {
+                self.invalidate_neighbor_cache_entry(id, level);
+                self.invalidate_vector_cache_entry(id, level);
+            }
+        } else {
+            self.clear_neighbor_cache();
+            self.clear_vector_cache();
+        }
         // Check if this is the entry point and replace it before removing edges
         let entry_point = {
             let r = self.backend.read_borrowed(&*txn);
@@ -4617,9 +5449,6 @@ impl VectorCore {
         };
         record_items("ids", ids.len());
 
-        self.clear_neighbor_cache();
-        self.clear_vector_cache();
-
         let id_set: std::collections::HashSet<u128> = ids.iter().copied().collect();
 
         // Entry-point handling. If the current entry point is in the batch,
@@ -4706,10 +5535,22 @@ impl VectorCore {
         let step_started = std::time::Instant::now();
         let mut vector_rows_deleted = 0usize;
         let mut edge_rows_deleted = 0usize;
+        let mut id_levels: std::collections::HashMap<u128, Vec<usize>> =
+            if self.shared_caches.is_some() {
+                std::collections::HashMap::with_capacity(ids.len())
+            } else {
+                std::collections::HashMap::new()
+            };
         for &id in ids {
             let id_bytes = id.to_be_bytes();
 
+            if self.shared_caches.is_some() {
+                id_levels.insert(id, Vec::new());
+            }
+
             let key_prefix = [VECTOR_PREFIX, &id_bytes].concat();
+            let prefix_len = key_prefix.len();
+            let level_end = prefix_len + std::mem::size_of::<usize>();
             let mut keys: Vec<Vec<u8>> = Vec::new();
             self.backend
                 .scan_heed(
@@ -4718,6 +5559,14 @@ impl VectorCore {
                     KeyRange::prefix(&key_prefix),
                     |k, _v| {
                         keys.push(k.to_vec());
+                        if let Some(levels) = id_levels.get_mut(&id) {
+                            if k.len() >= level_end {
+                                if let Ok(arr) = k[prefix_len..level_end].try_into() {
+                                    let level = usize::from_be_bytes(arr);
+                                    levels.push(level);
+                                }
+                            }
+                        }
                         true
                     },
                 )
@@ -4814,6 +5663,20 @@ impl VectorCore {
         }
 
         self.remove_cached_sidecar_ordinals(ids);
+
+        // Invalidate cache entries at the exact levels that were deleted
+        if self.shared_caches.is_some() {
+            for (&id, levels) in &id_levels {
+                for &level in levels {
+                    self.invalidate_neighbor_cache_entry(id, level);
+                    self.invalidate_vector_cache_entry(id, level);
+                }
+            }
+        } else {
+            self.clear_neighbor_cache();
+            self.clear_vector_cache();
+        }
+
         Ok(())
     }
 
@@ -4821,12 +5684,16 @@ impl VectorCore {
         &self,
         w: &mut AnyWrite<'_>,
         ids: &[u128],
-    ) -> Result<(), VectorError> {
+    ) -> Result<std::collections::HashMap<u128, Vec<usize>>, VectorError> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(std::collections::HashMap::new());
         }
-        self.clear_neighbor_cache();
-        self.clear_vector_cache();
+
+        let mut id_levels: std::collections::HashMap<u128, Vec<usize>> =
+            std::collections::HashMap::with_capacity(ids.len());
+        // Always record levels: per-core caches need post-commit invalidation
+        // even when shared caches are off.
+        let record_levels = true;
 
         for chunk in ids.chunks(dense_delete_read_snapshot_chunk()) {
             let r = self
@@ -4840,6 +5707,10 @@ impl VectorCore {
             for &id in chunk {
                 let id_bytes = id.to_be_bytes();
                 let key_prefix = [VECTOR_PREFIX, &id_bytes].concat();
+                let prefix_len = key_prefix.len();
+                let level_end = prefix_len + std::mem::size_of::<usize>();
+
+                id_levels.insert(id, Vec::new());
 
                 let mut vector_keys = Vec::new();
                 self.backend
@@ -4849,6 +5720,16 @@ impl VectorCore {
                         KeyRange::prefix(&key_prefix),
                         |k, _v| {
                             vector_keys.push(k.to_vec());
+                            if record_levels {
+                                if let Some(levels) = id_levels.get_mut(&id) {
+                                    if k.len() >= level_end {
+                                        if let Ok(arr) = k[prefix_len..level_end].try_into() {
+                                            let level = usize::from_be_bytes(arr);
+                                            levels.push(level);
+                                        }
+                                    }
+                                }
+                            }
                             true
                         },
                     )
@@ -4883,7 +5764,21 @@ impl VectorCore {
             }
         }
         self.remove_cached_sidecar_ordinals(ids);
-        Ok(())
+
+        // Invalidate cache entries at the exact levels that were deleted
+        if self.shared_caches.is_some() {
+            for (&id, levels) in &id_levels {
+                for &level in levels {
+                    self.invalidate_neighbor_cache_entry(id, level);
+                    self.invalidate_vector_cache_entry(id, level);
+                }
+            }
+        } else {
+            self.clear_neighbor_cache();
+            self.clear_vector_cache();
+        }
+
+        Ok(id_levels)
     }
 
     // ── Deferred-repair delete tombstones (issue #29 "fix 2") ──────────
@@ -4905,10 +5800,95 @@ impl VectorCore {
     /// deletes exist still excludes those ids from search.
     #[inline]
     pub(crate) fn is_delete_tombstoned(&self, id: u128) -> bool {
+        // Fast path: the common case (empty set, tombstones OFF in prod) is
+        // a single relaxed atomic load — no RwLock contention.
+        if self.delete_tombstones_count.load(AtomicOrdering::Relaxed) == 0 {
+            return false;
+        }
         self.delete_tombstones
             .read()
             .map(|set| set.contains(&id))
             .unwrap_or(false)
+    }
+
+    /// Gate for cache fills: blocks if the id is either delete-tombstoned
+    /// (flag ON) or recently hard-deleted (flag OFF). This prevents a
+    /// stale-snapshot read from re-populating caches with a deleted vector.
+    #[inline]
+    pub(crate) fn is_cache_fill_blocked(&self, id: u128) -> bool {
+        if self.delete_tombstones_count.load(AtomicOrdering::Relaxed) == 0
+            && self.hard_delete_guard_count.load(AtomicOrdering::Relaxed) == 0
+        {
+            return false;
+        }
+        self.is_delete_tombstoned(id) || self.is_hard_delete_guarded(id)
+    }
+
+    #[inline]
+    fn is_hard_delete_guarded(&self, id: u128) -> bool {
+        if self.hard_delete_guard_count.load(AtomicOrdering::Relaxed) == 0 {
+            return false;
+        }
+        self.is_hard_delete_guarded_at(id, unix_secs_now_nonzero())
+    }
+
+    fn is_hard_delete_guarded_at(&self, id: u128, now_secs: u64) -> bool {
+        if let Ok(guard) = self.hard_delete_guard.read() {
+            if !guard.rotation_due(now_secs) {
+                return guard.contains(id);
+            }
+        }
+        // A window has passed since the last rotation: expire the older
+        // generation before answering, so an idle segment returns to the
+        // empty fast path without waiting for the next delete.
+        match self.hard_delete_guard.write() {
+            Ok(mut guard) => {
+                guard.rotate_if_due(now_secs);
+                self.hard_delete_guard_count
+                    .store(guard.len(), AtomicOrdering::Relaxed);
+                guard.contains(id)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Mark ids as recently hard-deleted so read-side cache fills reject them.
+    pub(crate) fn guard_hard_deletes(&self, ids: &[u128]) {
+        self.guard_hard_deletes_at(ids, unix_secs_now_nonzero());
+    }
+
+    fn guard_hard_deletes_at(&self, ids: &[u128], now_secs: u64) {
+        if ids.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.hard_delete_guard.write() {
+            guard.rotate_if_due(now_secs);
+            guard.current.extend(ids.iter().copied());
+            self.hard_delete_guard_count
+                .store(guard.len(), AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Post-commit companion of `delete_vectors_batch_be`, run once the
+    /// batch is durable: guard the ids this segment owned (`guarded`), then
+    /// drop every deleted id's cached ordinal and cache entries at the exact
+    /// deleted levels. Guard first: a read-side fill checks the guard before
+    /// inserting, so guarding before invalidating is what makes a fill that
+    /// raced the check land before this invalidation, never after it.
+    pub(crate) fn apply_hard_deletes_post_commit(
+        &self,
+        guarded: &[u128],
+        id_levels: &std::collections::HashMap<u128, Vec<usize>>,
+    ) {
+        self.guard_hard_deletes(guarded);
+        let ids: Vec<u128> = id_levels.keys().copied().collect();
+        self.remove_cached_sidecar_ordinals(&ids);
+        for (&id, levels) in id_levels {
+            for &level in levels {
+                self.invalidate_neighbor_cache_entry(id, level);
+                self.invalidate_vector_cache_entry(id, level);
+            }
+        }
     }
 
     /// Count of ids delete-tombstoned on this segment. In-memory, O(1) —
@@ -4957,7 +5937,25 @@ impl VectorCore {
             return;
         }
         if let Ok(mut set) = self.delete_tombstones.write() {
+            let before = set.len();
             set.extend(ids.iter().copied());
+            let added = set.len() - before;
+            if added > 0 {
+                self.delete_tombstones_count
+                    .fetch_add(added, AtomicOrdering::Relaxed);
+            }
+        }
+
+        // Post-commit cache invalidation: concurrent reads between pre-commit
+        // invalidation and commit may have re-cached deleted entries.
+        // Use MAX_HNSW_LEVEL as conservative upper bound (exact levels unavailable).
+        if self.shared_caches.is_some() {
+            for &id in ids {
+                for level in 0..=MAX_HNSW_LEVEL {
+                    self.invalidate_neighbor_cache_entry(id, level);
+                    self.invalidate_vector_cache_entry(id, level);
+                }
+            }
         }
     }
 
@@ -4992,6 +5990,10 @@ impl VectorCore {
         let count = loaded.len();
         if let Ok(mut set) = self.delete_tombstones.write() {
             *set = loaded;
+            // Under the set's lock so the fast-path count never disagrees
+            // with the set a concurrent reader sees.
+            self.delete_tombstones_count
+                .store(count, AtomicOrdering::Relaxed);
         }
         Ok(count)
     }
@@ -5063,6 +6065,8 @@ impl VectorCore {
         }
         if let Ok(mut set) = self.delete_tombstones.write() {
             set.clear();
+            self.delete_tombstones_count
+                .store(0, AtomicOrdering::Relaxed);
         }
         Ok(removed)
     }
@@ -5823,13 +6827,67 @@ impl VectorCore {
             .and_then(|cache| cache.entries().get(&id).copied()))
     }
 
+    /// Read side: remember an ordinal resolved from the store. Checked
+    /// against the delete gate under the map lock: a delete guards the id
+    /// before it removes the id's entry under this same lock, so a fill
+    /// either sees the guard or lands before the removal — never after it.
     fn cache_sidecar_ordinal(&self, id: u128, ordinal: u64) {
         if let Ok(mut ordinals) = self.mmap_ordinals.write() {
+            if self.is_cache_fill_blocked(id) {
+                return;
+            }
             ordinals
                 .get_or_insert_with(|| SidecarOrdinals::Partial(HashMap::new()))
                 .entries_mut()
                 .insert(id, ordinal);
         }
+    }
+
+    /// Write side: publish an ordinal this writer assigned. Not gated by the
+    /// hard-delete guard, which only blocks read-side refills — a re-insert of
+    /// a recently deleted id must appear in the map (flat search walks a
+    /// Complete map). Returns the entry it replaced, for an abort to restore.
+    fn publish_sidecar_ordinal(&self, id: u128, ordinal: u64) -> Option<u64> {
+        let mut ordinals = self.mmap_ordinals.write().ok()?;
+        ordinals
+            .get_or_insert_with(|| SidecarOrdinals::Partial(HashMap::new()))
+            .entries_mut()
+            .insert(id, ordinal)
+    }
+
+    /// The map is published before the batch commits (so a commit can never
+    /// leave a committed row unmapped ahead of a concurrent delete's removal).
+    /// If the batch is dropped uncommitted or fails to commit, take the
+    /// publication back, else a vector that never existed is served through
+    /// its dangling sidecar slot. Only the exact publication is undone (a
+    /// later batch may have re-published the id), and undoing restores
+    /// `prior`: dropping an upserted id would hide its committed vector from
+    /// flat search, which walks only a Complete map.
+    fn retract_sidecar_ordinal_on_abort(
+        &self,
+        w: &mut AnyWrite<'_>,
+        id: u128,
+        ordinal: u64,
+        prior: Option<u64>,
+    ) -> Result<(), VectorError> {
+        let map = Arc::clone(&self.mmap_ordinals);
+        w.on_txn_end(Box::new(move |committed| {
+            if committed {
+                return;
+            }
+            if let Ok(mut ordinals) = map.write() {
+                if let Some(entries) = ordinals.as_mut() {
+                    let entries = entries.entries_mut();
+                    if entries.get(&id) == Some(&ordinal) {
+                        match prior {
+                            Some(prior) => entries.insert(id, prior),
+                            None => entries.remove(&id),
+                        };
+                    }
+                }
+            }
+        }))
+        .map_err(|e| VectorError::VectorCoreError(e.to_string()))
     }
 
     fn sidecar_ordinals_loaded(&self) -> Result<bool, VectorError> {
@@ -5851,24 +6909,56 @@ impl VectorCore {
         self.backend.kind() == BackendKind::Lsm && self.mmap_sidecar_stem.is_some()
     }
 
-    fn ensure_lsm_mmap_sidecar(&self) -> Result<bool, VectorError> {
-        self.ensure_lsm_mmap_sidecar_with_lock_observer(|| {})
+    /// Transition this segment to the row-only sidecar path. Emits one
+    /// warning and bumps `helix_lsm_sidecar_pinned_total{reason}` on the
+    /// first call per pin episode; subsequent calls while still pinned are
+    /// silent.
+    fn pin_to_rows(&self, reason: &'static str) {
+        if self
+            .sidecar_rows_only
+            .compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_ok()
+        {
+            tracing::warn!(
+                segment = %self.physical_name,
+                reason,
+                "segment pinned to row-only sidecar path"
+            );
+            metrics::counter!("helix_lsm_sidecar_pinned_total", "reason" => reason).increment(1);
+        }
     }
 
+    fn ensure_lsm_mmap_sidecar(&self) -> Result<bool, VectorError> {
+        self.ensure_lsm_mmap_sidecar_with_lock_observer(|| {}, false)
+    }
+
+    /// `for_write` (the write path) waits a bounded time for a permit instead
+    /// of deferring. Once `sidecar_rows_only` is set, nothing attaches.
+    ///
+    /// `on_lock_attempt` fires immediately before every attempt to take the
+    /// slot lock (a non-blocking try, or a blocking wait after a failed try).
+    ///
+    /// Lock ordering: the write path elects at most one materializer per
+    /// segment via `sidecar_materializing`, so N concurrent writers consume at
+    /// most 1 permit; the elected writer never holds a permit while queued on
+    /// the slot lock and never holds the slot lock while waiting for a permit.
+    /// The reader path keeps its original order (lock first, non-blocking
+    /// `try_acquire`) since `try_acquire` never waits.
     fn ensure_lsm_mmap_sidecar_with_lock_observer<F>(
         &self,
-        on_lock_attempt: F,
+        mut on_lock_attempt: F,
+        for_write: bool,
     ) -> Result<bool, VectorError>
     where
-        F: FnOnce(),
+        F: FnMut(),
     {
         if self.has_mmap_sidecar() {
             return Ok(true);
         }
-        if !self.should_try_lsm_sidecar() {
+        if !self.should_try_lsm_sidecar() || self.sidecar_rows_only.load(AtomicOrdering::Acquire) {
             return Ok(false);
         }
-        if self.lsm_sidecar_miss_is_cached() {
+        if !for_write && self.lsm_sidecar_miss_is_cached() {
             metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "cached_missing")
                 .increment(1);
             return Ok(false);
@@ -5876,62 +6966,204 @@ impl VectorCore {
         let Some(stem) = self.mmap_sidecar_stem.as_ref().cloned() else {
             return Ok(false);
         };
-        on_lock_attempt();
-        let mut slot = self
-            .mmap_store
-            .write()
-            .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?;
-        if slot.is_some() {
-            return Ok(true);
-        }
-        if self.lsm_sidecar_miss_is_cached() {
-            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "cached_missing")
-                .increment(1);
-            return Ok(false);
-        }
-        // Only the request that won this core's write lock and still needs a
-        // scan consumes a process-wide permit. Duplicate requests wait here
-        // without starving unrelated segments of materialization capacity.
-        let Some(_permit) = SidecarMaterializePermit::try_acquire() else {
-            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "deferred")
-                .increment(1);
-            return Ok(false);
-        };
 
+        if for_write {
+            // ----- WRITE PATH: permit before lock -----
+            // Fast-path cached miss (no lock or permit needed).
+            if self.lsm_sidecar_miss_is_cached() {
+                self.last_write_sidecar_miss
+                    .store(PIN_REASON_CACHED_MISS, AtomicOrdering::Relaxed);
+                metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "cached_missing")
+                    .increment(1);
+                return Ok(false);
+            }
+
+            // Election: at most one writer per segment materializes, so N
+            // concurrent writers consume at most 1 process-wide permit.
+            // RAII guard clears the flag on drop (panic-safe).
+            let Some(_materializing) =
+                SidecarMaterializingGuard::try_elect(&self.sidecar_materializing)
+            else {
+                #[cfg(test)]
+                WRITE_PATH_SIDECAR_WAITERS_FOR_TEST
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Another writer is already materializing; wait for it, then
+                // re-check whether it succeeded.
+                let deadline = std::time::Instant::now() + SIDECAR_WRITE_PERMIT_WAIT;
+                while self.sidecar_materializing.load(AtomicOrdering::Acquire) {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                if self.has_mmap_sidecar() {
+                    return Ok(true);
+                }
+                // Do not overwrite last_write_sidecar_miss: the elected
+                // writer's pin reason is the meaningful one.
+                metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "deferred")
+                    .increment(1);
+                return Ok(false);
+            };
+
+            // Elected. Two invariants, because searches hold the slot read
+            // guard most of the time: never queue on the slot lock holding a
+            // permit, and never wait for a permit holding the slot lock.
+            // Under the lock the permit is only `try_acquire`d; on failure the
+            // lock is dropped, the permit awaited lock-free, and the lock
+            // retried, until the deadline.
+            let deadline = std::time::Instant::now() + SIDECAR_WRITE_PERMIT_WAIT;
+            let mut permit: Option<SidecarMaterializePermit> = None;
+            let (mut slot, _permit) = loop {
+                on_lock_attempt();
+                let slot = match self.mmap_store.try_write() {
+                    Ok(slot) => slot,
+                    Err(std::sync::TryLockError::Poisoned(e)) => {
+                        return Err(VectorError::VectorCoreError(format!(
+                            "mmap lock poisoned: {}",
+                            e
+                        )));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        drop(permit.take());
+                        on_lock_attempt();
+                        self.mmap_store.write().map_err(|e| {
+                            VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e))
+                        })?
+                    }
+                };
+                if slot.is_some() {
+                    return Ok(true);
+                }
+                if let Some(permit) = permit.take().or_else(SidecarMaterializePermit::try_acquire) {
+                    break (slot, permit);
+                }
+                drop(slot);
+                #[cfg(test)]
+                WRITE_PATH_PERMIT_WAITS_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                match SidecarMaterializePermit::acquire_within(remaining) {
+                    Some(acquired) => permit = Some(acquired),
+                    None => {
+                        self.last_write_sidecar_miss
+                            .store(PIN_REASON_PERMIT_TIMEOUT, AtomicOrdering::Relaxed);
+                        metrics::counter!(
+                            "helix_lsm_sidecar_materialize_total",
+                            "outcome" => "deferred"
+                        )
+                        .increment(1);
+                        return Ok(false);
+                    }
+                }
+            };
+
+            // Re-check under lock.
+            if slot.is_some() {
+                return Ok(true);
+            }
+            if self.sidecar_rows_only.load(AtomicOrdering::Acquire) {
+                return Ok(false);
+            }
+            if self.lsm_sidecar_miss_is_cached() {
+                self.last_write_sidecar_miss
+                    .store(PIN_REASON_CACHED_MISS, AtomicOrdering::Relaxed);
+                metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "cached_missing")
+                    .increment(1);
+                return Ok(false);
+            }
+
+            self.do_lsm_sidecar_open_under_lock(&stem, &mut slot, true)
+        } else {
+            // ----- READER PATH: lock first, try_acquire (non-blocking) -----
+            on_lock_attempt();
+            let mut slot = self
+                .mmap_store
+                .write()
+                .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?;
+            if slot.is_some() {
+                return Ok(true);
+            }
+            if self.sidecar_rows_only.load(AtomicOrdering::Acquire) {
+                return Ok(false);
+            }
+            if self.lsm_sidecar_miss_is_cached() {
+                metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "cached_missing")
+                    .increment(1);
+                return Ok(false);
+            }
+            let Some(_permit) = SidecarMaterializePermit::try_acquire() else {
+                metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "deferred")
+                    .increment(1);
+                return Ok(false);
+            };
+
+            self.do_lsm_sidecar_open_under_lock(&stem, &mut slot, false)
+        }
+    }
+
+    /// Shared rebuild body called once the caller holds both the slot lock and
+    /// a materialization permit.
+    fn do_lsm_sidecar_open_under_lock(
+        &self,
+        stem: &Path,
+        slot: &mut std::sync::RwLockWriteGuard<'_, Option<super::mmap_vectors::MmapBackend>>,
+        for_write: bool,
+    ) -> Result<bool, VectorError> {
         let started = std::time::Instant::now();
-        let (store, ordinals) = Self::open_lsm_mmap_sidecar(
-            &self.backend,
-            &self.physical_name,
-            &stem,
-            &self.spindle,
-            true,
-        )?;
+        let rebuild_floor = self.sidecar_rebuild_min_slots.load(AtomicOrdering::Relaxed) as usize;
+        let open = || {
+            Self::open_lsm_mmap_sidecar(
+                &self.backend,
+                &self.physical_name,
+                stem,
+                &self.spindle,
+                true,
+                rebuild_floor,
+            )
+        };
+        let mut opened = open()?;
+        if opened.2 == Some(SIDECAR_ROWS_ORDINALS_DIFFER) {
+            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "retried")
+                .increment(1);
+            opened = open()?;
+        }
+        let (store, ordinals, refused) = opened;
         let loaded = store.is_some();
+        let outcome = match (loaded, refused) {
+            (true, _) => "loaded",
+            (false, Some(_)) => "refused",
+            (false, None) => "missing",
+        };
         if let Some(store) = store {
-            *slot = Some(store);
+            **slot = Some(store);
             self.clear_lsm_sidecar_miss_cache();
+            self.sidecar_rebuild_min_slots
+                .store(0, AtomicOrdering::Relaxed);
+        } else if let Some(reason) = refused {
+            self.record_lsm_sidecar_refusal(stem, reason);
+            if for_write {
+                self.last_write_sidecar_miss
+                    .store(PIN_REASON_REFUSED, AtomicOrdering::Relaxed);
+            }
         } else {
             self.record_lsm_sidecar_miss();
+            if for_write {
+                self.last_write_sidecar_miss
+                    .store(PIN_REASON_MISSING, AtomicOrdering::Relaxed);
+            }
         }
-        drop(slot);
+        // Before releasing the slot: a write-path append right after must land
+        // in this map, not be overwritten by it.
         if let Some(ordinals) = ordinals {
-            let mut slot = self.mmap_ordinals.write().map_err(|e| {
+            let mut map = self.mmap_ordinals.write().map_err(|e| {
                 VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {}", e))
             })?;
-            *slot = Some(SidecarOrdinals::Complete(ordinals));
+            *map = Some(SidecarOrdinals::Complete(ordinals));
         }
-        metrics::histogram!(
-            "helix_lsm_sidecar_materialize_ms",
-            "outcome" => if loaded { "loaded" } else { "missing" }
-        )
-        .record(started.elapsed().as_secs_f64() * 1000.0);
-        if loaded {
-            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "loaded")
-                .increment(1);
-        } else {
-            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "missing")
-                .increment(1);
-        }
+        // Slot guard is dropped by the caller (it owns the guard, we have &mut).
+        metrics::histogram!("helix_lsm_sidecar_materialize_ms", "outcome" => outcome)
+            .record(started.elapsed().as_secs_f64() * 1000.0);
+        metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => outcome).increment(1);
         Ok(loaded)
     }
 
@@ -5944,44 +7176,57 @@ impl VectorCore {
         }
 
         let started = std::time::Instant::now();
-        let mut loaded = HashMap::new();
-        let mut scan_err: Option<VectorError> = None;
-        self.backend
-            .scan(
-                read,
-                self.seg_ns(SegmentDb::Ordinals),
-                KeyRange::all(),
-                |key, value| {
-                    if key.len() != std::mem::size_of::<u128>() {
-                        scan_err = Some(VectorError::InvalidVectorData);
-                        return false;
-                    }
-                    let Ok(id_bytes) = <[u8; 16]>::try_from(key) else {
-                        scan_err = Some(VectorError::InvalidVectorData);
-                        return false;
-                    };
-                    let ordinal = match Self::ordinal_from_bytes(value) {
-                        Ok(ordinal) => ordinal,
-                        Err(err) => {
-                            scan_err = Some(err);
-                            return false;
-                        }
-                    };
-                    loaded.insert(u128::from_be_bytes(id_bytes), ordinal);
-                    true
-                },
-            )
-            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
-        if let Some(err) = scan_err {
-            return Err(err);
+        let gen_before = self.delete_generation.load(AtomicOrdering::Acquire);
+        // LSM: scan a FRESH snapshot. The caller's may predate a hard-delete
+        // commit, so scanning it would install a Complete map that resurrects
+        // deleted ordinals in flat search. LMDB: keep the caller's txn — a
+        // second read txn on a thread that already holds one fails with
+        // MDB_BAD_RSLOT, and LMDB has no stale-snapshot window here.
+        let fresh;
+        let scan_read: &AnyRead<'_> = match read {
+            AnyRead::Lsm(_) => {
+                fresh = self
+                    .backend
+                    .begin_read()
+                    .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+                &fresh
+            }
+            _ => read,
+        };
+        let mut loaded =
+            Self::scan_persisted_sidecar_ordinals(&self.backend, scan_read, &self.physical_name)?;
+
+        // Test hook: signal that the scan completed, then wait for the test
+        // thread to inject a generation bump before we check.
+        #[cfg(test)]
+        if ORDINAL_LOAD_POST_SCAN_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+            ORDINAL_LOAD_POST_SCAN_FIRED.store(true, std::sync::atomic::Ordering::Release);
+            while ORDINAL_LOAD_POST_SCAN_FIRED.load(std::sync::atomic::Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
         }
 
         let loaded_count = loaded.len();
+        // A delete committed while this scan was in flight — the loaded map
+        // may contain ordinals for ids that no longer exist.  Discard it so
+        // the next caller retries with a fresh snapshot.
+        if self.delete_generation.load(AtomicOrdering::Acquire) != gen_before {
+            metrics::counter!(
+                "helix_lsm_sidecar_ordinals_load_total",
+                "outcome" => "discarded_gen"
+            )
+            .increment(1);
+            return Ok(());
+        }
         let outcome = if loaded_count == 0 { "empty" } else { "loaded" };
         let mut ordinals = self.mmap_ordinals.write().map_err(|e| {
             VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {e}"))
         })?;
         if !ordinals.as_ref().is_some_and(SidecarOrdinals::is_complete) {
+            // Appends cached while this scanned are newer than its snapshot.
+            if let Some(SidecarOrdinals::Partial(cached)) = ordinals.take() {
+                loaded.extend(cached);
+            }
             *ordinals = Some(SidecarOrdinals::Complete(loaded));
             metrics::histogram!("helix_lsm_sidecar_ordinals_load_ms", "outcome" => outcome)
                 .record(started.elapsed().as_secs_f64() * 1000.0);
@@ -6005,6 +7250,9 @@ impl VectorCore {
     }
 
     fn sidecar_vec(&self, ordinal: u64) -> Result<Option<Vec<f32>>, VectorError> {
+        if ordinal >= ROW_ONLY_SIDECAR_ORDINAL {
+            return Ok(None);
+        }
         self.ensure_lsm_mmap_sidecar()?;
         for attempt in 0..2 {
             let found = {
@@ -6024,6 +7272,9 @@ impl VectorCore {
     }
 
     fn sidecar_distance(&self, ordinal: u64, query: &[f32]) -> Result<Option<f32>, VectorError> {
+        if ordinal >= ROW_ONLY_SIDECAR_ORDINAL {
+            return Ok(None);
+        }
         self.ensure_lsm_mmap_sidecar()?;
         for attempt in 0..2 {
             let found = {
@@ -6053,7 +7304,7 @@ impl VectorCore {
         Ok(())
     }
 
-    fn remove_cached_sidecar_ordinals(&self, point_ids: &[u128]) {
+    pub(crate) fn remove_cached_sidecar_ordinals(&self, point_ids: &[u128]) {
         if let Ok(mut ordinals) = self.mmap_ordinals.write() {
             if let Some(map) = ordinals.as_mut() {
                 for id in point_ids {
@@ -6061,6 +7312,7 @@ impl VectorCore {
                 }
             }
         }
+        self.delete_generation.fetch_add(1, AtomicOrdering::Release);
     }
 
     fn sidecar_ordinal(&self, read: &AnyRead<'_>, id: u128) -> Result<Option<u64>, VectorError> {
@@ -6187,7 +7439,7 @@ impl VectorCore {
             return Ok(None);
         };
         let ordinal = Self::ordinal_from_bytes(&ordinal_bytes)?;
-        if !matches!(read, AnyRead::LsmReader(_)) {
+        if !matches!(read, AnyRead::LsmReader(_)) && !self.is_cache_fill_blocked(id) {
             self.cache_sidecar_ordinal(id, ordinal);
         }
         Ok(Some(ordinal))
@@ -6444,7 +7696,11 @@ impl VectorCore {
                 continue;
             }
             let cached = if let Some(shared) = self.shared_caches.as_ref() {
-                let key = super::shared_cache::CacheKey::new(self.cache_namespace, id, level);
+                let key = super::shared_cache::CacheKey::new(
+                    self.cache_namespace.load(AtomicOrdering::Relaxed),
+                    id,
+                    level,
+                );
                 (level > 0 && shared.nav_vector.get(&key).is_some())
                     || shared.vector.get(&key).is_some()
             } else {
@@ -6918,6 +8174,8 @@ impl VectorCore {
         // present. Probe the set once so the common no-delete case pays
         // nothing per row.
         let has_tombstones = self.deleted_count() > 0;
+        // Rows written after this sidecar was built sit past its end.
+        let mut past_sidecar: Vec<u128> = Vec::new();
         let mut consider = |id: u128, ordinal: u64| -> Result<(), VectorError> {
             if has_tombstones && self.is_delete_tombstoned(id) {
                 return Ok(());
@@ -6928,6 +8186,7 @@ impl VectorCore {
                 }
             }
             let Some(distance) = store.distance_to(ordinal, projected_query, metric) else {
+                past_sidecar.push(id);
                 return Ok(());
             };
             let candidate = MmapFlatCandidate {
@@ -7017,6 +8276,32 @@ impl VectorCore {
                 results.push(vector);
             }
         }
+        drop(slot);
+        if self.backend.kind() == BackendKind::Lsm {
+            metrics::histogram!(
+                "helix_lsm_sidecar_past_end_rows",
+                "role" => if self.backend.is_reader_replica() { "reader" } else { "writer" }
+            )
+            .record(past_sidecar.len() as f64);
+        }
+        if past_sidecar.is_empty() {
+            return Ok(Some(results));
+        }
+        for id in past_sidecar {
+            let mut vector = match self.get_vector_from_row(r, id, 0, true, true) {
+                Ok(vector) => vector,
+                Err(VectorError::VectorNotFound(_)) => continue,
+                Err(err) => return Err(err),
+            };
+            vector.set_distance(self.distance_between(vector.get_data(), projected_query)?);
+            results.push(vector);
+        }
+        results.sort_by(|lhs, rhs| {
+            lhs.get_distance()
+                .partial_cmp(&rhs.get_distance())
+                .unwrap_or(Ordering::Equal)
+        });
+        results.truncate(target_k);
         Ok(Some(results))
     }
 
@@ -8633,21 +9918,32 @@ impl VectorCore {
     }
 
     fn cache_neighbor_block(&self, id: u128, level: usize, block: &NeighborBlock) {
+        if self.is_cache_fill_blocked(id) {
+            return;
+        }
         if let Some(shared) = self.shared_caches.as_ref() {
-            let key = super::shared_cache::CacheKey::new(self.cache_namespace, id, level);
+            let key = super::shared_cache::CacheKey::new(
+                self.cache_namespace.load(AtomicOrdering::Relaxed),
+                id,
+                level,
+            );
             if level > 0 {
                 shared.nav_neighbor.put(key, block.clone());
             }
             shared.neighbor.put(key, block.clone());
-            return;
-        }
-        if level > 0 {
-            if let Ok(mut cache) = self.nav_neighbor_cache.lock() {
+        } else {
+            if level > 0 {
+                if let Ok(mut cache) = self.nav_neighbor_cache.lock() {
+                    cache.put((id, level), block.clone());
+                }
+            }
+            if let Ok(mut cache) = self.neighbor_cache.lock() {
                 cache.put((id, level), block.clone());
             }
         }
-        if let Ok(mut cache) = self.neighbor_cache.lock() {
-            cache.put((id, level), block.clone());
+        // Same check-then-insert race as `cache_vector_for_read`.
+        if self.is_cache_fill_blocked(id) {
+            self.invalidate_neighbor_cache_entry(id, level);
         }
     }
 
@@ -8662,7 +9958,11 @@ impl VectorCore {
         // `tier="level0"` = level=0 neighbor blocks (bulk of search work, cold set huge).
         // Signal used to tune HELIX_NEIGHBOR_CACHE_CAP / HELIX_NAV_CACHE_CAP.
         if let Some(shared) = self.shared_caches.as_ref() {
-            let key = super::shared_cache::CacheKey::new(self.cache_namespace, id, level);
+            let key = super::shared_cache::CacheKey::new(
+                self.cache_namespace.load(AtomicOrdering::Relaxed),
+                id,
+                level,
+            );
             if level > 0 {
                 if let Some(block) = shared.nav_neighbor.get(&key) {
                     metrics::counter!("helix_vector_cache_hits_total",
@@ -10245,7 +11545,11 @@ impl HNSW for VectorCore {
                     "tier" => if level > 0 { "nav" } else { "level0" })
                 .increment(1);
             } else if let Some(shared) = self.shared_caches.as_ref() {
-                let key = super::shared_cache::CacheKey::new(self.cache_namespace, id, level);
+                let key = super::shared_cache::CacheKey::new(
+                    self.cache_namespace.load(AtomicOrdering::Relaxed),
+                    id,
+                    level,
+                );
                 if level > 0 {
                     if let Some(data) = shared.nav_vector.get(&key) {
                         metrics::counter!("helix_vector_cache_hits_total",
@@ -10867,7 +12171,7 @@ mod tests {
         assert!(shared
             .vector
             .get(&super::super::shared_cache::CacheKey::new(
-                reader_core.cache_namespace,
+                reader_core.cache_namespace.load(AtomicOrdering::Relaxed),
                 2,
                 0
             ))
@@ -11242,6 +12546,105 @@ mod tests {
                 "id {id} should be deleted"
             );
         }
+    }
+
+    #[test]
+    fn delete_batch_be_returns_ids_without_shared_caches() {
+        use crate::helix_engine::storage_core::backend::StorageBackend;
+
+        let (env, _dir) = setup();
+        // Force per-core caches regardless of HELIX_SHARED_VECTOR_CACHES: the
+        // test is about the shared-caches-off path.
+        let mut core = core_with_mode(&env, "delete_be_no_shared", SpindleMode::None);
+        core.shared_caches = None;
+        assert!(
+            core.shared_caches.is_none(),
+            "precondition: shared caches must be off"
+        );
+
+        let mut write = core.backend.begin_write().unwrap();
+        for id in 1..=3u128 {
+            let data = [id as f32, 0.0, 0.0, 0.0];
+            core.insert_flat_be(&mut write, &data, Some(id), None)
+                .unwrap();
+        }
+        core.backend.commit(write).unwrap();
+
+        let mut write = core.backend.begin_write().unwrap();
+        let id_levels = core
+            .delete_vectors_batch_be(&mut write, &[1, 2, 3])
+            .unwrap();
+        core.backend.commit(write).unwrap();
+
+        // Post-commit hook (apply_delete_tombstones) gates ordinal cleanup on
+        // id_levels being non-empty. Without the fix, shared_caches=None
+        // causes an empty map and the hook skips cleanup entirely.
+        assert_eq!(
+            id_levels.len(),
+            3,
+            "id_levels must contain every deleted id regardless of shared_caches"
+        );
+        for id in 1..=3u128 {
+            assert!(
+                id_levels.contains_key(&id),
+                "id {id} must be present in id_levels"
+            );
+        }
+    }
+
+    #[test]
+    fn tombstoned_id_skips_cache_and_ordinal_fill() {
+        let (env, _dir) = setup();
+        let core = core_with_mode(&env, "tombstone_cache_skip", SpindleMode::None);
+
+        // Tombstone id 1 via the in-memory set (simulates post-commit hook)
+        core.apply_delete_tombstones(&[1]);
+
+        // cache_sidecar_ordinal must skip a tombstoned id
+        core.cache_sidecar_ordinal(1, 42);
+        let ordinals = core.mmap_ordinals.read().unwrap();
+        let has_entry = ordinals
+            .as_ref()
+            .map(|o| o.entries().contains_key(&1))
+            .unwrap_or(false);
+        assert!(
+            !has_entry,
+            "tombstoned id must not be cached in ordinal map"
+        );
+        drop(ordinals);
+
+        // cache_neighbor_block must skip a tombstoned id
+        core.cache_neighbor_block(1, 0, &NeighborBlock::from_ids(vec![2, 3]));
+        let cache = core.neighbor_cache.lock().unwrap();
+        assert!(
+            !cache.contains(&(1, 0)),
+            "tombstoned id must not be in neighbor cache"
+        );
+        drop(cache);
+
+        // Non-tombstoned id must still be cacheable
+        core.cache_sidecar_ordinal(2, 99);
+        let ordinals = core.mmap_ordinals.read().unwrap();
+        let has_2 = ordinals
+            .as_ref()
+            .map(|o| o.entries().contains_key(&2))
+            .unwrap_or(false);
+        assert!(has_2, "non-tombstoned id must be cached normally");
+        drop(ordinals);
+
+        // remove_cached_sidecar_ordinals must bump delete_generation
+        let gen_before = core
+            .delete_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        core.remove_cached_sidecar_ordinals(&[2]);
+        let gen_after = core
+            .delete_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            gen_after,
+            gen_before + 1,
+            "delete generation must increment on ordinal removal"
+        );
     }
 
     #[test]
@@ -11771,6 +13174,829 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+    }
+
+    // Insertion order != id order, so the writer persists non-id-sorted ordinals.
+    const UNSORTED_ORDINAL_ROWS: [(u128, [f32; 2]); 3] =
+        [(30, [1.0, 0.0]), (10, [0.0, 1.0]), (20, [-1.0, 0.0])];
+
+    /// `dir: None` opens the segment with no sidecar, so inserts write rows only.
+    fn open_ordinal_test_core(dir: Option<&Path>, backend: &Arc<AnyBackend>) -> VectorCore {
+        VectorCore::new_named_lsm_with_dir(
+            "dense__seg_000001",
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Euclid,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            dir,
+            2,
+            Arc::clone(backend),
+        )
+        .unwrap()
+    }
+
+    fn in_memory_lsm_writer() -> (Arc<dyn object_store::ObjectStore>, String, Arc<AnyBackend>) {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let path = format!("sidecar-ordinals-{}", uuid::Uuid::new_v4());
+        let writer = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_with_store(&path, Arc::clone(&store)).unwrap(),
+        ));
+        (store, path, writer)
+    }
+
+    fn commit_rows(core: &VectorCore, writer: &AnyBackend, rows: &[(u128, [f32; 2])]) {
+        let mut write = writer.begin_write().unwrap();
+        for (id, vector) in rows {
+            core.insert_flat_be(&mut write, vector, Some(*id), None)
+                .unwrap();
+        }
+        writer.commit(write).unwrap();
+    }
+
+    const FLAT_QUERY: [f32; 2] = [1.0, 0.0];
+
+    /// Flat exact-search hits as (id, vector), by id. Each distance must match
+    /// the vector it was returned with.
+    fn flat_hits(core: &VectorCore, read: &AnyRead<'_>) -> Vec<(u128, Vec<f32>)> {
+        let mut hits = core
+            .search_flat_id_filter_direct::<fn(u128) -> bool>(
+                read,
+                &FLAT_QUERY,
+                &PreparedSpindleQuery::None,
+                16,
+                None,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hit| {
+                let expected = core.distance_between(hit.get_data(), &FLAT_QUERY).unwrap();
+                assert!(
+                    (hit.get_distance() - expected).abs() < 1e-5,
+                    "id {} distance must match its vector",
+                    hit.get_id()
+                );
+                (hit.get_id(), hit.get_data().to_vec())
+            })
+            .collect::<Vec<_>>();
+        hits.sort_by_key(|(id, _)| *id);
+        hits
+    }
+
+    fn assert_unsorted_ordinal_rows(core: &VectorCore, read: &AnyRead<'_>) {
+        for (id, vector) in &UNSORTED_ORDINAL_ROWS {
+            assert_eq!(
+                core.get_vector(read, *id, 0, true).unwrap().get_data(),
+                vector.as_slice(),
+                "id {id} must resolve to its own vector"
+            );
+        }
+        assert_eq!(core.sidecar_format_label(), "hvec");
+    }
+
+    fn unsorted_ordinal_writer() -> (
+        Arc<dyn object_store::ObjectStore>,
+        String,
+        Arc<AnyBackend>,
+        TempDir,
+    ) {
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        commit_rows(&core, &writer, &UNSORTED_ORDINAL_ROWS);
+        (store, path, writer, writer_dir)
+    }
+
+    #[test]
+    fn cold_reader_rebuilt_hvec_sidecar_matches_persisted_ordinals() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, _writer, _writer_dir) = unsorted_ordinal_writer();
+        // No local sidecar and no published blob: the first read rebuilds the
+        // sidecar from rows, then resolves ordinals from the store.
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_unsorted_ordinal_rows(&core, &read);
+    }
+
+    #[test]
+    fn reopened_writer_rebuilt_hvec_sidecar_matches_persisted_ordinals() {
+        let (_store, _path, writer, _writer_dir) = unsorted_ordinal_writer();
+        // A writer that lost its local sidecar rebuilds it from rows; once
+        // reopened it resolves ordinals from the store scan, not the rebuild map.
+        let rebuilt_dir = TempDir::new().unwrap();
+        let read = writer.begin_read().unwrap();
+        assert_unsorted_ordinal_rows(
+            &open_ordinal_test_core(Some(rebuilt_dir.path()), &writer),
+            &read,
+        );
+        assert_unsorted_ordinal_rows(
+            &open_ordinal_test_core(Some(rebuilt_dir.path()), &writer),
+            &read,
+        );
+    }
+
+    #[test]
+    fn writer_insert_after_refused_rebuild_keeps_ordinals_unique() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        // Upsert churn on one id leaves a mostly-dead ordinal range.
+        commit_rows(&core, &writer, &[(10, [0.0, 1.0])]);
+        commit_rows(&core, &writer, &[(20, [-1.0, 0.0]); 4100]);
+
+        // The writer lost its local sidecar: the first read refuses the rebuild,
+        // and the next insert must not start a fresh file at ordinal 0.
+        let lost_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(lost_dir.path()), &writer);
+        let read = writer.begin_read().unwrap();
+        assert_eq!(
+            core.get_vector(&read, 10, 0, true).unwrap().get_data(),
+            &[0.0, 1.0]
+        );
+        commit_rows(&core, &writer, &[(30, [1.0, 0.0])]);
+
+        let expected = vec![
+            (10, vec![0.0, 1.0]),
+            (20, vec![-1.0, 0.0]),
+            (30, vec![1.0, 0.0]),
+        ];
+        let read = writer.begin_read().unwrap();
+        assert_eq!(flat_hits(&core, &read), expected);
+        for (id, vector) in &expected[1..] {
+            assert_eq!(
+                core.get_vector(&read, *id, 0, true).unwrap().get_data(),
+                vector.as_slice(),
+                "id {id} must resolve to its own vector"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuilt_sidecar_never_hides_rows_without_ordinals_from_flat_search() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        commit_rows(
+            &open_ordinal_test_core(Some(writer_dir.path()), &writer),
+            &writer,
+            &[(10, [0.0, 1.0]), (20, [-1.0, 0.0])],
+        );
+        // A row written while no sidecar was attached has no persisted ordinal.
+        commit_rows(
+            &open_ordinal_test_core(None, &writer),
+            &writer,
+            &[(30, [1.0, 0.0])],
+        );
+
+        let lost_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(lost_dir.path()), &writer);
+        let read = writer.begin_read().unwrap();
+        let expected = vec![
+            (10, vec![0.0, 1.0]),
+            (20, vec![-1.0, 0.0]),
+            (30, vec![1.0, 0.0]),
+        ];
+        // The first search may rebuild the sidecar; the second may use it.
+        assert_eq!(flat_hits(&core, &read), expected);
+        assert_eq!(flat_hits(&core, &read), expected);
+    }
+
+    #[test]
+    fn reader_flat_search_scores_rows_written_after_its_rebuild() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let writer_core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        commit_rows(
+            &writer_core,
+            &writer,
+            &[(10, [0.0, 1.0]), (20, [-1.0, 0.0]), (30, [1.0, 0.0])],
+        );
+        // A delete and an upsert leave dead slots below the live ordinals.
+        let mut write = writer.begin_write().unwrap();
+        writer_core
+            .delete_vectors_batch_be(&mut write, &[20])
+            .unwrap();
+        writer.commit(write).unwrap();
+        commit_rows(&writer_core, &writer, &[(10, [0.0, 2.0])]);
+
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        let rebuilt = vec![(10, vec![0.0, 2.0]), (30, vec![1.0, 0.0])];
+        assert_eq!(flat_hits(&core, &read), rebuilt);
+        assert_eq!(flat_hits(&core, &read), rebuilt);
+        assert_eq!(core.sidecar_format_label(), "hvec");
+
+        // Rows the writer appends after the reader's rebuild sit past its file.
+        commit_rows(&writer_core, &writer, &[(40, [2.0, 0.0]), (30, [3.0, 0.0])]);
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(
+            flat_hits(&core, &read),
+            vec![
+                (10, vec![0.0, 2.0]),
+                (30, vec![3.0, 0.0]),
+                (40, vec![2.0, 0.0]),
+            ]
+        );
+    }
+
+    #[test]
+    fn reader_refused_rebuild_reports_refused_and_backs_off() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        commit_rows(
+            &open_ordinal_test_core(Some(writer_dir.path()), &writer),
+            &writer,
+            &[(10, [0.0, 1.0])],
+        );
+        commit_rows(
+            &open_ordinal_test_core(None, &writer),
+            &writer,
+            &[(30, [1.0, 0.0])],
+        );
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let hits = metrics::with_local_recorder(&recorder, || flat_hits(&core, &read));
+        assert_eq!(hits, vec![(10, vec![0.0, 1.0]), (30, vec![1.0, 0.0])]);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"helix_lsm_sidecar_materialize_total{outcome="refused"} 1"#),
+            "{rendered}"
+        );
+        // A row without an ordinal can be a write racing the reader's scans,
+        // so the rebuild is retried once before it is refused.
+        assert!(
+            rendered.contains(r#"helix_lsm_sidecar_materialize_total{outcome="retried"} 1"#),
+            "{rendered}"
+        );
+        // The refusal outlives a plain miss's TTL.
+        let ttl = lsm_sidecar_miss_ttl_secs();
+        let cached_at = core
+            .lsm_sidecar_miss_cached_at_secs
+            .load(AtomicOrdering::Relaxed);
+        assert!(!lsm_sidecar_miss_expired(
+            cached_at,
+            unix_secs_now_nonzero() + ttl,
+            ttl
+        ));
+    }
+
+    #[test]
+    fn row_only_writes_keep_reader_sidecars_current() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        commit_rows(
+            &open_ordinal_test_core(Some(writer_dir.path()), &writer),
+            &writer,
+            &[(10, [0.0, 1.0]), (20, [-1.0, 0.0])],
+        );
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let reader_core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(
+            flat_hits(&reader_core, &read),
+            vec![(10, vec![0.0, 1.0]), (20, vec![-1.0, 0.0])]
+        );
+        assert_eq!(reader_core.sidecar_format_label(), "hvec");
+
+        // A row without an ordinal makes the writer's rebuild refuse, so the
+        // writer stores rows without slots: an upsert of 10 and a new id 30.
+        commit_rows(
+            &open_ordinal_test_core(None, &writer),
+            &writer,
+            &[(5, [0.0, -1.0])],
+        );
+        let lost_dir = TempDir::new().unwrap();
+        let writer_core = open_ordinal_test_core(Some(lost_dir.path()), &writer);
+        commit_rows(&writer_core, &writer, &[(10, [2.0, 0.0]), (30, [1.0, 0.0])]);
+        assert!(!writer_core.has_mmap_sidecar());
+
+        // The reader keeps its sidecar, yet neither scores 10's old slot nor
+        // misses 30. (5 has no ordinal at all; this test does not cover it.)
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        let mut hits = flat_hits(&reader_core, &read);
+        hits.retain(|(id, _)| *id != 5);
+        assert_eq!(
+            hits,
+            vec![
+                (10, vec![2.0, 0.0]),
+                (20, vec![-1.0, 0.0]),
+                (30, vec![1.0, 0.0]),
+            ]
+        );
+        assert_eq!(reader_core.sidecar_format_label(), "hvec");
+        assert_eq!(
+            reader_core
+                .get_vector(&read, 10, 0, true)
+                .unwrap()
+                .get_data(),
+            &[2.0, 0.0]
+        );
+    }
+
+    /// Insert 30 while every materialization permit is busy, free one, run
+    /// `attach` in the same open batch, then commit it.
+    fn insert_while_permits_busy_then(
+        attach: impl FnOnce(&VectorCore, &mut AnyWrite<'_>),
+    ) -> (
+        Arc<dyn object_store::ObjectStore>,
+        String,
+        Arc<AnyBackend>,
+        VectorCore,
+        TempDir,
+    ) {
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        commit_rows(
+            &open_ordinal_test_core(Some(writer_dir.path()), &writer),
+            &writer,
+            &[(10, [0.0, 1.0]), (20, [-1.0, 0.0])],
+        );
+        // The writer lost its local sidecar.
+        let lost_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(lost_dir.path()), &writer);
+        let busy = (0..sidecar_materialize_concurrency())
+            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(busy);
+        });
+        let mut write = writer.begin_write().unwrap();
+        core.insert_flat_be(&mut write, &[1.0, 0.0], Some(30), None)
+            .unwrap();
+        release.join().unwrap();
+        attach(&core, &mut write);
+        writer.commit(write).unwrap();
+        (store, path, writer, core, lost_dir)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn busy_then_free_permit_in_one_batch_keeps_every_row() {
+        let (_store, _path, writer, core, _dir) = insert_while_permits_busy_then(|core, write| {
+            core.insert_flat_be(write, &[2.0, 0.0], Some(40), None)
+                .unwrap();
+        });
+        let read = writer.begin_read().unwrap();
+        assert_eq!(
+            flat_hits(&core, &read),
+            vec![
+                (10, vec![0.0, 1.0]),
+                (20, vec![-1.0, 0.0]),
+                (30, vec![1.0, 0.0]),
+                (40, vec![2.0, 0.0]),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn read_rebuild_during_an_open_batch_keeps_every_row_through_seal() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer, core, _dir) = insert_while_permits_busy_then(|core, _| {
+            // A search touches the segment on the writer while the batch is open.
+            core.ensure_lsm_mmap_sidecar().unwrap();
+        });
+        let expected = vec![
+            (10, vec![0.0, 1.0]),
+            (20, vec![-1.0, 0.0]),
+            (30, vec![1.0, 0.0]),
+        ];
+        let read = writer.begin_read().unwrap();
+        assert_eq!(flat_hits(&core, &read), expected);
+
+        // Seal publishes the sidecar and its ordinals; a cold reader restores both.
+        let mut write = writer.begin_write().unwrap();
+        assert!(core.persist_hvec_sidecar_blob_be(&mut write).unwrap());
+        assert!(core
+            .persist_hvec_sidecar_ordinals_blob_be(&mut write, &[10, 20, 30])
+            .unwrap());
+        writer.commit(write).unwrap();
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let reader_core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(flat_hits(&reader_core, &read), expected);
+    }
+
+    #[test]
+    fn writer_never_appends_into_a_sidecar_whose_header_lost_appends() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &[(10, [0.0, 1.0]), (20, [-1.0, 0.0])]);
+        core.flush_mmap().unwrap();
+        // Committed to the LSM; the process dies before the sidecar header flush.
+        commit_rows(&core, &writer, &[(30, [1.0, 0.0])]);
+        drop(core);
+
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &[(40, [2.0, 0.0])]);
+        let expected = vec![
+            (10, vec![0.0, 1.0]),
+            (20, vec![-1.0, 0.0]),
+            (30, vec![1.0, 0.0]),
+            (40, vec![2.0, 0.0]),
+        ];
+        let read = writer.begin_read().unwrap();
+        assert_eq!(flat_hits(&core, &read), expected);
+        for (id, vector) in &expected {
+            assert_eq!(
+                core.get_vector(&read, *id, 0, true).unwrap().get_data(),
+                vector.as_slice(),
+                "id {id} must resolve to its own vector"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinal_map_load_keeps_appends_cached_while_it_scanned() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &[(10, [0.0, 1.0]), (20, [-1.0, 0.0])]);
+        core.flush_mmap().unwrap();
+
+        // A reopened writer: a query snapshots the store and starts loading
+        // the ordinal map while an upsert appends 30.
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        let read = writer.begin_read().unwrap();
+        let mut write = writer.begin_write().unwrap();
+        core.insert_flat_be(&mut write, &[1.0, 0.0], Some(30), None)
+            .unwrap();
+        core.ensure_sidecar_ordinals_loaded(&read).unwrap();
+        writer.commit(write).unwrap();
+
+        let read = writer.begin_read().unwrap();
+        assert_eq!(
+            flat_hits(&core, &read),
+            vec![
+                (10, vec![0.0, 1.0]),
+                (20, vec![-1.0, 0.0]),
+                (30, vec![1.0, 0.0]),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ordinal_map_load_discarded_when_delete_generation_moves() {
+        use crate::helix_engine::storage_core::backend::StorageBackend;
+
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &[(10, [0.0, 1.0]), (20, [-1.0, 0.0])]);
+        core.flush_mmap().unwrap();
+
+        // Reopen so ordinals must be loaded from disk.
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        assert!(!core.sidecar_ordinals_loaded().unwrap());
+
+        // Arm the two-phase hook so the loader thread pauses between
+        // scan and generation check.
+        ORDINAL_LOAD_POST_SCAN_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+        ORDINAL_LOAD_POST_SCAN_FIRED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let core_ref = &core;
+        let writer_ref = &*writer;
+        std::thread::scope(|s| {
+            // Thread that loads ordinals; the hook fires after the scan.
+            let loader = s.spawn(|| {
+                let read = writer_ref.begin_read().unwrap();
+                core_ref.ensure_sidecar_ordinals_loaded(&read).unwrap();
+            });
+
+            // Wait for the scan to complete (hook fires).
+            while !ORDINAL_LOAD_POST_SCAN_FIRED.load(std::sync::atomic::Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+
+            // Bump delete_generation (simulates a concurrent delete).
+            core_ref
+                .delete_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+            // Release the loader thread to continue past the generation check.
+            ORDINAL_LOAD_POST_SCAN_FIRED.store(false, std::sync::atomic::Ordering::Release);
+
+            loader.join().unwrap();
+        });
+
+        ORDINAL_LOAD_POST_SCAN_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        // With the fix: the generation moved during the scan so the loaded
+        // map was discarded and ordinals remain unloaded.
+        // On defaf673: no generation check exists, so the map is always
+        // installed (test would fail).
+        assert!(
+            !core.sidecar_ordinals_loaded().unwrap(),
+            "ordinal map must be discarded when delete generation moves during scan"
+        );
+    }
+
+    #[test]
+    fn write_path_sidecar_failure_stores_the_row_instead_of_failing_the_insert() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        commit_rows(
+            &open_ordinal_test_core(Some(writer_dir.path()), &writer),
+            &writer,
+            &[(10, [0.0, 1.0]), (20, [-1.0, 0.0])],
+        );
+        // The writer lost its sidecar and cannot rebuild it: a directory
+        // sits where the file goes.
+        let broken_dir = TempDir::new().unwrap();
+        std::fs::create_dir(
+            broken_dir
+                .path()
+                .join("dense__seg_000001")
+                .with_extension("hvec"),
+        )
+        .unwrap();
+        let obstacle = broken_dir
+            .path()
+            .join("dense__seg_000001")
+            .with_extension("hvec");
+        let core = open_ordinal_test_core(Some(broken_dir.path()), &writer);
+        let mut write = writer.begin_write().unwrap();
+        core.insert_flat_be(&mut write, &[1.0, 0.0], Some(30), None)
+            .unwrap();
+        // Rebuilding would now work, but not from a snapshot missing 30.
+        std::fs::remove_dir(&obstacle).unwrap();
+        assert!(!core.ensure_lsm_mmap_sidecar().unwrap());
+        writer.commit(write).unwrap();
+
+        let expected = vec![
+            (10, vec![0.0, 1.0]),
+            (20, vec![-1.0, 0.0]),
+            (30, vec![1.0, 0.0]),
+        ];
+        let read = writer.begin_read().unwrap();
+        assert_eq!(flat_hits(&core, &read), expected);
+        // A reader that rebuilds a sidecar scores the slotless row from its row.
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let reader_core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(flat_hits(&reader_core, &read), expected);
+        assert_eq!(reader_core.sidecar_format_label(), "hvec");
+    }
+
+    #[test]
+    fn sidecar_verify_discards_and_republishes_id_sorted_sidecars() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+        use crate::helix_engine::vector_core::mmap_vectors::MmapVectorStore;
+
+        let verify = EnvGuard::set("HELIX_LSM_SIDECAR_VERIFY", "1");
+        let (store, path, writer, _writer_dir) = unsorted_ordinal_writer();
+        // What rebuilds before e3ec18de wrote: rows in id order, while the
+        // persisted ordinals follow insert order. Left on the writer's disk
+        // and published as the blob.
+        let stale_dir = TempDir::new().unwrap();
+        let stale = stale_dir
+            .path()
+            .join("dense__seg_000001")
+            .with_extension("hvec");
+        let mut by_id = UNSORTED_ORDINAL_ROWS;
+        by_id.sort_by_key(|(id, _)| *id);
+        let slices = by_id
+            .iter()
+            .map(|(_, row)| row.as_slice())
+            .collect::<Vec<_>>();
+        drop(MmapVectorStore::create_from_slices(&stale, &slices).unwrap());
+        let mut write = writer.begin_write().unwrap();
+        writer
+            .put(
+                &mut write,
+                Namespace::Segment {
+                    physical_name: "dense__seg_000001",
+                    db: SegmentDb::VectorData,
+                },
+                HVEC_SIDECAR_BLOB_KEY,
+                &std::fs::read(&stale).unwrap(),
+            )
+            .unwrap();
+        writer.commit(write).unwrap();
+
+        // The writer discards its stale file and the restored blob, rebuilds
+        // from rows, and republishes the blob.
+        let read = writer.begin_read().unwrap();
+        assert_unsorted_ordinal_rows(
+            &open_ordinal_test_core(Some(stale_dir.path()), &writer),
+            &read,
+        );
+
+        // The rebuilt file now matches its rows: the check keeps it.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            assert_unsorted_ordinal_rows(
+                &open_ordinal_test_core(Some(stale_dir.path()), &writer),
+                &read,
+            );
+        });
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"helix_lsm_sidecar_verify_total{outcome="ok"} 1"#),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("mismatch"), "{rendered}");
+
+        // A fresh pod without the check now restores a matching blob.
+        drop(verify);
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_unsorted_ordinal_rows(
+            &open_ordinal_test_core(Some(reader_dir.path()), &reader),
+            &read,
+        );
+    }
+
+    #[test]
+    fn rebuilt_sidecar_layout_follows_persisted_ordinals() {
+        type Layout = fn(
+            Vec<(u128, char)>,
+            &HashMap<u128, u64>,
+            usize,
+        ) -> Result<
+            Result<(Vec<Option<char>>, HashMap<u128, u64>), &'static str>,
+            VectorError,
+        >;
+        let layout: Layout = VectorCore::layout_rows_by_persisted_ordinals::<char>;
+        let rows = || vec![(10u128, 'a'), (20, 'b'), (30, 'c')];
+        let persisted = |pairs: &[(u128, u64)]| pairs.iter().copied().collect::<HashMap<_, _>>();
+
+        // No persisted ordinals: positional layout.
+        let (slots, map) = layout(rows(), &HashMap::new(), 0).unwrap().unwrap();
+        assert_eq!(slots, [Some('a'), Some('b'), Some('c')]);
+        assert_eq!(map, persisted(&[(10, 0), (20, 1), (30, 2)]));
+
+        // Each row lands at its ordinal; deleted ordinals stay dead slots.
+        let ordinals = persisted(&[(30, 0), (10, 3), (20, 4)]);
+        let (slots, map) = layout(rows(), &ordinals, 0).unwrap().unwrap();
+        assert_eq!(slots, [Some('c'), None, None, Some('a'), Some('b')]);
+        assert_eq!(map, ordinals);
+
+        // Row-only ordinals get no slot but keep the slots they once needed.
+        let ordinals = persisted(&[
+            (10, 0),
+            (20, ROW_ONLY_SIDECAR_ORDINAL + 3),
+            (30, ROW_ONLY_SIDECAR_ORDINAL),
+        ]);
+        let (slots, map) = layout(rows(), &ordinals, 0).unwrap().unwrap();
+        assert_eq!(slots, [Some('a'), None, None]);
+        assert_eq!(map, ordinals);
+
+        // Ordinals that cannot describe the rows refuse to build.
+        for refused in [
+            persisted(&[(10, 0), (20, 0), (30, 1)]),
+            persisted(&[(10, 0), (30, 1)]),
+            persisted(&[(10, 0), (20, 1), (404, 2)]),
+            persisted(&[(10, 0), (20, 1), (30, u64::MAX)]),
+            persisted(&[(10, 0), (20, 1), (30, 5000)]),
+        ] {
+            assert!(layout(rows(), &refused, 0).unwrap().is_err(), "{refused:?}");
+        }
+
+        // min_slots floors the rebuild: ordinals need 5 slots but floor is 8.
+        let ordinals = persisted(&[(30, 0), (10, 3), (20, 4)]);
+        let (slots, _) = layout(rows(), &ordinals, 8).unwrap().unwrap();
+        assert_eq!(slots.len(), 8, "min_slots must widen the file to the floor");
+        // Original slots still present at their ordinals.
+        assert_eq!(slots[0], Some('c'));
+        assert_eq!(slots[3], Some('a'));
+        assert_eq!(slots[4], Some('b'));
+        // Extra slots are dead (None).
+        assert!(slots[5..].iter().all(|s| s.is_none()));
+    }
+
+    /// A short-file detection must floor the next rebuild at the old file's
+    /// physical slot count via `sidecar_rebuild_min_slots`.
+    #[test]
+    #[serial_test::serial]
+    fn short_file_sets_rebuild_floor_for_next_materialize() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let (_env, dir) = setup();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+
+        // Write rows so ordinals get persisted and a sidecar is created.
+        commit_rows(&core, &writer, &UNSORTED_ORDINAL_ROWS);
+
+        // Record the old sidecar's slot count.
+        let old_count = {
+            let slot = core.mmap_store.read().unwrap();
+            slot.as_ref().expect("sidecar must exist").count()
+        };
+        assert!(old_count >= 3, "initial sidecar must have at least 3 slots");
+
+        // Artificially set a floor higher than what persisted ordinals need.
+        // This simulates a short-file detection saving the old file's count.
+        let inflated = old_count as u64 + 10;
+        core.sidecar_rebuild_min_slots
+            .store(inflated, AtomicOrdering::Relaxed);
+
+        // Drop the sidecar so the next write triggers a rebuild.
+        {
+            let mut slot = core.mmap_store.write().unwrap();
+            if let Some(ref store) = *slot {
+                let _ = std::fs::remove_file(store.path());
+            }
+            *slot = None;
+        }
+
+        // Write a new row; the rebuild must honour the floor.
+        let mut w = writer.begin_write().unwrap();
+        core.insert_flat_be(&mut w, &[0.5, 0.5], Some(40), None)
+            .unwrap();
+        writer.commit(w).unwrap();
+
+        let slot = core.mmap_store.read().unwrap();
+        let new_count = slot.as_ref().expect("sidecar must be rebuilt").count();
+        assert!(
+            new_count >= inflated,
+            "rebuilt sidecar ({new_count} slots) must be >= floor ({inflated})"
+        );
+        // Floor must be cleared after a successful rebuild.
+        assert_eq!(
+            core.sidecar_rebuild_min_slots.load(AtomicOrdering::Relaxed),
+            0,
+            "floor must be reset after successful rebuild"
+        );
+
+        // Existing ids must keep their ordinals.
+        let read = writer.begin_read().unwrap();
+        let hits = flat_hits(&core, &read);
+        assert!(
+            hits.len() >= 4,
+            "all 4 rows must be readable, got {}",
+            hits.len()
+        );
     }
 
     #[test]
@@ -16007,12 +18233,15 @@ mod tests {
             let (continue_tx, continue_rx) = mpsc::sync_channel(0);
             let core_ref = &core;
             let worker = scope.spawn(move || {
-                core_ref.ensure_lsm_mmap_sidecar_with_lock_observer(|| {
-                    lock_attempt_tx
-                        .send(())
-                        .expect("test receiver must remain connected");
-                    let _ = continue_rx.recv();
-                })
+                core_ref.ensure_lsm_mmap_sidecar_with_lock_observer(
+                    || {
+                        lock_attempt_tx
+                            .send(())
+                            .expect("test receiver must remain connected");
+                        let _ = continue_rx.recv();
+                    },
+                    false,
+                )
             });
 
             lock_attempt_rx
@@ -16045,6 +18274,248 @@ mod tests {
             SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
             0,
             "all materialization permits must be released after the test"
+        );
+    }
+
+    /// While the write-path materializer waits for a permit, the slot lock
+    /// must be free so concurrent readers are not blocked.
+    #[test]
+    #[serial_test::serial]
+    fn write_path_permit_wait_does_not_block_readers() {
+        use crate::helix_engine::storage_core::backend_any::AnyBackend;
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::sync::{mpsc, Arc};
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let cap = sidecar_materialize_concurrency();
+        assert!(cap >= 1 && cap <= 64, "need finite cap, got {cap}");
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0
+        );
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("writer-permit-reader-{nanos}"))
+                .expect("open in-memory LSM backend"),
+        ));
+        let (_env, dir) = setup();
+        let core = Arc::new(
+            VectorCore::new_named_lsm_with_dir(
+                "dense__seg_000000",
+                HNSWConfig::new(Some(8), Some(16), Some(32)),
+                DistanceMetric::Cosine,
+                SpindleConfig {
+                    mode: SpindleMode::None,
+                    ..SpindleConfig::default()
+                },
+                Some(dir.path()),
+                4,
+                Arc::clone(&backend),
+            )
+            .unwrap(),
+        );
+
+        // Exhaust all permits so the write path blocks in acquire_within.
+        let held: Vec<_> = (0..cap)
+            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
+            .collect();
+
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let core2 = Arc::clone(&core);
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            // This will block waiting for a permit (all are held).
+            core2.ensure_lsm_mmap_sidecar_with_lock_observer(|| {}, true)
+        });
+
+        // Wait for the writer to start.
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Give the writer a moment to enter the permit-wait loop.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // A reader must be able to take the slot read lock while the writer
+        // is waiting for a permit.
+        let reader_ok = core.mmap_store.try_write().is_ok();
+        assert!(
+            reader_ok,
+            "slot lock must be free while writer waits for permit"
+        );
+
+        // Release permits so the writer can finish.
+        drop(held);
+        let _ = writer.join().unwrap();
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0
+        );
+    }
+
+    /// N concurrent writers to the same segment must consume at most 1
+    /// materialization permit (the elected materializer).
+    #[test]
+    #[serial_test::serial]
+    fn concurrent_writers_consume_at_most_one_permit() {
+        use crate::helix_engine::storage_core::backend_any::AnyBackend;
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::sync::{Arc, Barrier};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let cap = sidecar_materialize_concurrency();
+        assert!(cap >= 2 && cap <= 64, "need cap >= 2, got {cap}");
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0
+        );
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("concurrent-writers-{nanos}"))
+                .expect("open in-memory LSM backend"),
+        ));
+        let (_env, dir) = setup();
+        let core = Arc::new(
+            VectorCore::new_named_lsm_with_dir(
+                "dense__seg_000000",
+                HNSWConfig::new(Some(8), Some(16), Some(32)),
+                DistanceMetric::Cosine,
+                SpindleConfig {
+                    mode: SpindleMode::None,
+                    ..SpindleConfig::default()
+                },
+                Some(dir.path()),
+                4,
+                Arc::clone(&backend),
+            )
+            .unwrap(),
+        );
+
+        // Hold cap-2 permits so only 2 remain. If two materializers tried
+        // to acquire, one would succeed and one would contend.
+        let held: Vec<_> = (0..cap.saturating_sub(2))
+            .filter_map(|_| SidecarMaterializePermit::try_acquire())
+            .collect();
+
+        let n_writers = 4;
+        let barrier = Arc::new(Barrier::new(n_writers));
+        let peak_inflight = std::sync::atomic::AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            for _ in 0..n_writers {
+                let core = Arc::clone(&core);
+                let barrier = Arc::clone(&barrier);
+                let peak = &peak_inflight;
+                s.spawn(move || {
+                    barrier.wait();
+                    let _ = core.ensure_lsm_mmap_sidecar_with_lock_observer(
+                        || {
+                            // Sample inflight inside the lock observer (called
+                            // while a permit is held and the lock is contended).
+                            let cur = SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire);
+                            peak.fetch_max(cur, AtomicOrdering::Relaxed);
+                        },
+                        true,
+                    );
+                    // Also sample after the call returns (permit still held
+                    // inside for the elected writer).
+                    let cur = SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire);
+                    peak.fetch_max(cur, AtomicOrdering::Relaxed);
+                });
+            }
+        });
+        // Peak inflight = held permits + at most 1 writer permit.
+        let peak = peak_inflight.load(AtomicOrdering::Relaxed);
+        assert!(
+            peak <= held.len() + 1,
+            "at most 1 writer permit should be consumed; peak={peak}, held={}",
+            held.len()
+        );
+        // After all writers complete, the inflight count must be back to
+        // only the permits we're holding.
+        let after = SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire);
+        assert_eq!(
+            after,
+            held.len(),
+            "all writer permits must be released; inflight={after}, held={}",
+            held.len()
+        );
+
+        drop(held);
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0,
+            "all permits must be released"
+        );
+    }
+
+    /// Write-path pin emits `helix_lsm_sidecar_pinned_total` exactly once per
+    /// pin episode, labels the counter with the failure reason, and leaves
+    /// rows readable through flat search.
+    #[test]
+    #[serial_test::serial]
+    fn write_path_pin_emits_metric_once_and_rows_remain_readable() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let (_env, dir) = setup();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+
+        // Seed ordinals so the write path needs a sidecar rebuild.
+        commit_rows(&core, &writer, &UNSORTED_ORDINAL_ROWS);
+
+        // Drop the sidecar and cache a miss so the rebuild path is hit
+        // instantly (no 5-second permit timeout needed).
+        {
+            let mut slot = core.mmap_store.write().unwrap();
+            if let Some(ref store) = *slot {
+                let _ = std::fs::remove_file(store.path());
+            }
+            *slot = None;
+        }
+        core.record_lsm_sidecar_miss();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        // First write with sidecar missing: triggers pin.
+        metrics::with_local_recorder(&recorder, || {
+            let mut w = writer.begin_write().unwrap();
+            core.insert_flat_be(&mut w, &[0.5, 0.5], Some(40), None)
+                .unwrap();
+            writer.commit(w).unwrap();
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"helix_lsm_sidecar_pinned_total{reason="cached_miss"} 1"#),
+            "first pin must emit counter=1: {rendered}"
+        );
+
+        // Second write while already pinned: counter must NOT increase.
+        metrics::with_local_recorder(&recorder, || {
+            let mut w = writer.begin_write().unwrap();
+            core.insert_flat_be(&mut w, &[0.3, 0.7], Some(50), None)
+                .unwrap();
+            writer.commit(w).unwrap();
+        });
+
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"helix_lsm_sidecar_pinned_total{reason="cached_miss"} 1"#),
+            "second write while pinned must not bump the counter: {rendered}"
+        );
+
+        // All rows (original 3 + new 2) must be readable.
+        let read = writer.begin_read().unwrap();
+        let hits = flat_hits(&core, &read);
+        assert!(
+            hits.len() >= 5,
+            "all 5 rows must be readable, got {}",
+            hits.len()
         );
     }
 
@@ -17148,5 +19619,1483 @@ mod tests {
             })
             .collect();
         assert_eq!(worst.pop().unwrap().0.id, 1, "NaN must be evicted first");
+    }
+
+    #[test]
+    fn shared_cache_cross_collection_conflation_fixed() {
+        // Regression: Two collections with identical segment names must not
+        // share cache entries. With per-core unique namespace, Collection B
+        // reads its own vector, not Collection A's.
+        //
+        // RED on parent (namespace_id(name, "")): both cores share namespace,
+        // reading A first populates cache, B reads A's cached value.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use uuid::Uuid;
+
+        let shared = Arc::new(super::super::shared_cache::SharedVectorCaches::new(
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+        ));
+
+        let coll_a = format!("coll_a_{}", Uuid::new_v4());
+        let coll_b = format!("coll_b_{}", Uuid::new_v4());
+        let backend_a = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&coll_a).unwrap(),
+        ));
+        let backend_b = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&coll_b).unwrap(),
+        ));
+
+        let segment_name = "embedding__seg_000001"; // Identical physical name
+
+        let mut core_a = VectorCore::new_named_lsm_with_dir(
+            segment_name,
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Cosine,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            None,
+            384,
+            Arc::clone(&backend_a),
+        )
+        .unwrap();
+        core_a.shared_caches = Some(Arc::clone(&shared));
+
+        let mut core_b = VectorCore::new_named_lsm_with_dir(
+            segment_name,
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Cosine,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            None,
+            384,
+            Arc::clone(&backend_b),
+        )
+        .unwrap();
+        core_b.shared_caches = Some(Arc::clone(&shared));
+
+        // Insert id 42 with one-hot vectors at different indices
+        let mut write_a = core_a.backend.begin_write().unwrap();
+        let mut write_b = core_b.backend.begin_write().unwrap();
+
+        // A: [1, 0, 0, 0, ...], B: [0, 0, 1, 0, ...]
+        let mut vec_a = vec![0.0f32; 384];
+        vec_a[0] = 1.0;
+        let mut vec_b = vec![0.0f32; 384];
+        vec_b[2] = 1.0;
+
+        core_a
+            .insert_flat_be(&mut write_a, &vec_a, Some(42), None)
+            .unwrap();
+        core_b
+            .insert_flat_be(&mut write_b, &vec_b, Some(42), None)
+            .unwrap();
+
+        core_a.backend.commit(write_a).unwrap();
+        core_b.backend.commit(write_b).unwrap();
+
+        // Read A first (populates cache on parent semantics)
+        let read_a = core_a.backend.begin_read().unwrap();
+        let retrieved_a = core_a.get_vector(&read_a, 42, 0, true).unwrap();
+        assert_eq!(retrieved_a.get_data()[0], 1.0);
+        assert_eq!(retrieved_a.get_data()[2], 0.0);
+        drop(read_a);
+
+        // Read B: must return B's vector [0,0,1,...], not A's cached [1,0,0,...]
+        let read_b = core_b.backend.begin_read().unwrap();
+        let retrieved_b = core_b.get_vector(&read_b, 42, 0, true).unwrap();
+        assert_eq!(
+            retrieved_b.get_data()[2],
+            1.0,
+            "Collection B returned Collection A's cached vector (cross-collection conflation)"
+        );
+        assert_eq!(retrieved_b.get_data()[0], 0.0);
+    }
+
+    #[test]
+    fn shared_cache_stale_recreate_conflation_fixed() {
+        // Regression: Drop + recreate collection must not serve old cached vectors.
+        // With per-core unique namespace, new core cannot read old entries.
+        //
+        // RED on parent (namespace_id(name, "")): old and new cores share namespace,
+        // new core reads old core's cached entry for id 7.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use uuid::Uuid;
+
+        let shared = Arc::new(super::super::shared_cache::SharedVectorCaches::new(
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+        ));
+
+        let coll_name = format!("coll_recreate_{}", Uuid::new_v4());
+        let backend_old = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("{}_old", coll_name)).unwrap(),
+        ));
+
+        let segment_name = "embedding__seg_000001";
+
+        let mut core_old = VectorCore::new_named_lsm_with_dir(
+            segment_name,
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Cosine,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            None,
+            384,
+            Arc::clone(&backend_old),
+        )
+        .unwrap();
+        core_old.shared_caches = Some(Arc::clone(&shared));
+
+        // Old core: insert id 7 with [1,0,0,...]
+        let mut write = core_old.backend.begin_write().unwrap();
+        let mut vec_old = vec![0.0f32; 384];
+        vec_old[0] = 1.0;
+        core_old
+            .insert_flat_be(&mut write, &vec_old, Some(7), None)
+            .unwrap();
+        core_old.backend.commit(write).unwrap();
+
+        // Read once to populate cache
+        let read = core_old.backend.begin_read().unwrap();
+        let cached = core_old.get_vector(&read, 7, 0, true).unwrap();
+        assert_eq!(cached.get_data()[0], 1.0);
+        drop(read);
+
+        // Drop old core (simulates collection drop)
+        drop(core_old);
+
+        // Recreate: FRESH backend (different storage), same segment name
+        let backend_new = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("{}_new", coll_name)).unwrap(),
+        ));
+
+        let mut core_new = VectorCore::new_named_lsm_with_dir(
+            segment_name,
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Cosine,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            None,
+            384,
+            Arc::clone(&backend_new),
+        )
+        .unwrap();
+        core_new.shared_caches = Some(Arc::clone(&shared));
+
+        // New core reads id 7: must fail (not in new storage), not resurrect from cache
+        let read_new = core_new.backend.begin_read().unwrap();
+        assert!(
+            core_new.get_vector(&read_new, 7, 0, true).is_err(),
+            "New core resurrected old core's cached vector (stale-recreate conflation)"
+        );
+    }
+
+    #[test]
+    fn shared_cache_live_delete_invalidates() {
+        // Regression: delete_vectors_batch_be must invalidate shared cache entries.
+        // Pre-fix (9f72396e with delete paths not popping): get_vector after delete
+        // still returns the cached vector.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use uuid::Uuid;
+
+        let shared = Arc::new(super::super::shared_cache::SharedVectorCaches::new(
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+        ));
+
+        let coll_name = format!("coll_delete_{}", Uuid::new_v4());
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&coll_name).unwrap(),
+        ));
+
+        let mut core = VectorCore::new_named_lsm_with_dir(
+            "seg",
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Cosine,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            None,
+            4,
+            Arc::clone(&backend),
+        )
+        .unwrap();
+        core.shared_caches = Some(Arc::clone(&shared));
+
+        // Insert id 5
+        let mut write = core.backend.begin_write().unwrap();
+        let vec = vec![1.0f32, 0.0, 0.0, 0.0];
+        core.insert_flat_be(&mut write, &vec, Some(5), None)
+            .unwrap();
+        core.backend.commit(write).unwrap();
+
+        // Read (populates cache)
+        let read = core.backend.begin_read().unwrap();
+        let cached = core.get_vector(&read, 5, 0, true).unwrap();
+        assert_eq!(cached.get_data()[0], 1.0);
+        drop(read);
+
+        // Delete
+        let mut write_del = core.backend.begin_write().unwrap();
+        core.delete_vectors_batch_be(&mut write_del, &[5]).unwrap();
+        core.backend.commit(write_del).unwrap();
+
+        // get_vector must fail (not return cached value)
+        let read_after = core.backend.begin_read().unwrap();
+        assert!(
+            core.get_vector(&read_after, 5, 0, true).is_err(),
+            "get_vector after delete returned cached vector (delete didn't invalidate)"
+        );
+
+        // Full clear switches the namespace: rewrite storage behind the cache, then clear.
+        let mut write2 = core.backend.begin_write().unwrap();
+        core.insert_flat_be(&mut write2, &[1.0f32, 0.0, 0.0, 0.0], Some(6), None)
+            .unwrap();
+        core.backend.commit(write2).unwrap();
+        let read2 = core.backend.begin_read().unwrap();
+        assert_eq!(
+            core.get_vector(&read2, 6, 0, true).unwrap().get_data()[0],
+            1.0
+        );
+        drop(read2);
+
+        let encoded = encode_vector(&[0.0f32, 1.0, 0.0, 0.0], &core.spindle).unwrap();
+        let mut raw = core.backend.begin_write().unwrap();
+        core.backend
+            .put(
+                &mut raw,
+                core.seg_ns(SegmentDb::Vectors),
+                &VectorCore::vector_key(6, 0),
+                encoded.as_slice(),
+            )
+            .unwrap();
+        core.backend.commit(raw).unwrap();
+        let read3 = core.backend.begin_read().unwrap();
+        assert_eq!(
+            core.get_vector(&read3, 6, 0, true).unwrap().get_data()[0],
+            1.0,
+            "the raw write bypasses invalidation, so the cache still serves the old vector"
+        );
+        drop(read3);
+
+        core.clear_vector_cache();
+        let read4 = core.backend.begin_read().unwrap();
+        assert_eq!(
+            core.get_vector(&read4, 6, 0, true).unwrap().get_data()[1],
+            1.0,
+            "clear did not switch the cache namespace"
+        );
+    }
+
+    #[test]
+    fn shared_cache_delete_invalidates_high_levels_with_small_m() {
+        // Regression: delete must invalidate cache at ALL levels the node occupies.
+        // The fix uses exact-level iteration from Vectors prefix scan, not m_max_0.
+        // With small m (m=2 → m_max_0=4), nodes can exist at higher levels, and
+        // pre-fix code using m_max_0 would miss those levels.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use uuid::Uuid;
+
+        let shared = Arc::new(super::super::shared_cache::SharedVectorCaches::new(
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+        ));
+
+        let coll_name = format!("coll_high_level_{}", Uuid::new_v4());
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&coll_name).unwrap(),
+        ));
+
+        // Small m=2 → m_max_0=4
+        let mut core = VectorCore::new_named_lsm_with_dir(
+            "seg",
+            HNSWConfig::new(Some(2), Some(4), Some(32)),
+            DistanceMetric::Cosine,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            None,
+            4,
+            Arc::clone(&backend),
+        )
+        .unwrap();
+        core.shared_caches = Some(Arc::clone(&shared));
+
+        // Insert id 1 and write its vector at multiple levels (0..=6) to simulate
+        // HNSW structure with higher-level vectors. This tests that delete invalidates
+        // cache entries at ALL levels, not just 0..m_max_0 (which would be 0..=4).
+        use crate::helix_engine::storage_core::backend::SegmentDb;
+        let mut write = core.backend.begin_write().unwrap();
+        let vec = vec![1.0f32, 0.0, 0.0, 0.0];
+        for level in 0..=6 {
+            let key = VectorCore::vector_key(1, level);
+            let encoded = bincode::serialize(&vec).unwrap();
+            core.backend
+                .put(&mut write, core.seg_ns(SegmentDb::Vectors), &key, &encoded)
+                .unwrap();
+        }
+        core.backend.commit(write).unwrap();
+
+        // Read and cache at all levels 0..=6
+        let read = core.backend.begin_read().unwrap();
+        for level in 0..=6 {
+            let _ = core.get_vector(&read, 1, level, true);
+        }
+        drop(read);
+
+        // Delete via delete_vectors_batch_be (tests exact-level invalidation)
+        let mut write_del = core.backend.begin_write().unwrap();
+        let id_levels = core.delete_vectors_batch_be(&mut write_del, &[1]).unwrap();
+        core.backend.commit(write_del).unwrap();
+
+        // The fix must have recorded all 7 levels in id_levels
+        assert_eq!(
+            id_levels.get(&1).map(|v| v.len()),
+            Some(7),
+            "delete_vectors_batch_be didn't record all 7 levels"
+        );
+
+        // All must miss at all levels 0..=6
+        let read_after = core.backend.begin_read().unwrap();
+        for level in 0..=6 {
+            assert!(
+                core.get_vector(&read_after, 1, level, true).is_err(),
+                "ID 1 level {} still cached after delete (invalidation missed high level)",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn shared_cache_post_commit_invalidation_handles_concurrent_recache() {
+        // Regression: A concurrent read between pre-commit invalidation and commit
+        // can re-cache the deleted entry. Post-commit invalidation (apply_delete_tombstones)
+        // must clean up any such re-cached entries.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use uuid::Uuid;
+
+        let shared = Arc::new(super::super::shared_cache::SharedVectorCaches::new(
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+            NonZeroUsize::new(512).unwrap(),
+        ));
+
+        let coll_name = format!("coll_post_commit_{}", Uuid::new_v4());
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&coll_name).unwrap(),
+        ));
+
+        let mut core = VectorCore::new_named_lsm_with_dir(
+            "seg",
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Cosine,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            None,
+            4,
+            Arc::clone(&backend),
+        )
+        .unwrap();
+        core.shared_caches = Some(Arc::clone(&shared));
+
+        // Insert and cache
+        let mut write = core.backend.begin_write().unwrap();
+        let vec = vec![1.0f32, 0.0, 0.0, 0.0];
+        core.insert_flat_be(&mut write, &vec, Some(9), None)
+            .unwrap();
+        core.backend.commit(write).unwrap();
+
+        let read = core.backend.begin_read().unwrap();
+        let _ = core.get_vector(&read, 9, 0, true).unwrap();
+        drop(read);
+
+        // Delete (with pre-commit invalidation)
+        let mut write_del = core.backend.begin_write().unwrap();
+        core.delete_vectors_batch_be(&mut write_del, &[9]).unwrap();
+
+        // Manually re-cache to simulate concurrent read between invalidation and commit
+        if let Some(shared) = core.shared_caches.as_ref() {
+            let key = super::super::shared_cache::CacheKey::new(
+                core.cache_namespace
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                9,
+                0,
+            );
+            shared.vector.put(key, vec.clone());
+        }
+
+        core.backend.commit(write_del).unwrap();
+
+        // Verify cache still has it before post-commit hook
+        if let Some(shared) = core.shared_caches.as_ref() {
+            let key = super::super::shared_cache::CacheKey::new(
+                core.cache_namespace
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                9,
+                0,
+            );
+            assert!(
+                shared.vector.get(&key).is_some(),
+                "Cache should still have entry before post-commit invalidation"
+            );
+        }
+
+        // Post-commit hook must invalidate the re-cached entry
+        core.apply_delete_tombstones(&[9]);
+
+        // Verify cache was cleared by post-commit invalidation
+        if let Some(shared) = core.shared_caches.as_ref() {
+            let key = super::super::shared_cache::CacheKey::new(
+                core.cache_namespace
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                9,
+                0,
+            );
+            assert!(
+                shared.vector.get(&key).is_none(),
+                "Post-commit invalidation failed to clear re-cached entry"
+            );
+        }
+    }
+
+    // ── Write-path permit / slot-lock ordering ──
+
+    /// In-memory LSM core with a sidecar stem and no rows: every write-path
+    /// materialize attempt reaches the election and the lock loop, and ends
+    /// with a recorded miss.
+    fn write_path_probe_core(dir: &Path) -> VectorCore {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("write-path-{}", uuid::Uuid::new_v4())).unwrap(),
+        ));
+        VectorCore::new_named_lsm_with_dir(
+            "dense__seg_000000",
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Cosine,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            Some(dir),
+            4,
+            backend,
+        )
+        .unwrap()
+    }
+
+    /// Hook closure that parks the worker at its FIRST lock attempt only:
+    /// sends on `arrived`, waits on `go`. Later attempts pass straight through.
+    fn park_first_attempt(
+        arrived: std::sync::mpsc::SyncSender<()>,
+        go: std::sync::mpsc::Receiver<()>,
+    ) -> impl FnMut() {
+        let mut first = true;
+        move || {
+            if first {
+                first = false;
+                arrived.send(()).unwrap();
+                let _ = go.recv();
+            }
+        }
+    }
+
+    /// Finding 3 (reviewer probe `rr_wouldblock_path`): with a search holding
+    /// the slot read guard, `try_write` fails. At the lock attempt the worker
+    /// must hold no permit (the test can take the last one), and once the lock
+    /// is acquired and the permit is gone, the worker must wait for the permit
+    /// with the slot lock released (a reader can take it).
+    #[test]
+    #[serial_test::serial]
+    fn write_path_contended_lock_holds_no_permit_and_permit_wait_holds_no_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let cap = sidecar_materialize_concurrency();
+        assert!((1..=64).contains(&cap), "need a finite cap, got {cap}");
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0
+        );
+        let (_env, dir) = setup();
+        let core = write_path_probe_core(dir.path());
+        let held = (1..cap)
+            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        let waits_before =
+            WRITE_PATH_PERMIT_WAITS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst);
+
+        let (released_at_hook, lock_free_during_permit_wait) = std::thread::scope(|scope| {
+            let (a_tx, a_rx) = mpsc::sync_channel(0);
+            let (c_tx, c_rx) = mpsc::sync_channel(0);
+            let reader_guard = core.mmap_store.read().unwrap();
+            let core_ref = &core;
+            let worker = scope.spawn(move || {
+                core_ref.ensure_lsm_mmap_sidecar_with_lock_observer(
+                    park_first_attempt(a_tx, c_rx),
+                    true,
+                )
+            });
+            a_rx.recv_timeout(Duration::from_secs(5))
+                .expect("hook must fire on the contended write path");
+            // The worker is at its lock attempt: it must not hold a permit.
+            let last = SidecarMaterializePermit::try_acquire();
+            let released = last.is_some();
+            c_tx.send(()).unwrap();
+            drop(reader_guard);
+            // All permits are now held by the test, so once the worker gets the
+            // slot lock it must drop it again and wait for a permit lock-free.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while WRITE_PATH_PERMIT_WAITS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst)
+                == waits_before
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "worker never reached the lock-free permit wait"
+                );
+                std::thread::yield_now();
+            }
+            let lock_free = core.mmap_store.try_read().is_ok();
+            drop(last);
+            let _ = worker.join().unwrap();
+            (released, lock_free)
+        });
+        drop(held);
+        assert!(
+            released_at_hook,
+            "worker queued on the slot lock still holds a permit"
+        );
+        assert!(
+            lock_free_during_permit_wait,
+            "worker holds the slot WRITE lock while waiting for a permit (searches blocked)"
+        );
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0
+        );
+    }
+
+    /// Reviewer probe `rr_hook_fires_before_lock_on_uncontended_write_path`:
+    /// a hook named lock-attempt fires where the lock is attempted, i.e. before
+    /// the slot lock is taken.
+    #[test]
+    #[serial_test::serial]
+    fn write_path_lock_attempt_hook_fires_before_lock_is_taken() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (_env, dir) = setup();
+        let core = write_path_probe_core(dir.path());
+        let locked_at_hook = std::thread::scope(|scope| {
+            let (a_tx, a_rx) = mpsc::sync_channel(0);
+            let (c_tx, c_rx) = mpsc::sync_channel(0);
+            let core_ref = &core;
+            let worker = scope.spawn(move || {
+                core_ref.ensure_lsm_mmap_sidecar_with_lock_observer(
+                    park_first_attempt(a_tx, c_rx),
+                    true,
+                )
+            });
+            a_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let locked = core.mmap_store.try_read().is_err();
+            c_tx.send(()).unwrap();
+            let _ = worker.join().unwrap();
+            locked
+        });
+        assert!(
+            !locked_at_hook,
+            "on_lock_attempt fires AFTER the slot lock is acquired"
+        );
+    }
+
+    /// Uncontended write path: the elected writer reaches its lock attempt
+    /// holding nothing — no permit (the lock is tried first, the permit only
+    /// `try_acquire`d under it) and no slot lock — and releases its permit
+    /// before returning.
+    #[test]
+    #[serial_test::serial]
+    fn write_path_elected_writer_attempts_lock_holding_no_permit() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let cap = sidecar_materialize_concurrency();
+        assert!((1..=64).contains(&cap), "need a finite cap, got {cap}");
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0
+        );
+        let (_env, dir) = setup();
+        let core = write_path_probe_core(dir.path());
+        let held: Vec<_> = (1..cap)
+            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
+            .collect();
+
+        let (inflight_at_hook, locked_at_hook) = std::thread::scope(|scope| {
+            let (a_tx, a_rx) = mpsc::sync_channel(0);
+            let (c_tx, c_rx) = mpsc::sync_channel(0);
+            let core_ref = &core;
+            let worker = scope.spawn(move || {
+                core_ref.ensure_lsm_mmap_sidecar_with_lock_observer(
+                    park_first_attempt(a_tx, c_rx),
+                    true,
+                )
+            });
+            a_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let inflight = SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire);
+            let locked = core.mmap_store.try_read().is_err();
+            c_tx.send(()).unwrap();
+            assert!(
+                !worker.join().unwrap().unwrap(),
+                "empty segment must not materialize a sidecar"
+            );
+            (inflight, locked)
+        });
+        assert_eq!(
+            inflight_at_hook,
+            cap - 1,
+            "elected writer must attempt the slot lock without a permit"
+        );
+        assert!(
+            !locked_at_hook,
+            "slot lock must be free at the lock attempt"
+        );
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            cap - 1,
+            "elected writer must release its permit on return"
+        );
+        drop(held);
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0
+        );
+    }
+
+    /// N4: an elected writer that acquired a permit lock-free and then finds
+    /// the slot lock contended must drop the permit before queuing on the
+    /// lock. Drives the loop through both iterations with handshakes at each
+    /// lock attempt: #1 try (iteration 1), #2 blocking wait, #3 try with a
+    /// permit (iteration 2), #4 blocking wait — permit must be gone.
+    #[test]
+    #[serial_test::serial]
+    fn write_path_retry_drops_permit_before_queuing_on_contended_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let cap = sidecar_materialize_concurrency();
+        assert!((2..=64).contains(&cap), "need cap >= 2, got {cap}");
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0
+        );
+        let (_env, dir) = setup();
+        let core = write_path_probe_core(dir.path());
+        let held: Vec<_> = (1..cap)
+            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
+            .collect();
+        let waits_before =
+            WRITE_PATH_PERMIT_WAITS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst);
+
+        std::thread::scope(|scope| {
+            let (fire_tx, fire_rx) = mpsc::sync_channel::<usize>(0);
+            let (go_tx, go_rx) = mpsc::sync_channel::<()>(0);
+            let guard1 = core.mmap_store.read().unwrap();
+            let core_ref = &core;
+            let worker = scope.spawn(move || {
+                let mut fires = 0usize;
+                core_ref.ensure_lsm_mmap_sidecar_with_lock_observer(
+                    move || {
+                        fires += 1;
+                        fire_tx.send(fires).unwrap();
+                        let _ = go_rx.recv();
+                    },
+                    true,
+                )
+            });
+            let inflight = || SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire);
+            let recv = |n: usize| {
+                assert_eq!(
+                    fire_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    n,
+                    "lock attempt #{n} expected"
+                );
+            };
+
+            // #1: iteration 1, non-blocking try, nothing held yet.
+            recv(1);
+            assert_eq!(inflight(), cap - 1, "#1: no permit before the first try");
+            go_tx.send(()).unwrap();
+            // #2: iteration 1, try failed (guard1), queuing on the lock.
+            recv(2);
+            assert_eq!(
+                inflight(),
+                cap - 1,
+                "#2: no permit while queued on the lock"
+            );
+            // Exhaust permits so the worker cannot take one under the lock.
+            let last = SidecarMaterializePermit::try_acquire().unwrap();
+            go_tx.send(()).unwrap();
+            drop(guard1);
+            // Worker: gets the lock, try_acquire fails, drops the lock, waits.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while WRITE_PATH_PERMIT_WAITS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst)
+                == waits_before
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no lock-free permit wait"
+                );
+                std::thread::yield_now();
+            }
+            let guard2 = core
+                .mmap_store
+                .try_read()
+                .expect("slot lock must be free while the worker waits for a permit");
+            drop(last);
+            // #3: iteration 2, non-blocking try, permit held from the wait.
+            recv(3);
+            assert_eq!(inflight(), cap, "#3: permit held for the retry");
+            go_tx.send(()).unwrap();
+            // #4: iteration 2, try failed (guard2): the permit must be dropped.
+            recv(4);
+            assert_eq!(
+                inflight(),
+                cap - 1,
+                "#4: worker queued on the contended slot lock still holds its permit"
+            );
+            go_tx.send(()).unwrap();
+            drop(guard2);
+            assert!(!worker.join().unwrap().unwrap());
+        });
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            cap - 1
+        );
+        drop(held);
+        assert_eq!(
+            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
+            0
+        );
+    }
+
+    /// N9: the per-segment election flag is released when the elected
+    /// writer's attempt ends (RAII guard drop), so the next writer is elected
+    /// again instead of waiting out the deadline as a non-elected waiter.
+    #[test]
+    #[serial_test::serial]
+    fn write_path_election_flag_clears_after_materialize_attempt() {
+        let (_env, dir) = setup();
+        let core = write_path_probe_core(dir.path());
+        assert!(!core
+            .ensure_lsm_mmap_sidecar_with_lock_observer(|| {}, true)
+            .unwrap());
+        assert!(
+            !core.sidecar_materializing.load(AtomicOrdering::Acquire),
+            "election flag must be released after the attempt"
+        );
+        // The miss the attempt recorded short-circuits the next write-path
+        // call before the election; a later successful attach clears it the
+        // same way.
+        core.clear_lsm_sidecar_miss_cache();
+        let waiters_before =
+            WRITE_PATH_SIDECAR_WAITERS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst);
+        let mut attempted = false;
+        let _ = core
+            .ensure_lsm_mmap_sidecar_with_lock_observer(|| attempted = true, true)
+            .unwrap();
+        assert!(
+            attempted,
+            "second writer must be elected and attempt the lock"
+        );
+        assert_eq!(
+            WRITE_PATH_SIDECAR_WAITERS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst),
+            waiters_before,
+            "second writer must not fall into the non-elected wait"
+        );
+    }
+
+    /// Parks writer A at its first lock attempt (elected), then runs writer B
+    /// against the same segment until B either enters the non-elected wait
+    /// or attempts the lock itself. Returns (B attempted the lock, join both).
+    fn run_elected_and_second_writer(
+        core: &VectorCore,
+        before_release: impl FnOnce(),
+    ) -> (bool, Result<bool, VectorError>, Result<bool, VectorError>) {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let waiters_before =
+            WRITE_PATH_SIDECAR_WAITERS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst);
+        let b_attempted = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let (a_tx, a_rx) = mpsc::sync_channel(0);
+            let (c_tx, c_rx) = mpsc::sync_channel(0);
+            let a = scope.spawn(move || {
+                core.ensure_lsm_mmap_sidecar_with_lock_observer(
+                    park_first_attempt(a_tx, c_rx),
+                    true,
+                )
+            });
+            a_rx.recv_timeout(Duration::from_secs(5))
+                .expect("writer A must reach its lock attempt");
+            let b_attempted_ref = &b_attempted;
+            let b = scope.spawn(move || {
+                core.ensure_lsm_mmap_sidecar_with_lock_observer(
+                    || b_attempted_ref.store(true, std::sync::atomic::Ordering::SeqCst),
+                    true,
+                )
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while WRITE_PATH_SIDECAR_WAITERS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst)
+                == waiters_before
+                && !b_attempted.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writer B neither waited nor attempted the lock"
+                );
+                std::thread::yield_now();
+            }
+            let attempted = b_attempted.load(std::sync::atomic::Ordering::SeqCst);
+            before_release();
+            c_tx.send(()).unwrap();
+            let a_result = a.join().unwrap();
+            let b_result = b.join().unwrap();
+            (attempted, a_result, b_result)
+        })
+    }
+
+    /// M3b: while one writer is elected for a segment, a second writer waits
+    /// for it and never attempts the slot lock (so it consumes no permit).
+    #[test]
+    #[serial_test::serial]
+    fn write_path_second_writer_waits_for_elected_without_attempting_lock() {
+        let (_env, dir) = setup();
+        let core = write_path_probe_core(dir.path());
+        let (b_attempted, a, b) = run_elected_and_second_writer(&core, || {});
+        assert!(
+            !b_attempted,
+            "second writer attempted the lock while another writer was elected"
+        );
+        assert!(!a.unwrap());
+        assert!(!b.unwrap());
+    }
+
+    /// N12: a non-elected waiter must not overwrite the elected writer's pin
+    /// reason; the elected attempt's outcome is the meaningful one.
+    #[test]
+    #[serial_test::serial]
+    fn write_path_waiter_keeps_elected_writers_pin_reason() {
+        let (_env, dir) = setup();
+        let core = write_path_probe_core(dir.path());
+        let (b_attempted, a, b) = run_elected_and_second_writer(&core, || {});
+        assert!(!b_attempted);
+        assert!(!a.unwrap());
+        assert!(!b.unwrap());
+        assert_eq!(
+            core.last_write_sidecar_miss.load(AtomicOrdering::Relaxed),
+            PIN_REASON_MISSING,
+            "pin reason must be the elected writer's (missing), not the waiter's"
+        );
+    }
+
+    // ── Hard-delete guard (bounded, two-generation) ──
+
+    /// Delete `ids` through the production pre-commit + post-commit path:
+    /// `delete_vectors_batch_be`, commit, `apply_hard_deletes_post_commit`
+    /// (what `NamedVectorManager::apply_delete_tombstones` calls per core).
+    fn hard_delete_committed(core: &VectorCore, backend: &AnyBackend, ids: &[u128]) {
+        let mut w = backend.begin_write().unwrap();
+        let id_levels = core.delete_vectors_batch_be(&mut w, ids).unwrap();
+        backend.commit(w).unwrap();
+        core.apply_hard_deletes_post_commit(ids, &id_levels);
+    }
+
+    #[test]
+    fn hard_delete_guard_blocks_fills_only_for_deleted_ids() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let (_env, dir) = setup();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &[(42, [1.0, 0.0]), (99, [0.0, 1.0])]);
+        assert!(
+            !core.is_cache_fill_blocked(42),
+            "live id must not be blocked"
+        );
+
+        hard_delete_committed(&core, &writer, &[42]);
+
+        assert!(
+            core.is_cache_fill_blocked(42),
+            "deleted id must block fills"
+        );
+        assert!(
+            !core.is_cache_fill_blocked(99),
+            "unrelated id must not be blocked"
+        );
+    }
+
+    /// Rotation with a synthetic clock: an id is guarded for at least one
+    /// window and at most two; memory holds only the last two windows of
+    /// deletes; both sets empty restore the lock-free fast path (count 0).
+    #[test]
+    fn hard_delete_guard_rotates_out_after_two_windows_and_bounds_memory() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let core = open_ordinal_test_core(None, &writer);
+        let w = HARD_DELETE_GUARD_WINDOW_SECS;
+        let t0 = 1_000_000u64;
+        let first: Vec<u128> = (1..=1000).collect();
+        let second: Vec<u128> = (1001..=2000).collect();
+
+        core.guard_hard_deletes_at(&first, t0);
+        assert!(core.is_hard_delete_guarded_at(1, t0 + w - 1));
+        assert_eq!(
+            core.hard_delete_guard_count.load(AtomicOrdering::Relaxed),
+            1000
+        );
+
+        // One window later: first batch rotates to `previous`, still guarded.
+        core.guard_hard_deletes_at(&second, t0 + w);
+        assert!(core.is_hard_delete_guarded_at(1, t0 + w));
+        assert!(core.is_hard_delete_guarded_at(1001, t0 + w));
+        assert_eq!(
+            core.hard_delete_guard_count.load(AtomicOrdering::Relaxed),
+            2000
+        );
+
+        // Two windows after the first batch: it is gone, the second remains.
+        assert!(!core.is_hard_delete_guarded_at(1, t0 + 2 * w));
+        assert!(core.is_hard_delete_guarded_at(1001, t0 + 2 * w));
+        assert_eq!(
+            core.hard_delete_guard_count.load(AtomicOrdering::Relaxed),
+            1000,
+            "memory must hold only the last two windows of deletes"
+        );
+
+        // Idle for another window: everything expires on a plain lookup.
+        assert!(!core.is_hard_delete_guarded_at(1001, t0 + 3 * w));
+        assert_eq!(
+            core.hard_delete_guard_count.load(AtomicOrdering::Relaxed),
+            0,
+            "empty guard must restore the count==0 fast path"
+        );
+        assert!(!core.is_cache_fill_blocked(1001));
+    }
+
+    /// Rows-only P5 (reviewer probe `rr_p5r_*`): after a committed hard
+    /// delete, a read on a pre-delete snapshot must not refill caches, and a
+    /// re-insert that is staged then ABORTED must not change that (nothing
+    /// un-guards; the guard expires by rotation only).
+    fn rows_only_p5(abort_reinsert: bool) {
+        let (_store, _path, backend) = in_memory_lsm_writer();
+        let core = open_ordinal_test_core(None, &backend);
+        commit_rows(&core, &backend, &[(7, [1.0, 0.0])]);
+        let old = backend.begin_read().unwrap();
+        hard_delete_committed(&core, &backend, &[7]);
+        if abort_reinsert {
+            let mut w = backend.begin_write().unwrap();
+            core.insert_flat_be(&mut w, &[0.0, 1.0], Some(7), None)
+                .unwrap();
+            drop(w); // never committed
+        }
+        let old_read = core
+            .get_vector(&old, 7, 0, true)
+            .map(|v| v.get_data().to_vec());
+        assert_eq!(
+            old_read.as_deref().ok(),
+            Some(&[1.0f32, 0.0][..]),
+            "pre-delete snapshot keeps serving its own row"
+        );
+        drop(old);
+        let fresh = core
+            .get_vector(&backend.begin_read().unwrap(), 7, 0, true)
+            .map(|v| v.get_data().to_vec());
+        assert!(
+            fresh.is_err(),
+            "abort={abort_reinsert}: deleted id served after a stale-snapshot read: {fresh:?}"
+        );
+    }
+
+    #[test]
+    fn hard_deleted_id_not_refilled_by_stale_snapshot_read() {
+        rows_only_p5(false)
+    }
+
+    #[test]
+    fn hard_deleted_id_not_refilled_after_aborted_reinsert() {
+        rows_only_p5(true)
+    }
+
+    /// Rows-only P4 (reviewer probe `rr_p4r_reinsert_after_delete`): a
+    /// re-insert of a hard-deleted id, with a pre-delete snapshot reading the
+    /// id while the re-insert is staged, must serve the new vector once
+    /// committed — the stale read cannot park the old vector in the cache.
+    #[test]
+    fn reinsert_after_hard_delete_serves_new_vector_despite_stale_read() {
+        let (_store, _path, backend) = in_memory_lsm_writer();
+        let core = open_ordinal_test_core(None, &backend);
+        commit_rows(&core, &backend, &[(7, [1.0, 0.0])]);
+        let old = backend.begin_read().unwrap();
+        hard_delete_committed(&core, &backend, &[7]);
+        let mut w = backend.begin_write().unwrap();
+        core.insert_flat_be(&mut w, &[0.0, 1.0], Some(7), None)
+            .unwrap();
+        let _ = core.get_vector(&old, 7, 0, true);
+        backend.commit(w).unwrap();
+        drop(old);
+        let fresh = core
+            .get_vector(&backend.begin_read().unwrap(), 7, 0, true)
+            .map(|v| v.get_data().to_vec());
+        assert_eq!(
+            fresh.as_deref().ok(),
+            Some(&[0.0f32, 1.0][..]),
+            "stale vector served after re-insert: {fresh:?}"
+        );
+    }
+
+    /// N2 (new design): a re-insert of a guarded id publishes its ordinal to
+    /// a Complete map regardless of the guard, so flat search (which walks
+    /// the Complete map on the writer) finds the new vector.
+    #[test]
+    fn reinsert_of_guarded_id_is_published_to_complete_ordinal_map() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let (_env, dir) = setup();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &UNSORTED_ORDINAL_ROWS);
+        core.flush_mmap().unwrap();
+
+        // Reopen so the first read loads the Complete map from the store.
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        {
+            let read = writer.begin_read().unwrap();
+            assert_eq!(core.sidecar_ordinal(&read, 20).unwrap(), Some(2));
+        }
+        assert!(
+            core.sidecar_ordinals_loaded().unwrap(),
+            "map must be Complete"
+        );
+
+        hard_delete_committed(&core, &writer, &[10]);
+        assert!(core.is_cache_fill_blocked(10));
+        commit_rows(&core, &writer, &[(10, [0.5, 0.5])]);
+
+        let read = writer.begin_read().unwrap();
+        let hits = flat_hits(&core, &read);
+        assert!(
+            hits.contains(&(10, vec![0.5, 0.5])),
+            "re-inserted id missing from flat search over the Complete map: {hits:?}"
+        );
+        assert_eq!(
+            core.get_vector(&read, 10, 0, true).unwrap().get_data(),
+            &[0.5, 0.5]
+        );
+    }
+
+    /// An aborted upsert of a live id must leave the id at its committed
+    /// ordinal in the writer's Complete map, not drop it: flat search walks
+    /// only that map, so a dropped entry hides a committed vector. Two
+    /// upserts in one batch check that the undo runs newest-first.
+    #[test]
+    fn aborted_upsert_restores_committed_sidecar_ordinal() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let (_env, dir) = setup();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &UNSORTED_ORDINAL_ROWS);
+        core.flush_mmap().unwrap();
+
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        {
+            let read = writer.begin_read().unwrap();
+            assert_eq!(core.sidecar_ordinal(&read, 20).unwrap(), Some(2));
+        }
+        assert!(
+            core.sidecar_ordinals_loaded().unwrap(),
+            "map must be Complete"
+        );
+
+        let mut w = writer.begin_write().unwrap();
+        core.insert_flat_be(&mut w, &[0.9, 0.1], Some(20), None)
+            .unwrap();
+        core.insert_flat_be(&mut w, &[0.8, 0.2], Some(20), None)
+            .unwrap();
+        assert_ne!(
+            core.cached_sidecar_ordinal(20).unwrap(),
+            Some(2),
+            "the staged upsert must publish a new slot"
+        );
+        drop(w); // never committed
+
+        assert_eq!(
+            core.cached_sidecar_ordinal(20).unwrap(),
+            Some(2),
+            "aborted upsert must restore the committed ordinal"
+        );
+        let read = writer.begin_read().unwrap();
+        let hits = flat_hits(&core, &read);
+        assert!(
+            hits.contains(&(20, vec![-1.0, 0.0])),
+            "committed vector hidden from flat search after an aborted upsert: {hits:?}"
+        );
+    }
+
+    /// Hot-path cost of the fill gate. Run with
+    /// `cargo test ... hard_delete_guard_gate_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "micro-benchmark; prints ns/op"]
+    fn hard_delete_guard_gate_cost() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let core = open_ordinal_test_core(None, &writer);
+        let iters = 20_000_000u64;
+        let bench = |label: &str| {
+            let start = std::time::Instant::now();
+            let mut hits = 0u64;
+            for i in 0..iters {
+                if core.is_cache_fill_blocked(std::hint::black_box(i as u128 + 5_000_000)) {
+                    hits += 1;
+                }
+            }
+            let ns = start.elapsed().as_nanos() as f64 / iters as f64;
+            println!("{label}: {ns:.1} ns/op (hits={hits})");
+        };
+        bench("empty guard (fast path)");
+        core.guard_hard_deletes(&[1]);
+        bench("1 guarded id, lookups miss");
+        let many: Vec<u128> = (1..=1_000_000).collect();
+        core.guard_hard_deletes(&many);
+        bench("1M guarded ids, lookups miss");
+        assert!(core.is_cache_fill_blocked(1));
+    }
+
+    // ── Sidecar rebuild floor (short-file drop) ──
+
+    const FLOOR_ROWS: [(u128, [f32; 2]); 5] = [
+        (1, [1.0, 0.0]),
+        (2, [0.0, 1.0]),
+        (3, [-1.0, 0.0]),
+        (4, [0.0, -1.0]),
+        (5, [0.5, 0.5]),
+    ];
+
+    /// Writes 5 rows (ordinals 0..4, a 5-slot sidecar), then replaces the
+    /// sidecar on disk with a 3-slot file holding the first three rows — the
+    /// lost-tail shape a crash leaves behind (rows 4 and 5 committed, their
+    /// slots never reached the file). Returns the backend and the data dir.
+    fn short_sidecar_rig() -> (Arc<AnyBackend>, TempDir) {
+        use super::super::mmap_vectors::MmapVectorStore;
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let (_env, dir) = setup();
+        let hvec_path = {
+            let core = open_ordinal_test_core(Some(dir.path()), &writer);
+            commit_rows(&core, &writer, &FLOOR_ROWS);
+            core.flush_mmap().unwrap();
+            let slot = core.mmap_store.read().unwrap();
+            let store = slot.as_ref().unwrap();
+            assert_eq!(store.count(), 5);
+            store.path().to_path_buf()
+        };
+        let short: Vec<&[f32]> = FLOOR_ROWS[..3].iter().map(|(_, v)| &v[..]).collect();
+        drop(MmapVectorStore::create_from_slices(&hvec_path, &short).unwrap());
+        (writer, dir)
+    }
+
+    /// Runs `materialize` on a thread; when it reaches the row scan, commits a
+    /// hard delete of rows 2..=5 through `delete_core`, so the scan sees only
+    /// row 1 (ordinal 0) while the short-file check already saw all five.
+    fn with_rows_2_to_5_deleted_before_row_scan<T: Send>(
+        delete_core: &VectorCore,
+        backend: &AnyBackend,
+        materialize: impl FnOnce() -> T + Send,
+    ) -> T {
+        use std::sync::atomic::Ordering::SeqCst;
+        MATERIALIZE_PRE_COLLECT_FIRED.store(false, SeqCst);
+        MATERIALIZE_PRE_COLLECT_ARMED.store(true, SeqCst);
+        std::thread::scope(|s| {
+            let worker = s.spawn(materialize);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !MATERIALIZE_PRE_COLLECT_FIRED.load(SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rebuild never reached its row scan"
+                );
+                std::hint::spin_loop();
+            }
+            hard_delete_committed(delete_core, backend, &[2, 3, 4, 5]);
+            MATERIALIZE_PRE_COLLECT_ARMED.store(false, SeqCst);
+            MATERIALIZE_PRE_COLLECT_FIRED.store(false, SeqCst);
+            worker.join().unwrap()
+        })
+    }
+
+    /// M2b: the write path finds the reopened sidecar short (ordinals need 5
+    /// slots, file has 3), drops it and records the old slot count as the
+    /// rebuild floor. Rows 2..=5 are deleted before the rebuild scans rows, so
+    /// the surviving ordinals need only 1 slot: without the floor the rebuilt
+    /// file has 1 slot and the row being inserted lands on ordinal 1, a slot
+    /// a reader's stale copy of the old file still maps to another id.
+    #[test]
+    #[serial_test::serial]
+    fn write_path_short_file_drop_floors_rebuild_at_old_slot_count() {
+        let (writer, dir) = short_sidecar_rig();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        assert!(core.sidecar_unchecked.load(AtomicOrdering::Acquire));
+        assert_eq!(core.mmap_store.read().unwrap().as_ref().unwrap().count(), 3);
+
+        let core_ref = &core;
+        let writer_ref = &*writer;
+        with_rows_2_to_5_deleted_before_row_scan(&core, &writer, move || {
+            let mut w = writer_ref.begin_write().unwrap();
+            core_ref
+                .insert_flat_be(&mut w, &[0.25, 0.75], Some(6), None)
+                .unwrap();
+            writer_ref.commit(w).unwrap();
+        });
+
+        let read = writer.begin_read().unwrap();
+        let ordinal = core.sidecar_ordinal(&read, 6).unwrap().unwrap();
+        assert!(
+            ordinal >= 3,
+            "new row took ordinal {ordinal}, inside the dropped 3-slot file"
+        );
+        let count = core.mmap_store.read().unwrap().as_ref().unwrap().count();
+        assert!(
+            count >= 4,
+            "rebuilt file has {count} slots, floor was 3 + 1 append"
+        );
+        assert_eq!(
+            core.sidecar_rebuild_min_slots.load(AtomicOrdering::Relaxed),
+            0,
+            "floor must reset after a successful rebuild"
+        );
+        let hits = flat_hits(&core, &read);
+        assert_eq!(
+            hits,
+            vec![(1, vec![1.0, 0.0]), (6, vec![0.25, 0.75])],
+            "flat search must see exactly the surviving and the new row"
+        );
+    }
+
+    /// M2c: the open path (`open_lsm_mmap_sidecar` with materialization
+    /// allowed, as the first read or write of a cold segment runs it) finds
+    /// the on-disk sidecar short, and must floor the immediate rebuild at the
+    /// short file's slot count for the same reason as the write path.
+    #[test]
+    #[serial_test::serial]
+    fn open_path_short_file_floors_rebuild_at_old_slot_count() {
+        let (writer, dir) = short_sidecar_rig();
+        // Rows-only handle on the same segment for the concurrent delete.
+        let delete_core = open_ordinal_test_core(None, &writer);
+        let stem = dir.path().join("dense__seg_000001");
+        let spindle = SpindleConfig {
+            mode: SpindleMode::None,
+            ..SpindleConfig::default()
+        };
+
+        let writer_ref = &*writer;
+        let (store, ordinals, refused) =
+            with_rows_2_to_5_deleted_before_row_scan(&delete_core, &writer, || {
+                VectorCore::open_lsm_mmap_sidecar(
+                    writer_ref,
+                    "dense__seg_000001",
+                    &stem,
+                    &spindle,
+                    true,
+                    0,
+                )
+                .unwrap()
+            });
+        assert_eq!(refused, None);
+        let store = store.expect("sidecar must be rebuilt");
+        assert!(
+            store.count() >= 3,
+            "rebuilt file has {} slots, below the dropped file's 3",
+            store.count()
+        );
+        assert_eq!(
+            ordinals.unwrap(),
+            HashMap::from([(1u128, 0u64)]),
+            "only the surviving row keeps an ordinal"
+        );
+    }
+
+    /// N10: a floor above the dead-slot ceiling is clamped to the ceiling and
+    /// counted, instead of refusing the rebuild (which would pin the segment
+    /// to rows for a past file size that is not an invariant).
+    #[test]
+    fn rebuild_floor_above_ceiling_is_clamped_and_counted() {
+        let rows = vec![(10u128, 'a'), (20, 'b'), (30, 'c')];
+        let persisted: HashMap<u128, u64> = [(30, 0), (10, 3), (20, 4)].into_iter().collect();
+        // Production ceiling: max(16 x rows, 4096) = 4096 for 3 rows.
+        let ceiling = rows.len().saturating_mul(16).max(4096);
+        assert_eq!(ceiling, 4096);
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let layout = metrics::with_local_recorder(&recorder, || {
+            VectorCore::layout_rows_by_persisted_ordinals(rows.clone(), &persisted, 1_000_000)
+                .unwrap()
+        });
+        let (slots, map) = layout.expect("floor above the ceiling must clamp, not refuse");
+        assert_eq!(
+            slots.len(),
+            4096,
+            "slot count must be clamped to the ceiling"
+        );
+        assert_eq!(map, persisted);
+        assert!(
+            handle
+                .render()
+                .contains("helix_lsm_sidecar_rebuild_floor_clamped_total 1"),
+            "clamp must be counted: {}",
+            handle.render()
+        );
+
+        // A floor at or below the ceiling is neither clamped nor counted.
+        let (slots, _) = VectorCore::layout_rows_by_persisted_ordinals(rows, &persisted, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(slots.len(), 8);
+    }
+
+    /// N11: rows with no persisted ordinals (a segment written without a
+    /// sidecar stem) rebuilt under a floor must start their ordinals at the
+    /// floor, so none lands on a slot of the file the floor came from.
+    #[test]
+    fn rows_without_persisted_ordinals_rebuild_from_floor() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let core = open_ordinal_test_core(None, &writer);
+        commit_rows(&core, &writer, &UNSORTED_ORDINAL_ROWS);
+        assert!(!core.has_persisted_sidecar_ordinals().unwrap());
+
+        let (_env, dir) = setup();
+        let hvec_path = dir.path().join("dense__seg_000001.hvec");
+        let spindle = SpindleConfig {
+            mode: SpindleMode::None,
+            ..SpindleConfig::default()
+        };
+        let RowRebuild::Built(store, ordinals) =
+            VectorCore::materialize_exact_hvec_sidecar_from_lsm_rows(
+                &writer,
+                "dense__seg_000001",
+                &hvec_path,
+                &spindle,
+                8,
+            )
+            .unwrap()
+        else {
+            panic!("rows must rebuild");
+        };
+        assert_eq!(ordinals.len(), 3);
+        assert_eq!(
+            *ordinals.values().min().unwrap(),
+            8,
+            "ordinals must start at the floor: {ordinals:?}"
+        );
+        assert_eq!(store.count(), 11, "8 floor slots + 3 rows");
+        for (id, vector) in UNSORTED_ORDINAL_ROWS {
+            assert_eq!(store.get_vec(ordinals[&id]).unwrap(), vector.to_vec());
+        }
+    }
+
+    // ── Aborted write batches and the sidecar ordinal map ──
+
+    /// Item 8: `insert_flat_be` appends to the sidecar and publishes the
+    /// id -> ordinal mapping before the batch commits. If the batch is dropped
+    /// uncommitted, the publication must be retracted, else a vector that
+    /// never existed is served through its dangling slot (get_vector) and
+    /// walked by flat search over a Complete map.
+    #[test]
+    fn aborted_insert_retracts_published_sidecar_ordinal() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let (_env, dir) = setup();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &UNSORTED_ORDINAL_ROWS);
+        core.flush_mmap().unwrap();
+
+        // Reopen so the map is loaded Complete (flat search then walks it).
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        {
+            let read = writer.begin_read().unwrap();
+            assert_eq!(core.sidecar_ordinal(&read, 20).unwrap(), Some(2));
+        }
+        assert!(core.sidecar_ordinals_loaded().unwrap());
+
+        {
+            let mut w = writer.begin_write().unwrap();
+            core.insert_flat_be(&mut w, &[0.5, 0.5], Some(40), None)
+                .unwrap();
+            assert_eq!(
+                core.cached_sidecar_ordinal(40).unwrap(),
+                Some(3),
+                "staged insert publishes its ordinal ahead of commit"
+            );
+            drop(w); // abort: never committed
+        }
+        assert_eq!(
+            core.cached_sidecar_ordinal(40).unwrap(),
+            None,
+            "aborted batch must retract its ordinal publication"
+        );
+        let read = writer.begin_read().unwrap();
+        assert!(
+            core.get_vector(&read, 40, 0, true).is_err(),
+            "never-committed vector served"
+        );
+        let hits = flat_hits(&core, &read);
+        assert!(
+            !hits.iter().any(|(id, _)| *id == 40),
+            "never-committed vector in flat search: {hits:?}"
+        );
+        drop(read);
+
+        // The slot the aborted append took stays dead; a later committed
+        // insert lands past it and is found.
+        commit_rows(&core, &writer, &[(50, [0.5, -0.5])]);
+        let read = writer.begin_read().unwrap();
+        assert_eq!(core.sidecar_ordinal(&read, 50).unwrap(), Some(4));
+        assert!(flat_hits(&core, &read).contains(&(50, vec![0.5, -0.5])));
+    }
+
+    /// A retraction only removes the exact publication: when a later batch
+    /// re-published the id at a newer ordinal and committed, the earlier
+    /// batch's abort must leave that mapping alone.
+    #[test]
+    fn aborted_insert_does_not_retract_a_newer_committed_publication() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let (_env, dir) = setup();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &[(10, [1.0, 0.0])]);
+
+        let mut aborted = writer.begin_write().unwrap();
+        core.insert_flat_be(&mut aborted, &[0.0, 1.0], Some(20), None)
+            .unwrap();
+        commit_rows(&core, &writer, &[(20, [0.0, -1.0])]);
+        let committed_ordinal = core.cached_sidecar_ordinal(20).unwrap().unwrap();
+        drop(aborted);
+
+        assert_eq!(
+            core.cached_sidecar_ordinal(20).unwrap(),
+            Some(committed_ordinal),
+            "abort of the older batch must keep the newer committed mapping"
+        );
+        let read = writer.begin_read().unwrap();
+        assert_eq!(
+            core.get_vector(&read, 20, 0, true).unwrap().get_data(),
+            &[0.0, -1.0]
+        );
     }
 }

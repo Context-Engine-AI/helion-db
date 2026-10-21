@@ -214,9 +214,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn refresh_runtime_gauges(input: &HandlerInput) {
     let collections = &input.collections;
     // Total collections visible on disk (manifest) vs currently resident in
-    // the LRU cache.
-    if let Ok(list) = collections.list_collections() {
-        metrics::gauge!("helix_collections_on_disk").set(list.len() as f64);
+    // the LRU cache. The on-disk count is a cached snapshot: listing inline
+    // is an S3 round trip per collection and must not stall the scrape.
+    if let Some(count) = collections.collections_on_disk_cached() {
+        metrics::gauge!("helix_collections_on_disk").set(count as f64);
     }
     let loaded = collections.loaded_count();
     let max_open = collections.max_open_collections_limit();

@@ -40,6 +40,12 @@ use crate::protocol::response::Response;
 use crate::protocol::value::Value;
 
 #[cfg(test)]
+#[path = "probe_nonblocking_tests.rs"]
+mod probe_nonblocking_tests;
+#[cfg(test)]
+#[path = "qdrant_file_size_tests.rs"]
+mod qdrant_file_size_tests;
+#[cfg(test)]
 #[path = "qdrant_payload_cache_handler_tests.rs"]
 mod qdrant_payload_cache_handler_tests;
 #[cfg(test)]
@@ -4001,6 +4007,9 @@ struct PointScanOptions<'a> {
     partition: Option<ScanPartition>,
     max_scan: Option<usize>,
     deadline: Option<Instant>,
+    /// Wall-clock bound for the indexed-candidates plan (`deadline` bounds the
+    /// primary walk only).
+    indexed_deadline: Option<Instant>,
     filter_hash: u64,
     cursor_generation: Option<usize>,
     fuse_pending: bool,
@@ -4088,6 +4097,11 @@ const DEFAULT_QDRANT_SCROLL_SCAN_BUDGET_MIN: usize = 1_024;
 const DEFAULT_QDRANT_SCROLL_SCAN_BUDGET_MULTIPLIER: usize = 64;
 const DEFAULT_QDRANT_SCROLL_SCAN_BUDGET_MAX: usize = 4_096;
 const DEFAULT_QDRANT_SCROLL_SCAN_BUDGET_MS: usize = 250;
+/// Indexed pages are already capped at `max_scan` candidates, but on a cold
+/// cache each candidate is an object-store read (~7-8ms): 2s returns a ~100-hit
+/// set whole (scroll agrees with count) and pages a ~1000-hit one before the
+/// upstream proxy and client deadlines expire.
+const DEFAULT_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS: usize = 2_000;
 
 fn env_usize_or(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -4134,18 +4148,34 @@ fn qdrant_scroll_scan_budget(limit: usize, filter: &Filter) -> Option<usize> {
     )
 }
 
-fn qdrant_scroll_scan_deadline(filter: &Filter) -> Option<Instant> {
-    if filter.is_empty() {
-        return None;
-    }
-    let budget_ms = env_usize_or(
-        "HELIX_QDRANT_SCROLL_SCAN_BUDGET_MS",
-        DEFAULT_QDRANT_SCROLL_SCAN_BUDGET_MS,
-    );
-    if budget_ms == 0 {
+/// Wall-clock bound for one filtered page; `None` when unfiltered or disabled (`0`).
+fn scan_deadline_from_budget_ms(filter: &Filter, budget_ms: usize) -> Option<Instant> {
+    if filter.is_empty() || budget_ms == 0 {
         return None;
     }
     Instant::now().checked_add(Duration::from_millis(budget_ms as u64))
+}
+
+/// Primary (unindexed) plan deadline (ff1c90f7).
+fn qdrant_scroll_scan_deadline(filter: &Filter) -> Option<Instant> {
+    scan_deadline_from_budget_ms(
+        filter,
+        env_usize_or(
+            "HELIX_QDRANT_SCROLL_SCAN_BUDGET_MS",
+            DEFAULT_QDRANT_SCROLL_SCAN_BUDGET_MS,
+        ),
+    )
+}
+
+/// Indexed-candidates plan deadline; see `DEFAULT_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS`.
+fn qdrant_indexed_scroll_scan_deadline(filter: &Filter) -> Option<Instant> {
+    scan_deadline_from_budget_ms(
+        filter,
+        env_usize_or(
+            "HELIX_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS",
+            DEFAULT_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS,
+        ),
+    )
 }
 
 fn normalize_scan_budget(max_scan: Option<usize>) -> Option<usize> {
@@ -4342,10 +4372,22 @@ fn point_json_id(point: &serde_json::Value) -> Option<u128> {
     point.get("id").map(point_id_to_u128)
 }
 
-fn point_scan_budget_exhausted(scanned: usize, opts: &PointScanOptions<'_>) -> bool {
+/// `max_scan` bounds every plan; each plan has its own wall-clock bound. The
+/// primary (unindexed) walk keeps the short ff1c90f7 `deadline`. The indexed
+/// plan, already capped at `max_scan` candidates, gets the longer
+/// `indexed_deadline`: cutting a small cold set short made scroll disagree
+/// with count, while a huge one must still page before proxy timeouts fire.
+fn point_scan_budget_exhausted(
+    scanned: usize,
+    opts: &PointScanOptions<'_>,
+    plan: PointScanPlan,
+) -> bool {
+    let deadline = match plan {
+        PointScanPlan::Primary => opts.deadline,
+        PointScanPlan::IndexedCandidates => opts.indexed_deadline,
+    };
     opts.max_scan.map(|max| scanned >= max).unwrap_or(false)
-        || opts
-            .deadline
+        || deadline
             .map(|deadline| Instant::now() >= deadline)
             .unwrap_or(false)
 }
@@ -4462,7 +4504,7 @@ fn execute_point_scan(
                 Err(e) => return Err(e),
             };
             if !opts.filter.is_empty() && !opts.filter.matches_point(Some(id), &node.properties) {
-                if point_scan_budget_exhausted(scanned, opts) {
+                if point_scan_budget_exhausted(scanned, opts, plan) {
                     budget_exhausted = true;
                     next_offset = next_scan_offset(id);
                     break;
@@ -4484,7 +4526,7 @@ fn execute_point_scan(
                 next_offset = next_scan_offset(id);
                 break;
             }
-            if point_scan_budget_exhausted(scanned, opts) {
+            if point_scan_budget_exhausted(scanned, opts, plan) {
                 budget_exhausted = true;
                 next_offset = next_scan_offset(id);
                 break;
@@ -4524,7 +4566,7 @@ fn execute_point_scan(
                 };
                 if !opts.filter.is_empty() && !opts.filter.matches_point(Some(id), &node.properties)
                 {
-                    if point_scan_budget_exhausted(scanned, opts) {
+                    if point_scan_budget_exhausted(scanned, opts, plan) {
                         budget_exhausted = true;
                         next_offset = next_scan_offset(id);
                         return false;
@@ -4546,7 +4588,7 @@ fn execute_point_scan(
                     next_offset = next_scan_offset(id);
                     return false;
                 }
-                if point_scan_budget_exhausted(scanned, opts) {
+                if point_scan_budget_exhausted(scanned, opts, plan) {
                     budget_exhausted = true;
                     next_offset = next_scan_offset(id);
                     return false;
@@ -4641,7 +4683,7 @@ fn execute_point_scan_be(
                     // missing candidates never terminates the page — this is
                     // the generic runaway-scan protection every other branch
                     // below already gets.
-                    if point_scan_budget_exhausted(scanned, opts) {
+                    if point_scan_budget_exhausted(scanned, opts, plan) {
                         budget_exhausted = true;
                         next_offset = next_scan_offset(id);
                         break;
@@ -4651,7 +4693,7 @@ fn execute_point_scan_be(
                 Err(e) => return Err(e),
             };
             if !opts.filter.is_empty() && !opts.filter.matches_point(Some(id), &node.properties) {
-                if point_scan_budget_exhausted(scanned, opts) {
+                if point_scan_budget_exhausted(scanned, opts, plan) {
                     budget_exhausted = true;
                     next_offset = next_scan_offset(id);
                     break;
@@ -4673,7 +4715,7 @@ fn execute_point_scan_be(
                 next_offset = next_scan_offset(id);
                 break;
             }
-            if point_scan_budget_exhausted(scanned, opts) {
+            if point_scan_budget_exhausted(scanned, opts, plan) {
                 budget_exhausted = true;
                 next_offset = next_scan_offset(id);
                 break;
@@ -4709,7 +4751,7 @@ fn execute_point_scan_be(
                 };
                 if !opts.filter.is_empty() && !opts.filter.matches_point(Some(id), &node.properties)
                 {
-                    if point_scan_budget_exhausted(scanned, opts) {
+                    if point_scan_budget_exhausted(scanned, opts, plan) {
                         budget_exhausted = true;
                         next_offset = next_scan_offset(id);
                         return false;
@@ -4731,7 +4773,7 @@ fn execute_point_scan_be(
                     next_offset = next_scan_offset(id);
                     return false;
                 }
-                if point_scan_budget_exhausted(scanned, opts) {
+                if point_scan_budget_exhausted(scanned, opts, plan) {
                     budget_exhausted = true;
                     next_offset = next_scan_offset(id);
                     return false;
@@ -4936,6 +4978,7 @@ pub fn handle_scroll_points(
         partition: None,
         max_scan: qdrant_scroll_scan_budget(req.limit, &filter),
         deadline: qdrant_scroll_scan_deadline(&filter),
+        indexed_deadline: qdrant_indexed_scroll_scan_deadline(&filter),
         filter_hash: scan_filter_hash(&filter),
         cursor_generation: None,
         fuse_pending: true,
@@ -5078,6 +5121,7 @@ pub fn handle_scan_points(input: &HandlerInput, response: &mut Response) -> Resu
         partition,
         max_scan: req.max_scan,
         deadline: None,
+        indexed_deadline: None,
         filter_hash,
         cursor_generation,
         fuse_pending: true,
@@ -6134,6 +6178,153 @@ pub fn handle_set_payload(input: &HandlerInput, response: &mut Response) -> Resu
     })?;
 
     json_ok(response, &sonic_rs::json!({"status": "completed"}))
+}
+
+// ─── Atomic File Size Repair ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairFileSizeRequest {
+    points: Vec<u64>,
+    expected_file_hash: String,
+    file_size_bytes: u64,
+    filter: Filter,
+}
+
+fn patch_file_size(node: &mut Node, req: &RepairFileSizeRequest) -> bool {
+    if !req.filter.matches_point(Some(node.id), &node.properties)
+        || node.properties.get("_pending_prune") == Some(&Value::Boolean(true))
+    {
+        return false;
+    }
+    let Some(Value::Object(metadata)) = node.properties.get_mut("metadata") else {
+        return false;
+    };
+    if !matches!(metadata.get("file_hash"), Some(Value::String(hash)) if hash == &req.expected_file_hash)
+    {
+        return false;
+    }
+    let known_size = match metadata.get("file_size_bytes") {
+        Some(Value::U8(_) | Value::U16(_) | Value::U32(_) | Value::U64(_)) => true,
+        Some(Value::U128(size)) => *size <= u64::MAX as u128,
+        Some(Value::I8(size)) => *size >= 0,
+        Some(Value::I16(size)) => *size >= 0,
+        Some(Value::I32(size)) => *size >= 0,
+        Some(Value::I64(size)) => *size >= 0,
+        _ => false,
+    };
+    if !known_size {
+        return false;
+    }
+    metadata.insert(
+        "file_size_bytes".to_string(),
+        Value::from(req.file_size_bytes),
+    );
+    true
+}
+
+/// Helion extension: all current rows must still match before committing any size patch.
+pub fn handle_repair_file_size(
+    input: &HandlerInput,
+    response: &mut Response,
+) -> Result<(), GraphError> {
+    let Some(name) = get_collection_name(input) else {
+        return json_err(response, 400, "Missing collection name");
+    };
+    let req: RepairFileSizeRequest = match sonic_rs::from_slice(&input.request.body) {
+        Ok(req) => req,
+        Err(error) => return json_err(response, 400, &format!("Invalid JSON: {error}")),
+    };
+    if req.points.is_empty() || req.points.len() > 50_000 || req.expected_file_hash.is_empty() {
+        return json_err(
+            response,
+            400,
+            "File-size repair requires 1..50000 IDs and an expected hash",
+        );
+    }
+    let ids = req
+        .points
+        .iter()
+        .copied()
+        .map(u128::from)
+        .collect::<Vec<_>>();
+    if ids.iter().copied().collect::<HashSet<_>>().len() != ids.len() {
+        return json_err(response, 400, "Duplicate file-size repair IDs");
+    }
+    let storage = input.collections.get_collection(&name)?;
+    storage.ensure_not_degraded()?;
+    let matched = if let AnyBackend::Lsm(backend) = storage.backend.as_ref() {
+        // Raw transactional node patches must not stale an optional payload index.
+        let indices = storage
+            .payload_indices
+            .read()
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        if ["metadata", "metadata.file_size_bytes"]
+            .iter()
+            .any(|key| indices.contains_key(*key))
+            || storage.secondary_indices.contains_key("metadata")
+            || storage.multi_indices.contains_key("metadata")
+        {
+            return json_err(
+                response,
+                400,
+                "Atomic file-size repair does not support indexed size fields",
+            );
+        }
+        backend
+            .compare_patch_nodes(&ids, |id, bytes| {
+                let mut node = SerializedNode::decode_node(bytes, id)
+                    .map_err(|error| BackendError::Io(error.to_string()))?;
+                if !patch_file_size(&mut node, &req) {
+                    return Ok(None);
+                }
+                SerializedNode::encode_node(&node)
+                    .map(Some)
+                    .map_err(|error| BackendError::Io(error.to_string()))
+            })
+            .map_err(|error| {
+                let error = graph_error_from_backend_error(error);
+                storage.mark_collection_degraded(&error, "repair_file_size");
+                error
+            })?
+    } else {
+        storage.with_write_txn(|txn| {
+            let mut nodes = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let mut node = match storage.get_node(txn, id) {
+                    Ok(node) => node,
+                    Err(GraphError::NodeNotFound) => return Ok(false),
+                    Err(error) => return Err(error),
+                };
+                if !patch_file_size(&mut node, &req) {
+                    return Ok(false);
+                }
+                nodes.push(node);
+            }
+            for node in nodes {
+                storage.upsert_node(
+                    txn,
+                    &crate::helix_engine::storage_core::upsert::NodeUpsert {
+                        id: node.id,
+                        label: node.label,
+                        properties: node.properties,
+                    },
+                )?;
+            }
+            Ok(true)
+        })?
+    };
+    if !matched {
+        return json_err(
+            response,
+            409,
+            "File-size repair precondition failed; no points changed; retry snapshot validation",
+        );
+    }
+    json_ok(
+        response,
+        &sonic_rs::json!({"status": "completed", "affected": ids.len()}),
+    )
 }
 
 // ─── Count Points ────────────────────────────────────────────────────────
@@ -10472,7 +10663,7 @@ mod tests {
         }
     }
 
-    fn create_dense_collection(ctx: &TestContext, name: &str) {
+    pub(super) fn create_dense_collection(ctx: &TestContext, name: &str) {
         let storage = ctx.collections.create_collection(name).unwrap();
         let mut wtxn = storage.lmdb_env().unwrap().write_txn().unwrap();
         storage
@@ -10561,7 +10752,7 @@ mod tests {
         }
     }
 
-    fn upsert_points(ctx: &TestContext, name: &str, points: serde_json::Value) {
+    pub(super) fn upsert_points(ctx: &TestContext, name: &str, points: serde_json::Value) {
         let body = sonic_rs::to_vec(&sonic_rs::json!({ "points": points })).unwrap();
         let input = make_input(
             ctx,
@@ -11263,6 +11454,206 @@ mod tests {
             qdrant_scroll_scan_budget_for(100, true, 1_024, 64, 0, 100_000),
             None
         );
+    }
+
+    /// The wall-clock scroll deadline exists to stop an UNINDEXED filter from
+    /// walking the whole collection (ff1c90f7). On the indexed-candidates plan
+    /// the page is already bounded by `max_scan` candidates, and letting the
+    /// deadline cut it short makes a cold scroll disagree with count (prod:
+    /// 33 of 104 right after a writer restart). An expired deadline must not
+    /// truncate an indexed page below `limit`.
+    /// Create `repo` with 12 points, 8 of them `repo = context-engine`, and a
+    /// keyword payload index on `repo`; returns the filter selecting those 8.
+    fn seed_indexed_repo(ctx: &TestContext) -> serde_json::Value {
+        ctx.collections.create_collection("repo").unwrap();
+        let points: Vec<serde_json::Value> = (1..=12)
+            .map(|id| {
+                serde_json::json!({
+                    "id": id,
+                    "payload": {
+                        "repo": if id % 3 == 0 { "other" } else { "context-engine" }
+                    }
+                })
+            })
+            .collect();
+        upsert_points(ctx, "repo", serde_json::Value::Array(points));
+        let create_index_body = sonic_rs::to_vec(&sonic_rs::json!({
+            "field_name": "repo",
+            "field_schema": "keyword",
+        }))
+        .unwrap();
+        let create_index_input = make_input(
+            ctx,
+            "PUT",
+            "/collections/repo/index",
+            create_index_body,
+            HashMap::from([("name".into(), "repo".into())]),
+        );
+        let mut create_index_response = Response::new();
+        handle_create_index(&create_index_input, &mut create_index_response).unwrap();
+        assert_eq!(create_index_response.status, 200);
+        wait_for_payload_index_ready(ctx, "repo", "repo");
+        serde_json::json!({
+            "must": [{"key": "repo", "match": {"value": "context-engine"}}]
+        })
+    }
+
+    fn assert_indexed_scroll_ignores_expired_deadline(ctx: &TestContext) {
+        let filter_json = seed_indexed_repo(ctx);
+        let filter: Filter = serde_json::from_value(filter_json.clone()).unwrap();
+        let storage = ctx.collections.get_collection("repo").unwrap();
+        let opts = PointScanOptions {
+            collection: "repo",
+            limit: 100,
+            offset_id: 0,
+            filter: &filter,
+            with_payload: &WithPayload::default(),
+            with_vectors: &WithVectors::default(),
+            partition: None,
+            max_scan: qdrant_scroll_scan_budget(100, &filter),
+            // Already expired: every budget check after the first point fires.
+            deadline: Some(Instant::now()),
+            indexed_deadline: None,
+            filter_hash: scan_filter_hash(&filter),
+            cursor_generation: None,
+            fuse_pending: true,
+        };
+        let scan = if storage.backend.kind() == BackendKind::Lsm {
+            let r = storage.backend.begin_read().unwrap();
+            execute_point_scan_be(&storage, &r, &opts).unwrap()
+        } else {
+            let txn = storage.begin_resize_safe_read_txn().unwrap();
+            execute_point_scan(&storage, &txn, &opts).unwrap()
+        };
+        assert!(matches!(scan.plan, PointScanPlan::IndexedCandidates));
+        assert_eq!(
+            scan.points.len(),
+            8,
+            "indexed page must not be cut short by the wall-clock deadline"
+        );
+        assert_eq!(scan.next_offset, None);
+        assert!(!scan.budget_exhausted);
+
+        let count_body = sonic_rs::to_vec(&sonic_rs::json!({ "filter": filter_json })).unwrap();
+        let count_input = make_input(
+            ctx,
+            "POST",
+            "/collections/repo/points/count",
+            count_body,
+            HashMap::from([("name".into(), "repo".into())]),
+        );
+        let mut count_response = Response::new();
+        handle_count_points(&count_input, &mut count_response).unwrap();
+        let count: serde_json::Value = serde_json::from_slice(&count_response.body).unwrap();
+        assert_eq!(
+            count["result"]["count"],
+            serde_json::json!(scan.points.len()),
+            "scroll and count must agree"
+        );
+    }
+
+    /// The other half of `point_scan_budget_exhausted`: an unindexed filter
+    /// (primary plan) must still stop at the wall-clock deadline (ff1c90f7).
+    #[test]
+    fn primary_scroll_honors_expired_deadline_on_lsm_writer() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        ctx.collections.create_collection("repo").unwrap();
+        let points: Vec<serde_json::Value> = (1..=12)
+            .map(|id| serde_json::json!({"id": id, "payload": {"repo": "context-engine"}}))
+            .collect();
+        upsert_points(&ctx, "repo", serde_json::Value::Array(points));
+        let filter: Filter = serde_json::from_value(serde_json::json!({
+            "must": [{"key": "repo", "match": {"value": "context-engine"}}]
+        }))
+        .unwrap();
+        let storage = ctx.collections.get_collection("repo").unwrap();
+        let opts = PointScanOptions {
+            collection: "repo",
+            limit: 100,
+            offset_id: 0,
+            filter: &filter,
+            with_payload: &WithPayload::default(),
+            with_vectors: &WithVectors::default(),
+            partition: None,
+            max_scan: qdrant_scroll_scan_budget(100, &filter),
+            deadline: Some(Instant::now()),
+            indexed_deadline: None,
+            filter_hash: scan_filter_hash(&filter),
+            cursor_generation: None,
+            fuse_pending: true,
+        };
+        let r = storage.backend.begin_read().unwrap();
+        let scan = execute_point_scan_be(&storage, &r, &opts).unwrap();
+        assert!(matches!(scan.plan, PointScanPlan::Primary));
+        assert!(
+            scan.budget_exhausted,
+            "an unindexed filter must stop at the deadline"
+        );
+        assert!(scan.points.len() < 12);
+        assert!(
+            scan.next_offset.is_some(),
+            "a cut page must hand back a resume offset"
+        );
+    }
+
+    /// The indexed plan has its own, longer wall-clock bound: an expired
+    /// `indexed_deadline` must still page with a resume offset so a huge cold
+    /// candidate set cannot hold a scan slot past the reader-proxy timeout.
+    #[test]
+    fn indexed_scroll_pages_at_its_own_expired_deadline_on_lsm_writer() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let filter: Filter = serde_json::from_value(seed_indexed_repo(&ctx)).unwrap();
+        let storage = ctx.collections.get_collection("repo").unwrap();
+        let opts = PointScanOptions {
+            collection: "repo",
+            limit: 100,
+            offset_id: 0,
+            filter: &filter,
+            with_payload: &WithPayload::default(),
+            with_vectors: &WithVectors::default(),
+            partition: None,
+            max_scan: qdrant_scroll_scan_budget(100, &filter),
+            deadline: None,
+            indexed_deadline: Some(Instant::now()),
+            filter_hash: scan_filter_hash(&filter),
+            cursor_generation: None,
+            fuse_pending: true,
+        };
+        let r = storage.backend.begin_read().unwrap();
+        let scan = execute_point_scan_be(&storage, &r, &opts).unwrap();
+        assert!(matches!(scan.plan, PointScanPlan::IndexedCandidates));
+        assert!(
+            scan.budget_exhausted,
+            "an indexed page must stop at its own deadline"
+        );
+        assert!(scan.points.len() < 8);
+        assert!(
+            scan.next_offset.is_some(),
+            "a cut page must hand back a resume offset"
+        );
+    }
+
+    #[test]
+    fn scan_deadline_from_budget_ms_disables_on_zero_or_unfiltered() {
+        let filter: Filter = serde_json::from_value(serde_json::json!({
+            "must": [{"key": "repo", "match": {"value": "x"}}]
+        }))
+        .unwrap();
+        assert!(scan_deadline_from_budget_ms(&filter, 0).is_none());
+        assert!(scan_deadline_from_budget_ms(&Filter::default(), 2_000).is_none());
+        assert!(scan_deadline_from_budget_ms(&filter, 2_000).is_some());
+    }
+
+    #[test]
+    fn indexed_scroll_ignores_expired_deadline_on_lsm_writer() {
+        assert_indexed_scroll_ignores_expired_deadline(&setup_with_config(
+            Config::default().with_lsm_in_memory(),
+        ));
+    }
+
+    #[test]
+    fn indexed_scroll_ignores_expired_deadline_on_lmdb() {
+        assert_indexed_scroll_ignores_expired_deadline(&setup());
     }
 
     #[test]
@@ -12197,6 +12588,7 @@ mod tests {
             partition: None,
             max_scan: None,
             deadline: None,
+            indexed_deadline: None,
             filter_hash: scan_filter_hash(filter),
             cursor_generation: None,
             fuse_pending: false,
@@ -13174,6 +13566,7 @@ mod tests {
             partition: None,
             max_scan: None,
             deadline: None,
+            indexed_deadline: None,
             filter_hash: scan_filter_hash(&filter),
             cursor_generation: None,
             fuse_pending: false,
@@ -13256,6 +13649,7 @@ mod tests {
             partition: None,
             max_scan: Some(10),
             deadline: None,
+            indexed_deadline: None,
             filter_hash: scan_filter_hash(&filter),
             cursor_generation: None,
             fuse_pending: false,
@@ -13330,6 +13724,7 @@ mod tests {
             partition: None,
             max_scan: None,
             deadline: None,
+            indexed_deadline: None,
             filter_hash: scan_filter_hash(&filter),
             cursor_generation: None,
             fuse_pending: false,

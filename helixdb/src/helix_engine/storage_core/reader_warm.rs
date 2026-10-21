@@ -9,9 +9,11 @@
 //!    (most-recent first, capped) to `<cache dir>/.helix_hot_collections.json`;
 //! 2. on startup, re-open those collections through the normal
 //!    [`CollectionManager::get_collection`] path with bounded concurrency and a
-//!    total time budget; and
+//!    total time budget, then reopen each warmed `DbReader` against the current
+//!    manifest so Ready means caught up with the writer (a write landing while
+//!    an open is in flight is skipped by the feed poller as not-yet-resident); and
 //! 3. report not-ready on `/readyz/warm` (and `/ready`, `/readyz`) until that
-//!    warm finishes or the budget is exhausted.
+//!    warm and catch-up finish or the budget is exhausted.
 //!
 //! Each reader only learns what it served, so the startup warm also unions in
 //! Ready peers' lists, fetched from their in-memory snapshot at
@@ -45,7 +47,10 @@
 //! client falls back to the writer (`reader_fallback_retryable`) meanwhile.
 
 use super::{
-    backend_lsm::{allow_lsm_blocking, cache_root_from_env},
+    backend_lsm::{
+        allow_lsm_blocking, cache_root_from_env, reader_active_poll_interval_from_env,
+        reader_idle_poll_interval_from_env,
+    },
     collection_manager::CollectionManager,
 };
 use crate::helix_engine::types::GraphError;
@@ -707,6 +712,40 @@ fn open_for_warm(collections: &CollectionManager, name: &str) -> WarmOutcome {
     outcome
 }
 
+/// Reopen a warmed collection's `DbReader` against the current manifest, on
+/// its current poll tier, so Ready implies "caught up to the end of warm". A
+/// poll-tier transition already in flight is itself a fresh open: skip it.
+fn refresh_for_warm(collections: &CollectionManager, name: &str) -> WarmOutcome {
+    let Ok(Some(storage)) = collections.get_loaded_collection(name) else {
+        return WarmOutcome::Skipped;
+    };
+    if !storage.try_begin_poll_tier_transition() {
+        return WarmOutcome::Skipped;
+    }
+    let interval = if storage.reader_poll_tier_is_fast() {
+        reader_active_poll_interval_from_env()
+    } else {
+        reader_idle_poll_interval_from_env()
+    };
+    let result = allow_lsm_blocking(|| {
+        storage
+            .backend
+            .refresh_lsm_reader_with_poll_interval(interval)
+    });
+    storage.end_poll_tier_transition();
+    match result {
+        Ok(_) => WarmOutcome::Warmed,
+        Err(err) => {
+            warn!(
+                collection = name,
+                error = %err,
+                "reader warm catch-up refresh failed"
+            );
+            WarmOutcome::Failed
+        }
+    }
+}
+
 /// Warm at most half the open-collection LRU (min 1) so the first live cold
 /// opens after ready have headroom instead of evicting warmed collections.
 fn warm_cap_for_open_limit(max_open: usize) -> usize {
@@ -723,18 +762,24 @@ fn retouch_in_hot_order(collections: &CollectionManager, names_hot_first: &[Stri
     }
 }
 
-fn record_warm_report(report: &WarmReport, elapsed: Duration) {
+/// `report` is the open phase, `catch_up` the refresh of every warmed
+/// collection that follows it; both run inside the one warm budget.
+fn record_warm_report(report: &WarmReport, catch_up: &WarmReport, elapsed: Duration) {
     metrics::histogram!("helix_reader_warm_duration_ms").record(elapsed.as_secs_f64() * 1000.0);
     for (outcome, value) in [
         ("warmed", report.warmed),
         ("skipped", report.skipped),
         ("failed", report.failed),
         ("incomplete", report.incomplete()),
+        ("refreshed", catch_up.warmed),
+        ("refresh_failed", catch_up.failed),
+        ("refresh_incomplete", catch_up.incomplete()),
     ] {
         metrics::counter!("helix_reader_warm_collections_total", "outcome" => outcome)
             .increment(value as u64);
     }
-    metrics::gauge!("helix_reader_warm_budget_exhausted").set(if report.budget_exhausted {
+    let budget_exhausted = report.budget_exhausted || catch_up.budget_exhausted;
+    metrics::gauge!("helix_reader_warm_budget_exhausted").set(if budget_exhausted {
         1.0
     } else {
         0.0
@@ -745,7 +790,11 @@ fn record_warm_report(report: &WarmReport, elapsed: Duration) {
         skipped = report.skipped,
         failed = report.failed,
         incomplete = report.incomplete(),
-        budget_exhausted = report.budget_exhausted,
+        refreshed = catch_up.warmed,
+        refresh_skipped = catch_up.skipped,
+        refresh_failed = catch_up.failed,
+        refresh_incomplete = catch_up.incomplete(),
+        budget_exhausted,
         elapsed_ms = elapsed.as_millis() as u64,
         "reader startup warm finished; reporting ready"
     );
@@ -900,11 +949,36 @@ pub fn spawn_reader_startup_warm(collections: Arc<CollectionManager>) {
                 "reader startup warm starting"
             );
             let warm_collections = Arc::clone(&collections);
+            let warmed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let warmed_sink = Arc::clone(&warmed);
             let report = run_startup_warm(
                 names,
                 warm_concurrency(),
                 budget.saturating_sub(started.elapsed()),
-                move |name| open_for_warm(&warm_collections, name),
+                move |name| {
+                    let outcome = open_for_warm(&warm_collections, name);
+                    if outcome == WarmOutcome::Warmed {
+                        if let Ok(mut warmed) = warmed_sink.lock() {
+                            warmed.push(name.to_string());
+                        }
+                    }
+                    outcome
+                },
+            )
+            .await;
+            // Catch up before reporting ready: each warmed DbReader's view
+            // dates from its open, and the feed poller skips a collection that
+            // was still opening when its write was signalled.
+            let warmed_names = warmed
+                .lock()
+                .map(|mut warmed| std::mem::take(&mut *warmed))
+                .unwrap_or_default();
+            let refresh_collections = Arc::clone(&collections);
+            let catch_up = run_startup_warm(
+                warmed_names,
+                warm_concurrency(),
+                budget.saturating_sub(started.elapsed()),
+                move |name| refresh_for_warm(&refresh_collections, name),
             )
             .await;
             let retouch_collections = Arc::clone(&collections);
@@ -912,7 +986,7 @@ pub fn spawn_reader_startup_warm(collections: Arc<CollectionManager>) {
                 retouch_in_hot_order(&retouch_collections, &retouch_names)
             })
             .await;
-            record_warm_report(&report, started.elapsed());
+            record_warm_report(&report, &catch_up, started.elapsed());
             drop(gate);
         }
 
@@ -1471,5 +1545,236 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(recency, names(&["warm_b", "warm_a"]));
+    }
+
+    use crate::helix_engine::storage_core::backend::StorageBackend;
+
+    struct EnvVar(&'static str, Option<String>);
+    impl EnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self(key, previous)
+        }
+    }
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(value) => std::env::set_var(self.0, value),
+                None => std::env::remove_var(self.0),
+            }
+        }
+    }
+    fn put_node(writer: &CollectionManager, id: u128) {
+        let storage = writer.get_or_create_collection("hot").unwrap();
+        let mut w = storage.backend.begin_write().unwrap();
+        storage
+            .create_node_be(
+                &mut w,
+                "Sym",
+                Vec::<(String, crate::protocol::value::Value)>::new(),
+                None,
+                Some(id),
+            )
+            .unwrap();
+        storage.backend.commit(w).unwrap();
+    }
+    fn reader_sees(reader: &CollectionManager, id: u128) -> bool {
+        let storage = reader.get_collection("hot").unwrap();
+        let r = storage.backend.begin_read().unwrap();
+        storage.get_node_be(&r, &id).is_ok()
+    }
+    async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        tokio::task::spawn_blocking(move || allow_lsm_blocking(f))
+            .await
+            .unwrap()
+    }
+
+    /// Ready must mean "caught up with the writer". A warmed collection's
+    /// `DbReader` view dates from its open, and the feed poller skips a
+    /// collection that is still opening when its write is signalled, so a
+    /// write landing between the open and the end of warm stays invisible
+    /// until the next manifest poll. Modeled with the collection resident
+    /// before warm starts and the reader's own poll far beyond the test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn startup_warm_catches_up_resident_collections_before_ready() {
+        use crate::helix_engine::storage_core::backend::{
+            LsmRole, LsmStorage, StorageBackendConfig,
+        };
+        use crate::helix_engine::storage_core::backend_any;
+
+        let _gate_lock = warm_gate_test_lock();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache = EnvVar::set("HELIX_LSM_CACHE_DIR", cache_dir.path().to_str().unwrap());
+        let _prefix = EnvVar::set("HELIX_LSM_PREFIX", "warm_catch_up");
+        // Far beyond this test's runtime: any visibility change is the warm's.
+        let _poll = EnvVar::set("HELIX_LSM_READER_MANIFEST_POLL_MS", "60000");
+        let _peers = EnvVar::set("HELIX_READER_WARM_PEER_URLS", "off");
+        let _persist = EnvVar::set("HELIX_READER_HOT_LIST_INTERVAL_SECS", "0");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let backend = |role| StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role,
+        };
+        let writer_dir = TempDir::new().unwrap();
+        let reader_dir = TempDir::new().unwrap();
+        let writer = Arc::new(
+            CollectionManager::new(
+                writer_dir.path().to_path_buf(),
+                Config::new(16, 128, 768, 1).with_storage_backend(backend(LsmRole::Writer)),
+            )
+            .unwrap(),
+        );
+        let reader = Arc::new(
+            CollectionManager::new(
+                reader_dir.path().to_path_buf(),
+                Config::new(16, 128, 768, 1).with_storage_backend(backend(LsmRole::Reader)),
+            )
+            .unwrap(),
+        );
+
+        // The reader opens the collection at a view holding node 1 only ...
+        let (w, r) = (Arc::clone(&writer), Arc::clone(&reader));
+        blocking(move || {
+            put_node(&w, 1);
+            assert!(reader_sees(&r, 1));
+            assert!(!reader_sees(&r, 2));
+        })
+        .await;
+        // ... then a write lands that the resident DbReader has not polled.
+        let (w, r) = (Arc::clone(&writer), Arc::clone(&reader));
+        assert!(
+            !blocking(move || {
+                put_node(&w, 2);
+                reader_sees(&r, 2)
+            })
+            .await,
+            "precondition: the resident DbReader must still serve the old view"
+        );
+        write_hot_list(
+            &cache_dir.path().join(HOT_LIST_FILE_NAME),
+            &names(&["hot"]),
+            64,
+        )
+        .unwrap();
+
+        spawn_reader_startup_warm(Arc::clone(&reader));
+        assert!(
+            !startup_warm_ready(),
+            "warm must gate readiness from the first probe"
+        );
+        let started = Instant::now();
+        while !startup_warm_ready() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "warm did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let r = Arc::clone(&reader);
+        assert!(
+            blocking(move || reader_sees(&r, 2)).await,
+            "Ready must imply the warmed collection is caught up with the writer"
+        );
+    }
+
+    async fn wait_for_warm_ready() {
+        let started = Instant::now();
+        while !startup_warm_ready() {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "warm did not finish"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The catch-up reopen must keep the collection on the tier its belief
+    /// says (a fast belief over an idle `DbReader` never promotes, so writes
+    /// stay invisible for the whole idle poll), and a warm open must count as
+    /// a read so the sweeper does not demote it on its first tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn startup_warm_keeps_fast_tier_and_read_window() {
+        use crate::helix_engine::storage_core::backend::{
+            LsmRole, LsmStorage, StorageBackendConfig,
+        };
+        use crate::helix_engine::storage_core::backend_any;
+
+        let _gate_lock = warm_gate_test_lock();
+        let cache_dir = TempDir::new().unwrap();
+        let _cache = EnvVar::set("HELIX_LSM_CACHE_DIR", cache_dir.path().to_str().unwrap());
+        let _prefix = EnvVar::set("HELIX_LSM_PREFIX", "warm_tier");
+        let _fast = EnvVar::set("HELIX_LSM_READER_MANIFEST_POLL_MS", "200");
+        let _idle = EnvVar::set("HELIX_LSM_READER_IDLE_POLL_MS", "600000");
+        // Sweeper tick = idle_after / 4 = 2s; a never-read open is demoted on it.
+        let _idle_after = EnvVar::set("HELIX_LSM_READER_IDLE_AFTER_MS", "8000");
+        let _peers = EnvVar::set("HELIX_READER_WARM_PEER_URLS", "off");
+        let _persist = EnvVar::set("HELIX_READER_HOT_LIST_INTERVAL_SECS", "0");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let backend = |role| StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role,
+        };
+        let (writer_dir, reader_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let writer = Arc::new(
+            CollectionManager::new(
+                writer_dir.path().to_path_buf(),
+                Config::new(16, 128, 768, 1).with_storage_backend(backend(LsmRole::Writer)),
+            )
+            .unwrap(),
+        );
+        let reader = Arc::new(
+            CollectionManager::new(
+                reader_dir.path().to_path_buf(),
+                Config::new(16, 128, 768, 1).with_storage_backend(backend(LsmRole::Reader)),
+            )
+            .unwrap(),
+        );
+        let w = Arc::clone(&writer);
+        blocking(move || put_node(&w, 1)).await;
+        write_hot_list(
+            &cache_dir.path().join(HOT_LIST_FILE_NAME),
+            &names(&["hot"]),
+            64,
+        )
+        .unwrap();
+
+        // Warm does the cold open itself (nothing resident), as after a restart.
+        spawn_reader_startup_warm(Arc::clone(&reader));
+        wait_for_warm_ready().await;
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        let loaded =
+            |reader: &CollectionManager| reader.get_loaded_collection("hot").unwrap().unwrap();
+        assert!(
+            loaded(&reader).reader_poll_tier_is_fast(),
+            "a warm open is read activity: the sweeper must not demote it on its first tick"
+        );
+
+        let w = Arc::clone(&writer);
+        blocking(move || put_node(&w, 2)).await;
+        let started = Instant::now();
+        loop {
+            let r = Arc::clone(&reader);
+            let visible = blocking(move || {
+                let storage = loaded(&r);
+                let txn = storage.backend.begin_read().unwrap();
+                storage.get_node_be(&txn, &2).is_ok()
+            })
+            .await;
+            if visible {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "after catch-up the DbReader must poll at the fast tier its belief claims"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }

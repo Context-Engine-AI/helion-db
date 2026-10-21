@@ -25,7 +25,6 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use futures::{future::try_join_all, stream, StreamExt, TryStreamExt};
-use object_store::aws::AmazonS3Builder;
 use object_store::ObjectStore;
 use slatedb::config::ScanOptions;
 use slatedb::{DbReader, DbSnapshot};
@@ -34,12 +33,12 @@ use tokio::runtime::Handle;
 use super::backend::{is_dup, next_prefix, BackendError, KeyRange, Namespace};
 use super::backend_lsm::{
     block_on_lsm, block_on_lsm_mapped, block_on_lsm_read, block_on_lsm_read_mapped,
-    collections_root_prefix, decode_dup_full_key, dup_composite, dup_key_prefix,
-    ensure_lsm_read_not_cancelled, list_child_collection_names, logical_key_in_range,
+    collections_root_prefix, decode_dup_full_key, dup_composite, dup_key_prefix, dup_scan_plan,
+    ensure_lsm_read_not_cancelled, list_child_collection_names, list_drop_tombstones,
     lsm_multi_get_enabled, lsm_scan_options, lsm_streaming_scan_options, ns_prefix,
-    prefix_filter_policies_from_env, prefixed, range_covers_all_logical_keys,
-    reader_options_from_env, scan_prefix_for_namespace_range, shared_db_cache, shared_lsm_handle,
-    shared_merge_operator, LsmBackend,
+    prefix_filter_policies_from_env, prefixed, reader_options_from_env,
+    scan_prefix_for_namespace_range, shared_db_cache, shared_lsm_handle, shared_merge_operator,
+    DupScanCursor, LsmBackend,
 };
 
 fn reader_io<E: std::fmt::Display>(e: E) -> BackendError {
@@ -246,6 +245,14 @@ impl LsmReader {
         list_child_collection_names(&self.rt, &self.store, root)
     }
 
+    /// Collection names the writer has drop-tombstoned under this reader's root.
+    pub(crate) fn list_drop_tombstones(
+        &self,
+    ) -> Result<std::collections::HashSet<String>, BackendError> {
+        let root = collections_root_prefix(&self.path);
+        list_drop_tombstones(&self.rt, &self.store, root)
+    }
+
     pub fn storage_bytes(&self) -> Result<u64, BackendError> {
         let store = Arc::clone(&self.store);
         let prefix = object_store::path::Path::from(self.path.trim_matches('/'));
@@ -275,21 +282,15 @@ impl LsmReader {
         endpoint: Option<&str>,
         allow_http: bool,
     ) -> Result<Self, BackendError> {
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(bucket);
-        if let Some(r) = region {
-            builder = builder.with_region(r);
-        }
-        if let Some(endpoint) = endpoint {
-            builder = builder.with_endpoint(endpoint);
-        }
-        if allow_http {
-            builder = builder.with_allow_http(true);
-        }
-        builder = super::backend_lsm::apply_s3_timeout(builder);
-        let store = builder
-            .build()
-            .map_err(|e| BackendError::Io(e.to_string()))?;
-        Self::open_with_store(prefix, Arc::new(store))
+        // The process-shared client: the cold-open tombstone HEAD and the
+        // catalog LISTs reuse this same handle instead of building their own.
+        let store = super::backend_lsm::build_s3_store(&super::backend_lsm::S3StoreConfig {
+            bucket,
+            region,
+            endpoint,
+            allow_http,
+        })?;
+        Self::open_with_store(prefix, store)
     }
 
     /// Open a reader replica on AWS S3 with environment/IRSA credentials.
@@ -594,46 +595,47 @@ impl LsmReader {
         mut visit: impl FnMut(&[u8], &[u8]) -> bool,
     ) -> Result<(), BackendError> {
         let prefix = ns_prefix(ns);
-        let lo: Bound<Vec<u8>> = Bound::Included(prefix.clone());
-        let hi: Bound<Vec<u8>> = match next_prefix(&prefix) {
-            Some(end) => Bound::Excluded(end),
-            None => Bound::Unbounded,
-        };
-        let scan_prefix = if range_covers_all_logical_keys(&range) {
-            Some(prefix.clone())
-        } else {
-            None
-        };
+        let plan = dup_scan_plan(ns, &range);
         let reader = self.current_reader();
         block_on_lsm_read_mapped(
             &self.rt,
             async {
-                let mut iter = match (snap, scan_prefix) {
+                let iter = match (snap, &plan.scan_prefix) {
                     (Some(snapshot), Some(scan_prefix)) => {
                         snapshot
-                            .scan_prefix_with_options(scan_prefix, .., &scan_options)
+                            .scan_prefix_with_options(scan_prefix.clone(), .., &scan_options)
                             .await
                     }
                     (Some(snapshot), None) => {
-                        snapshot.scan_with_options((lo, hi), &scan_options).await
+                        snapshot
+                            .scan_with_options((plan.lo.clone(), plan.hi.clone()), &scan_options)
+                            .await
                     }
                     (None, Some(scan_prefix)) => {
                         reader
-                            .scan_prefix_with_options(scan_prefix, .., &scan_options)
+                            .scan_prefix_with_options(scan_prefix.clone(), .., &scan_options)
                             .await
                     }
-                    (None, None) => reader.scan_with_options((lo, hi), &scan_options).await,
+                    (None, None) => {
+                        reader
+                            .scan_with_options((plan.lo.clone(), plan.hi.clone()), &scan_options)
+                            .await
+                    }
                 }
                 .map_err(reader_io)?;
-                while let Some(kv) = iter.next().await.map_err(reader_io)? {
+                let mut rows = DupScanCursor::new(
+                    iter,
+                    &prefix,
+                    &range,
+                    plan.seek_prefix.as_deref(),
+                    reader_io,
+                );
+                while let Some(kv) = rows.next().await? {
                     let (logical_key, logical_value) =
                         match decode_dup_full_key(kv.key.as_ref(), &prefix)? {
                             Some(parts) => parts,
                             None => continue,
                         };
-                    if !logical_key_in_range(logical_key, &range) {
-                        continue;
-                    }
                     if !visit(logical_key, logical_value) {
                         break;
                     }
@@ -1339,5 +1341,49 @@ mod tests {
         assert!(!reader
             .contains_dup(Namespace::OutEdges, b"n1", b"zzz")
             .unwrap());
+    }
+
+    #[test]
+    fn lsm_reader_exact_dup_scan_preserves_values_and_snapshot() {
+        use crate::helix_engine::storage_core::backend::StorageBackend;
+        use object_store::memory::InMemory;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let writer = LsmBackend::open_with_store("reader-exact-dup", store.clone()).unwrap();
+        let mut w = writer.begin_write().unwrap();
+        for (key, value) in [
+            (b"".as_slice(), b"empty".as_slice()),
+            (b"n1", b"a"),
+            (b"n1", b"b"),
+            (b"n10", b"other"),
+        ] {
+            writer
+                .put_dup(&mut w, Namespace::OutEdges, key, value)
+                .unwrap();
+        }
+        writer.commit(w).unwrap();
+        let reader = LsmReader::open_with_store("reader-exact-dup", store).unwrap();
+        let snapshot = reader.begin_snapshot().unwrap();
+        for snap in [None, Some(&snapshot)] {
+            for (key, expected) in [
+                (b"n1".as_slice(), vec![b"a".to_vec(), b"b".to_vec()]),
+                (b"missing", vec![]),
+                (b"", vec![b"empty".to_vec()]),
+            ] {
+                let mut values = Vec::new();
+                let range = KeyRange {
+                    start: Bound::Included(key.to_vec()),
+                    end: Bound::Included(key.to_vec()),
+                };
+                reader
+                    .scan_dup_with_at(snap, Namespace::OutEdges, range, |actual_key, value| {
+                        assert_eq!(actual_key, key);
+                        values.push(value.to_vec());
+                        true
+                    })
+                    .unwrap();
+                assert_eq!(values, expected);
+            }
+        }
     }
 }
