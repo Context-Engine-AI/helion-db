@@ -29,16 +29,47 @@ impl PartialOrd for HVector {
 }
 
 impl Ord for HVector {
-    /// Reversed distance order (closest is "greatest"). Total: a NaN distance
-    /// ranks as farthest instead of comparing Equal to everything, which
-    /// would break heap invariants; an unset distance ranks below any set one
+    /// The order of dense hits, reversed (the nearest is "greatest", and of
+    /// equally far hits the one with the smaller id): see
+    /// `nearer_then_smaller_id`. An unset distance ranks below any set one
     /// (same as the previous `Option::partial_cmp`).
     fn cmp(&self, other: &Self) -> Ordering {
         match (other.distance, self.distance) {
-            (Some(lhs), Some(rhs)) => nan_as_farthest(lhs).total_cmp(&nan_as_farthest(rhs)),
+            #[cfg(test)]
+            (Some(lhs), Some(rhs)) if distance_alone_for_test("hits") => {
+                nearer_then_smaller_id((lhs, 0), (rhs, 0))
+            }
+            (Some(lhs), Some(rhs)) => nearer_then_smaller_id((lhs, other.id), (rhs, self.id)),
             (lhs, rhs) => lhs.is_some().cmp(&rhs.is_some()),
         }
     }
+}
+
+/// Test builds only. `HELIX_TEST_DISTANCE_ALONE` names the kinds of candidate
+/// (`hits` for `HVector`, `rows` and `slots` for the two candidates of the
+/// flat scans; comma-separated) whose order leaves the id out for the whole
+/// run, as it did before `nearer_then_smaller_id`. The tests of the one order
+/// fail under the switch of their kind on the build that passes them without.
+#[cfg(test)]
+pub(crate) fn distance_alone_for_test(kind: &str) -> bool {
+    static KINDS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KINDS
+        .get_or_init(|| std::env::var("HELIX_TEST_DISTANCE_ALONE").unwrap_or_default())
+        .split(',')
+        .any(|named| named == kind)
+}
+
+/// The one order of dense hits, over (distance, id): the nearer first, and
+/// of two equally far the smaller id, so that an answer is the same in
+/// whatever order its rows were met. Total: a NaN distance is the farthest
+/// instead of comparing equal to everything, which would break heap
+/// invariants, and -0.0 is 0.0 (`+ 0.0` makes it so), where `total_cmp` alone
+/// would put it first whatever the ids.
+#[inline(always)]
+pub(crate) fn nearer_then_smaller_id(lhs: (f32, u128), rhs: (f32, u128)) -> Ordering {
+    (nan_as_farthest(lhs.0) + 0.0)
+        .total_cmp(&(nan_as_farthest(rhs.0) + 0.0))
+        .then_with(|| lhs.1.cmp(&rhs.1))
 }
 
 #[inline(always)]

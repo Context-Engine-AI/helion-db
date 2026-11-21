@@ -43,7 +43,7 @@
 //!
 //! Operational note: the gate is per pod. If BOTH readers restart at once (node
 //! drain, manual delete — not the one-at-a-time StatefulSet rollout), the reader
-//! Service has no ready endpoints for up to the warm budget, and CE's reader
+//! Service has no ready endpoints for up to the warm budget, and the client's reader
 //! client falls back to the writer (`reader_fallback_retryable`) meanwhile.
 
 use super::{
@@ -712,9 +712,10 @@ fn open_for_warm(collections: &CollectionManager, name: &str) -> WarmOutcome {
     outcome
 }
 
-/// Reopen a warmed collection's `DbReader` against the current manifest, on
-/// its current poll tier, so Ready implies "caught up to the end of warm". A
-/// poll-tier transition already in flight is itself a fresh open: skip it.
+/// Bring a warmed collection's `DbReader` up to the current manifest, on its
+/// current poll tier, so Ready implies "caught up to the end of warm": one
+/// manifest poll, or a reopen where tier changes are reopens. A poll-tier
+/// transition already in flight catches up by itself: skip it.
 fn refresh_for_warm(collections: &CollectionManager, name: &str) -> WarmOutcome {
     let Ok(Some(storage)) = collections.get_loaded_collection(name) else {
         return WarmOutcome::Skipped;
@@ -727,11 +728,7 @@ fn refresh_for_warm(collections: &CollectionManager, name: &str) -> WarmOutcome 
     } else {
         reader_idle_poll_interval_from_env()
     };
-    let result = allow_lsm_blocking(|| {
-        storage
-            .backend
-            .refresh_lsm_reader_with_poll_interval(interval)
-    });
+    let result = allow_lsm_blocking(|| storage.backend.retier_lsm_reader(interval));
     storage.end_poll_tier_transition();
     match result {
         Ok(_) => WarmOutcome::Warmed,

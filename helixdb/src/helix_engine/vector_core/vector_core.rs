@@ -7,10 +7,11 @@ use crate::helix_engine::{
         hnsw::HNSW,
         named_vectors::DistanceMetric,
         spindle::{
-            decode_vector, encode_vector, prepare_query, project_for_search, score_encoded,
-            ApproximateInnerProduct, PreparedSpindleQuery, SpindleConfig, SpindleMode,
+            decode_vector, encode_vector, is_spindle_payload, prepare_query, project_for_search,
+            score_encoded, ApproximateInnerProduct, PreparedSpindleQuery, SpindleConfig,
+            SpindleMode,
         },
-        vector::HVector,
+        vector::{nearer_then_smaller_id, HVector},
     },
 };
 use crate::protocol::value::Value;
@@ -314,6 +315,78 @@ const DB_HNSW_OUT_EDGES: &str = "hnsw_out_nodes"; // for hnsw out node data
 const DB_HNSW_NEIGHBOR_LISTS: &str = "hnsw_neighbors"; // packed adjacency lists
 const VECTOR_PREFIX: &[u8] = b"v:";
 const ENTRY_POINT_KEY: &str = "entry_point";
+/// Beside the entry point: the number of the build procedure that made the
+/// segment's graph, one byte. No row: a graph from before the number was kept.
+const BUILD_NUMBER_KEY: &str = "build_number";
+/// Raised when the bulk build changes so that the graphs made before are
+/// worth a rebuild: a regraph leaves the segments that carry it alone.
+/// 1: diverse neighbours, and a link to each point no link led to, where a
+/// near point had room for one.
+const HNSW_BUILD_NUMBER: u8 = 1;
+/// Beside the entry point: how many rows of the segment's graph hard deletes
+/// have taken since it was built, eight bytes big-endian. No row: none. A
+/// merge or a regraph writes a new segment, which starts without one.
+const DELETED_ROWS_KEY: &str = "deleted_rows";
+/// Beside the entry point: the number of the link pass that has been over
+/// this segment's graph as it is stored (`VectorCore::plan_stored_links`),
+/// one byte. No row: none has. Not the build number: the pass gives a graph
+/// the links a build would have added and none of its other properties.
+///
+/// After the number comes the count of deleted rows (`DELETED_ROWS_KEY`,
+/// eight bytes big-endian) the pass began at in this segment: a delete that
+/// takes a row a link came from leaves what the link led to unreached again,
+/// so a segment whose count has grown since is due again
+/// (`VectorCore::link_pass_done`). A mark without one, as the passes before
+/// this rule wrote it, reads as begun at none.
+///
+/// A pass that is part of the way through a segment keeps a 0 there, after
+/// it the id (16 bytes big-endian) of the last unreached row it has looked
+/// at, that same count, and then its own number: the next call goes on from
+/// the rows after that one, and the count goes with the place from call to
+/// call into the mark. A place kept by another pass is not taken up
+/// (`VectorCore::link_pass_after`), and that segment starts again from its
+/// first row. Pass 1 kept the place without a number, and no place kept
+/// before this rule has a count.
+const LINK_PASS_KEY: &str = "link_pass";
+/// Raised when the pass changes so that a segment it has been over is worth
+/// another go.
+/// 2: a link goes past a list a build filled ([`link_pass_list_bound`]).
+/// Pass 1 linked only under `m_max_0`, and in the graphs built before the
+/// builds linked their own unreached points every near list is full: it
+/// marked their segments with nothing linked.
+/// 3: where every near list is at its bound, the link comes from a row the
+/// pass has linked below the nearest (`VectorCore::link_host_below`). Pass 2
+/// tried the eight nearest rows and no other: of the rows that share those
+/// eight, as rows with one vector do, a call linked as many as the eight had
+/// places for and left the others.
+const LINK_PASS_NUMBER: u8 = 3;
+/// How many rows with one vector the link pass leaves arrived at: a row gets
+/// no link once this many rows with its own vector are. Rows with one vector
+/// are all as near to a query as each other, so a walk that comes to a group
+/// of them takes them all, and a group with more linked rows than a walk
+/// keeps takes every place of it. As many as the rows the pass's walk
+/// returns, which is how it counts them.
+const LINK_PASS_TWINS: usize = UNREACHED_LINK_HOSTS;
+/// Two rows have one vector, for the pass, at a distance of no more than
+/// this.
+const LINK_PASS_TWIN_DISTANCE: f32 = 1e-6;
+
+/// How many ids a level-0 list may hold once the link pass over a stored
+/// graph has added to it: a quarter more than a build fills it to. No build
+/// writes a list past `m_max_0`, so the ids past it are the pass's, and the
+/// bound is what keeps a list many unreached rows lie near from growing
+/// with each of them. Nothing that reads a stored list goes by `m_max_0`:
+/// the lists are decoded by their length, cached whole and walked id by id.
+fn link_pass_list_bound(m_max_0: usize) -> usize {
+    m_max_0 + m_max_0 / 4
+}
+
+/// How many rows down the links of the pass a plan goes from a row whose
+/// list is at its bound, for one with room (`VectorCore::link_host_below`).
+/// With eight places a row, as at an `m` of 16, that is more rows below one
+/// row than a segment holds. It bounds the reads where no row below has
+/// room, as where a build wrote lists longer than the bound.
+const LINK_PASS_STEPS_DOWN: usize = 16;
 const NEIGHBOR_BLOCK_MAGIC: &[u8; 4] = b"NBR2";
 /// IVF build metadata key (under `SegmentDb::IvfCentroids`). Written last by
 /// the IVF build, so its presence marks a complete index — the runtime
@@ -392,6 +465,472 @@ fn shared_caches_enabled() -> bool {
     *ENABLED
 }
 
+#[cfg(test)]
+thread_local! {
+    static LAZY_FILTER_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` on this thread with lazy id-filter evaluation forced.
+/// Thread-local, so it does not reach rayon fanout workers: parity tests must
+/// search a single segment (the serial path).
+#[cfg(test)]
+pub(crate) fn with_lazy_filter_for_test<R>(lazy: bool, f: impl FnOnce() -> R) -> R {
+    LAZY_FILTER_OVERRIDE.with(|cell| cell.set(Some(lazy)));
+    let out = f();
+    LAZY_FILTER_OVERRIDE.with(|cell| cell.set(None));
+    out
+}
+
+/// Id-filtered HNSW evaluates the filter only for neighbors that could enter
+/// the result set. The filter never steers navigation (rejected neighbors are
+/// still enqueued as bridges), so results are identical while every
+/// non-contender skips its payload read. `HELIX_HNSW_LAZY_FILTER=0` restores
+/// eager per-neighbor evaluation and the post-search recheck.
+fn hnsw_lazy_filter_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = LAZY_FILTER_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("HELIX_HNSW_LAZY_FILTER")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
+#[cfg(test)]
+thread_local! {
+    static DIVERSE_NEIGHBORS_OVERRIDE: std::cell::Cell<Option<Option<bool>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with the bulk-build neighbor rule forced (see
+/// `hnsw_diverse_neighbors`). Builds read the rule once on the calling thread.
+#[cfg(test)]
+pub(crate) fn with_diverse_neighbors_for_test<R>(
+    diverse: Option<bool>,
+    f: impl FnOnce() -> R,
+) -> R {
+    DIVERSE_NEIGHBORS_OVERRIDE.with(|cell| cell.set(Some(diverse)));
+    let out = f();
+    DIVERSE_NEIGHBORS_OVERRIDE.with(|cell| cell.set(None));
+    out
+}
+
+/// Bulk HNSW builds choose and prune links with the diversity heuristic of
+/// Malkov & Yashunin (Algorithm 4, see `select_neighbor_ords`): with
+/// nearest-`M` alone, clustered code embeddings form islands that no search
+/// `ef` crosses. Returns `Some(keep_pruned)` when on. Affects only graphs
+/// built afterwards; the neighbor row format and the `M`/`M0` caps are
+/// unchanged. `HELIX_HNSW_DIVERSE_NEIGHBORS=0` restores nearest-`M`.
+fn hnsw_diverse_neighbors() -> Option<bool> {
+    #[cfg(test)]
+    if let Some(forced) = DIVERSE_NEIGHBORS_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("HELIX_HNSW_DIVERSE_NEIGHBORS")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    });
+    ENABLED.then_some(HNSW_KEEP_PRUNED_CONNECTIONS)
+}
+
+#[cfg(test)]
+thread_local! {
+    static LINK_UNREACHED_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `hnsw_link_unreached` forced on the calling
+/// thread.
+#[cfg(test)]
+pub(crate) fn with_link_unreached_for_test<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    LINK_UNREACHED_OVERRIDE.with(|cell| cell.set(Some(enabled)));
+    let out = f();
+    LINK_UNREACHED_OVERRIDE.with(|cell| cell.set(None));
+    out
+}
+
+/// A bulk HNSW build ends by linking the points it left with no way in
+/// (see `link_unreached_points`). `HELIX_HNSW_LINK_UNREACHED=0` leaves them
+/// as they are; they are still counted.
+fn hnsw_link_unreached() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = LINK_UNREACHED_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("HELIX_HNSW_LINK_UNREACHED")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
+#[cfg(test)]
+thread_local! {
+    static WALK_RESTART_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `hnsw_walk_restart` forced on the calling thread.
+#[cfg(test)]
+pub(crate) fn with_walk_restart_for_test<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    WALK_RESTART_OVERRIDE.with(|cell| cell.set(Some(enabled)));
+    let out = f();
+    WALK_RESTART_OVERRIDE.with(|cell| cell.set(None));
+    out
+}
+
+/// A search's level-0 walk that runs out of candidates below ef goes on,
+/// once, from its start's level-1 list (see `search_level`).
+/// `HELIX_HNSW_WALK_RESTART=0` ends such a walk where it ran dry, as before.
+fn hnsw_walk_restart() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = WALK_RESTART_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("HELIX_HNSW_WALK_RESTART")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
+#[cfg(test)]
+thread_local! {
+    static DELETED_LISTS_OVERRIDE: std::cell::Cell<Option<(bool, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `keep_deleted_lists`, `deleted_lists_crossed` and
+/// `deleted_lists_budget` forced on the calling thread.
+#[cfg(test)]
+pub(crate) fn with_deleted_lists_budget_for_test<R>(
+    keep: bool,
+    crossed: usize,
+    budget: usize,
+    f: impl FnOnce() -> R,
+) -> R {
+    DELETED_LISTS_OVERRIDE.with(|cell| cell.set(Some((keep, crossed, budget))));
+    let out = f();
+    DELETED_LISTS_OVERRIDE.with(|cell| cell.set(None));
+    out
+}
+
+/// Test-only: [`with_deleted_lists_budget_for_test`] with no limit on the
+/// lists a walk reads.
+#[cfg(test)]
+pub(crate) fn with_deleted_lists_for_test<R>(
+    keep: bool,
+    crossed: usize,
+    f: impl FnOnce() -> R,
+) -> R {
+    with_deleted_lists_budget_for_test(keep, crossed, usize::MAX, f)
+}
+
+/// A hard delete takes a point's rows and leaves its neighbour lists, so
+/// that a walk still gets through them to the points they led to (see
+/// `VectorCore::rowless_candidate`). The lists go when the segment is merged
+/// or retired. `HELIX_HNSW_KEEP_DELETED_LISTS=0` deletes them with the rows,
+/// as before.
+fn keep_deleted_lists() -> bool {
+    #[cfg(test)]
+    if let Some((keep, _, _)) = DELETED_LISTS_OVERRIDE.with(|cell| cell.get()) {
+        return keep;
+    }
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("HELIX_HNSW_KEEP_DELETED_LISTS")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
+/// How many ids in a row that have lists and no row a level-0 walk gets
+/// through. At 0 it ends at the first, as it did before the lists were kept,
+/// and that is the default: the lists are kept from the first delete on, and
+/// the walk is switched on by a measurement on a copy with deletes (how many
+/// points come back first for their own vector, and what a walk costs, for
+/// each value of this and of the budget).
+const HNSW_DELETED_LISTS_CROSSED: usize = 0;
+
+/// How many such lists one level-0 walk reads, nearest first.
+// shortcut: 32 is a placeholder, not a measured value, and it bounds nothing
+// while `HNSW_DELETED_LISTS_CROSSED` is 0; set both from the one measurement.
+const HNSW_DELETED_LISTS_BUDGET: usize = 32;
+
+/// A count from the environment. One that is set and does not parse reads as
+/// 0, so that `off` does not leave a default above 0 in force.
+fn env_count_or(name: &str, default: usize) -> usize {
+    match std::env::var(name) {
+        Ok(value) => value.trim().parse().unwrap_or(0),
+        Err(_) => default,
+    }
+}
+
+/// [`HNSW_DELETED_LISTS_CROSSED`], or `HELIX_HNSW_DELETED_LISTS_CROSSED`.
+fn deleted_lists_crossed() -> usize {
+    #[cfg(test)]
+    if let Some((_, crossed, _)) = DELETED_LISTS_OVERRIDE.with(|cell| cell.get()) {
+        return crossed;
+    }
+    static CROSSED: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        env_count_or(
+            "HELIX_HNSW_DELETED_LISTS_CROSSED",
+            HNSW_DELETED_LISTS_CROSSED,
+        )
+    });
+    *CROSSED
+}
+
+/// [`HNSW_DELETED_LISTS_BUDGET`], or `HELIX_HNSW_DELETED_LISTS_BUDGET`.
+fn deleted_lists_budget() -> usize {
+    #[cfg(test)]
+    if let Some((_, _, budget)) = DELETED_LISTS_OVERRIDE.with(|cell| cell.get()) {
+        return budget;
+    }
+    static BUDGET: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        env_count_or("HELIX_HNSW_DELETED_LISTS_BUDGET", HNSW_DELETED_LISTS_BUDGET)
+    });
+    *BUDGET
+}
+
+/// What one level's walk knows of the ids that have lists and no row (see
+/// `VectorCore::rowless_candidate`).
+struct RowlessLists {
+    /// How many of them in a row the walk gets through: none above level 0,
+    /// where a descent keeps one result and takes no such candidate.
+    crossed: usize,
+    /// How many of their lists the walk reads.
+    budget: usize,
+    /// By id: the fewest in a row, itself counted, that it was made a
+    /// candidate through, and the count its list was last read at
+    /// (`usize::MAX`: not yet).
+    met: HashMap<u128, (usize, usize)>,
+    /// The lists read, and how many of them were there.
+    read: usize,
+    found: usize,
+}
+
+/// What a popped candidate is to [`RowlessLists`].
+enum RowlessTurn {
+    /// It has a row.
+    Row,
+    /// No row: its list is read now, the walk having come through this many
+    /// such ids in a row, itself counted.
+    Read(usize),
+    /// No row, and its list is not read: it was read by a way as short, or
+    /// the walk has read as many as it may.
+    Skip,
+}
+
+impl RowlessLists {
+    fn at_level(level: usize) -> Self {
+        Self {
+            crossed: if level == 0 {
+                deleted_lists_crossed()
+            } else {
+                0
+            },
+            budget: deleted_lists_budget(),
+            met: HashMap::new(),
+            read: 0,
+            found: 0,
+        }
+    }
+
+    /// Whether the walk has met `id` and found no row.
+    fn knows(&self, id: u128) -> bool {
+        !self.met.is_empty() && self.met.contains_key(&id)
+    }
+
+    /// Notes that `id` has no row and was met `through` such ids in a row
+    /// deep, itself counted. True when that makes it a candidate: near
+    /// enough, no deeper than the walk gets through, and by a shorter way
+    /// than any it was a candidate by before.
+    fn candidate_by(&mut self, id: u128, through: usize, near: bool) -> bool {
+        let known = self.met.entry(id).or_insert((usize::MAX, usize::MAX));
+        let take = near && through <= self.crossed && through < known.0;
+        if take {
+            known.0 = through;
+        }
+        take
+    }
+
+    fn turn(&mut self, id: u128) -> RowlessTurn {
+        if self.met.is_empty() {
+            return RowlessTurn::Row;
+        }
+        let Some((through, read_at)) = self.met.get_mut(&id) else {
+            return RowlessTurn::Row;
+        };
+        if *read_at <= *through || self.read >= self.budget {
+            return RowlessTurn::Skip;
+        }
+        *read_at = *through;
+        self.read += 1;
+        RowlessTurn::Read(*through)
+    }
+}
+
+/// The paper's keepPrunedConnections: refill diverse lists with the nearest
+/// rejected candidates. Without it lists hold about half the cap, and sparse
+/// graphs lose reachability under deletes (low-dimensional ones most).
+const HNSW_KEEP_PRUNED_CONNECTIONS: bool = true;
+
+/// Segments this small keep nearest-`M` links: they already reach the whole
+/// segment within two hops, and on real vectors diverse graphs of a few
+/// hundred points only added build-to-build variance (from 600 points up
+/// they win on every collection measured). Searches of segments this small
+/// skip the graph (see `small_segment_exact_enabled`).
+pub(crate) const HNSW_DIVERSE_MIN_POINTS: usize = 512;
+
+#[cfg(test)]
+thread_local! {
+    static SMALL_SEGMENT_EXACT_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `small_segment_exact_enabled` forced on the
+/// calling thread.
+#[cfg(test)]
+pub(crate) fn with_small_segment_exact_for_test<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    SMALL_SEGMENT_EXACT_OVERRIDE.with(|cell| cell.set(Some(enabled)));
+    let out = f();
+    SMALL_SEGMENT_EXACT_OVERRIDE.with(|cell| cell.set(None));
+    out
+}
+
+/// HNSW segments of up to `small_segment_exact_max_rows` level-0 rows are
+/// searched exactly on every dense route; with a filter, those of fewer than
+/// `HNSW_DIVERSE_MIN_POINTS` rows (see `is_small_hnsw_segment`). Below
+/// `HNSW_DIVERSE_MIN_POINTS` rows their nearest-`M` graphs strand points the
+/// entry point cannot reach (recall@10 ~0.90 at 300-511 real code vectors,
+/// some queries 0), and up to the limit scoring every row beats the walk.
+/// `HELIX_SMALL_SEGMENT_EXACT=0` restores the walk.
+fn small_segment_exact_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = SMALL_SEGMENT_EXACT_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("HELIX_SMALL_SEGMENT_EXACT")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
+/// Default of `small_segment_exact_max_rows`. On a reader with two cores, at
+/// 768 dimensions, a warm exact search of 2048 rows took 3.2 ms against the
+/// walk's 6.1, and the first search of the segment after its open 20 ms
+/// against 13. At 4096 rows the warm times were 5.9 and 7.3 ms and the first
+/// search took 39 ms against 21.
+pub(crate) const SMALL_SEGMENT_EXACT_MAX_ROWS: u64 = 2048;
+
+/// The most level-0 rows an HNSW segment may hold and still be searched
+/// exactly when the search has no filter
+/// (`HELIX_SMALL_SEGMENT_EXACT_MAX_ROWS`, read once). 511 is the rule before
+/// this setting, fewer than `HNSW_DIVERSE_MIN_POINTS` rows, and the least it
+/// takes: a smaller graph strands points, and only
+/// `HELIX_SMALL_SEGMENT_EXACT=0` walks one.
+fn small_segment_exact_max_rows() -> u64 {
+    static MAX_ROWS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        small_segment_exact_max_rows_from_raw(
+            std::env::var("HELIX_SMALL_SEGMENT_EXACT_MAX_ROWS")
+                .ok()
+                .as_deref(),
+        )
+    });
+    *MAX_ROWS
+}
+
+fn small_segment_exact_max_rows_from_raw(raw: Option<&str>) -> u64 {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(SMALL_SEGMENT_EXACT_MAX_ROWS)
+        .max(HNSW_DIVERSE_MIN_POINTS as u64 - 1)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FLAT_SCAN_ROW_BATCH_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `flat_scan_row_batch` forced on the calling thread.
+#[cfg(test)]
+pub(crate) fn with_flat_scan_row_batch_for_test<R>(batch: usize, f: impl FnOnce() -> R) -> R {
+    let previous = FLAT_SCAN_ROW_BATCH_OVERRIDE.with(|cell| cell.replace(Some(batch)));
+    let out = f();
+    FLAT_SCAN_ROW_BATCH_OVERRIDE.with(|cell| cell.set(previous));
+    out
+}
+
+/// Most rows one batched flat-scan read holds in memory at once, whatever the
+/// switch says: 16,384 rows of a 1,024-dimension space are 64 MB.
+const FLAT_SCAN_ROW_BATCH_MAX: usize = 16_384;
+
+/// Ids a flat scan has to read by row go to the store this many at a time, one
+/// batched read each. The broad prefilter scan asks every segment for every
+/// member the segment does not list by ordinal, so nearly all of those ids
+/// have no row there; the batched read answers them without a lookup each.
+/// `HELIX_FLAT_SCAN_ROW_BATCH=0` restores one read per id; a value above
+/// [`FLAT_SCAN_ROW_BATCH_MAX`] is that maximum.
+fn flat_scan_row_batch() -> usize {
+    #[cfg(test)]
+    if let Some(forced) = FLAT_SCAN_ROW_BATCH_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+    static BATCH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("HELIX_FLAT_SCAN_ROW_BATCH")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(2048)
+            .min(FLAT_SCAN_ROW_BATCH_MAX)
+    });
+    *BATCH
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXACT_ROWS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `exact_rows_enabled` forced on the calling thread.
+#[cfg(test)]
+pub(crate) fn with_exact_rows_for_test<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let previous = EXACT_ROWS_OVERRIDE.with(|cell| cell.replace(Some(on)));
+    let out = f();
+    EXACT_ROWS_OVERRIDE.with(|cell| cell.set(previous));
+    out
+}
+
+/// `HELIX_DENSE_EXACT_ROWS` as set: on, but for `0`, `false`, `no` or `off`.
+fn exact_rows_enabled_of(value: Option<&str>) -> bool {
+    !matches!(
+        value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
+/// Whether the exact scorer of a set of ids scores a segment from one batched
+/// read of its rows ([`VectorCore::exact_hits_from_rows`]).
+/// `HELIX_DENSE_EXACT_ROWS=0` is that scorer's own way back to the read of
+/// each id. `HELIX_FLAT_SCAN_ROW_BATCH=0` takes it back too, and with it the
+/// flat scan's batches: a scan then looks up each member a segment does not
+/// list, one read each.
+fn exact_rows_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = EXACT_ROWS_OVERRIDE.with(|cell| cell.get()) {
+        return forced;
+    }
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        exact_rows_enabled_of(std::env::var("HELIX_DENSE_EXACT_ROWS").ok().as_deref())
+    });
+    *ON
+}
+
 /// Experimental exact HVTQ block-transposed scanner. The current row scorer is
 /// faster in local benches, so keep this opt-in until the SIMD LUT kernel wins.
 fn hvtq_fastscan_enabled() -> bool {
@@ -436,6 +975,27 @@ fn patch_reverse_edges_on_batch_delete() -> bool {
         .unwrap_or(false)
 }
 
+/// On the backend-routed paths a segment keeps a usable entry point: a hard
+/// delete that takes it and a build that publishes over a row a delete took
+/// both move the key to a surviving row. Without one every search of the
+/// segment is an exact scan of all its rows. `HELIX_DENSE_REPOINT_ENTRY=0`
+/// restores that.
+#[inline]
+fn repoint_entry_enabled() -> bool {
+    std::env::var("HELIX_DENSE_REPOINT_ENTRY")
+        .map(|value| !matches!(value.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+        .unwrap_or(true)
+}
+
+/// Rows a delete batch may scan for a new entry point once the old one and
+/// every neighbor it had are gone. The batch holds the collection's point
+/// mutation gate, and 1,024 rows are about 4 MB at 1,024 dimensions.
+const ENTRY_REPOINT_SCAN_ROWS: usize = 1024;
+
+/// Ids a publish probes, highest level first, for one that still has its
+/// level-0 row when the built entry point lost its own.
+const ENTRY_REPOINT_PUBLISH_PROBES: usize = 64;
+
 const DENSE_DELETE_READ_SNAPSHOT_CHUNK_DEFAULT: usize = 64;
 const DENSE_DELETE_READ_SNAPSHOT_CHUNK_ENV: &str = "HELIX_DENSE_DELETE_READ_SNAPSHOT_CHUNK";
 
@@ -444,12 +1004,15 @@ static DENSE_DELETE_READ_SNAPSHOT_OPENS_FOR_TEST: std::sync::atomic::AtomicUsize
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Two-phase test hook for `ensure_sidecar_ordinals_loaded`. A test arms the
-/// hook by setting `_ARMED` to `true`. When the function reaches the point
-/// between the scan and the generation check it sets `_FIRED` to `true` and
-/// spins until `_FIRED` is cleared by the test thread.
+/// hook for ONE core by storing its address in `_ARMED` (0: not armed). When
+/// that core reaches the point between the scan and the generation check it
+/// sets `_FIRED` to `true` and spins until `_FIRED` is cleared by the test
+/// thread. Armed for every core of the process, a test beside the arming one
+/// fired it: the arming test let that thread go, and its own loader, which
+/// came to the hook after it, spun for good.
 #[cfg(test)]
-static ORDINAL_LOAD_POST_SCAN_ARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static ORDINAL_LOAD_POST_SCAN_ARMED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static ORDINAL_LOAD_POST_SCAN_FIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -459,6 +1022,16 @@ static ORDINAL_LOAD_POST_SCAN_FIRED: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 static WRITE_PATH_SIDECAR_WAITERS_FOR_TEST: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Broad prefilter scan completions (returned Some) for test assertions.
+#[cfg(test)]
+static BROAD_SCAN_COMPLETIONS_FOR_TEST: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn broad_scan_completions_for_test() -> usize {
+    BROAD_SCAN_COMPLETIONS_FOR_TEST.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Elected write-path materializers that dropped the slot lock to wait for
 /// a permit lock-free.
 #[cfg(test)]
@@ -615,6 +1188,11 @@ struct StoredVectorData {
     original_vector: Option<Vec<f32>>,
 }
 
+/// Payload rows [`VectorCore::export_level_zero`] reads per batched read. A
+/// row is a few KB (the original vector and the point's fields), so a chunk
+/// holds a few MB beside an export that keeps every row anyway, and a
+/// 200,000-row segment takes 391 round trips instead of 200,000.
+const EXPORT_VECTOR_DATA_CHUNK: usize = 512;
 const EXTERNALIZED_VECTOR_MARKER: &[u8] = b"";
 pub(crate) const HVTQ_SIDECAR_BLOB_KEY: &[u8] = b"__helix_sidecar:hvtq";
 pub(crate) const HVEC_SIDECAR_BLOB_KEY: &[u8] = b"__helix_sidecar:hvec";
@@ -624,6 +1202,7 @@ const HVEC_SIDECAR_ORDINALS_MAGIC: &[u8; 4] = b"HORD";
 /// Pre-computed HNSW graph that can be flushed to LMDB in a separate write
 /// transaction. This allows the expensive graph construction to happen outside
 /// the write lock, dramatically reducing write-lock contention during ingest.
+#[cfg_attr(test, derive(Clone))]
 pub struct PreparedIndex {
     pub(crate) point_ids: Vec<u128>,
     pub(crate) original_data: Vec<Option<Vec<f32>>>,
@@ -633,6 +1212,10 @@ pub struct PreparedIndex {
     pub(crate) adjacency: Vec<Option<Vec<Vec<u32>>>>,
     pub(crate) entry_ord: usize,
     pub(crate) level_zero_preflushed: bool,
+    /// Points no link leads to, as the build counted them after its linking
+    /// pass (see `reach_every_point`). The segment that receives the index
+    /// says so by name when it is written.
+    pub(crate) unreached: usize,
 }
 
 impl PreparedIndex {
@@ -841,7 +1424,7 @@ impl NeighborBlock {
 /// Reject vectors with NaN/inf components at the engine boundary: they yield
 /// NaN distances that corrupt heap ordering and graph construction.
 #[inline]
-fn ensure_finite_vector(data: &[f32]) -> Result<(), VectorError> {
+pub(crate) fn ensure_finite_vector(data: &[f32]) -> Result<(), VectorError> {
     if data.iter().all(|v| v.is_finite()) {
         Ok(())
     } else {
@@ -1003,13 +1586,19 @@ impl Eq for FlatCandidate {}
 
 impl PartialOrd for FlatCandidate {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.distance.partial_cmp(&other.distance)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for FlatCandidate {
+    /// The order of dense hits: the nearer is the lesser, and of equally far
+    /// rows the one with the smaller id.
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        #[cfg(test)]
+        if super::vector::distance_alone_for_test("rows") {
+            return nearer_then_smaller_id((self.distance, 0), (other.distance, 0));
+        }
+        nearer_then_smaller_id((self.distance, self.id), (other.distance, other.id))
     }
 }
 
@@ -1024,14 +1613,69 @@ impl Eq for MmapFlatCandidate {}
 
 impl PartialOrd for MmapFlatCandidate {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.distance.partial_cmp(&other.distance)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for MmapFlatCandidate {
+    /// The order of dense hits: the nearer is the lesser, and of equally far
+    /// rows the one with the smaller id.
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        #[cfg(test)]
+        if super::vector::distance_alone_for_test("slots") {
+            return nearer_then_smaller_id((self.distance, 0), (other.distance, 0));
+        }
+        nearer_then_smaller_id((self.distance, self.id), (other.distance, other.id))
     }
+}
+
+/// Offers `candidate` to the `target_k` nearest kept so far: it is taken
+/// while there is room, and after that in the place of the last one kept
+/// when it comes before that one in the candidates' order. With a total
+/// order, which rows are kept is the same in whatever order they are offered
+/// and however many more are wanted.
+#[inline(always)]
+fn keep_nearest<T: Ord>(nearest: &mut BinaryHeap<T>, target_k: usize, candidate: T) {
+    if nearest.len() < target_k {
+        nearest.push(candidate);
+    } else if nearest.peek().is_some_and(|last| candidate < *last) {
+        nearest.pop();
+        nearest.push(candidate);
+    }
+}
+
+/// The `target_k` nearest of `rows` that pass the filter, in the order of
+/// dense hits: the rows a scan gives that asks the filter about every row
+/// before it keeps the nearest. Here the filter is asked last.
+///
+/// The rows are walked in that order and asked until `target_k` have passed.
+/// The order is total (equal vectors are common, and a NaN is the farthest),
+/// so that is the answer in whatever order `rows` come. No row is asked
+/// twice and none behind the last one returned: every row only when fewer
+/// pass than are wanted, which is what a scan that asks first asks always.
+fn nearest_passing_rows(
+    rows: &[MmapFlatCandidate],
+    target_k: usize,
+    passes: impl Fn(u128) -> bool,
+) -> Vec<MmapFlatCandidate> {
+    if target_k == 0 {
+        return Vec::new();
+    }
+    // shortcut: orders every row (18 ns a row at 2,048 rows, 27 at 100,000);
+    // order the nearest first and the rest when the filter turns those down,
+    // as `search_broad_prefilter_scan` does, if a filtered tail scan shows it.
+    let mut nearest_first: Vec<usize> = (0..rows.len()).collect();
+    nearest_first.sort_unstable_by(|&lhs, &rhs| rows[lhs].cmp(&rows[rhs]));
+    let mut passed = Vec::with_capacity(target_k.min(rows.len()));
+    for row in nearest_first {
+        if passed.len() == target_k {
+            break;
+        }
+        if passes(rows[row].id) {
+            passed.push(rows[row]);
+        }
+    }
+    passed
 }
 
 fn search_layer_ord<DF>(
@@ -1109,16 +1753,48 @@ where
     results
 }
 
-fn select_neighbor_ords(
+/// Pick at most `max_neighbors` links from `candidates` (ascending distance to
+/// the base point). `diverse: None` keeps the nearest. `Some(keep_pruned)` is
+/// Malkov & Yashunin's SELECT-NEIGHBORS-HEURISTIC: a candidate is kept only if
+/// no kept neighbor is closer to it than the base is; with `keep_pruned` the
+/// rejected candidates then fill the list nearest-first.
+fn select_neighbor_ords<DF>(
     candidates: &[(usize, f32)],
     max_neighbors: usize,
     point_count: usize,
-) -> Vec<u32> {
-    candidates
-        .iter()
-        .take(max_neighbors)
-        .filter_map(|&(ord, _)| (ord < point_count).then_some(ord as u32))
-        .collect()
+    diverse: Option<bool>,
+    dist_fn: &DF,
+) -> Vec<u32>
+where
+    DF: Fn(usize, usize) -> f32,
+{
+    let candidates = candidates.iter().filter(|&&(ord, _)| ord < point_count);
+    let Some(keep_pruned) = diverse else {
+        return candidates
+            .take(max_neighbors)
+            .map(|&(ord, _)| ord as u32)
+            .collect();
+    };
+    let mut kept: Vec<u32> = Vec::with_capacity(max_neighbors);
+    let mut pruned: Vec<u32> = Vec::new();
+    for &(ord, distance) in candidates {
+        if kept.len() == max_neighbors {
+            break;
+        }
+        if kept
+            .iter()
+            .all(|&other| dist_fn(ord, other as usize) >= distance)
+        {
+            kept.push(ord as u32);
+        } else if keep_pruned {
+            pruned.push(ord as u32);
+        }
+    }
+    if keep_pruned {
+        let room = max_neighbors - kept.len();
+        kept.extend(pruned.into_iter().take(room));
+    }
+    kept
 }
 
 /// Construction distance for the in-memory merge and split builds between
@@ -1156,6 +1832,7 @@ fn insert_point_ord<DF>(
     ef_construction: usize,
     m: usize,
     m_max_0: usize,
+    diverse: Option<bool>,
     dist_fn: &DF,
 ) where
     DF: Fn(usize, usize) -> f32,
@@ -1170,7 +1847,14 @@ fn insert_point_ord<DF>(
         }
     }
 
+    // Searched from the top level down, linked from level 0 up. A point the
+    // parallel phase can find at a level then has its lists below that level:
+    // linked top-down, another point's descent met it with those lists still
+    // empty, took it for its only neighbour, and the link back to that point
+    // was written over when this one stored its own list. The other point
+    // was left with no way in.
     let top = point_level.min(current_max_level);
+    let mut selected_at = Vec::with_capacity(top + 1);
     for level in (0..=top).rev() {
         let nearest = search_layer_ord(point_ord, ep, ef_construction, level, adjacency, dist_fn);
 
@@ -1179,8 +1863,12 @@ fn insert_point_ord<DF>(
         }
 
         let max_neighbors = if level == 0 { m_max_0 } else { m };
-        let selected = select_neighbor_ords(&nearest, max_neighbors, levels.len());
+        let selected =
+            select_neighbor_ords(&nearest, max_neighbors, levels.len(), diverse, dist_fn);
+        selected_at.push((level, max_neighbors, selected));
+    }
 
+    for (level, max_neighbors, selected) in selected_at.into_iter().rev() {
         {
             let mut guard = adjacency[point_ord].write().unwrap();
             if level < guard.len() {
@@ -1201,22 +1889,300 @@ fn insert_point_ord<DF>(
                         guard[level].push(point_ord_u32);
                     }
                     if guard[level].len() > max_neighbors {
-                        let mut scored: Vec<(u32, f32)> = guard[level]
+                        let mut scored: Vec<(usize, f32)> = guard[level]
                             .iter()
-                            .copied()
-                            .map(|nord| {
-                                let nord_usize = nord as usize;
-                                (nord, dist_fn(neighbor_ord, nord_usize))
-                            })
+                            .map(|&nord| (nord as usize, dist_fn(neighbor_ord, nord as usize)))
                             .collect();
                         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-                        scored.truncate(max_neighbors);
-                        guard[level] = scored.into_iter().map(|(id, _)| id).collect();
+                        // keepPruned refills lists to the cap, so every later reverse
+                        // link would rerun the heuristic; cutting to 7/8 of the cap
+                        // runs it once per cap/8 links instead.
+                        let keep = if diverse == Some(true) {
+                            max_neighbors - max_neighbors / 8
+                        } else {
+                            max_neighbors
+                        };
+                        guard[level] =
+                            select_neighbor_ords(&scored, keep, usize::MAX, diverse, dist_fn);
                     }
                 }
             }
         }
     }
+}
+
+/// What [`VectorCore::stored_reach`] reads of one segment.
+#[derive(Debug, PartialEq)]
+pub(crate) struct StoredReach {
+    /// The ids of its level-0 rows, ascending.
+    pub ids: Vec<u128>,
+    /// How many of them a search can return from here: not delete-tombstoned
+    /// and not replaced. With rows and none served, the segment serves
+    /// nothing.
+    pub served: usize,
+    /// Whether a search walks the graph: one with no filter, one with a
+    /// filter. Where neither does, the rows are scored one by one.
+    pub walked: bool,
+    pub walked_filtered: bool,
+    /// The served rows no stored link leads to; `None` where no search walks.
+    /// A walk gets through the lists a hard delete left on level 0, as many
+    /// in a row as `deleted_lists_crossed` says, and so does this. It does
+    /// not count the lists a walk reads, which a walk limits
+    /// (`deleted_lists_budget`).
+    pub unreached: Option<Vec<u128>>,
+    /// How many rows that are not served no stored link leads to either.
+    pub unreached_unserved: Option<usize>,
+    /// How many served rows would be unreached with a walk that gets through
+    /// 0, 1, 2 and 4 such lists in a row: `(lists, rows)`.
+    pub unreached_crossing: Option<Vec<(usize, usize)>>,
+    /// Ordinal rows whose id has no level-0 row here: a sidecar scan scores
+    /// such an id from its slot where a read of the row finds nothing. One
+    /// that names no slot, or a slot past the file's end, is counted too,
+    /// though a scan reads the row of such an id and scores nothing.
+    pub ordinals_without_row: usize,
+    /// Level-0 rows with no ordinal row: a sidecar scan reads each by row.
+    /// Every row of a space with a quantized store that keeps no ordinals.
+    pub rows_without_ordinal: usize,
+}
+
+/// The numbers of lists in a row `StoredReach::unreached_crossing` counts
+/// for.
+const LISTS_CROSSED_COUNTED: [usize; 4] = [0, 1, 2, 4];
+
+/// [`unreached_ords`] of a graph as it is stored, where a hard delete has
+/// left lists that have no row: the first `rows` of `adjacency` are the rows,
+/// the rest those lists. A walk gets through up to `crossed` of them in a
+/// row on level 0 and through none above it (see
+/// `VectorCore::rowless_candidate`). With none in the graph, or with
+/// `crossed` 0, this is `unreached_ords` of the rows. Returns the rows not
+/// reached, ascending.
+fn unreached_rows(
+    adjacency: &[Vec<Vec<u32>>],
+    rows: usize,
+    entry_ord: usize,
+    crossed: usize,
+) -> Vec<u32> {
+    // The fewest rowless lists in a row a walk has just come through on its
+    // way to each point: 0 at a row.
+    const UNREACHED: usize = usize::MAX;
+    let mut behind = vec![UNREACHED; adjacency.len()];
+    if entry_ord >= rows {
+        return (0..rows as u32).collect();
+    }
+    behind[entry_ord] = 0;
+    let mut queue: Vec<u32> = vec![entry_ord as u32];
+    for upper in [true, false] {
+        let crossed = if upper { 0 } else { crossed };
+        let mut next = 0;
+        while next < queue.len() {
+            let at = queue[next] as usize;
+            next += 1;
+            let from = behind[at];
+            let lists = &adjacency[at];
+            let links = if upper {
+                lists.get(1..)
+            } else {
+                lists.get(..1)
+            };
+            for &neighbor in links.into_iter().flatten().flatten() {
+                let through = if (neighbor as usize) < rows {
+                    0
+                } else {
+                    from + 1
+                };
+                let Some(seen) = behind.get_mut(neighbor as usize) else {
+                    continue;
+                };
+                if through <= crossed && through < *seen {
+                    *seen = through;
+                    queue.push(neighbor);
+                }
+            }
+        }
+        // Level 0 starts from every row the upper links reached.
+        queue = (0..rows as u32)
+            .filter(|&ord| behind[ord as usize] == 0)
+            .collect();
+    }
+    (0..rows as u32)
+        .filter(|&ord| behind[ord as usize] == UNREACHED)
+        .collect()
+}
+
+/// The points of a finished in-memory graph that no link leads to,
+/// ascending. A search descends from `entry_ord` along the links above level
+/// 0 and then walks level 0, so a point is reached when the links above
+/// level 0 lead from the entry to some point whose level-0 links lead to it.
+/// The links above level 0 are followed whatever their level: a little more
+/// than a descent can do, never less.
+///
+/// A point listed here is one no walk arrives at. A point not listed is not
+/// thereby found: this follows every link, a walk only the nearest, so a
+/// point can be linked and still not come back for its own vector.
+fn unreached_ords(adjacency: &[StdRwLock<Vec<Vec<u32>>>], entry_ord: usize) -> Vec<u32> {
+    let mut reached = vec![false; adjacency.len()];
+    let Some(entry) = reached.get_mut(entry_ord) else {
+        return Vec::new();
+    };
+    *entry = true;
+    let mut queue: Vec<u32> = vec![entry_ord as u32];
+    for upper in [true, false] {
+        let mut next = 0;
+        while next < queue.len() {
+            let lists = adjacency[queue[next] as usize].read().unwrap();
+            next += 1;
+            let links = if upper {
+                lists.get(1..)
+            } else {
+                lists.get(..1)
+            };
+            for &neighbor in links.into_iter().flatten().flatten() {
+                if let Some(seen) = reached.get_mut(neighbor as usize) {
+                    if !*seen {
+                        *seen = true;
+                        queue.push(neighbor);
+                    }
+                }
+            }
+        }
+        // Level 0 starts from every point the upper links reached.
+        queue = (0..adjacency.len() as u32)
+            .filter(|&ord| reached[ord as usize])
+            .collect();
+    }
+    (0..adjacency.len() as u32)
+        .filter(|&ord| !reached[ord as usize])
+        .collect()
+}
+
+/// How many of an unreached point's nearest reached points are tried as the
+/// one that links to it.
+const UNREACHED_LINK_HOSTS: usize = 8;
+
+/// Gives the points of a finished graph that no link leads to
+/// ([`unreached_ords`]) a level-0 link from a point the links do lead to,
+/// and returns how many it linked. The link goes at the end of the list of
+/// the nearest point with room among the [`UNREACHED_LINK_HOSTS`] a walk for
+/// the point returns, and that is all the pass ever does: it removes no link
+/// and moves none, so what a walk arrives at from any start can only grow.
+/// A point for which none of them has room is left as it is and stays
+/// counted.
+///
+/// A link is not a cure for every search: the host can be the eighth
+/// nearest, and a search arrives at the point only when it arrives at the
+/// host and still wants neighbours that far away.
+fn link_unreached_points<DF>(
+    adjacency: &[StdRwLock<Vec<Vec<u32>>>],
+    entry_ord: usize,
+    max_level: usize,
+    m_max_0: usize,
+    dist_fn: &DF,
+) -> usize
+where
+    DF: Fn(usize, usize) -> f32,
+{
+    let unreached = unreached_ords(adjacency, entry_ord);
+    let mut waiting = vec![false; adjacency.len()];
+    for &ord in &unreached {
+        waiting[ord as usize] = true;
+    }
+    let has_room = |host: usize| {
+        let lists = adjacency[host].read().unwrap();
+        lists
+            .first()
+            .is_some_and(|level_zero| level_zero.len() < m_max_0)
+    };
+    let mut linked = 0;
+    for &ord in &unreached {
+        let ord = ord as usize;
+        if !waiting[ord] {
+            continue; // a point linked before this one leads here
+        }
+        // The walk a search makes; it arrives at reached points only.
+        let mut ep = entry_ord;
+        for level in (1..=max_level).rev() {
+            let nearest = search_layer_ord(ord, ep, 1, level, adjacency, dist_fn);
+            if let Some(&(best, _)) = nearest.first() {
+                ep = best;
+            }
+        }
+        let hosts = search_layer_ord(ord, ep, UNREACHED_LINK_HOSTS, 0, adjacency, dist_fn);
+        let Some(&(host, _)) = hosts.iter().find(|&&(host, _)| has_room(host)) else {
+            continue; // no room among the nearest: the point stays counted
+        };
+        adjacency[host].write().unwrap()[0].push(ord as u32);
+        linked += 1;
+        // Whatever the point's own links lead to is reached with it.
+        waiting[ord] = false;
+        let mut queue = vec![ord];
+        while let Some(at) = queue.pop() {
+            let lists = adjacency[at].read().unwrap();
+            for &next in lists.first().into_iter().flatten() {
+                if let Some(wait) = waiting.get_mut(next as usize) {
+                    if *wait {
+                        *wait = false;
+                        queue.push(next as usize);
+                    }
+                }
+            }
+        }
+    }
+    linked
+}
+
+/// The last step of an in-memory build: links the points no link leads to,
+/// then counts the points still without one and says so in one line. The
+/// count is of links, not of searches (see [`unreached_ords`]). Segments
+/// under [`HNSW_DIVERSE_MIN_POINTS`] rows are scored exactly, so their graph
+/// is not walked and is left as built. Returns the count (0 for those).
+fn reach_every_point<DF>(
+    path: &'static str,
+    adjacency: &[StdRwLock<Vec<Vec<u32>>>],
+    entry_ord: usize,
+    max_level: usize,
+    m_max_0: usize,
+    dist_fn: &DF,
+) -> usize
+where
+    DF: Fn(usize, usize) -> f32,
+{
+    let points = adjacency.len();
+    if points < HNSW_DIVERSE_MIN_POINTS {
+        return 0;
+    }
+    let started = std::time::Instant::now();
+    let linked = if hnsw_link_unreached() {
+        link_unreached_points(adjacency, entry_ord, max_level, m_max_0, dist_fn)
+    } else {
+        0
+    };
+    let unreached = unreached_ords(adjacency, entry_ord).len();
+    let reach_ms = started.elapsed().as_secs_f64() * 1000.0;
+    metrics::counter!("helix_vector_core_hnsw_build_linked_points_total", "path" => path)
+        .increment(linked as u64);
+    metrics::counter!("helix_vector_core_hnsw_build_unreached_points_total", "path" => path)
+        .increment(unreached as u64);
+    metrics::histogram!("helix_vector_core_hnsw_build_reach_ms", "path" => path).record(reach_ms);
+    if unreached > 0 {
+        tracing::warn!(
+            path,
+            points,
+            linked,
+            unreached,
+            reach_ms,
+            "HNSW build left points no link leads to"
+        );
+    } else {
+        tracing::info!(
+            path,
+            points,
+            linked,
+            unreached,
+            reach_ms,
+            "HNSW build left no point without a link leading to it"
+        );
+    }
+    unreached
 }
 
 pub trait HeapOps<T> {
@@ -1375,6 +2341,86 @@ impl SidecarOrdinalRequestCache {
     }
 }
 
+/// What the segments a sidecar scan has already walked for a request say
+/// about the ids of its set. The scan walks a space's segments newest first,
+/// so every one of them is newer than the segment walked now, and an id is
+/// its newest holder's to answer.
+#[derive(Default)]
+pub(crate) struct NewerCopies<'a> {
+    /// Ids whose row a newer segment was read to hold. An older segment
+    /// neither scores them nor asks for their row.
+    held: HashSet<u128>,
+    /// Newest first: a walked segment and the ids of the set it lists (an
+    /// ordinal row; their rows were not read). A listing withholds its id
+    /// from an older segment only once the row it stands for has been read,
+    /// which `withholds` does when an older copy is about to be answered.
+    listed: Vec<(&'a VectorCore, HashSet<u128>)>,
+    /// `(segment, id)` of the listings whose row that read did not find.
+    void: Vec<(&'a str, u128)>,
+}
+
+impl<'a> NewerCopies<'a> {
+    /// Whether a newer segment holds `id`, asked when the segment walked now
+    /// would answer with its own copy. Each newer listing of the id is
+    /// settled by one read of that segment's row at the request's handle.
+    /// With a row the id is that segment's, whether or not it was among its
+    /// nearest, and it is passed over here. Without one the listing is void:
+    /// it is counted, and the hit it may have given is no row (`is_void`).
+    fn withholds(&mut self, r: &AnyRead<'_>, id: u128) -> Result<bool, VectorError> {
+        for (core, ids) in &mut self.listed {
+            if !ids.remove(&id) {
+                continue;
+            }
+            let core: &'a VectorCore = *core;
+            // The one read a scan makes beyond its segments' own walks,
+            // counted beside their row lookups by what it found.
+            match core.get_vector_from_row(r, id, 0, false, false) {
+                Ok(_) => {
+                    metrics::counter!("helix_broad_scan_row_lookups_total", "outcome" => "newer_copy")
+                        .increment(1);
+                    self.held.insert(id);
+                    return Ok(true);
+                }
+                Err(VectorError::VectorNotFound(_)) => {
+                    metrics::counter!("helix_broad_scan_row_lookups_total", "outcome" => "absent")
+                        .increment(1);
+                    metrics::counter!("helix_broad_scan_listing_without_row_total").increment(1);
+                    self.void.push((core.physical_name.as_str(), id));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
+    /// `core` has been walked: `listed` are the ids of the set it lists and
+    /// did not read, `read` those whose row it read.
+    fn walked(
+        &mut self,
+        core: &'a VectorCore,
+        listed: HashSet<u128>,
+        read: impl IntoIterator<Item = u128>,
+    ) {
+        self.held.extend(read);
+        if !listed.is_empty() {
+            self.listed.push((core, listed));
+        }
+    }
+
+    /// Whether a listing was found to have no row.
+    pub(crate) fn has_void(&self) -> bool {
+        !self.void.is_empty()
+    }
+
+    /// Whether `segment`'s listing of `id` was found to have no row: a hit
+    /// scored from that listing's slot is no row of the space.
+    pub(crate) fn is_void(&self, segment: &str, id: u128) -> bool {
+        self.void
+            .iter()
+            .any(|&(name, void)| void == id && name == segment)
+    }
+}
+
 pub struct VectorCore {
     pub vectors_db: Option<Database<Bytes, Bytes>>,
     pub vector_data_db: Option<Database<Bytes, Bytes>>,
@@ -1518,6 +2564,11 @@ pub struct VectorCore {
     /// in `is_delete_tombstoned`; the common case (empty set, tombstones OFF)
     /// avoids taking the RwLock entirely.
     delete_tombstones_count: AtomicUsize,
+    /// Level-0 rows counted up to one past `small_segment_exact_max_rows`
+    /// once this core has an HNSW index (`u64::MAX` = not counted). Built
+    /// segments only shrink, so a small count stays valid; HNSW `insert`
+    /// resets it.
+    hnsw_rows_upto_small: AtomicU64,
 }
 
 /// Unix-epoch seconds, floored to 1 so `0` stays reserved for "no cached miss".
@@ -1536,6 +2587,42 @@ fn lsm_sidecar_miss_ttl_secs() -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(30)
+}
+
+/// Rows past the end of its exact sidecar that a reader replica scores from
+/// the store before it rebuilds the file, as a floor under a quarter of the
+/// file (`HELIX_LSM_READER_SIDECAR_STALE_ROWS`, default 64). 0 = never
+/// rebuild, and a first flat search is not scored from the sidecar it builds.
+fn lsm_reader_sidecar_stale_rows() -> usize {
+    std::env::var("HELIX_LSM_READER_SIDECAR_STALE_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(64)
+}
+
+/// Slots past which a sidecar laid out for `rows` rows is mostly dead.
+fn sidecar_layout_ceiling(rows: usize) -> usize {
+    rows.saturating_mul(16).max(4096)
+}
+
+/// Whether a reader replica should rebuild an exact sidecar of
+/// `sidecar_count` slots: the store holds more rows past its end than
+/// `max(floor, a quarter of the file)`, each a point read on every flat
+/// search, and a rebuild from rows would be laid out.
+fn reader_sidecar_is_stale(sidecar_count: u64, ordinals: &[(u128, u64)], floor: usize) -> bool {
+    if floor == 0 {
+        return false;
+    }
+    let mut past_end = 0usize;
+    let mut slots_needed = 0u64;
+    for &(_, ordinal) in ordinals {
+        slots_needed = slots_needed.max(sidecar_slots_needed(ordinal));
+        if (sidecar_count..ROW_ONLY_SIDECAR_ORDINAL).contains(&ordinal) {
+            past_end += 1;
+        }
+    }
+    past_end > floor.max((sidecar_count / 4) as usize)
+        && slots_needed <= sidecar_layout_ceiling(ordinals.len()) as u64
 }
 
 /// Opt-in (`HELIX_LSM_SIDECAR_VERIFY=1`) spot check of each exact sidecar a pod
@@ -1815,6 +2902,7 @@ impl VectorCore {
             hard_delete_guard: StdRwLock::new(HardDeleteGuard::default()),
             hard_delete_guard_count: AtomicUsize::new(0),
             delete_tombstones_count: AtomicUsize::new(0),
+            hnsw_rows_upto_small: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -1860,6 +2948,7 @@ impl VectorCore {
             hard_delete_guard: StdRwLock::new(HardDeleteGuard::default()),
             hard_delete_guard_count: AtomicUsize::new(0),
             delete_tombstones_count: AtomicUsize::new(0),
+            hnsw_rows_upto_small: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -1927,6 +3016,7 @@ impl VectorCore {
             hard_delete_guard: StdRwLock::new(HardDeleteGuard::default()),
             hard_delete_guard_count: AtomicUsize::new(0),
             delete_tombstones_count: AtomicUsize::new(0),
+            hnsw_rows_upto_small: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -2063,11 +3153,17 @@ impl VectorCore {
                         let _ = fs::remove_file(&hvec_path);
                         republish = true;
                     } else {
-                        let ordinals = if allow_backend_materialization {
-                            Self::load_hvec_sidecar_ordinals_blob(backend, physical_name)?
-                        } else {
-                            None
-                        };
+                        // Readers only. The published map is as of indexing
+                        // and a hard delete never rewrites it, while a writer
+                        // trusts a complete map: it would serve the deleted
+                        // ids again. A writer loads its map from the live
+                        // ordinal rows, as it does when the file was present.
+                        let ordinals =
+                            if allow_backend_materialization && backend.is_reader_replica() {
+                                Self::load_hvec_sidecar_ordinals_blob(backend, physical_name)?
+                            } else {
+                                None
+                            };
                         // Sealed segments publish their map and take no appends.
                         // Without one, a writer appends next, so the file must
                         // cover the store's ordinals.
@@ -2460,6 +3556,7 @@ impl VectorCore {
             hard_delete_guard: StdRwLock::new(HardDeleteGuard::default()),
             hard_delete_guard_count: AtomicUsize::new(0),
             delete_tombstones_count: AtomicUsize::new(0),
+            hnsw_rows_upto_small: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -2679,6 +3776,23 @@ impl VectorCore {
         );
     }
 
+    /// Reader replicas: a reconcile found this core's segment off the list.
+    /// Reads pinned before that still search it, and a sidecar built or
+    /// rebuilt from here on would be laid out from the newest view, where the
+    /// writer is reaping the segment: a reaped id's slot repeats a live row
+    /// and an older read is scored from it. A miss stamped past any expiry
+    /// keeps the file the core has, or its rows, for as long as it lives.
+    pub(crate) fn keep_sidecar_as_is(&self) {
+        self.lsm_sidecar_miss_cached_at_secs
+            .store(u64::MAX, AtomicOrdering::Relaxed);
+    }
+
+    pub(crate) fn sidecar_kept_as_is(&self) -> bool {
+        self.lsm_sidecar_miss_cached_at_secs
+            .load(AtomicOrdering::Relaxed)
+            == u64::MAX
+    }
+
     /// True while a cached "sidecar missing" probe is still authoritative. On
     /// the writer a miss never expires (only local materialization changes the
     /// answer, and those paths clear the cache). On a reader replica the
@@ -2793,7 +3907,7 @@ impl VectorCore {
         // building. When min_slots (the short-file floor) exceeds the 16x
         // ceiling, clamp to the ceiling: the floor records a past file's size,
         // not an invariant, and refusing the rebuild pins the segment to rows.
-        let ceiling = rows.len().saturating_mul(16).max(4096);
+        let ceiling = sidecar_layout_ceiling(rows.len());
         let slot_count = match usize::try_from(slots_needed) {
             Ok(count) => {
                 if min_slots > ceiling.max(count) {
@@ -3326,9 +4440,14 @@ impl VectorCore {
         }
     }
 
+    /// Whether a read may be answered from, and may fill, the vector caches.
+    /// Not a reader replica's, pinned or not: nothing there removes a cached
+    /// vector when the writer deletes its row, so a read after the delete
+    /// would score the row and return it. A reader has the row's ordinal
+    /// and the row itself from the store at each read.
     #[inline]
     fn can_use_global_vector_cache(read_context: &AnyRead<'_>) -> bool {
-        !matches!(read_context, AnyRead::LsmReader(Some(_)))
+        !matches!(read_context, AnyRead::LsmReader(_))
     }
 
     #[inline]
@@ -3477,6 +4596,102 @@ impl VectorCore {
         record_count("filtered_out", filtered_out);
         record_count("result_candidates", result_candidates);
         record_count("hydrated_results", hydrated_results);
+    }
+
+    /// What a walk does with a neighbour that has no row. A hard delete took
+    /// the row and left the point's lists (`delete_vectors_batch_be`), so the
+    /// id can still be a candidate, whose lists the walk reads when its turn
+    /// comes, and never a result. Without this every point that only deleted
+    /// rows linked to is one no walk arrives at.
+    ///
+    /// Its distance is read from the sign code that `block`, the list naming
+    /// it, keeps for it, and where there is none it is `from`'s: the distance
+    /// of the point whose list this is. The stored graphs keep no codes, so
+    /// there the distance says little, and what bounds the lists a walk
+    /// reads is their number ([`deleted_lists_budget`]). It is a candidate
+    /// when that distance is nearer than `within`, the distance a row has to
+    /// beat. `from` also says how many ids with no row in a row led to that
+    /// point; past [`deleted_lists_crossed`] of them the walk ends there, as
+    /// it did at the first before. The count is the fewest of any way to the
+    /// id: one the walk stopped at is a candidate when a shorter way names
+    /// it later, and one whose list was read is read again from a shorter
+    /// way, for the ids it could not go on to before. An id whose lists went
+    /// with its row (deleted before lists were kept) is a candidate with
+    /// nothing to read.
+    fn rowless_candidate(
+        &self,
+        block: &NeighborBlock,
+        neighbor_id: u128,
+        neighbor_prepared: Option<&PreparedSpindleQuery>,
+        from: (f32, usize),
+        within: f32,
+        rowless: &mut RowlessLists,
+    ) -> Option<Candidate> {
+        // Today's walk: nothing is noted.
+        if rowless.crossed == 0 {
+            return None;
+        }
+        let (from_distance, in_a_row) = from;
+        let distance = neighbor_prepared
+            .and_then(|prepared| {
+                let index = block.ids.iter().position(|&id| id == neighbor_id)?;
+                let approx = score_encoded(prepared, block.code_at(index)?).ok()??;
+                Some(self.distance_from_approximate(&approx))
+            })
+            .unwrap_or(from_distance);
+        let near = !distance.is_nan() && distance < within;
+        rowless
+            .candidate_by(neighbor_id, in_a_row + 1, near)
+            .then_some(Candidate {
+                id: neighbor_id,
+                distance,
+            })
+    }
+
+    /// Counts the lists of rowless ids a level's walk read (see
+    /// [`Self::rowless_candidate`]), by whether the list was there: `none`
+    /// is a read for an id whose lists went with its row.
+    fn observe_deleted_lists_crossed(mode: &'static str, rowless: &RowlessLists) {
+        for (list, lists) in [
+            ("found", rowless.found),
+            ("none", rowless.read - rowless.found),
+        ] {
+            if lists > 0 {
+                metrics::counter!(
+                    "helix_vector_core_hnsw_deleted_lists_crossed_total",
+                    "mode" => mode,
+                    "list" => list,
+                )
+                .increment(lists as u64);
+            }
+        }
+    }
+
+    /// Counts a level-0 walk that ran out of candidates below ef and went on
+    /// from its start's level-1 list, by what came of it. `nothing_new`: the
+    /// walk had visited the whole list, scored nothing more and returns what
+    /// it would have. `filled`, `short`: it scored at least one more point
+    /// and ended with ef results, or still below ef.
+    fn observe_dry_restart(
+        mode: &'static str,
+        scored_at_restart: Option<usize>,
+        scored: usize,
+        filled: bool,
+    ) {
+        let Some(scored_before) = scored_at_restart else {
+            return;
+        };
+        let outcome = match (scored == scored_before, filled) {
+            (true, _) => "nothing_new",
+            (false, true) => "filled",
+            (false, false) => "short",
+        };
+        metrics::counter!(
+            "helix_vector_core_hnsw_walk_restarts_total",
+            "mode" => mode,
+            "outcome" => outcome,
+        )
+        .increment(1);
     }
 
     /// True when the given segment namespace holds no keys. Early-stops on the
@@ -3642,20 +4857,29 @@ impl VectorCore {
         id: u128,
         level: usize,
     ) -> Result<NeighborBlock, VectorError> {
+        if let Some(block) = self.packed_neighbor_block(r, id, level)? {
+            return Ok(block);
+        }
+        self.get_legacy_neighbor_ids(r, id, level)
+    }
+
+    /// The packed list stored for (`id`, `level`), if there is one.
+    fn packed_neighbor_block(
+        &self,
+        r: &AnyRead<'_>,
+        id: u128,
+        level: usize,
+    ) -> Result<Option<NeighborBlock>, VectorError> {
         let key = Self::neighbor_list_key(id, level);
-        let decoded = self
-            .backend
+        self.backend
             .get_with(
                 r,
                 self.seg_ns(SegmentDb::HnswNeighbors),
                 key.as_ref(),
                 |opt| opt.map(Self::decode_neighbor_block),
             )
-            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
-        if let Some(block) = decoded {
-            return block;
-        }
-        self.get_legacy_neighbor_ids(r, id, level)
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?
+            .transpose()
     }
 
     fn build_neighbor_block(
@@ -3850,6 +5074,568 @@ impl VectorCore {
             .is_ok())
     }
 
+    /// True once an HNSW graph was built here, also after its entry point's
+    /// rows were deleted (LSM deletes leave the key; `has_index` is false).
+    pub(crate) fn has_entry_point_key(&self, r: &AnyRead<'_>) -> Result<bool, VectorError> {
+        self.backend
+            .get_with(
+                r,
+                self.seg_ns(SegmentDb::Vectors),
+                ENTRY_POINT_KEY.as_bytes(),
+                |opt| opt.is_some(),
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    /// True when the graph here was made by the current build procedure (see
+    /// `HNSW_BUILD_NUMBER`), or by a later one.
+    pub(crate) fn has_current_graph(&self, r: &AnyRead<'_>) -> Result<bool, VectorError> {
+        self.backend
+            .get_with(
+                r,
+                self.seg_ns(SegmentDb::Vectors),
+                BUILD_NUMBER_KEY.as_bytes(),
+                |row| row.and_then(|bytes| bytes.first().copied()) >= Some(HNSW_BUILD_NUMBER),
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    fn decode_deleted_rows(row: Option<&[u8]>) -> u64 {
+        row.and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+            .map_or(0, u64::from_be_bytes)
+    }
+
+    /// How many rows of this segment's graph hard deletes have taken since
+    /// it was built (`DELETED_ROWS_KEY`): each left a hole in the graph, and
+    /// its lists for a walk to get through.
+    pub(crate) fn deleted_graph_rows(&self, r: &AnyRead<'_>) -> Result<u64, VectorError> {
+        self.backend
+            .get_with(
+                r,
+                self.seg_ns(SegmentDb::Vectors),
+                DELETED_ROWS_KEY.as_bytes(),
+                Self::decode_deleted_rows,
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    /// True when hard deletes have taken more than `fraction` of the rows
+    /// this segment's graph was built with. Only a rewrite of the segment
+    /// takes the holes and the lists left behind away. One point read where
+    /// nothing was deleted; otherwise the rows left are counted, and no
+    /// further than the answer needs: the read grows with the deletes and
+    /// not with the segment.
+    ///
+    /// False with fewer than `min_left` rows left, whatever share is gone:
+    /// the caller passes the number of rows a search walks a graph from, and
+    /// a rewrite of a graph no search walks buys nothing. Until enough rows
+    /// are gone for a segment of that size to be past the ceiling, nothing is
+    /// counted.
+    pub(crate) fn deleted_graph_rows_over(
+        &self,
+        r: &AnyRead<'_>,
+        fraction: f64,
+        min_left: u64,
+    ) -> Result<bool, VectorError> {
+        let gone = self.deleted_graph_rows(r)?;
+        if gone == 0 {
+            return Ok(false);
+        }
+        // gone / (left + gone) > fraction only with fewer than
+        // gone * (1 - fraction) / fraction rows left: one past that settles it.
+        let limit = ((gone as f64 * (1.0 - fraction) / fraction).ceil() as u64).saturating_add(1);
+        if limit <= min_left {
+            return Ok(false);
+        }
+        let mut left = self.ordinals_count_upto(r, limit)?;
+        if left == 0 {
+            // No ordinal rows in this segment: the rows themselves.
+            left = self.level_zero_count_upto(r, limit)?;
+        }
+        Ok(left >= min_left && left < limit && gone as f64 / (left + gone) as f64 > fraction)
+    }
+
+    /// The count of deleted rows in a mark of this pass or a later one
+    /// (`LINK_PASS_KEY`), 0 where the mark has none; `None` for any other
+    /// row.
+    fn link_pass_mark(row: Option<&[u8]>) -> Option<u64> {
+        match row {
+            Some([number, count @ ..]) if *number >= LINK_PASS_NUMBER => {
+                Some(Self::decode_deleted_rows(Some(count)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The place a pass of this number kept (`LINK_PASS_KEY`): the row it
+    /// has come to, and the count of deleted rows it began at, 0 where the
+    /// place has none.
+    fn link_pass_place(row: Option<&[u8]>) -> Option<(u128, u64)> {
+        let Some([0, kept @ .., LINK_PASS_NUMBER]) = row else {
+            return None;
+        };
+        // The id alone, or the id and the count.
+        if !matches!(kept.len(), 16 | 24) {
+            return None;
+        }
+        let (id, count) = kept.split_at(16);
+        let id = <[u8; 16]>::try_from(id).ok()?;
+        Some((
+            u128::from_be_bytes(id),
+            Self::decode_deleted_rows(Some(count)),
+        ))
+    }
+
+    /// True when the link pass has been over this segment's stored graph
+    /// (`LINK_PASS_KEY`) and no hard delete has taken a row of the graph
+    /// since it began there: one may have taken a row a link came from, and
+    /// what that link led to is unreached again. A second point read where
+    /// the mark is there, the count of deleted rows beside it.
+    pub(crate) fn link_pass_done(&self, r: &AnyRead<'_>) -> Result<bool, VectorError> {
+        let began_at = self
+            .backend
+            .get_with(
+                r,
+                self.seg_ns(SegmentDb::Vectors),
+                LINK_PASS_KEY.as_bytes(),
+                Self::link_pass_mark,
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        match began_at {
+            Some(began_at) => Ok(self.deleted_graph_rows(r)? <= began_at),
+            None => Ok(false),
+        }
+    }
+
+    /// For a call of the pass that reads this segment in `r`: the count of
+    /// deleted rows the pass began at here, which the call's mark or place
+    /// is to carry, and the count the segment has in `r`. The first is the
+    /// place's where a pass of this number is part of the way through, and
+    /// the second where this call begins one. The mark a call writes at the
+    /// end reads as done only where the two are equal.
+    pub(crate) fn link_pass_counts(&self, r: &AnyRead<'_>) -> Result<(u64, u64), VectorError> {
+        let deleted = self.deleted_graph_rows(r)?;
+        let place = self
+            .backend
+            .get_with(
+                r,
+                self.seg_ns(SegmentDb::Vectors),
+                LINK_PASS_KEY.as_bytes(),
+                Self::link_pass_place,
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        Ok((place.map_or(deleted, |(_, began_at)| began_at), deleted))
+    }
+
+    /// True when the link pass has this segment still to do: a search under
+    /// a filter walks its graph, and the pass has not marked it, or a hard
+    /// delete has taken a row of it since. Reads the entry point, the mark
+    /// and, where the mark is there, the count of deleted rows; no list.
+    pub(crate) fn link_pass_due(&self, r: &AnyRead<'_>) -> Result<bool, VectorError> {
+        Ok(self.has_index(r)?
+            && !self.is_small_hnsw_segment(r, true)?
+            && !self.link_pass_done(r)?)
+    }
+
+    /// The id after which a pass that is part of the way through this
+    /// segment goes on (`LINK_PASS_KEY`); `None` where none is, and where
+    /// the place was kept by a pass of another number. That pass looked at
+    /// the rows before it by another rule, so this one looks at them all.
+    pub(crate) fn link_pass_after(&self, r: &AnyRead<'_>) -> Result<Option<u128>, VectorError> {
+        self.backend
+            .get_with(
+                r,
+                self.seg_ns(SegmentDb::Vectors),
+                LINK_PASS_KEY.as_bytes(),
+                |row| Self::link_pass_place(row).map(|(row, _)| row),
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    /// The row a link to `point` goes at the end of where every row near it
+    /// is at its bound: one the pass has linked below one of `near`, the
+    /// rows a walk for the point arrives at, the nearest first. No build
+    /// writes a list past `m_max_0`, so the ids past it in a stored list are
+    /// rows the pass linked from that row, and `planned` has those this call
+    /// is about to. Each was linked from a row near it, or came down to it
+    /// this way.
+    ///
+    /// It goes down from the nearest a row a step, to the first that has
+    /// room. Which of the rows below a row it takes is a part of the point's
+    /// id, another part at each step, so that the points share the rows out
+    /// and the way down stays short: at an `m` of 16 a row has eight places,
+    /// its eight rows take 64 points and theirs 512. A row the pass has
+    /// linked nothing from has room, as a build left its list, so the way
+    /// down ends at one.
+    ///
+    /// A delete can have taken the rows below a row, all of them: a list
+    /// keeps the id of a row that is gone, and its place. The way down then
+    /// goes back to the row above and on to the next of the rows below that
+    /// one, and from the rows below the nearest row to those below the next
+    /// nearest. It gives up when it has read the lists of
+    /// [`LINK_PASS_STEPS_DOWN`] rows below.
+    ///
+    /// A search for the point's vector arrives at it by the lists on that
+    /// way, and reads them where those rows are among the rows it ends with:
+    /// they share a row near the point and are not picked for being near the
+    /// point. Rows with one vector are all as near as each other.
+    fn link_host_below(
+        &self,
+        r: &AnyRead<'_>,
+        near: &[u128],
+        point: u128,
+        planned: &HashMap<u128, Vec<u128>>,
+        waiting: &HashSet<u128>,
+    ) -> Result<Option<u128>, VectorError> {
+        let bound = link_pass_list_bound(self.config.m_max_0);
+        let mixed = point.wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835);
+        // The rows the pass linked from `row`, whose stored list is `list`,
+        // from the one this point takes first that many rows down.
+        let below = |row: u128, list: &[u128], down: usize| {
+            let mut below: Vec<u128> = list
+                .iter()
+                .skip(self.config.m_max_0)
+                .chain(planned.get(&row).into_iter().flatten())
+                .copied()
+                .collect();
+            if !below.is_empty() {
+                let first = (mixed.rotate_left(7 * down as u32) >> 64) as usize % below.len();
+                below.rotate_left(first);
+            }
+            below.into_iter()
+        };
+        let mut read = 0;
+        for &from in near {
+            let list = self.get_neighbor_block_uncached(r, from, 0)?.ids;
+            // The rows still to try at each step down, the deepest last.
+            let mut trail = vec![below(from, &list, 0)];
+            while let Some(rows) = trail.last_mut() {
+                let Some(row) = rows.next() else {
+                    trail.pop();
+                    continue;
+                };
+                // Only a row a walk returns: not one a delete has taken, nor
+                // one no link leads to, which a list longer than a build of
+                // this `m` writes could name here.
+                if waiting.contains(&row)
+                    || self.is_delete_tombstoned(row)
+                    || !self.contains_id(r, row)?
+                {
+                    continue;
+                }
+                if read == LINK_PASS_STEPS_DOWN {
+                    return Ok(None);
+                }
+                read += 1;
+                // As in the plan: only a row with a packed list.
+                let Some(list) = self.packed_neighbor_block(r, row, 0)? else {
+                    continue;
+                };
+                if list.ids.len() + planned.get(&row).map_or(0, Vec::len) < bound {
+                    return Ok(Some(row));
+                }
+                let down = trail.len();
+                trail.push(below(row, &list.ids, down));
+            }
+        }
+        Ok(None)
+    }
+
+    /// What a build's last step does (`link_unreached_points`), for a graph
+    /// as it is stored: for each of `unreached`, the served rows no stored
+    /// link leads to (`stored_reach`, ascending), the row whose level-0 list
+    /// a link to it would go at the end of, as `(that row, the point)`. It is
+    /// the nearest with room among the [`UNREACHED_LINK_HOSTS`] rows a walk
+    /// for the point's own vector returns, and a walk returns only rows it
+    /// arrives at. Where none of them has room it is a row the pass has
+    /// linked below one of them, the nearest first (`link_host_below`), which
+    /// can be one this call links. A row that keeps its list in the layout
+    /// before the packed one, a stored row an edge, is passed over as a row
+    /// to link from: the write (`apply_stored_links_be`) lengthens a packed
+    /// list and no other. Reads only; nothing is removed or moved by what it
+    /// plans.
+    ///
+    /// A list has room up to [`link_pass_list_bound`], which is past what a
+    /// build fills it to: the build's step links under `m_max_0` and the
+    /// lists of the graphs it was not run on are full there.
+    ///
+    /// A point one planned before leads to is left out, as what its own
+    /// links lead to is reached with it. A point for which no row has room,
+    /// near it or below, gets no link and stays unreached: the second value
+    /// counts those. It counts with them a point that is left because
+    /// [`LINK_PASS_TWINS`] rows with its own vector are arrived at already,
+    /// those of the walk's rows and of this call's links within
+    /// [`LINK_PASS_TWIN_DISTANCE`] of it: a search with no filter is
+    /// answered by those rows, and a group that is linked whole takes every
+    /// place of a walk that comes by. Such a point is not returned under a
+    /// filter that none of those rows passes.
+    ///
+    /// It looks at the rows after `after` and at no more than `max_rows` of
+    /// them (at one, where that is 0), a walk each. The third value is the last row it looked at where
+    /// rows are left after it, for the next call's `after`, and `None` where
+    /// it came to the end.
+    pub(crate) fn plan_stored_links(
+        &self,
+        r: &AnyRead<'_>,
+        unreached: &[u128],
+        after: Option<u128>,
+        max_rows: usize,
+    ) -> Result<(Vec<(u128, u128)>, usize, Option<u128>), VectorError> {
+        let mut waiting: HashSet<u128> = unreached.iter().copied().collect();
+        // The points planned so far into each row's list.
+        let mut planned: HashMap<u128, Vec<u128>> = HashMap::new();
+        let mut links = Vec::new();
+        // The vectors of the points this call links.
+        let mut linked_vectors: Vec<Vec<f32>> = Vec::new();
+        let mut without_room = 0;
+        let mut looked_at = Vec::new();
+        let bound = link_pass_list_bound(self.config.m_max_0);
+        // A filter that keeps every row: a filtered search walks from
+        // `HNSW_DIVERSE_MIN_POINTS` rows, an unfiltered one scores up to
+        // `small_segment_exact_max_rows` of them one by one.
+        let every_row = |_: u128| true;
+        let walked: &[&dyn Fn(u128) -> bool] = &[&every_row];
+        for &point in unreached {
+            if after.is_some_and(|after| point <= after) || !waiting.contains(&point) {
+                continue;
+            }
+            // One row at least: a call that looked at none has no row to
+            // stop at, and would read as one that came to the end.
+            if looked_at.len() >= max_rows.max(1) {
+                return Ok((links, without_room, looked_at.last().copied()));
+            }
+            looked_at.push(point);
+            let vector = match self.get_vector(r, point, 0, true) {
+                Ok(vector) => vector,
+                Err(VectorError::VectorNotFound(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let near = self.search_with_id_filter_ef_observed(
+                r,
+                vector.get_data(),
+                UNREACHED_LINK_HOSTS,
+                Some(walked),
+                true,
+                None,
+                None,
+                None,
+            )?;
+            // The rows with the point's own vector that a walk arrives at,
+            // and those this call has linked, which no walk sees yet.
+            // Under a dot product no distance says that two rows have one
+            // vector (it is the product, negated): no row is counted there.
+            let counted = !matches!(self.distance_metric, DistanceMetric::Dot);
+            let mut twins = 0;
+            for row in &near {
+                twins += usize::from(
+                    counted
+                        && !waiting.contains(&row.get_id())
+                        && row.get_distance() <= LINK_PASS_TWIN_DISTANCE,
+                );
+            }
+            for linked in &linked_vectors {
+                if !counted || twins >= LINK_PASS_TWINS {
+                    break;
+                }
+                let distance = self.distance_between(linked, vector.get_data())?;
+                twins += usize::from(distance <= LINK_PASS_TWIN_DISTANCE);
+            }
+            if twins >= LINK_PASS_TWINS {
+                without_room += 1;
+                continue;
+            }
+            let mut host = None;
+            // Those of them at their bound, the nearest first: where the
+            // ways down start.
+            let mut at_bound = Vec::new();
+            for row in near.iter().map(HVector::get_id) {
+                if waiting.contains(&row) {
+                    continue;
+                }
+                // The write lengthens a packed list and no other: a row that
+                // keeps its list a stored row an edge is no row to link from.
+                let Some(list) = self.packed_neighbor_block(r, row, 0)? else {
+                    continue;
+                };
+                if list.ids.len() + planned.get(&row).map_or(0, Vec::len) < bound {
+                    host = Some(row);
+                    break;
+                }
+                at_bound.push(row);
+            }
+            if host.is_none() {
+                host = self.link_host_below(r, &at_bound, point, &planned, &waiting)?;
+            }
+            let Some(host) = host else {
+                without_room += 1;
+                continue;
+            };
+            planned.entry(host).or_default().push(point);
+            links.push((host, point));
+            linked_vectors.push(vector.get_data().to_vec());
+            waiting.remove(&point);
+            let mut reached = vec![point];
+            while let Some(at) = reached.pop() {
+                for next in self.get_neighbor_block_uncached(r, at, 0)?.ids {
+                    if waiting.remove(&next) {
+                        reached.push(next);
+                    }
+                }
+            }
+        }
+        Ok((links, without_room, None))
+    }
+
+    /// Writes what `plan_stored_links` planned into `w`: each point's id at
+    /// the end of its row's level-0 list. A list that is at its bound by now
+    /// ([`link_pass_list_bound`]), or gone, or names the point already, is
+    /// left as it is. With it goes the mark: that the pass has been over
+    /// this segment, or with `upto` the row it has come to. Returns the rows
+    /// whose list changed, for `forget_neighbor_lists` once `w` has
+    /// committed.
+    ///
+    /// Both carry `began_at`, the count of deleted rows the pass began at in
+    /// this segment (`LINK_PASS_KEY`), as the plan's own read has it
+    /// (`link_pass_counts`): nothing is read here for it, so a delete that
+    /// lands after the plan cannot get into the mark. The count of the call
+    /// that ends the pass would hide what a delete between two calls cut
+    /// off among the rows already looked at; with the count it began at,
+    /// the segment is due again after such a delete.
+    ///
+    /// The stored graphs keep no sign codes in their lists (a publish writes
+    /// ids alone). A list that does keep them is written without: a walk
+    /// then scores every row it names, where a code made for another build
+    /// could rank the new link out.
+    pub(crate) fn apply_stored_links_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        links: &[(u128, u128)],
+        upto: Option<u128>,
+        began_at: u64,
+    ) -> Result<Vec<u128>, VectorError> {
+        let lists = self.seg_ns(SegmentDb::HnswNeighbors);
+        let bound = link_pass_list_bound(self.config.m_max_0);
+        let mut changed = Vec::new();
+        for &(row, point) in links {
+            let key = Self::neighbor_list_key(row, 0);
+            let stored = self
+                .backend
+                .get_for_update(w, lists, key.as_ref(), |opt| {
+                    opt.map(Self::decode_neighbor_block)
+                })
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?
+                .transpose()?;
+            let Some(mut block) = stored else {
+                continue;
+            };
+            if block.ids.len() >= bound || block.ids.contains(&point) {
+                continue;
+            }
+            if block.has_approx_codes() {
+                block = NeighborBlock::from_ids(block.ids);
+            }
+            block.ids.push(point);
+            self.backend
+                .put(
+                    w,
+                    lists,
+                    key.as_ref(),
+                    Self::encode_neighbor_block(&block).as_slice(),
+                )
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            changed.push(row);
+        }
+        let began_at = began_at.to_be_bytes();
+        let mark = match upto {
+            Some(row) => [
+                &[0u8][..],
+                &row.to_be_bytes(),
+                &began_at,
+                &[LINK_PASS_NUMBER],
+            ]
+            .concat(),
+            None => [&[LINK_PASS_NUMBER][..], &began_at].concat(),
+        };
+        self.backend
+            .put(
+                w,
+                self.seg_ns(SegmentDb::Vectors),
+                LINK_PASS_KEY.as_bytes(),
+                &mark,
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        Ok(changed)
+    }
+
+    /// Drops the cached level-0 lists of `rows`, after a commit changed them.
+    ///
+    /// The rows are guarded first, as the rows of a hard delete are
+    /// (`apply_hard_deletes_post_commit`): a read whose snapshot is from
+    /// before the commit reads a list as it was, and without the guard it
+    /// puts that older, shorter list into the cache again, where walks stop
+    /// short of the new link for as long as the cache keeps it. While the
+    /// guard lasts no read caches these rows' lists, vectors or ordinals.
+    pub(crate) fn forget_neighbor_lists(&self, rows: &[u128]) {
+        self.guard_hard_deletes(rows);
+        for &row in rows {
+            self.invalidate_neighbor_cache_entry(row, 0);
+        }
+    }
+
+    /// Test-only: stages `mark` as this segment's link pass row
+    /// (`LINK_PASS_KEY`), as a pass of another number left it.
+    #[cfg(test)]
+    pub(crate) fn put_link_pass_mark_for_test(&self, w: &mut AnyWrite<'_>, mark: &[u8]) {
+        self.backend
+            .put(
+                w,
+                self.seg_ns(SegmentDb::Vectors),
+                LINK_PASS_KEY.as_bytes(),
+                mark,
+            )
+            .unwrap();
+    }
+
+    /// Test-only: stages `rows` as this segment's count of deleted graph rows.
+    #[cfg(test)]
+    pub(crate) fn put_deleted_graph_rows_for_test(&self, w: &mut AnyWrite<'_>, rows: u64) {
+        self.backend
+            .put(
+                w,
+                self.seg_ns(SegmentDb::Vectors),
+                DELETED_ROWS_KEY.as_bytes(),
+                &rows.to_be_bytes(),
+            )
+            .unwrap();
+    }
+
+    /// True when a graph was built here and its entry point's row is gone: a
+    /// hard delete took the row and left the key, and every search of the
+    /// segment scores it row by row. Unlike `has_index`, a read that fails is
+    /// an error here and not "gone".
+    pub(crate) fn entry_point_row_is_gone(&self, r: &AnyRead<'_>) -> Result<bool, VectorError> {
+        let Some(entry) = self
+            .backend
+            .get_with(
+                r,
+                self.seg_ns(SegmentDb::Vectors),
+                ENTRY_POINT_KEY.as_bytes(),
+                |opt| opt.map(|b| b.to_vec()),
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let mut id = [0u8; 16];
+        let len = entry.len().min(16);
+        id[..len].copy_from_slice(&entry[..len]);
+        match self.get_vector(r, u128::from_be_bytes(id), 0, false) {
+            Ok(_) => Ok(false),
+            Err(VectorError::VectorNotFound(_)) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Runtime-derived ANN index mode for this segment, probed the same way
     /// `has_index` derives HNSW state (no metadata fields — bincode-positional
     /// metadata structs must not grow). HNSW is probed first so the production
@@ -3879,6 +5665,58 @@ impl VectorCore {
     /// stable per-space point count regardless of whether higher HNSW layers
     /// exist yet.
     pub fn level_zero_count(&self, r: &AnyRead<'_>) -> Result<u64, VectorError> {
+        self.level_zero_count_upto(r, u64::MAX)
+    }
+
+    /// True when this HNSW-indexed core has too few rows to walk (see
+    /// `small_segment_exact_enabled`); counted once per core, not per query.
+    /// A filtered search keeps the rule from before the row limit, fewer than
+    /// `HNSW_DIVERSE_MIN_POINTS` rows: the exact search asks the filter about
+    /// every row, the walk only about rows that can enter the result, and a
+    /// filter may read the point each time it is asked.
+    fn is_small_hnsw_segment(&self, r: &AnyRead<'_>, filtered: bool) -> Result<bool, VectorError> {
+        if !small_segment_exact_enabled() {
+            return Ok(false);
+        }
+        // Counting stops at the first row count that is always walked.
+        let limit = small_segment_exact_max_rows().saturating_add(1);
+        let mut rows = self.hnsw_rows_upto_small.load(AtomicOrdering::Relaxed);
+        if rows == u64::MAX {
+            // An ordinal row (24 B) costs a fraction of a vector row (~3 KB) to
+            // read, so large segments are told apart without the row scan.
+            rows = self.ordinals_count_upto(r, limit)?;
+            if rows < limit {
+                rows = self.level_zero_count_upto(r, limit)?;
+            }
+            self.hnsw_rows_upto_small
+                .store(rows, AtomicOrdering::Relaxed);
+        }
+        Ok(rows < limit && !(filtered && rows >= HNSW_DIVERSE_MIN_POINTS as u64))
+    }
+
+    /// Persisted sidecar ordinal rows, stopping once `limit` are counted.
+    fn ordinals_count_upto(&self, r: &AnyRead<'_>, limit: u64) -> Result<u64, VectorError> {
+        let mut count = 0u64;
+        self.backend
+            .scan(
+                r,
+                self.seg_ns(SegmentDb::Ordinals),
+                KeyRange::all(),
+                |_, _| {
+                    count += 1;
+                    count < limit
+                },
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        Ok(count)
+    }
+
+    /// `level_zero_count`, stopping once `limit` rows are counted.
+    pub(crate) fn level_zero_count_upto(
+        &self,
+        r: &AnyRead<'_>,
+        limit: u64,
+    ) -> Result<u64, VectorError> {
         let level_offset = VECTOR_PREFIX.len() + std::mem::size_of::<u128>();
         let level_end = level_offset + std::mem::size_of::<usize>();
         let mut count = 0u64;
@@ -3897,7 +5735,7 @@ impl VectorCore {
                             count += 1;
                         }
                     }
-                    true
+                    count < limit
                 },
             )
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
@@ -3936,6 +5774,160 @@ impl VectorCore {
             )
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
         Ok(ids)
+    }
+
+    /// How many ordinal rows have no level-0 row of their id, and how many of
+    /// `rows` (this segment's level-0 ids, ascending as `level_zero_ids`
+    /// returns them) have no ordinal row. One scan of the ordinal rows.
+    fn unpaired_ordinal_rows(
+        &self,
+        r: &AnyRead<'_>,
+        rows: &[u128],
+    ) -> Result<(usize, usize), VectorError> {
+        let (mut paired, mut ordinals_without_row) = (0usize, 0usize);
+        self.backend
+            .scan(
+                r,
+                self.seg_ns(SegmentDb::Ordinals),
+                KeyRange::all(),
+                |key, _| {
+                    let id = <[u8; 16]>::try_from(key).map(u128::from_be_bytes);
+                    if id.is_ok_and(|id| rows.binary_search(&id).is_ok()) {
+                        paired += 1;
+                    } else {
+                        ordinals_without_row += 1;
+                    }
+                    true
+                },
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        Ok((ordinals_without_row, rows.len() - paired))
+    }
+
+    /// This segment's level-0 rows, whether a search walks its graph, and the
+    /// rows no stored link leads to: [`unreached_rows`] over the graph as it
+    /// is stored, where the build only counts them for a graph it has just
+    /// made. Three scans, of the ids, of the ordinal rows (held against the
+    /// ids: `unpaired_ordinal_rows`) and of the neighbour lists; writes
+    /// nothing.
+    ///
+    /// A link to an id with no row is followed where a hard delete left that
+    /// id's lists, as far as a walk follows it (`deleted_lists_crossed`), and
+    /// leads nowhere where there are none.
+    ///
+    /// `replaced` says of an id that another copy has replaced this
+    /// segment's row (see `NamedVectorManager::stored_reach_be`). Such a row
+    /// and a delete-tombstoned one are not served: no search returns them
+    /// from here. A walk scores them all the same, so their links are
+    /// followed, and those no link leads to are counted apart. A segment no
+    /// search walks is not read for its lists.
+    // shortcut: reads neighbour blocks only; a segment that still has
+    // per-edge rows (`SegmentDb::HnswOut`, the LMDB layout) would count its
+    // points as unreached. Read those too if such a segment is ever asked.
+    pub(crate) fn stored_reach(
+        &self,
+        r: &AnyRead<'_>,
+        replaced: &dyn Fn(u128) -> Result<bool, VectorError>,
+    ) -> Result<StoredReach, VectorError> {
+        let ids = self.level_zero_ids(r)?;
+        let mut served = Vec::with_capacity(ids.len());
+        for &id in &ids {
+            served.push(!self.is_delete_tombstoned(id) && !replaced(id)?);
+        }
+        // No entry point, or its row is gone: every search scores the rows.
+        let indexed = self.has_index(r)?;
+        let walked = indexed && !self.is_small_hnsw_segment(r, false)?;
+        let walked_filtered = indexed && !self.is_small_hnsw_segment(r, true)?;
+        let (ordinals_without_row, rows_without_ordinal) = self.unpaired_ordinal_rows(r, &ids)?;
+        let mut reach = StoredReach {
+            ids: ids.clone(),
+            served: served.iter().filter(|&&row| row).count(),
+            walked,
+            walked_filtered,
+            unreached: None,
+            unreached_unserved: None,
+            unreached_crossing: None,
+            ordinals_without_row,
+            rows_without_ordinal,
+        };
+        if !walked_filtered {
+            return Ok(reach);
+        }
+        let entry = self.get_entry_point(r)?.get_id();
+        let mut ord_of: HashMap<u128, u32> = ids
+            .iter()
+            .enumerate()
+            .map(|(ord, &id)| (id, ord as u32))
+            .collect();
+        let Some(&entry_ord) = ord_of.get(&entry) else {
+            return Ok(reach);
+        };
+        const ID: usize = std::mem::size_of::<u128>();
+        const LEVEL: usize = std::mem::size_of::<usize>();
+        let mut lists: Vec<Vec<Vec<u32>>> = vec![vec![Vec::new()]; ids.len()];
+        let mut undecoded = None;
+        self.backend
+            .scan(
+                r,
+                self.seg_ns(SegmentDb::HnswNeighbors),
+                KeyRange::all(),
+                |key, value| {
+                    // `neighbor_list_key`: the id, then the level.
+                    let (Some(Ok(id)), Some(Ok(level))) = (
+                        key.get(..ID).map(<[u8; ID]>::try_from),
+                        key.get(ID..ID + LEVEL).map(<[u8; LEVEL]>::try_from),
+                    ) else {
+                        return true;
+                    };
+                    let level = usize::from_be_bytes(level);
+                    let block = match Self::decode_neighbor_block(value) {
+                        Ok(block) => block,
+                        Err(error) => {
+                            undecoded = Some(error);
+                            return false;
+                        }
+                    };
+                    // An id with no row is numbered after the rows: it has
+                    // the lists a hard delete left, or none.
+                    let mut ord = |id: u128| {
+                        *ord_of.entry(id).or_insert_with(|| {
+                            lists.push(vec![Vec::new()]);
+                            (lists.len() - 1) as u32
+                        })
+                    };
+                    let at = ord(u128::from_be_bytes(id)) as usize;
+                    let links: Vec<u32> = block.ids.iter().map(|&link| ord(link)).collect();
+                    let of_point = &mut lists[at];
+                    if of_point.len() <= level {
+                        of_point.resize(level + 1, Vec::new());
+                    }
+                    of_point[level] = links;
+                    true
+                },
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        if let Some(error) = undecoded {
+            return Err(error);
+        }
+        // The served rows a walk does not reach when it gets through
+        // `crossed` rowless lists in a row, and how many of the others.
+        let unreached_when = |crossed: usize| -> (Vec<u32>, usize) {
+            let (of_served, of_others): (Vec<u32>, Vec<u32>) =
+                unreached_rows(&lists, ids.len(), entry_ord as usize, crossed)
+                    .into_iter()
+                    .partition(|&ord| served[ord as usize]);
+            (of_served, of_others.len())
+        };
+        let (unreached, unserved) = unreached_when(deleted_lists_crossed());
+        reach.unreached = Some(unreached.into_iter().map(|ord| ids[ord as usize]).collect());
+        reach.unreached_unserved = Some(unserved);
+        reach.unreached_crossing = Some(
+            LISTS_CROSSED_COUNTED
+                .iter()
+                .map(|&crossed| (crossed, unreached_when(crossed).0.len()))
+                .collect(),
+        );
+        Ok(reach)
     }
 
     /// True only when all LMDB databases owned by this segment are empty.
@@ -4166,6 +6158,14 @@ impl VectorCore {
     #[inline(always)]
     fn is_vector_marker(bytes: &[u8]) -> bool {
         bytes.is_empty()
+    }
+
+    /// Whether a stored level row is the vector itself: not a marker (the
+    /// sidecar holds the vector) and not a spindle payload (a lossy form of
+    /// it). Such a row needs no sidecar, and where the two differ it is right.
+    #[inline(always)]
+    fn row_holds_the_vector(bytes: &[u8]) -> bool {
+        !Self::is_vector_marker(bytes) && !is_spindle_payload(bytes)
     }
 
     #[inline(always)]
@@ -5093,14 +7093,19 @@ impl VectorCore {
     /// L has level >= L, so the first non-empty layer yields the best
     /// candidates). If `old_ep` had no surviving neighbors at all, falls back
     /// to a key-only scan for the highest-level surviving row — rare (only on
-    /// an isolated entry point) and still cheaper than losing the index.
-    /// Returns `None` only when no level-0 row survives, i.e. the space is
-    /// genuinely empty and the entry point may be cleared.
+    /// an isolated entry point) and still cheaper than losing the index. The
+    /// scan stops after `max_scan_rows` rows. Only an id with a level-0 row is
+    /// chosen: a build can leave upper-level rows for an id deleted while it
+    /// ran, and `has_index` needs the level-0 one.
+    /// Returns `None` when no level-0 row survives, i.e. the space is
+    /// genuinely empty and the entry point may be cleared, or when the scan
+    /// stopped at its bound before it met one.
     fn replacement_entry_point(
         &self,
         r: &AnyRead<'_>,
         old_ep: &HVector,
         is_deleted: impl Fn(u128) -> bool,
+        max_scan_rows: usize,
     ) -> Result<Option<HVector>, VectorError> {
         let old_id = old_ep.get_id();
         let mut best: Option<(usize, u128)> = None;
@@ -5113,7 +7118,9 @@ impl VectorCore {
                     continue;
                 }
                 if let Ok(neighbor_level) = self.get_highest_level(r, neighbor_id) {
-                    if best.is_none_or(|(best_level, _)| neighbor_level > best_level) {
+                    if best.is_none_or(|(best_level, _)| neighbor_level > best_level)
+                        && self.get_vector(r, neighbor_id, 0, false).is_ok()
+                    {
                         best = Some((neighbor_level, neighbor_id));
                     }
                 }
@@ -5127,12 +7134,19 @@ impl VectorCore {
             let id_offset = VECTOR_PREFIX.len();
             let level_offset = id_offset + std::mem::size_of::<u128>();
             let level_end = level_offset + std::mem::size_of::<usize>();
+            let mut scanned = 0usize;
+            // An id's rows are adjacent, level 0 first.
+            let mut has_level_zero_row = None;
             self.backend
                 .scan(
                     r,
                     self.seg_ns(SegmentDb::Vectors),
                     KeyRange::prefix(VECTOR_PREFIX),
                     |key, _v| {
+                        scanned += 1;
+                        if scanned > max_scan_rows {
+                            return false;
+                        }
                         if key.len() < level_end {
                             return true;
                         }
@@ -5144,7 +7158,11 @@ impl VectorCore {
                         };
                         let id = u128::from_be_bytes(id_arr);
                         let level = usize::from_be_bytes(level_arr);
+                        if level == 0 {
+                            has_level_zero_row = Some(id);
+                        }
                         if id != old_id
+                            && has_level_zero_row == Some(id)
                             && !is_deleted(id)
                             && best.is_none_or(|(best_level, _)| level > best_level)
                         {
@@ -5191,7 +7209,7 @@ impl VectorCore {
             if ep.get_id() == id {
                 let replacement = {
                     let r = self.backend.read_borrowed(&*txn);
-                    self.replacement_entry_point(&r, &ep, |other| other == id)?
+                    self.replacement_entry_point(&r, &ep, |other| other == id, usize::MAX)?
                 };
                 match replacement {
                     Some(new_ep) => self.set_entry_point(txn, &new_ep)?,
@@ -5460,9 +7478,12 @@ impl VectorCore {
         let entry_point_replacement: Option<Option<HVector>> = {
             let r = self.backend.read_borrowed(&*txn);
             match self.get_entry_point(&r) {
-                Ok(ep) if id_set.contains(&ep.get_id()) => {
-                    Some(self.replacement_entry_point(&r, &ep, |other| id_set.contains(&other))?)
-                }
+                Ok(ep) if id_set.contains(&ep.get_id()) => Some(self.replacement_entry_point(
+                    &r,
+                    &ep,
+                    |other| id_set.contains(&other),
+                    usize::MAX,
+                )?),
                 _ => None,
             }
         };
@@ -5680,6 +7701,102 @@ impl VectorCore {
         Ok(())
     }
 
+    /// The namespace and key [`Self::contains_id`] reads for `id`, for callers
+    /// that probe many segments in one batched read.
+    pub(crate) fn contains_id_probe(&self, id: u128) -> (Namespace<'_>, Vec<u8>) {
+        (self.seg_ns(SegmentDb::Vectors), Self::vector_key(id, 0))
+    }
+
+    /// The keys under `prefix` in segment db `db`: the next row set of the
+    /// chunk's batched scan when there is one, else a scan of its own.
+    fn delete_scan_keys(
+        &self,
+        r: &AnyRead<'_>,
+        batched: &mut Option<std::vec::IntoIter<Vec<Vec<u8>>>>,
+        db: SegmentDb,
+        prefix: &[u8],
+    ) -> Result<Vec<Vec<u8>>, VectorError> {
+        if let Some(rows) = batched.as_mut() {
+            return rows.next().ok_or_else(|| {
+                VectorError::VectorCoreError("batched delete scan ended early".to_string())
+            });
+        }
+        let mut keys = Vec::new();
+        self.backend
+            .scan(r, self.seg_ns(db), KeyRange::prefix(prefix), |k, _v| {
+                keys.push(k.to_vec());
+                true
+            })
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        Ok(keys)
+    }
+
+    /// Before a batch deletes the entry point's rows, move the key to a
+    /// surviving row in the same batch (see `replacement_entry_point`). The
+    /// key stays as it is when the bounded scan finds no survivor.
+    fn repoint_entry_before_delete_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        ids: &[u128],
+    ) -> Result<(), VectorError> {
+        let entry_id = self
+            .backend
+            .get_for_update(
+                w,
+                self.seg_ns(SegmentDb::Vectors),
+                ENTRY_POINT_KEY.as_bytes(),
+                |opt| {
+                    opt.map(|bytes| {
+                        let mut arr = [0u8; 16];
+                        let len = bytes.len().min(16);
+                        arr[..len].copy_from_slice(&bytes[..len]);
+                        u128::from_be_bytes(arr)
+                    })
+                },
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        let Some(entry_id) = entry_id.filter(|id| ids.contains(id)) else {
+            return Ok(());
+        };
+        let r = self
+            .backend
+            .begin_read()
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        // No rows: the entry point was already unusable. No walk starts from
+        // it, whatever lists an earlier delete left it.
+        let Ok(level) = self.get_highest_level(&r, entry_id) else {
+            return Ok(());
+        };
+        let deleted: HashSet<u128> = ids.iter().copied().collect();
+        let replacement = self.replacement_entry_point(
+            &r,
+            &HVector::from_slice(entry_id, level, vec![]),
+            |id| deleted.contains(&id),
+            ENTRY_REPOINT_SCAN_ROWS,
+        )?;
+        let outcome = match replacement {
+            Some(new_entry) => {
+                self.backend
+                    .put(
+                        w,
+                        self.seg_ns(SegmentDb::Vectors),
+                        ENTRY_POINT_KEY.as_bytes(),
+                        &new_entry.get_id().to_be_bytes(),
+                    )
+                    .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+                "repointed"
+            }
+            None => "no_survivor",
+        };
+        metrics::counter!(
+            "helix_dense_entry_repoint_total",
+            "site" => "delete",
+            "outcome" => outcome
+        )
+        .increment(1);
+        Ok(())
+    }
+
     pub fn delete_vectors_batch_be(
         &self,
         w: &mut AnyWrite<'_>,
@@ -5688,12 +7805,17 @@ impl VectorCore {
         if ids.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
+        if repoint_entry_enabled() {
+            self.repoint_entry_before_delete_be(w, ids)?;
+        }
+        let keep_lists = keep_deleted_lists();
+        // Rows of the graph this batch takes (see `DELETED_ROWS_KEY`).
+        let mut graph_rows = 0u64;
 
+        // Levels are always recorded: per-core caches need post-commit
+        // invalidation even when shared caches are off.
         let mut id_levels: std::collections::HashMap<u128, Vec<usize>> =
             std::collections::HashMap::with_capacity(ids.len());
-        // Always record levels: per-core caches need post-commit invalidation
-        // even when shared caches are off.
-        let record_levels = true;
 
         for chunk in ids.chunks(dense_delete_read_snapshot_chunk()) {
             let r = self
@@ -5704,36 +7826,48 @@ impl VectorCore {
             DENSE_DELETE_READ_SNAPSHOT_OPENS_FOR_TEST
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+            // Each id needs three prefix scans. On the LSM writer the whole
+            // chunk's scans share one round trip; they read `r`, which never
+            // sees the deletes staged in `w`, so reading them up front returns
+            // what the one-at-a-time scans below would.
+            let prefixes: Vec<(Namespace<'_>, Vec<u8>)> = chunk
+                .iter()
+                .flat_map(|id| {
+                    let id_bytes = id.to_be_bytes();
+                    [
+                        (
+                            self.seg_ns(SegmentDb::Vectors),
+                            [VECTOR_PREFIX, &id_bytes].concat(),
+                        ),
+                        (self.seg_ns(SegmentDb::HnswNeighbors), id_bytes.to_vec()),
+                        (self.seg_ns(SegmentDb::HnswOut), id_bytes.to_vec()),
+                    ]
+                })
+                .collect();
+            let mut batched = self
+                .backend
+                .scan_prefix_keys_many(&r, &prefixes)
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?
+                .map(Vec::into_iter);
+
             for &id in chunk {
                 let id_bytes = id.to_be_bytes();
                 let key_prefix = [VECTOR_PREFIX, &id_bytes].concat();
                 let prefix_len = key_prefix.len();
                 let level_end = prefix_len + std::mem::size_of::<usize>();
 
-                id_levels.insert(id, Vec::new());
-
-                let mut vector_keys = Vec::new();
-                self.backend
-                    .scan(
-                        &r,
-                        self.seg_ns(SegmentDb::Vectors),
-                        KeyRange::prefix(&key_prefix),
-                        |k, _v| {
-                            vector_keys.push(k.to_vec());
-                            if record_levels {
-                                if let Some(levels) = id_levels.get_mut(&id) {
-                                    if k.len() >= level_end {
-                                        if let Ok(arr) = k[prefix_len..level_end].try_into() {
-                                            let level = usize::from_be_bytes(arr);
-                                            levels.push(level);
-                                        }
-                                    }
-                                }
-                            }
-                            true
-                        },
-                    )
-                    .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+                let vector_keys =
+                    self.delete_scan_keys(&r, &mut batched, SegmentDb::Vectors, &key_prefix)?;
+                let levels: Vec<usize> = vector_keys
+                    .iter()
+                    .filter_map(|key| key.get(prefix_len..level_end))
+                    .filter_map(|level| <[u8; std::mem::size_of::<usize>()]>::try_from(level).ok())
+                    .map(usize::from_be_bytes)
+                    .collect();
+                let had_row = !levels.is_empty();
+                // An id the batch names twice is read from before the batch
+                // both times: it is a row of the graph once.
+                let first = id_levels.insert(id, levels).is_none();
                 for key in vector_keys {
                     self.backend
                         .delete(w, self.seg_ns(SegmentDb::Vectors), &key)
@@ -5748,13 +7882,18 @@ impl VectorCore {
                     .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
 
                 for db in [SegmentDb::HnswNeighbors, SegmentDb::HnswOut] {
-                    let mut keys = Vec::new();
-                    self.backend
-                        .scan(&r, self.seg_ns(db), KeyRange::prefix(&id_bytes), |k, _v| {
-                            keys.push(k.to_vec());
-                            true
-                        })
-                        .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+                    let keys = self.delete_scan_keys(&r, &mut batched, db, &id_bytes)?;
+                    if db == SegmentDb::HnswNeighbors {
+                        // A row with lists was a point of the graph.
+                        graph_rows += u64::from(first && had_row && !keys.is_empty());
+                        // The lists stay: other points' lists still name
+                        // this id, and a walk gets through to what it led
+                        // to (see `rowless_candidate`). They go with the
+                        // segment.
+                        if keep_lists {
+                            continue;
+                        }
+                    }
                     for key in keys {
                         self.backend
                             .delete(w, self.seg_ns(db), &key)
@@ -5762,6 +7901,26 @@ impl VectorCore {
                     }
                 }
             }
+        }
+        if graph_rows > 0 {
+            // One more read in the batch, where the batch took graph rows.
+            let counted = self
+                .backend
+                .get_for_update(
+                    w,
+                    self.seg_ns(SegmentDb::Vectors),
+                    DELETED_ROWS_KEY.as_bytes(),
+                    Self::decode_deleted_rows,
+                )
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            self.backend
+                .put(
+                    w,
+                    self.seg_ns(SegmentDb::Vectors),
+                    DELETED_ROWS_KEY.as_bytes(),
+                    &counted.saturating_add(graph_rows).to_be_bytes(),
+                )
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
         }
         self.remove_cached_sidecar_ordinals(ids);
 
@@ -6071,30 +8230,34 @@ impl VectorCore {
         Ok(removed)
     }
 
+    /// One `VectorData` row: no row reads as the empty default, and a row in
+    /// neither the current nor the legacy format is an error.
+    fn decode_vector_data(row: Option<&[u8]>) -> Result<StoredVectorData, VectorError> {
+        let Some(bytes) = row else {
+            return Ok(StoredVectorData::default());
+        };
+
+        if let Ok(data) = bincode::deserialize::<StoredVectorData>(bytes) {
+            return Ok(data);
+        }
+
+        if let Ok(fields) = bincode::deserialize::<HashMap<String, Value>>(bytes) {
+            return Ok(StoredVectorData {
+                fields,
+                original_vector: None,
+            });
+        }
+
+        Err(VectorError::InvalidVectorData)
+    }
+
     fn get_vector_data(&self, r: &AnyRead<'_>, id: u128) -> Result<StoredVectorData, VectorError> {
         self.backend
             .get_with(
                 r,
                 self.seg_ns(SegmentDb::VectorData),
                 &id.to_be_bytes(),
-                |opt| {
-                    let Some(bytes) = opt else {
-                        return Ok(StoredVectorData::default());
-                    };
-
-                    if let Ok(data) = bincode::deserialize::<StoredVectorData>(bytes) {
-                        return Ok(data);
-                    }
-
-                    if let Ok(fields) = bincode::deserialize::<HashMap<String, Value>>(bytes) {
-                        return Ok(StoredVectorData {
-                            fields,
-                            original_vector: None,
-                        });
-                    }
-
-                    Err(VectorError::InvalidVectorData)
-                },
+                Self::decode_vector_data,
             )
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))?
     }
@@ -6188,7 +8351,7 @@ impl VectorCore {
         Ok(out)
     }
 
-    #[cfg(test)]
+    /// The fields row `id` was written with; none when it has no row.
     pub fn debug_fields(
         &self,
         r: &AnyRead<'_>,
@@ -6202,25 +8365,49 @@ impl VectorCore {
         r: &AnyRead<'_>,
     ) -> Result<Vec<(u128, Vec<f32>, HashMap<String, Value>)>, VectorError> {
         let mut exported = Vec::new();
-        for vector in self.get_all_vectors(r, Some(0))? {
-            let stored = self.get_vector_data(r, vector.get_id())?;
-            let raw = stored
-                .original_vector
-                .clone()
-                .map(Ok)
-                .or_else(|| {
-                    self.read_sidecar_vector_if_available(
-                        r,
-                        vector.get_id(),
-                        Some(vector.get_data().len()),
-                    )
-                    .transpose()
-                })
-                .transpose()?
-                .unwrap_or_else(|| vector.get_data().to_vec());
-            exported.push((vector.get_id(), raw, stored.fields));
+        let mut vectors = self.get_all_vector_rows(r, Some(0))?.into_iter();
+        loop {
+            // Payload rows a chunk at a time, in the vectors' order: one
+            // batched read per chunk on the LSM writer instead of a point get
+            // per vector (`HELIX_LSM_DELETE_BATCH_READS=0` puts those back).
+            // Only the chunk's rows are held beside the export, and no other
+            // key of the namespace (the sidecar blobs) is read.
+            let chunk: Vec<(HVector, bool)> =
+                vectors.by_ref().take(EXPORT_VECTOR_DATA_CHUNK).collect();
+            if chunk.is_empty() {
+                return Ok(exported);
+            }
+            let keys: Vec<Vec<u8>> = chunk
+                .iter()
+                .map(|(vector, _)| vector.get_id().to_be_bytes().to_vec())
+                .collect();
+            let rows = self
+                .backend
+                .get_many(r, self.seg_ns(SegmentDb::VectorData), &keys)
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+            for ((vector, row_holds_the_vector), row) in chunk.into_iter().zip(rows) {
+                let stored = Self::decode_vector_data(row.as_deref())?;
+                let raw = stored
+                    .original_vector
+                    .clone()
+                    .map(Ok)
+                    .or_else(|| {
+                        // The stored row wins over the sidecar's slot.
+                        if row_holds_the_vector {
+                            return None;
+                        }
+                        self.read_sidecar_vector_if_available(
+                            r,
+                            vector.get_id(),
+                            Some(vector.get_data().len()),
+                        )
+                        .transpose()
+                    })
+                    .transpose()?
+                    .unwrap_or_else(|| vector.get_data().to_vec());
+                exported.push((vector.get_id(), raw, stored.fields));
+            }
         }
-        Ok(exported)
     }
 
     pub fn clear(&self, txn: &mut RwTxn) -> Result<(), VectorError> {
@@ -6362,18 +8549,89 @@ impl VectorCore {
         self.read_exact_sidecar_vector(r, id, None)
     }
 
+    /// The vector a build takes for a row that `get_all_vector_rows` read.
+    /// The stored row wins over the sidecar's slot: the sidecar is asked only
+    /// where the row is a marker or a lossy payload.
     fn original_vector_for_rebuild(
         &self,
         r: &AnyRead<'_>,
         vector: &HVector,
+        row_holds_the_vector: bool,
         stored: &StoredVectorData,
     ) -> Result<Vec<f32>, VectorError> {
         if let Some(original) = stored.original_vector.clone() {
             return Ok(original);
         }
+        if row_holds_the_vector {
+            return Ok(vector.get_data().to_vec());
+        }
         Ok(self
             .read_exact_sidecar_vector(r, vector.get_id(), None)?
             .unwrap_or_else(|| vector.get_data().to_vec()))
+    }
+
+    /// Whether the exact sidecar's slot for `id` holds other bits than its
+    /// stored row. An id without a slot in the file has nothing to differ.
+    fn exact_sidecar_slot_differs(
+        &self,
+        r: &AnyRead<'_>,
+        id: u128,
+        row: &[f32],
+    ) -> Result<bool, VectorError> {
+        let Some(ordinal) = self.sidecar_ordinal(r, id)? else {
+            return Ok(false);
+        };
+        let slot = self
+            .mmap_store
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?;
+        Ok(slot
+            .as_ref()
+            .and_then(|store| {
+                store.with_vec_slice(ordinal, |slot| {
+                    bytemuck::cast_slice::<f32, u8>(slot) != bytemuck::cast_slice::<f32, u8>(row)
+                })
+            })
+            .unwrap_or(false))
+    }
+
+    /// Writer only. A build read `rows` stored rows and found the exact
+    /// sidecar's slot at odds with `slots` of them (a node's death can leave
+    /// zero blocks inside the file's length). The publish of that build stores
+    /// the file whole as the segment's blob, which every reader scores from.
+    /// So the file is dropped and built again from the rows, the way a file
+    /// that lost appends is (`attach_exact_hvec_sidecar_for_write`). Where the
+    /// rebuild is refused or has to wait, the segment is published without a
+    /// blob and scored from its rows.
+    fn rebuild_exact_sidecar_that_differs(
+        &self,
+        slots: usize,
+        rows: usize,
+    ) -> Result<(), VectorError> {
+        {
+            let mut slot = self
+                .mmap_store
+                .write()
+                .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?;
+            let Some(store) = slot.as_ref().filter(|store| store.is_exact()) else {
+                return Ok(());
+            };
+            tracing::warn!(
+                sidecar = %store.path().display(),
+                slots,
+                rows,
+                "sidecar slots differ from the rows a build read; rebuilding from rows"
+            );
+            metrics::counter!("helix_lsm_sidecar_verify_total", "outcome" => "build_mismatch")
+                .increment(1);
+            self.sidecar_rebuild_min_slots
+                .fetch_max(store.count(), AtomicOrdering::Relaxed);
+            let path = store.path().to_path_buf();
+            *slot = None;
+            let _ = fs::remove_file(path);
+        }
+        self.ensure_lsm_mmap_sidecar_with_lock_observer(|| {}, true)?;
+        Ok(())
     }
 
     fn get_encoded_vector(
@@ -6897,7 +9155,7 @@ impl VectorCore {
         Ok(ordinals.as_ref().is_some_and(SidecarOrdinals::is_complete))
     }
 
-    fn has_mmap_sidecar(&self) -> bool {
+    pub(crate) fn has_mmap_sidecar(&self) -> bool {
         self.mmap_store
             .read()
             .ok()
@@ -6905,8 +9163,40 @@ impl VectorCore {
             .is_some()
     }
 
+    /// Test-only: closes this segment's sidecar file, as if it had none.
+    #[cfg(test)]
+    pub(crate) fn close_mmap_sidecar_for_test(&self) {
+        *self.mmap_store.write().unwrap() = None;
+    }
+
     fn should_try_lsm_sidecar(&self) -> bool {
         self.backend.kind() == BackendKind::Lsm && self.mmap_sidecar_stem.is_some()
+    }
+
+    /// The slots of this segment's exact sidecar file, which are the rows a
+    /// sidecar scan of it walks, or `None` where a scan does not return what
+    /// a read of each id returns:
+    /// - a space with a quantized store, where the read of an id scores the
+    ///   encoded form and rescores, and the scan scores the slot;
+    /// - a segment with a row deleted by tombstone, which the two tell from
+    ///   a live row in different places;
+    /// - a segment with rows and no exact file open, which the scan declines.
+    ///
+    /// A segment with no file and no rows has nothing to walk: 0.
+    pub(crate) fn exact_scan_slots(&self, r: &AnyRead<'_>) -> Result<Option<u64>, VectorError> {
+        if self.spindle.is_enabled() || self.deleted_count() > 0 {
+            return Ok(None);
+        }
+        let slots = self
+            .mmap_store
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?
+            .as_ref()
+            .map(|store| store.is_exact().then(|| store.count()));
+        match slots {
+            Some(slots) => Ok(slots),
+            None => Ok(self.is_empty(r)?.then_some(0)),
+        }
     }
 
     /// Transition this segment to the row-only sidecar path. Emits one
@@ -6928,7 +9218,7 @@ impl VectorCore {
         }
     }
 
-    fn ensure_lsm_mmap_sidecar(&self) -> Result<bool, VectorError> {
+    pub(crate) fn ensure_lsm_mmap_sidecar(&self) -> Result<bool, VectorError> {
         self.ensure_lsm_mmap_sidecar_with_lock_observer(|| {}, false)
     }
 
@@ -7110,6 +9400,7 @@ impl VectorCore {
         for_write: bool,
     ) -> Result<bool, VectorError> {
         let started = std::time::Instant::now();
+        let gen_before = self.delete_generation.load(AtomicOrdering::Acquire);
         let rebuild_floor = self.sidecar_rebuild_min_slots.load(AtomicOrdering::Relaxed) as usize;
         let open = || {
             Self::open_lsm_mmap_sidecar(
@@ -7128,6 +9419,17 @@ impl VectorCore {
             opened = open()?;
         }
         let (store, ordinals, refused) = opened;
+        // A reconcile retired the core while this ran (`keep_sidecar_as_is`):
+        // what was read may already lack reaped rows, so nothing attaches.
+        // The file goes now: the core's drop unlinks only an attached one.
+        if self.sidecar_kept_as_is() {
+            if let Some(store) = &store {
+                let _ = fs::remove_file(store.path());
+            }
+            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "retired")
+                .increment(1);
+            return Ok(false);
+        }
         let loaded = store.is_some();
         let outcome = match (loaded, refused) {
             (true, _) => "loaded",
@@ -7155,16 +9457,32 @@ impl VectorCore {
         // Before releasing the slot: a write-path append right after must land
         // in this map, not be overwritten by it.
         if let Some(ordinals) = ordinals {
+            #[cfg(test)]
+            if self.ordinal_load_hook_is_armed() {
+                ORDINAL_LOAD_POST_SCAN_FIRED.store(true, AtomicOrdering::Release);
+                while ORDINAL_LOAD_POST_SCAN_FIRED.load(AtomicOrdering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            }
             let mut map = self.mmap_ordinals.write().map_err(|e| {
                 VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {}", e))
             })?;
-            *map = Some(SidecarOrdinals::Complete(ordinals));
+            // A hard delete can commit while the sidecar is rebuilt from rows.
+            if self.delete_generation.load(AtomicOrdering::Acquire) == gen_before {
+                *map = Some(SidecarOrdinals::Complete(ordinals));
+            }
         }
         // Slot guard is dropped by the caller (it owns the guard, we have &mut).
         metrics::histogram!("helix_lsm_sidecar_materialize_ms", "outcome" => outcome)
             .record(started.elapsed().as_secs_f64() * 1000.0);
         metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => outcome).increment(1);
         Ok(loaded)
+    }
+
+    /// Test-only: the ordinal-load hook is armed for this core.
+    #[cfg(test)]
+    fn ordinal_load_hook_is_armed(&self) -> bool {
+        ORDINAL_LOAD_POST_SCAN_ARMED.load(AtomicOrdering::Acquire) == self as *const Self as usize
     }
 
     fn ensure_sidecar_ordinals_loaded(&self, read: &AnyRead<'_>) -> Result<(), VectorError> {
@@ -7199,7 +9517,7 @@ impl VectorCore {
         // Test hook: signal that the scan completed, then wait for the test
         // thread to inject a generation bump before we check.
         #[cfg(test)]
-        if ORDINAL_LOAD_POST_SCAN_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+        if self.ordinal_load_hook_is_armed() {
             ORDINAL_LOAD_POST_SCAN_FIRED.store(true, std::sync::atomic::Ordering::Release);
             while ORDINAL_LOAD_POST_SCAN_FIRED.load(std::sync::atomic::Ordering::Acquire) {
                 std::hint::spin_loop();
@@ -7249,47 +9567,160 @@ impl VectorCore {
         Ok(())
     }
 
+    /// A lookup the attached file did not answer. `remap_may_help` is true
+    /// only while an append has dropped the file's read mapping: with the
+    /// mapping present the row is past the file's end, and the slot lock a
+    /// remap takes would be waited for behind every search that holds the
+    /// file (a broad filter scan holds it through its row phase). A reader's
+    /// file far short of `ordinal` is rebuilt instead, without waiting for
+    /// that lock; `graph_read` is as in `rebuild_reader_sidecar_behind`. True
+    /// when the lookup is worth one more try.
+    fn sidecar_lookup_missed(
+        &self,
+        function: &'static str,
+        attempt: usize,
+        remap_may_help: bool,
+        ordinal: u64,
+        graph_read: Option<&AnyRead<'_>>,
+    ) -> Result<bool, VectorError> {
+        if attempt == 0 {
+            if remap_may_help {
+                self.refresh_mmap_sidecar_reads()?;
+                return Ok(true);
+            }
+            if self.rebuild_reader_sidecar_behind(ordinal, graph_read)? {
+                return Ok(true);
+            }
+        }
+        metrics::counter!("helix_sidecar_lookup_miss_total", "function" => function).increment(1);
+        Ok(false)
+    }
+
+    /// Reader replicas only. A lookup far past the end of the exact sidecar
+    /// rebuilds the file from rows, as a flat scan does. A segment sealed and
+    /// indexed after the reader built its file is never flat-scanned again,
+    /// and every row past the file's end is a point read in each graph walk.
+    /// A segment with a graph takes no more rows, so one rebuild covers it and
+    /// the floor alone decides. Without a graph it may be a tail that still
+    /// grows, and it waits for a quarter of the file as a flat scan does.
+    /// `graph_read` is the read of a lookup that scores for a search; a fetch
+    /// passes none and keeps the quarter. A rebuild that still ends short of
+    /// `ordinal` (the row went since this read began) backs off like a miss.
+    /// True when the file is no longer that far short, so the lookup is worth
+    /// another try.
+    fn rebuild_reader_sidecar_behind(
+        &self,
+        ordinal: u64,
+        graph_read: Option<&AnyRead<'_>>,
+    ) -> Result<bool, VectorError> {
+        let floor = lsm_reader_sidecar_stale_rows() as u64;
+        if floor == 0 || !self.backend.is_reader_replica() || self.lsm_sidecar_miss_is_cached() {
+            return Ok(false);
+        }
+        let exact_count = || -> Result<Option<u64>, VectorError> {
+            let slot = self
+                .mmap_store
+                .read()
+                .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?;
+            Ok(slot
+                .as_ref()
+                .filter(|store| store.is_exact())
+                .map(|store| store.count()))
+        };
+        let far_behind = |count: u64, has_graph: bool| {
+            let allowed = if has_graph {
+                floor
+            } else {
+                floor.max(count / 4)
+            };
+            ordinal >= count.saturating_add(allowed)
+        };
+        let Some(count) = exact_count()? else {
+            return Ok(false);
+        };
+        if ordinal < count.saturating_add(floor) {
+            return Ok(false);
+        }
+        // The graph is read for only where it decides: between the floor and
+        // a quarter of the file.
+        let has_graph = !far_behind(count, false)
+            && graph_read.map_or(Ok(false), |read| self.has_entry_point_key(read))?;
+        if !far_behind(count, has_graph) {
+            return Ok(false);
+        }
+        // Not tried: nothing was learned about the file, so nothing backs off
+        // and the next lookup may rebuild.
+        if !self.rebuild_stale_reader_sidecar(count)? {
+            return Ok(false);
+        }
+        if exact_count()?.is_some_and(|count| far_behind(count, has_graph)) {
+            if !self.lsm_sidecar_miss_is_cached() {
+                self.record_lsm_sidecar_miss();
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn sidecar_vec(&self, ordinal: u64) -> Result<Option<Vec<f32>>, VectorError> {
         if ordinal >= ROW_ONLY_SIDECAR_ORDINAL {
             return Ok(None);
         }
         self.ensure_lsm_mmap_sidecar()?;
         for attempt in 0..2 {
-            let found = {
+            let (found, remap_may_help) = {
                 let slot = self.mmap_store.read().map_err(|e| {
                     VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e))
                 })?;
-                slot.as_ref().and_then(|store| store.get_vec(ordinal))
+                let Some(store) = slot.as_ref() else {
+                    return Ok(None);
+                };
+                (store.get_vec(ordinal), !store.read_mmap_is_current())
             };
             if found.is_some() {
                 return Ok(found);
             }
-            if attempt == 0 {
-                self.refresh_mmap_sidecar_reads()?;
+            if !self.sidecar_lookup_missed("sidecar_vec", attempt, remap_may_help, ordinal, None)? {
+                break;
             }
         }
         Ok(None)
     }
 
-    fn sidecar_distance(&self, ordinal: u64, query: &[f32]) -> Result<Option<f32>, VectorError> {
+    fn sidecar_distance(
+        &self,
+        read: &AnyRead<'_>,
+        ordinal: u64,
+        query: &[f32],
+    ) -> Result<Option<f32>, VectorError> {
         if ordinal >= ROW_ONLY_SIDECAR_ORDINAL {
             return Ok(None);
         }
         self.ensure_lsm_mmap_sidecar()?;
         for attempt in 0..2 {
-            let found = {
+            let (found, remap_may_help) = {
                 let slot = self.mmap_store.read().map_err(|e| {
                     VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e))
                 })?;
-                slot.as_ref().and_then(|store| {
-                    store.distance_to(ordinal, query, self.mmap_distance_metric())
-                })
+                let Some(store) = slot.as_ref() else {
+                    return Ok(None);
+                };
+                (
+                    store.distance_to(ordinal, query, self.mmap_distance_metric()),
+                    !store.read_mmap_is_current(),
+                )
             };
             if let Some(distance) = found {
                 return distance.map(Some);
             }
-            if attempt == 0 {
-                self.refresh_mmap_sidecar_reads()?;
+            if !self.sidecar_lookup_missed(
+                "sidecar_distance",
+                attempt,
+                remap_may_help,
+                ordinal,
+                Some(read),
+            )? {
+                break;
             }
         }
         Ok(None)
@@ -7636,7 +10067,7 @@ impl VectorCore {
                 self.sidecar_ordinal(read_context, neighbor_id)?
             };
             if let Some(ordinal) = ordinal {
-                if let Some(distance) = self.sidecar_distance(ordinal, query_data)? {
+                if let Some(distance) = self.sidecar_distance(read_context, ordinal, query_data)? {
                     return Ok(Some(distance));
                 }
             }
@@ -7772,33 +10203,149 @@ impl VectorCore {
             )
             .map_err(|error| VectorError::VectorCoreError(error.to_string()))?;
         match stored {
-            Some(bytes) => {
-                let vector = if with_data {
-                    let decoded = if Self::is_vector_marker(&bytes) {
-                        if !resolve_marker_sidecar {
-                            self.resolve_marker_vector_after_known_ordinal_miss(
-                                read_context,
-                                id,
-                                level,
-                            )?
-                        } else {
-                            self.resolve_marker_vector(read_context, id, level)?
-                        }
-                    } else {
-                        decode_vector(&bytes)?
-                    };
-                    self.cache_vector_for_read(read_context, id, level, &decoded);
-                    HVector::from_slice(id, level, decoded)
-                } else {
-                    HVector::from_slice(id, level, Vec::new())
-                };
-                Ok(vector)
-            }
+            Some(bytes) => self.vector_from_row_bytes(
+                read_context,
+                id,
+                level,
+                &bytes,
+                with_data,
+                resolve_marker_sidecar,
+            ),
             None if level > 0 => {
                 self.get_vector_from_row(read_context, id, 0, with_data, resolve_marker_sidecar)
             }
             None => Err(VectorError::VectorNotFound(id.to_string())),
         }
+    }
+
+    /// The vector the stored row `bytes` of (`id`, `level`) stands for: the
+    /// second half of [`Self::get_vector_from_row`], for a caller that already
+    /// holds the row.
+    fn vector_from_row_bytes(
+        &self,
+        read_context: &AnyRead<'_>,
+        id: u128,
+        level: usize,
+        bytes: &[u8],
+        with_data: bool,
+        resolve_marker_sidecar: bool,
+    ) -> Result<HVector, VectorError> {
+        if !with_data {
+            return Ok(HVector::from_slice(id, level, Vec::new()));
+        }
+        let decoded = if Self::is_vector_marker(bytes) {
+            if !resolve_marker_sidecar {
+                self.resolve_marker_vector_after_known_ordinal_miss(read_context, id, level)?
+            } else {
+                self.resolve_marker_vector(read_context, id, level)?
+            }
+        } else {
+            decode_vector(bytes)?
+        };
+        self.cache_vector_for_read(read_context, id, level, &decoded);
+        Ok(HVector::from_slice(id, level, decoded))
+    }
+
+    /// The level-0 rows of `ids`, aligned with `ids`, from one batched read
+    /// at the read's snapshot. `Ok(None)` where the backend has no such read:
+    /// the caller reads row by row.
+    ///
+    /// `mostly_absent` asks for a multi-get whatever `HELIX_LSM_MULTI_GET`
+    /// says: one filter read per SST then answers the whole batch, where a
+    /// single get walks every SST for each id. Readers run with that switch
+    /// off for keys that exist, which these are not.
+    fn level_zero_rows_many(
+        &self,
+        read_context: &AnyRead<'_>,
+        ids: &[u128],
+        mostly_absent: bool,
+    ) -> Result<Option<Vec<Option<Vec<u8>>>>, VectorError> {
+        let keys = || -> Vec<Vec<u8>> { ids.iter().map(|&id| Self::vector_key(id, 0)).collect() };
+        let multi_get = mostly_absent
+            || crate::helix_engine::storage_core::backend_lsm::lsm_multi_get_enabled();
+        let rows = match (&*self.backend, read_context) {
+            (AnyBackend::Lsm(writer), AnyRead::Lsm(read)) => writer.collect_values_many(
+                read,
+                self.seg_ns(SegmentDb::Vectors),
+                &keys(),
+                multi_get,
+            ),
+            (AnyBackend::LsmReader(reader), AnyRead::LsmReader(snapshot)) => reader
+                .collect_values_many_at(
+                    snapshot.as_ref(),
+                    self.seg_ns(SegmentDb::Vectors),
+                    &keys(),
+                    multi_get,
+                ),
+            _ => return Ok(None),
+        }
+        .map_err(|error| VectorError::VectorCoreError(error.to_string()))?;
+        // Rows are matched to ids by position: a short read would hand one
+        // id another id's vector.
+        if rows.len() != ids.len() {
+            return Err(VectorError::VectorCoreError(format!(
+                "batched row read returned {} rows for {} ids",
+                rows.len(),
+                ids.len()
+            )));
+        }
+        Ok(Some(rows))
+    }
+
+    /// Calls `visit` with the level-0 vector of every id in `ids` that has a
+    /// row in this segment, in the order of `ids`, and returns how many have
+    /// none (an id with an ordinal row and no vector row counts as none too).
+    /// Same rows, decoded the same way, as one
+    /// [`Self::get_vector_from_row`] per id; on the LSM backends they are read
+    /// [`flat_scan_row_batch`] at a time.
+    ///
+    /// A caller that holds the sidecar read guard passes
+    /// `resolve_marker_sidecar: false`: resolving an externalized row through
+    /// the sidecar refreshes the mapping when the slot is past the mapped
+    /// file, and that takes the write lock the caller's own guard blocks. The
+    /// row is an error then, and the scan's caller falls back.
+    fn for_each_vector_from_rows(
+        &self,
+        read_context: &AnyRead<'_>,
+        ids: &[u128],
+        mostly_absent: bool,
+        resolve_marker_sidecar: bool,
+        mut visit: impl FnMut(HVector) -> Result<(), VectorError>,
+    ) -> Result<u64, VectorError> {
+        let row_batch = flat_scan_row_batch();
+        let mut absent = 0;
+        for chunk in ids.chunks(row_batch.max(1)) {
+            let rows = if row_batch == 0 {
+                None
+            } else {
+                self.level_zero_rows_many(read_context, chunk, mostly_absent)?
+            };
+            for (at, &id) in chunk.iter().enumerate() {
+                let fetched = match rows.as_ref().map(|rows| rows[at].as_deref()) {
+                    Some(Some(bytes)) => self.vector_from_row_bytes(
+                        read_context,
+                        id,
+                        0,
+                        bytes,
+                        true,
+                        resolve_marker_sidecar,
+                    ),
+                    Some(None) => {
+                        absent += 1;
+                        continue;
+                    }
+                    None => {
+                        self.get_vector_from_row(read_context, id, 0, true, resolve_marker_sidecar)
+                    }
+                };
+                match fetched {
+                    Ok(vector) => visit(vector)?,
+                    Err(VectorError::VectorNotFound(_)) => absent += 1,
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        Ok(absent)
     }
 
     fn resolve_marker_vector_after_known_ordinal_miss(
@@ -7904,11 +10451,10 @@ impl VectorCore {
             }
         }
 
-        results.sort_by(|lhs, rhs| {
-            lhs.get_distance()
-                .partial_cmp(&rhs.get_distance())
-                .unwrap_or(Ordering::Equal)
-        });
+        // Equally far after the rescore: by id, not in the order of the
+        // approximate distances. `HVector` orders the nearer, then the smaller
+        // id, as the greater.
+        results.sort_by(|lhs, rhs| rhs.cmp(lhs));
         Ok(results)
     }
 
@@ -8114,11 +10660,9 @@ impl VectorCore {
                 results.push(candidate);
             }
         }
-        results.sort_by(|lhs, rhs| {
-            lhs.get_distance()
-                .partial_cmp(&rhs.get_distance())
-                .unwrap_or(Ordering::Equal)
-        });
+        // Equally far rows by id, whichever posting list holds them:
+        // `HVector` orders the nearer, then the smaller id, as the greater.
+        results.sort_by(|lhs, rhs| rhs.cmp(lhs));
         results.truncate(target_k);
         if self.spindle.is_enabled() && self.spindle.rescore {
             results = self.rescore_results(r, raw_query, results)?;
@@ -8153,6 +10697,132 @@ impl VectorCore {
     where
         F: Fn(u128) -> bool,
     {
+        let mut stale_count = None;
+        let results = self.search_flat_mmap_ordinals_scan(
+            r,
+            projected_query,
+            target_k,
+            filter,
+            Some(&mut stale_count),
+        )?;
+        let Some(stale_count) = stale_count else {
+            return Ok(results);
+        };
+        self.rebuild_stale_reader_sidecar(stale_count)?;
+        self.search_flat_mmap_ordinals_scan(r, projected_query, target_k, filter, None)
+    }
+
+    /// Reader replicas only. Replace an exact sidecar that fell behind the
+    /// store with one rebuilt from rows. The short file stays attached when
+    /// no rebuild can run or the rebuild is refused: it still covers its rows.
+    ///
+    /// False when the rebuild was not tried for a reason that says nothing
+    /// about the file: another search held it, or the caller had left.
+    fn rebuild_stale_reader_sidecar(&self, stale_count: u64) -> Result<bool, VectorError> {
+        let Some(stem) = self.mmap_sidecar_stem.as_ref() else {
+            return Ok(true);
+        };
+        // The file is not waited for. A search that holds it (the broad scan
+        // keeps it through its row phase, for seconds) would hold this one up,
+        // and a waiting writer admits no new search of the space. This search
+        // is served from the short file and a later one rebuilds.
+        let mut slot = match self.mmap_store.try_write() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "stale_busy")
+                    .increment(1);
+                return Ok(false);
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                return Err(VectorError::VectorCoreError(format!(
+                    "mmap lock poisoned: {}",
+                    e
+                )));
+            }
+        };
+        // Another search may have rebuilt it since this one's scan.
+        let still_stale = slot
+            .as_ref()
+            .is_some_and(|store| store.is_exact() && store.count() == stale_count);
+        if !still_stale || self.lsm_sidecar_miss_is_cached() {
+            return Ok(true);
+        }
+        let Some(_permit) = SidecarMaterializePermit::try_acquire() else {
+            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "deferred")
+                .increment(1);
+            return Ok(true);
+        };
+        let started = std::time::Instant::now();
+        let hvec_path = stem.with_extension("hvec");
+        // The attached file keeps its inode: a fresh one replaces it on disk.
+        let rebuild = || {
+            Self::materialize_exact_hvec_sidecar_from_lsm_rows(
+                &self.backend,
+                &self.physical_name,
+                &hvec_path,
+                &self.spindle,
+                0,
+            )
+        };
+        let mut rebuilt = rebuild();
+        if matches!(
+            rebuilt,
+            Ok(RowRebuild::Refused(SIDECAR_ROWS_ORDINALS_DIFFER))
+        ) {
+            metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => "retried")
+                .increment(1);
+            rebuilt = rebuild();
+        }
+        // Every outcome but a rebuild backs off: the search is still served.
+        let outcome = match rebuilt {
+            // Retired while this ran: the short file stays attached.
+            Ok(RowRebuild::Built(..)) if self.sidecar_kept_as_is() => "stale_retired",
+            Ok(RowRebuild::Built(store, _)) => {
+                *slot = Some(store);
+                "stale_rebuilt"
+            }
+            Ok(RowRebuild::Refused(reason)) => {
+                self.record_lsm_sidecar_refusal(stem, reason);
+                "stale_refused"
+            }
+            Ok(RowRebuild::NoRows) => {
+                self.record_lsm_sidecar_miss();
+                "stale_missing"
+            }
+            // Its reads were cancelled with the request. Nothing is wrong with
+            // the rebuild, so the next search is not held off it.
+            Err(error) if error.to_string().contains("LSM read request cancelled") => {
+                "stale_cancelled"
+            }
+            Err(error) => {
+                tracing::warn!(
+                    sidecar = %hvec_path.display(),
+                    %error,
+                    "stale sidecar rebuild failed; keeping the short file"
+                );
+                self.record_lsm_sidecar_miss();
+                "stale_error"
+            }
+        };
+        metrics::histogram!("helix_lsm_sidecar_materialize_ms", "outcome" => outcome)
+            .record(started.elapsed().as_secs_f64() * 1000.0);
+        metrics::counter!("helix_lsm_sidecar_materialize_total", "outcome" => outcome).increment(1);
+        Ok(outcome != "stale_cancelled")
+    }
+
+    /// `stale` is set, and nothing scored, when a reader replica finds its
+    /// sidecar too far behind the store's ordinals to serve this search.
+    fn search_flat_mmap_ordinals_scan<F>(
+        &self,
+        r: &AnyRead<'_>,
+        projected_query: &[f32],
+        target_k: usize,
+        filter: Option<&[F]>,
+        stale: Option<&mut Option<u64>>,
+    ) -> Result<Option<Vec<HVector>>, VectorError>
+    where
+        F: Fn(u128) -> bool,
+    {
         let slot = self
             .mmap_store
             .read()
@@ -8176,33 +10846,39 @@ impl VectorCore {
         let has_tombstones = self.deleted_count() > 0;
         // Rows written after this sidecar was built sit past its end.
         let mut past_sidecar: Vec<u128> = Vec::new();
+        // The filter is a read of the point for each row it is asked about,
+        // where a score from the file is a few bytes of arithmetic. So with a
+        // filter every row the file holds is scored first, and the filter is
+        // asked last, about the rows that can still be among the nearest
+        // (`nearest_passing_rows`). A row the file cannot score is asked
+        // about at once, as before: scoring it is a read of its own.
+        let passes = |id: u128| filter.map_or(true, |filters| filters.iter().all(|f| f(id)));
+        let mut scored_rows: Vec<MmapFlatCandidate> = Vec::new();
         let mut consider = |id: u128, ordinal: u64| -> Result<(), VectorError> {
             if has_tombstones && self.is_delete_tombstoned(id) {
                 return Ok(());
             }
-            if let Some(filters) = filter {
-                if !filters.iter().all(|f| f(id)) {
+            let distance = match store.distance_to(ordinal, projected_query, metric) {
+                Some(Ok(distance)) => distance,
+                Some(Err(error)) if passes(id) => return Err(error),
+                Some(Err(_)) => return Ok(()),
+                None => {
+                    if passes(id) {
+                        past_sidecar.push(id);
+                    }
                     return Ok(());
                 }
-            }
-            let Some(distance) = store.distance_to(ordinal, projected_query, metric) else {
-                past_sidecar.push(id);
-                return Ok(());
             };
             let candidate = MmapFlatCandidate {
                 id,
                 ordinal,
-                distance: distance?,
+                distance,
             };
-            if nearest.len() < target_k {
-                nearest.push(candidate);
-            } else if nearest
-                .peek()
-                .is_some_and(|worst| candidate.distance < worst.distance)
-            {
-                nearest.pop();
-                nearest.push(candidate);
+            if filter.is_some() {
+                scored_rows.push(candidate);
+                return Ok(());
             }
+            keep_nearest(&mut nearest, target_k, candidate);
             Ok(())
         };
 
@@ -8254,6 +10930,27 @@ impl VectorCore {
             if let Some(err) = scan_err {
                 return Err(err);
             }
+            // A sidecar laid out from rows (no persisted ordinals) leaves
+            // nothing to scan here: score this segment from its rows.
+            if scanned_ordinals.is_empty() {
+                return Ok(None);
+            }
+            if let Some(stale) = stale {
+                // While a rebuild is backed off the short file serves, without
+                // a second scan and without a try at the file's lock.
+                if self.backend.is_reader_replica()
+                    && store.is_exact()
+                    && reader_sidecar_is_stale(
+                        store.count(),
+                        &scanned_ordinals,
+                        lsm_reader_sidecar_stale_rows(),
+                    )
+                    && !self.lsm_sidecar_miss_is_cached()
+                {
+                    *stale = Some(store.count());
+                    return Ok(None);
+                }
+            }
             for (id, ordinal) in scanned_ordinals {
                 consider(id, ordinal)?;
             }
@@ -8262,12 +10959,12 @@ impl VectorCore {
             return Err(err);
         }
 
-        let mut scored = nearest.into_vec();
-        scored.sort_by(|lhs, rhs| {
-            lhs.distance
-                .partial_cmp(&rhs.distance)
-                .unwrap_or(Ordering::Equal)
-        });
+        // Either way nearest first, and equally far rows by id.
+        let scored = if filter.is_some() {
+            nearest_passing_rows(&scored_rows, target_k, passes)
+        } else {
+            nearest.into_sorted_vec()
+        };
         let mut results = Vec::with_capacity(scored.len());
         for candidate in scored {
             if let Some(data) = store.get_vec(candidate.ordinal) {
@@ -8287,22 +10984,37 @@ impl VectorCore {
         if past_sidecar.is_empty() {
             return Ok(Some(results));
         }
-        for id in past_sidecar {
-            let mut vector = match self.get_vector_from_row(r, id, 0, true, true) {
-                Ok(vector) => vector,
-                Err(VectorError::VectorNotFound(_)) => continue,
-                Err(err) => return Err(err),
-            };
+        self.for_each_vector_from_rows(r, &past_sidecar, false, true, |mut vector| {
             vector.set_distance(self.distance_between(vector.get_data(), projected_query)?);
             results.push(vector);
-        }
-        results.sort_by(|lhs, rhs| {
-            lhs.get_distance()
-                .partial_cmp(&rhs.get_distance())
-                .unwrap_or(Ordering::Equal)
-        });
+            Ok(())
+        })?;
+        // A row past the file comes before an equally far row of the file
+        // with a larger id: `HVector` orders the nearer, then the smaller
+        // id, as the greater.
+        results.sort_by(|lhs, rhs| rhs.cmp(lhs));
         results.truncate(target_k);
         Ok(Some(results))
+    }
+
+    /// The two sidecar-backed flat scans, in the order a search tries them.
+    fn search_flat_sidecar_direct<F>(
+        &self,
+        r: &AnyRead<'_>,
+        projected_query: &[f32],
+        prepared: &PreparedSpindleQuery,
+        target_k: usize,
+        filter: Option<&[F]>,
+    ) -> Result<Option<Vec<HVector>>, VectorError>
+    where
+        F: Fn(u128) -> bool,
+    {
+        if let Some(results) =
+            self.search_flat_hvtq_fastscan_direct(r, prepared, target_k, filter)?
+        {
+            return Ok(Some(results));
+        }
+        self.search_flat_mmap_ordinals_direct(r, projected_query, target_k, filter)
     }
 
     fn search_flat_id_filter_direct<F>(
@@ -8320,14 +11032,24 @@ impl VectorCore {
             return Ok(Vec::new());
         }
         if let Some(results) =
-            self.search_flat_hvtq_fastscan_direct(r, prepared, target_k, filter)?
+            self.search_flat_sidecar_direct(r, projected_query, prepared, target_k, filter)?
         {
             return Ok(results);
         }
-        if let Some(results) =
-            self.search_flat_mmap_ordinals_direct(r, projected_query, target_k, filter)?
+        // A reader replica's first search of a segment that has rows builds
+        // the sidecar here and is scored from it, as its next search is.
+        // Below, the build is followed by a point read for every row's ordinal.
+        if self.backend.is_reader_replica()
+            && lsm_reader_sidecar_stale_rows() > 0
+            && !self.has_mmap_sidecar()
+            && !self.ns_empty_be(r, SegmentDb::Ordinals)?
+            && self.ensure_lsm_mmap_sidecar()?
         {
-            return Ok(results);
+            if let Some(results) =
+                self.search_flat_sidecar_direct(r, projected_query, prepared, target_k, filter)?
+            {
+                return Ok(results);
+            }
         }
 
         let level_offset = VECTOR_PREFIX.len() + std::mem::size_of::<u128>();
@@ -8415,23 +11137,11 @@ impl VectorCore {
                 level,
                 distance,
             };
-            if nearest.len() < target_k {
-                nearest.push(candidate);
-            } else if nearest
-                .peek()
-                .is_some_and(|worst| candidate.distance < worst.distance)
-            {
-                nearest.pop();
-                nearest.push(candidate);
-            }
+            keep_nearest(&mut nearest, target_k, candidate);
         }
 
-        let mut scored = nearest.into_vec();
-        scored.sort_by(|lhs, rhs| {
-            lhs.distance
-                .partial_cmp(&rhs.distance)
-                .unwrap_or(Ordering::Equal)
-        });
+        // Nearest first, and equally far rows by id.
+        let scored = nearest.into_sorted_vec();
         let mut results = Vec::with_capacity(scored.len());
         for candidate in scored {
             match self.get_vector_with_ordinal_cache(
@@ -8527,23 +11237,12 @@ impl VectorCore {
                 level: 0,
                 distance,
             };
-            if nearest.len() < target_k {
-                nearest.push(candidate);
-            } else if nearest
-                .peek()
-                .is_some_and(|worst| candidate.distance < worst.distance)
-            {
-                nearest.pop();
-                nearest.push(candidate);
-            }
+            keep_nearest(&mut nearest, target_k, candidate);
         }
 
-        let mut scored = nearest.into_vec();
-        scored.sort_by(|lhs, rhs| {
-            lhs.distance
-                .partial_cmp(&rhs.distance)
-                .unwrap_or(Ordering::Equal)
-        });
+        // Nearest first, and equally far rows by id: the candidates of a
+        // filtered search come in the order of a hash set made for it.
+        let scored = nearest.into_sorted_vec();
         let mut results = Vec::with_capacity(scored.len());
         for candidate in scored {
             match self.get_vector_with_ordinal_cache(r, candidate.id, 0, true, &mut ordinal_cache) {
@@ -8577,6 +11276,123 @@ impl VectorCore {
         }
         results.truncate(k);
         Ok(results)
+    }
+
+    /// The nearest `k` of `ids` that have a row in this segment, scored from
+    /// the rows themselves; with them the ids that have a row, in the order
+    /// asked, and the time the row reads took. `None` where the exact path
+    /// keeps its read of each id ([`Self::search_exact_ids_with_selectivity`]).
+    ///
+    /// The rows are read [`flat_scan_row_batch`] ids at a time at the read's
+    /// own view, so a set costs a segment one round trip where it cost two
+    /// reads an id. A row that is the vector needs no ordinal read and no
+    /// vector file, so this path starts neither a file's load nor the rebuild
+    /// of a reader's short file: the first graph walk does. On a segment
+    /// without a quantizer the file's score is the row's (the same kernel on
+    /// the same floats), so the hits are the ones the read of each id returns,
+    /// in the same order.
+    ///
+    /// `None`, with nothing scored: the path is switched off
+    /// (`HELIX_DENSE_EXACT_ROWS=0`, its way back to the read of each id; or
+    /// `HELIX_FLAT_SCAN_ROW_BATCH=0`, which un-batches the flat scan too),
+    /// the read has no batched row read, the space has a quantizer or the
+    /// mapped file is not the exact one (their score is not the row's), or a
+    /// row is not a vector this read can score: a marker (resolved through
+    /// the file), a quantized payload, or bytes that do not decode to the
+    /// query's length (the read of each id scores their slot, as it did).
+    /// `helix_dense_exact_rows_total` counts a segment by outcome: `scored`,
+    /// or `declined_after_read` where the rows were read and then left to
+    /// the read of each id, which reads them again.
+    pub(crate) fn exact_hits_from_rows(
+        &self,
+        r: &AnyRead<'_>,
+        raw_query: &[f32],
+        ids: &[u128],
+        k: usize,
+        selectivity_hint: Option<f32>,
+    ) -> Result<Option<(Vec<u128>, Vec<HVector>, std::time::Duration)>, VectorError> {
+        let row_batch = flat_scan_row_batch();
+        let exact_or_no_file = self
+            .mmap_store
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?
+            .as_ref()
+            .is_none_or(|store| store.is_exact());
+        if row_batch == 0 || !exact_rows_enabled() || self.spindle.is_enabled() || !exact_or_no_file
+        {
+            return Ok(None);
+        }
+
+        // The batch starts its cold reads many at a time: under this mark the
+        // fills of this collection's parts they miss take turns in the cache,
+        // one fetch at a time as the reads of each id made them, and go on
+        // after the read.
+        let _in_flight = match &*self.backend {
+            AnyBackend::Lsm(writer) => Some(writer.batch_row_read_in_flight()),
+            AnyBackend::LsmReader(reader) => Some(reader.batch_row_read_in_flight()),
+            _ => None,
+        };
+        let projected_query = project_for_search(raw_query, &self.spindle)?;
+        let target_k = self.rerank_target_k(k, selectivity_hint);
+        let mut nearest: BinaryHeap<FlatCandidate> = BinaryHeap::with_capacity(target_k);
+        // The vectors of the rows kept so far: `target_k` and one batch at most.
+        let mut kept: HashMap<u128, Vec<f32>> = HashMap::new();
+        let mut present = Vec::new();
+        let mut read = std::time::Duration::ZERO;
+        for chunk in ids.chunks(row_batch) {
+            let read_start = std::time::Instant::now();
+            let Some(rows) = self.level_zero_rows_many(r, chunk, false)? else {
+                return Ok(None);
+            };
+            read += read_start.elapsed();
+            for (&id, row) in chunk.iter().zip(rows) {
+                let Some(row) = row else {
+                    continue;
+                };
+                let vector = match Self::row_holds_the_vector(&row).then(|| decode_vector(&row)) {
+                    Some(Ok(vector)) if vector.len() == projected_query.len() => vector,
+                    _ => {
+                        metrics::counter!(
+                            "helix_dense_exact_rows_total",
+                            "outcome" => "declined_after_read"
+                        )
+                        .increment(1);
+                        return Ok(None);
+                    }
+                };
+                present.push(id);
+                // As the read of an id: a row deleted by tombstone is this
+                // segment's and is not scored.
+                if self.is_delete_tombstoned(id) {
+                    continue;
+                }
+                let distance = self.distance_between(&vector, &projected_query)?;
+                kept.insert(id, vector);
+                let candidate = FlatCandidate {
+                    id,
+                    level: 0,
+                    distance,
+                };
+                keep_nearest(&mut nearest, target_k, candidate);
+            }
+            let in_heap: HashSet<u128> = nearest.iter().map(|candidate| candidate.id).collect();
+            kept.retain(|id, _| in_heap.contains(id));
+        }
+
+        // Nearest first, and equally far rows by id, as the read of each id.
+        let mut hits = Vec::with_capacity(nearest.len());
+        for candidate in nearest.into_sorted_vec() {
+            let Some(vector) = kept.remove(&candidate.id) else {
+                continue;
+            };
+            self.cache_vector_for_read(r, candidate.id, 0, &vector);
+            let mut hit = HVector::from_slice(candidate.id, 0, vector);
+            hit.set_distance(candidate.distance);
+            hits.push(hit);
+        }
+        hits.truncate(k);
+        metrics::counter!("helix_dense_exact_rows_total", "outcome" => "scored").increment(1);
+        Ok(Some((present, hits, read)))
     }
 
     fn search_flat_hvtq_fastscan_direct<F>(
@@ -8655,26 +11471,19 @@ impl VectorCore {
             .saturating_mul(hvtq_fastscan_rerank_multiplier())
             .max(target_k)
             .min(count);
-        let mut fast_nearest: BinaryHeap<FlatCandidate> = BinaryHeap::with_capacity(candidate_k);
+        // Equally far rows by their ids here too, not by their slots.
+        let mut fast_nearest: BinaryHeap<MmapFlatCandidate> =
+            BinaryHeap::with_capacity(candidate_k);
         for (ordinal, maybe_id) in ordinal_to_id.iter().enumerate() {
-            if maybe_id.is_none() {
+            let Some(id) = *maybe_id else {
                 continue;
-            }
-            let distance = self.distance_from_approximate(&scores[ordinal]);
-            let candidate = FlatCandidate {
-                id: ordinal as u128,
-                level: 0,
-                distance,
             };
-            if fast_nearest.len() < candidate_k {
-                fast_nearest.push(candidate);
-            } else if fast_nearest
-                .peek()
-                .is_some_and(|worst| candidate.distance < worst.distance)
-            {
-                fast_nearest.pop();
-                fast_nearest.push(candidate);
-            }
+            let candidate = MmapFlatCandidate {
+                id,
+                ordinal: ordinal as u64,
+                distance: self.distance_from_approximate(&scores[ordinal]),
+            };
+            keep_nearest(&mut fast_nearest, candidate_k, candidate);
         }
 
         let mut exact_nearest: BinaryHeap<FlatCandidate> = BinaryHeap::with_capacity(target_k);
@@ -8687,38 +11496,22 @@ impl VectorCore {
                 return Ok(None);
             };
             for fast_candidate in fast_nearest.into_vec() {
-                let ordinal = fast_candidate.id as usize;
-                let Some(id) = ordinal_to_id.get(ordinal).and_then(|value| *value) else {
-                    continue;
-                };
-                let distance = match store.score_encoded_to(ordinal as u64, prepared) {
+                let distance = match store.score_encoded_to(fast_candidate.ordinal, prepared) {
                     Some(Ok(approx)) => self.distance_from_approximate(&approx),
                     Some(Err(err)) => return Err(err),
                     None => continue,
                 };
                 let candidate = FlatCandidate {
-                    id,
+                    id: fast_candidate.id,
                     level: 0,
                     distance,
                 };
-                if exact_nearest.len() < target_k {
-                    exact_nearest.push(candidate);
-                } else if exact_nearest
-                    .peek()
-                    .is_some_and(|worst| candidate.distance < worst.distance)
-                {
-                    exact_nearest.pop();
-                    exact_nearest.push(candidate);
-                }
+                keep_nearest(&mut exact_nearest, target_k, candidate);
             }
         }
 
-        let mut scored = exact_nearest.into_vec();
-        scored.sort_by(|lhs, rhs| {
-            lhs.distance
-                .partial_cmp(&rhs.distance)
-                .unwrap_or(Ordering::Equal)
-        });
+        // Nearest first, and equally far rows by id.
+        let scored = exact_nearest.into_sorted_vec();
         let mut results = Vec::with_capacity(scored.len());
         for candidate in scored {
             match self.get_vector(r, candidate.id, 0, true) {
@@ -8747,6 +11540,295 @@ impl VectorCore {
             }
         }
 
+        Ok(Some(results))
+    }
+
+    /// Broad-filter optimized search: scans mmap sidecar ordinals, filters by
+    /// a prefilter `HashSet` (cheap membership test), scores matching vectors
+    /// via the mmap store, then applies `recheck` best-first until `k` pass,
+    /// so the result is the exact top-k of the prefilter members that pass.
+    ///
+    /// Returns `Ok(None)` when no mmap sidecar is available, signalling the
+    /// caller to fall back to the regular HNSW path.
+    pub fn search_broad_prefilter_scan<F>(
+        &self,
+        r: &AnyRead<'_>,
+        raw_query: &[f32],
+        k: usize,
+        prefilter: &HashSet<u128>,
+        recheck: Option<&[F]>,
+        selectivity_hint: Option<f32>,
+    ) -> Result<Option<Vec<HVector>>, VectorError>
+    where
+        F: Fn(u128) -> bool,
+    {
+        self.search_broad_prefilter_scan_after(
+            r,
+            raw_query,
+            k,
+            prefilter,
+            recheck,
+            selectivity_hint,
+            &mut NewerCopies::default(),
+        )
+    }
+
+    /// [`Self::search_broad_prefilter_scan`] of one segment of a space after
+    /// its newer ones. `newer` is what those, walked before this one for the
+    /// same request, say of the set: a member one of them was read to hold
+    /// is not this segment's, and a member one of them only lists is this
+    /// segment's to answer only if a read finds no row behind that listing
+    /// (`NewerCopies::withholds`). What this segment lists and reads is
+    /// added to `newer` for the segments older than it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_broad_prefilter_scan_after<'a, F>(
+        &'a self,
+        r: &AnyRead<'_>,
+        raw_query: &[f32],
+        k: usize,
+        prefilter: &HashSet<u128>,
+        recheck: Option<&[F]>,
+        selectivity_hint: Option<f32>,
+        newer: &mut NewerCopies<'a>,
+    ) -> Result<Option<Vec<HVector>>, VectorError>
+    where
+        F: Fn(u128) -> bool,
+    {
+        if k == 0 || prefilter.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        // Empty segment: nothing to scan; return empty, not None (fallback).
+        if self.is_empty(r)? {
+            return Ok(Some(Vec::new()));
+        }
+        // Use an already-materialized sidecar only (try-only, never build
+        // inline on the query path). The background/lazy builder creates
+        // sidecars; big collections must not pay a full S3 scan inline.
+        if !self.has_mmap_sidecar() {
+            return Ok(None);
+        }
+
+        let projected_query = project_for_search(raw_query, &self.spindle)?;
+        let _prepared = prepare_query(raw_query, &self.spindle)?;
+        let target_k = self.rerank_target_k(k, selectivity_hint);
+        // Members ordered up front; recheck rejections (prefilter false
+        // positives) usually leave `target_k` among the nearest 4x.
+        let head = if recheck.is_some() {
+            target_k.saturating_mul(4)
+        } else {
+            target_k
+        };
+
+        let metric = self.mmap_distance_metric();
+        let has_tombstones = self.deleted_count() > 0;
+        // Every scored member is kept: the recheck may reject all of the
+        // nearest ones, and rescanning would cost more than the list.
+        let mut scored: Vec<MmapFlatCandidate> = Vec::new();
+        let mut scan_err: Option<VectorError> = None;
+        let mut past_sidecar: Vec<u128> = Vec::new();
+        // The members this segment lists (an ordinal row). Those it does not
+        // list are scored from live rows (handles in-place updates whose
+        // ordinal changed or was dropped after the sidecar was built).
+        let mut seen_ids: HashSet<u128> = HashSet::with_capacity(prefilter.len());
+
+        let slot = self
+            .mmap_store
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("mmap lock poisoned: {}", e)))?;
+        let Some(store) = slot.as_ref() else {
+            return Ok(None);
+        };
+        // A file with no slot yet scores nothing; the segment's rows are all
+        // past its end, and are read below like any row past it.
+
+        // Phase 1: score prefilter members via mmap ordinals (cheap: HashSet
+        // check + mmap array read, no payload read).
+        let held_by_newer = &newer.held;
+        let mut consider = |id: u128, ordinal: u64| -> Result<(), VectorError> {
+            if !prefilter.contains(&id) || held_by_newer.contains(&id) {
+                return Ok(());
+            }
+            seen_ids.insert(id);
+            if has_tombstones && self.is_delete_tombstoned(id) {
+                return Ok(()); // dead — don't re-score from live row
+            }
+            let Some(distance) = store.distance_to(ordinal, &projected_query, metric) else {
+                past_sidecar.push(id);
+                return Ok(());
+            };
+            scored.push(MmapFlatCandidate {
+                id,
+                ordinal,
+                distance: distance?,
+            });
+            Ok(())
+        };
+
+        let used_cached_ordinals = {
+            let ordinals = self.mmap_ordinals.read().map_err(|e| {
+                VectorError::VectorCoreError(format!("mmap ordinal lock poisoned: {e}"))
+            })?;
+            match ordinals.as_ref() {
+                Some(SidecarOrdinals::Complete(map)) if !matches!(r, AnyRead::LsmReader(_)) => {
+                    for (&id, &ordinal) in map {
+                        consider(id, ordinal)?;
+                    }
+                    true
+                }
+                Some(SidecarOrdinals::Partial(_)) | Some(SidecarOrdinals::Complete(_)) | None => {
+                    false
+                }
+            }
+        };
+        if !used_cached_ordinals {
+            self.backend
+                .scan(
+                    r,
+                    self.seg_ns(SegmentDb::Ordinals),
+                    KeyRange::all(),
+                    |key, value| {
+                        if key.len() != std::mem::size_of::<u128>() {
+                            scan_err = Some(VectorError::InvalidVectorData);
+                            return false;
+                        }
+                        let Ok(id_bytes) = key.try_into() else {
+                            scan_err = Some(VectorError::InvalidVectorData);
+                            return false;
+                        };
+                        let id = u128::from_be_bytes(id_bytes);
+                        let ordinal = match Self::ordinal_from_bytes(value) {
+                            Ok(ordinal) => ordinal,
+                            Err(err) => {
+                                scan_err = Some(err);
+                                return false;
+                            }
+                        };
+                        if let Err(err) = consider(id, ordinal) {
+                            scan_err = Some(err);
+                            return false;
+                        }
+                        true
+                    },
+                )
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        }
+        if let Some(err) = scan_err {
+            return Err(err);
+        }
+
+        // Score from live rows: vectors beyond the sidecar's mmap range
+        // (past_sidecar) AND prefilter members whose ordinal changed or was
+        // dropped by an in-place update after the sidecar was built (unseen).
+        // Every member this segment does not list is asked for, unless a
+        // newer segment was read to hold it; nearly all of them live in
+        // another segment, so the rows are read in batches
+        // (`for_each_vector_from_rows`).
+        let unseen: Vec<u128> = prefilter
+            .iter()
+            .copied()
+            .filter(|id| !seen_ids.contains(id) && !held_by_newer.contains(id))
+            .collect();
+        let mut absent = 0;
+        // The members whose row is read here: this segment holds them.
+        let mut read_here: Vec<u128> = Vec::new();
+        // A row past the file exists; a member the segment does not list
+        // almost never has a row here.
+        for (ids, found_as, mostly_absent) in [
+            (&past_sidecar, "past_file", false),
+            (&unseen, "no_ordinal", true),
+        ] {
+            let live: Vec<u128> = ids
+                .iter()
+                .copied()
+                .filter(|id| !(has_tombstones && self.is_delete_tombstoned(*id)))
+                .collect();
+            let read_before = read_here.len();
+            // `slot` is still held here.
+            let missing =
+                self.for_each_vector_from_rows(r, &live, mostly_absent, false, |vector| {
+                    read_here.push(vector.get_id());
+                    scored.push(MmapFlatCandidate {
+                        id: vector.get_id(),
+                        ordinal: u64::MAX,
+                        distance: self.distance_between(vector.get_data(), &projected_query)?,
+                    });
+                    Ok(())
+                })?;
+            absent += missing;
+            metrics::counter!("helix_broad_scan_row_lookups_total", "outcome" => found_as)
+                .increment((read_here.len() - read_before) as u64);
+            if !mostly_absent {
+                // Listed, its slot past the file, and no row: the listing
+                // stands for nothing, here or for an older segment.
+                metrics::counter!("helix_broad_scan_listing_without_row_total").increment(missing);
+            }
+        }
+        metrics::counter!("helix_broad_scan_row_lookups_total", "outcome" => "absent")
+            .increment(absent);
+        // A listing whose slot is past the file is settled: read, or void.
+        for id in &past_sidecar {
+            seen_ids.remove(id);
+        }
+
+        // Phase 2: recheck best-first (expensive filter). Order only the
+        // nearest `head`, and the rest once rechecks reject too many of them:
+        // the excluded points can crowd the query (tests sit nearest the code
+        // they cover), and stopping at a fixed window returned none of the
+        // matches beyond it. NaN distances sort last, and equally far
+        // members by id (`MmapFlatCandidate`'s order): a writer meets the
+        // members in the order of a hash map.
+        let mut ordered = head.min(scored.len());
+        if ordered < scored.len() {
+            scored.select_nth_unstable(ordered);
+        }
+        scored[..ordered].sort_unstable();
+
+        let mut results = Vec::with_capacity(target_k);
+        for next in 0..scored.len() {
+            if results.len() >= target_k {
+                break;
+            }
+            if next == ordered {
+                scored[ordered..].sort_unstable();
+                ordered = scored.len();
+            }
+            let candidate = &scored[next];
+            // Near enough to be answered: a newer segment that holds the id
+            // answers for it, among its nearest or not.
+            if newer.withholds(r, candidate.id)? {
+                continue;
+            }
+            if let Some(fns) = recheck {
+                if !fns.iter().all(|f| f(candidate.id)) {
+                    continue;
+                }
+            }
+            if let Some(data) = store.get_vec(candidate.ordinal) {
+                let mut vector = HVector::from_slice(candidate.id, 0, data);
+                vector.set_distance(candidate.distance);
+                results.push(vector);
+            } else if candidate.ordinal == u64::MAX {
+                // past-sidecar: already scored from the row. `slot` is still
+                // held, so an externalized row is an error here as well.
+                match self.get_vector_from_row(r, candidate.id, 0, true, false) {
+                    Ok(mut v) => {
+                        v.set_distance(candidate.distance);
+                        results.push(v);
+                    }
+                    Err(VectorError::VectorNotFound(_)) => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+        }
+        drop(slot);
+        newer.walked(self, seen_ids, read_here);
+
+        if self.spindle.is_enabled() && self.spindle.rescore {
+            results = self.rescore_results(r, raw_query, results)?;
+        }
+        results.truncate(k);
+        #[cfg(test)]
+        BROAD_SCAN_COMPLETIONS_FOR_TEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(results))
     }
 
@@ -8783,7 +11865,7 @@ impl VectorCore {
                 .increment(1);
                 return Ok(());
             }
-            self.get_all_vectors(&rd, Some(0))?
+            self.get_all_vector_rows(&rd, Some(0))?
         };
         self.observe_hnsw_build_phase(
             "monolithic",
@@ -8832,7 +11914,7 @@ impl VectorCore {
                 .increment(1);
                 return Ok(());
             }
-            self.get_all_vectors(&rd, Some(0))?
+            self.get_all_vector_rows(&rd, Some(0))?
         };
         self.observe_hnsw_build_phase(
             "ivf",
@@ -8859,10 +11941,11 @@ impl VectorCore {
         let phase_start = std::time::Instant::now();
         {
             let rd = self.backend.read_borrowed(&*txn);
-            for vector in &vectors {
+            for (vector, row_holds_the_vector) in &vectors {
                 let id = vector.get_id();
                 let stored = self.get_vector_data(&rd, id)?;
-                let raw = self.original_vector_for_rebuild(&rd, vector, &stored)?;
+                let raw =
+                    self.original_vector_for_rebuild(&rd, vector, *row_holds_the_vector, &stored)?;
                 let projected = project_for_search(&raw, &self.spindle)?;
                 point_ids.push(id);
                 point_data.push(projected);
@@ -8932,7 +12015,11 @@ impl VectorCore {
     }
 
     /// Inner build logic, called with build permit held.
-    fn build_index_inner(&self, txn: &mut RwTxn, vectors: Vec<HVector>) -> Result<(), VectorError> {
+    fn build_index_inner(
+        &self,
+        txn: &mut RwTxn,
+        vectors: Vec<(HVector, bool)>,
+    ) -> Result<(), VectorError> {
         let build_start = std::time::Instant::now();
         // ── Step 1: Load all vectors into memory ──
         let n = vectors.len();
@@ -8944,10 +12031,11 @@ impl VectorCore {
         let phase_start = std::time::Instant::now();
         {
             let rd = self.backend.read_borrowed(&*txn);
-            for vector in &vectors {
+            for (vector, row_holds_the_vector) in &vectors {
                 let id = vector.get_id();
                 let stored = self.get_vector_data(&rd, id)?;
-                let raw = self.original_vector_for_rebuild(&rd, vector, &stored)?;
+                let raw =
+                    self.original_vector_for_rebuild(&rd, vector, *row_holds_the_vector, &stored)?;
                 let projected = project_for_search(&raw, &self.spindle)?;
                 point_ids.push(id);
                 point_data.push(projected);
@@ -8965,6 +12053,7 @@ impl VectorCore {
         // (minimum 32). This is 2-3x faster per build without meaningful
         // recall loss since we're building the full graph at once.
         let ef_construction = (self.config.ef_construct / 2).max(32);
+        let diverse = hnsw_diverse_neighbors().filter(|_| n >= HNSW_DIVERSE_MIN_POINTS);
 
         let mut rng = rand::rng();
         let phase_start = std::time::Instant::now();
@@ -9025,6 +12114,7 @@ impl VectorCore {
                 ef_construction,
                 m,
                 m_max_0,
+                diverse,
                 &dist_fn_ord,
             );
             if levels[i] > current_max_level {
@@ -9055,6 +12145,7 @@ impl VectorCore {
                     ef_construction,
                     m,
                     m_max_0,
+                    diverse,
                     &dist_fn_ord,
                 );
             });
@@ -9068,6 +12159,15 @@ impl VectorCore {
             }
         }
         self.observe_hnsw_build_phase("monolithic", "parallel_build", n, phase_start.elapsed());
+        let unreached = reach_every_point(
+            "monolithic",
+            &adjacency,
+            current_entry_ord,
+            current_max_level,
+            m_max_0,
+            &dist_fn_ord,
+        );
+        self.warn_unreached_points(n, unreached);
 
         // ── Step 6: Single LMDB flush ──
         // Re-write all vector data first, then adjacency. Packed neighbor blocks
@@ -9200,6 +12300,7 @@ impl VectorCore {
         let m_max_0 = hnsw_config.m_max_0;
         let m_l = hnsw_config.m_l;
         let ef_construction = (hnsw_config.ef_construct / 2).max(32);
+        let diverse = hnsw_diverse_neighbors().filter(|_| n >= HNSW_DIVERSE_MIN_POINTS);
 
         let mut rng = rand::rng();
         let mut levels: Vec<usize> = Vec::with_capacity(n);
@@ -9260,6 +12361,7 @@ impl VectorCore {
                 ef_construction,
                 m,
                 m_max_0,
+                diverse,
                 &dist_fn_q,
             );
             if levels[i] > current_max_level {
@@ -9286,6 +12388,7 @@ impl VectorCore {
                     ef_construction,
                     m,
                     m_max_0,
+                    diverse,
                     &dist_fn_q,
                 );
             });
@@ -9296,6 +12399,14 @@ impl VectorCore {
                 }
             }
         }
+        let unreached = reach_every_point(
+            "merge",
+            &adjacency,
+            current_entry_ord,
+            current_max_level,
+            m_max_0,
+            &dist_fn_q,
+        );
 
         let adj_plain: Vec<Option<Vec<Vec<u32>>>> = adjacency
             .into_iter()
@@ -9311,6 +12422,7 @@ impl VectorCore {
             adjacency: adj_plain,
             entry_ord: current_entry_ord,
             level_zero_preflushed: false,
+            unreached,
         })
     }
 
@@ -9337,7 +12449,7 @@ impl VectorCore {
 
         let prepare_start = std::time::Instant::now();
         let phase_start = std::time::Instant::now();
-        let vectors = self.get_all_vectors(r, Some(0))?;
+        let vectors = self.get_all_vector_rows(r, Some(0))?;
         self.observe_hnsw_build_phase(
             "split_prepare",
             "load_flat_vectors",
@@ -9384,8 +12496,15 @@ impl VectorCore {
         };
         self.observe_hnsw_build_phase("split_prepare", "prefetch", n, phase_start.elapsed());
 
+        // The publish of this build stores the writer's exact sidecar whole as
+        // the segment's blob, so its slots are held to the rows read here.
+        // shortcut: a file attached after this loop is not compared. Only
+        // HELIX_LSM_SIDECAR_VERIFY leaves a file to be attached later as it is;
+        // compare at the publish before that switch goes to production.
+        let check_sidecar = lsm && !self.backend.is_reader_replica();
+        let mut sidecar_slots_differ = 0usize;
         let phase_start = std::time::Instant::now();
-        for vector in &vectors {
+        for (vector, row_holds_the_vector) in &vectors {
             let id = vector.get_id();
             let stored = match prefetched_vector_data.as_ref() {
                 // Sequential-scan hit: reuse the prefetched row. A point missing
@@ -9394,7 +12513,14 @@ impl VectorCore {
                 Some(map) => map.get(&id).cloned().unwrap_or_default(),
                 None => self.get_vector_data(r, id)?,
             };
-            let raw = self.original_vector_for_rebuild(r, vector, &stored)?;
+            if check_sidecar
+                && *row_holds_the_vector
+                && self.exact_sidecar_slot_differs(r, id, vector.get_data())?
+            {
+                sidecar_slots_differ += 1;
+            }
+            let raw =
+                self.original_vector_for_rebuild(r, vector, *row_holds_the_vector, &stored)?;
             let projected = project_for_search(&raw, &self.spindle)?;
             point_ids.push(id);
             point_data.push(projected);
@@ -9415,11 +12541,15 @@ impl VectorCore {
             point_fields.push(stored.fields);
         }
         self.observe_hnsw_build_phase("split_prepare", "prepare_rows", n, phase_start.elapsed());
+        if sidecar_slots_differ > 0 {
+            self.rebuild_exact_sidecar_that_differs(sidecar_slots_differ, n)?;
+        }
 
         let m = self.config.m;
         let m_max_0 = self.config.m_max_0;
         let m_l = self.config.m_l;
         let ef_construction = (self.config.ef_construct / 2).max(32);
+        let diverse = hnsw_diverse_neighbors().filter(|_| n >= HNSW_DIVERSE_MIN_POINTS);
 
         let mut rng = rand::rng();
         let phase_start = std::time::Instant::now();
@@ -9511,6 +12641,7 @@ impl VectorCore {
                 ef_construction,
                 m,
                 m_max_0,
+                diverse,
                 &dist_fn_q,
             );
             if levels[i] > current_max_level {
@@ -9540,6 +12671,7 @@ impl VectorCore {
                     ef_construction,
                     m,
                     m_max_0,
+                    diverse,
                     &dist_fn_q,
                 );
             });
@@ -9552,6 +12684,14 @@ impl VectorCore {
             }
         }
         self.observe_hnsw_build_phase("split_prepare", "parallel_build", n, phase_start.elapsed());
+        let unreached = reach_every_point(
+            "split_prepare",
+            &adjacency,
+            current_entry_ord,
+            current_max_level,
+            m_max_0,
+            &dist_fn_q,
+        );
 
         // Extract adjacency into plain vecs (drop the RwLocks)
         let phase_start = std::time::Instant::now();
@@ -9576,6 +12716,7 @@ impl VectorCore {
             adjacency: adj_plain,
             entry_ord: current_entry_ord,
             level_zero_preflushed: true,
+            unreached,
         }))
     }
 
@@ -9879,11 +13020,27 @@ impl VectorCore {
         if prepared.point_ids.is_empty() {
             return Ok(());
         }
+        self.warn_unreached_points(prepared.point_ids.len(), prepared.unreached);
         let entry_id = prepared.point_ids[prepared.entry_ord];
         let entry_vector =
             HVector::from_slice(entry_id, prepared.levels[prepared.entry_ord], vec![]);
         self.set_entry_point(txn, &entry_vector)?;
         Ok(())
+    }
+
+    /// Says by name that this segment's graph is written with points no link
+    /// leads to. The build's own line (see `reach_every_point`) has the count
+    /// and no segment, and a segment written this way still gets the current
+    /// build number, so a requested regraph leaves it as it is.
+    fn warn_unreached_points(&self, points: usize, unreached: usize) {
+        if unreached > 0 {
+            tracing::warn!(
+                segment = %self.physical_name,
+                points,
+                unreached,
+                "HNSW segment written with points no link leads to"
+            );
+        }
     }
 
     pub fn finalize_prepared_index_entry_be(
@@ -9896,7 +13053,22 @@ impl VectorCore {
         }
         self.persist_hvec_sidecar_blob_be(w)?;
         self.persist_hvec_sidecar_ordinals_blob_be(w, &prepared.point_ids)?;
-        let entry_id = prepared.point_ids[prepared.entry_ord];
+        self.warn_unreached_points(prepared.point_ids.len(), prepared.unreached);
+        // What both builders of a `PreparedIndex` did when these hold.
+        if prepared.point_ids.len() >= HNSW_DIVERSE_MIN_POINTS
+            && hnsw_diverse_neighbors().is_some()
+            && hnsw_link_unreached()
+        {
+            self.backend
+                .put(
+                    w,
+                    self.seg_ns(SegmentDb::Vectors),
+                    BUILD_NUMBER_KEY.as_bytes(),
+                    &[HNSW_BUILD_NUMBER],
+                )
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+        }
+        let entry_id = self.entry_with_level_zero_row_be(w, prepared)?;
         self.backend
             .put(
                 w,
@@ -9905,6 +13077,55 @@ impl VectorCore {
                 &entry_id.to_be_bytes(),
             )
             .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    /// The build's entry point, or, when a delete took its level-0 row while
+    /// the build ran, the highest-level id of the build that still has one.
+    /// Falls back to the built entry point when none of the first
+    /// `ENTRY_REPOINT_PUBLISH_PROBES` has.
+    fn entry_with_level_zero_row_be(
+        &self,
+        w: &AnyWrite<'_>,
+        prepared: &PreparedIndex,
+    ) -> Result<u128, VectorError> {
+        let built_entry = prepared.point_ids[prepared.entry_ord];
+        if !repoint_entry_enabled() {
+            return Ok(built_entry);
+        }
+        let has_level_zero_row = |id: u128| {
+            self.backend
+                .get_for_update(
+                    w,
+                    self.seg_ns(SegmentDb::Vectors),
+                    &Self::vector_key(id, 0),
+                    |row| row.is_some(),
+                )
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+        };
+        if has_level_zero_row(built_entry)? {
+            return Ok(built_entry);
+        }
+        let mut by_level: Vec<usize> = (0..prepared.point_ids.len()).collect();
+        by_level.sort_unstable_by_key(|&ord| std::cmp::Reverse(prepared.levels[ord]));
+        let mut entry = None;
+        for ord in by_level.into_iter().take(ENTRY_REPOINT_PUBLISH_PROBES) {
+            if has_level_zero_row(prepared.point_ids[ord])? {
+                entry = Some(prepared.point_ids[ord]);
+                break;
+            }
+        }
+        let outcome = if entry.is_some() {
+            "repointed"
+        } else {
+            "no_survivor"
+        };
+        metrics::counter!(
+            "helix_dense_entry_repoint_total",
+            "site" => "publish",
+            "outcome" => outcome
+        )
+        .increment(1);
+        Ok(entry.unwrap_or(built_entry))
     }
 
     #[inline(always)]
@@ -9953,6 +13174,38 @@ impl VectorCore {
         id: u128,
         level: usize,
     ) -> Result<NeighborBlock, VectorError> {
+        self.neighbor_block_of(r, id, level, true)
+    }
+
+    /// The list of an id that has no row, which a hard delete left: the
+    /// packed list, or an empty one. The per-edge rows of the older layout
+    /// go with the row, so they are not looked for: that is a prefix scan
+    /// for every id deleted before lists were kept.
+    fn rowless_neighbor_block(
+        &self,
+        r: &AnyRead<'_>,
+        id: u128,
+        level: usize,
+    ) -> Result<NeighborBlock, VectorError> {
+        self.neighbor_block_of(r, id, level, false)
+    }
+
+    fn neighbor_block_of(
+        &self,
+        r: &AnyRead<'_>,
+        id: u128,
+        level: usize,
+        per_edge_rows: bool,
+    ) -> Result<NeighborBlock, VectorError> {
+        let read = || -> Result<NeighborBlock, VectorError> {
+            if per_edge_rows {
+                self.get_neighbor_block_uncached(r, id, level)
+            } else {
+                Ok(self
+                    .packed_neighbor_block(r, id, level)?
+                    .unwrap_or_default())
+            }
+        };
         // Cache instrumentation: per-cache hit/miss counters by tier.
         // `tier="nav"` = level>0 HNSW navigation layer (small, hot, reused across queries).
         // `tier="level0"` = level=0 neighbor blocks (bulk of search work, cold set huge).
@@ -9981,7 +13234,7 @@ impl VectorCore {
                 "cache" => "neighbor",
                 "tier" => if level > 0 { "nav" } else { "level0" })
             .increment(1);
-            let block = self.get_neighbor_block_uncached(r, id, level)?;
+            let block = read()?;
             self.cache_neighbor_block(id, level, &block);
             return Ok(block);
         }
@@ -10007,7 +13260,7 @@ impl VectorCore {
             "cache" => "neighbor",
             "tier" => if level > 0 { "nav" } else { "level0" })
         .increment(1);
-        let block = self.get_neighbor_block_uncached(r, id, level)?;
+        let block = read()?;
         self.cache_neighbor_block(id, level, &block);
         Ok(block)
     }
@@ -10452,7 +13705,7 @@ impl VectorCore {
     ///
     /// Returns up to `HELIX_GRAPH_BRIDGE_MAX_SEEDS` out-edge targets of
     /// `id` from the attached graph. When the point being inserted has
-    /// pre-existing graph edges (CE's normal ingest order: symbols and
+    /// pre-existing graph edges (the client's normal ingest order: symbols and
     /// edges first, embeddings later), those targets are strong semantic
     /// priors for HNSW neighbor candidates. Returns empty when the flag
     /// is off, no graph DB is attached, or the node has no outgoing edges.
@@ -10531,6 +13784,7 @@ impl VectorCore {
         metrics_labels: Option<VectorSearchMetrics<'_>>,
         seed_ids: &[u128],
         ordinal_cache: &mut SidecarOrdinalRequestCache,
+        restart_when_dry: bool,
     ) -> Result<BinaryHeap<HVector>, VectorError>
     where
         F: Fn(&HVector) -> bool,
@@ -10624,12 +13878,45 @@ impl VectorCore {
             }
         }
 
-        while let Some(curr_cand) = candidates.pop() {
-            if results.len() >= ef && curr_cand.distance > worst_distance {
-                break;
-            }
-
-            let block = self.get_neighbor_block(r, curr_cand.id, level)?;
+        // A level-0 walk that runs out of candidates below ef has scored
+        // and expanded every point its start's level-0 links lead to. When
+        // those lead nowhere else (a group of more equal vectors than a list
+        // holds links only to itself) the walk goes on, once, from the
+        // start's level-1 list, which the descent read last: its ids are
+        // handled like any other list's. One the walk has visited is skipped
+        // before it is scored, so a walk that was not shut in scores nothing
+        // more and returns what it did.
+        let start_id = entry_point.get_id();
+        let mut scored_at_restart: Option<usize> = None;
+        // The ids with no row this walk met (see `rowless_candidate`).
+        let mut rowless = RowlessLists::at_level(level);
+        loop {
+            // The distance of the point whose list is read next, and how
+            // many ids with no row in a row led to it, itself counted.
+            let (block, from) = match candidates.pop() {
+                Some(curr) if results.len() >= ef && curr.distance > worst_distance => break,
+                Some(curr) => match rowless.turn(curr.id) {
+                    RowlessTurn::Row => (
+                        self.get_neighbor_block(r, curr.id, level)?,
+                        (curr.distance, 0),
+                    ),
+                    RowlessTurn::Read(in_a_row) => {
+                        let block = self.rowless_neighbor_block(r, curr.id, level)?;
+                        rowless.found += usize::from(!block.ids.is_empty());
+                        (block, (curr.distance, in_a_row))
+                    }
+                    RowlessTurn::Skip => continue,
+                },
+                None if restart_when_dry
+                    && level == 0
+                    && results.len() < ef
+                    && scored_at_restart.is_none() =>
+                {
+                    scored_at_restart = Some(neighbor_edges_scored);
+                    (self.get_neighbor_block(r, start_id, 1)?, (ep_dist, 0))
+                }
+                None => break,
+            };
             neighbor_blocks += 1;
             neighbor_edges_seen += block.ids.len();
 
@@ -10688,6 +13975,25 @@ impl VectorCore {
 
             for &neighbor_id in neighbor_iter {
                 if !visited.insert(neighbor_id) {
+                    // An id with no row is a candidate again by a shorter
+                    // way; see `rowless_candidate`.
+                    if rowless.knows(neighbor_id) {
+                        let within = if results.len() < ef {
+                            f32::INFINITY
+                        } else {
+                            worst_distance
+                        };
+                        if let Some(candidate) = self.rowless_candidate(
+                            &block,
+                            neighbor_id,
+                            neighbor_prepared.as_ref(),
+                            from,
+                            within,
+                            &mut rowless,
+                        ) {
+                            candidates.push(candidate);
+                        }
+                    }
                     continue;
                 }
                 // Deferred-repair deletes: a tombstoned id's row and links
@@ -10717,7 +14023,7 @@ impl VectorCore {
                     } else if let Some(fs) = filter {
                         // Preserve the generic HNSW filter contract: callers
                         // receive the same full HVector they received before
-                        // this optimization. Qdrant/CE id-only filters can use
+                        // this optimization. Qdrant/client id-only filters can use
                         // the no-filter branch when no payload filter is active.
                         let neighbor = match self.get_vector_with_ordinal_cache(
                             r,
@@ -10727,7 +14033,24 @@ impl VectorCore {
                             ordinal_cache,
                         ) {
                             Ok(n) => n,
-                            Err(VectorError::VectorNotFound(_)) => continue,
+                            Err(VectorError::VectorNotFound(_)) => {
+                                let within = if results.len() < ef {
+                                    f32::INFINITY
+                                } else {
+                                    worst_distance
+                                };
+                                if let Some(candidate) = self.rowless_candidate(
+                                    &block,
+                                    neighbor_id,
+                                    neighbor_prepared.as_ref(),
+                                    from,
+                                    within,
+                                    &mut rowless,
+                                ) {
+                                    candidates.push(candidate);
+                                }
+                                continue;
+                            }
                             Err(e) => return Err(e),
                         };
                         (
@@ -10755,6 +14078,21 @@ impl VectorCore {
                             Some(ordinal_cache),
                         )?
                         else {
+                            let within = if results.len() < ef {
+                                f32::INFINITY
+                            } else {
+                                worst_distance
+                            };
+                            if let Some(candidate) = self.rowless_candidate(
+                                &block,
+                                neighbor_id,
+                                neighbor_prepared.as_ref(),
+                                from,
+                                within,
+                                &mut rowless,
+                            ) {
+                                candidates.push(candidate);
+                            }
                             continue;
                         };
                         (distance, true)
@@ -10789,6 +14127,14 @@ impl VectorCore {
                 }
             }
         }
+
+        Self::observe_dry_restart(
+            "hvector",
+            scored_at_restart,
+            neighbor_edges_scored,
+            results.len() >= ef,
+        );
+        Self::observe_deleted_lists_crossed("hvector", &rowless);
 
         // Graph-entangled bridge: if the HNSW frontier dead-ended before
         // we collected `ef` results (common on filtered search at low
@@ -10858,6 +14204,7 @@ impl VectorCore {
         metrics_labels: Option<VectorSearchMetrics<'_>>,
         _seed_ids: &[u128],
         ordinal_cache: &mut SidecarOrdinalRequestCache,
+        restart_when_dry: bool,
     ) -> Result<BinaryHeap<HVector>, VectorError>
     where
         F: Fn(u128) -> bool,
@@ -10871,6 +14218,7 @@ impl VectorCore {
         let mut approx_blocks = 0usize;
         let mut approx_candidates_kept = 0usize;
         let mut filtered_out = 0usize;
+        let lazy_filter = hnsw_lazy_filter_enabled();
         let neighbor_prepared = if level == 0 {
             Self::neighbor_code_config(query.get_data().len())
                 .and_then(|config| prepare_query(query.get_data(), &config).ok())
@@ -10901,12 +14249,36 @@ impl VectorCore {
             ep_dist
         };
 
-        while let Some(curr_cand) = candidates.pop() {
-            if results.len() >= ef && curr_cand.distance > worst_distance {
-                break;
-            }
-
-            let block = self.get_neighbor_block(r, curr_cand.id, level)?;
+        // Out of candidates below ef: once, on from the start's level-1
+        // list; see `search_level`.
+        let mut scored_at_restart: Option<usize> = None;
+        // The ids with no row this walk met; see `search_level`.
+        let mut rowless = RowlessLists::at_level(level);
+        loop {
+            let (block, from) = match candidates.pop() {
+                Some(curr) if results.len() >= ef && curr.distance > worst_distance => break,
+                Some(curr) => match rowless.turn(curr.id) {
+                    RowlessTurn::Row => (
+                        self.get_neighbor_block(r, curr.id, level)?,
+                        (curr.distance, 0),
+                    ),
+                    RowlessTurn::Read(in_a_row) => {
+                        let block = self.rowless_neighbor_block(r, curr.id, level)?;
+                        rowless.found += usize::from(!block.ids.is_empty());
+                        (block, (curr.distance, in_a_row))
+                    }
+                    RowlessTurn::Skip => continue,
+                },
+                None if restart_when_dry
+                    && level == 0
+                    && results.len() < ef
+                    && scored_at_restart.is_none() =>
+                {
+                    scored_at_restart = Some(neighbor_edges_scored);
+                    (self.get_neighbor_block(r, entry_id, 1)?, (ep_dist, 0))
+                }
+                None => break,
+            };
             neighbor_blocks += 1;
             neighbor_edges_seen += block.ids.len();
 
@@ -10964,12 +14336,33 @@ impl VectorCore {
 
             for &neighbor_id in neighbor_iter {
                 if !visited.insert(neighbor_id) {
+                    // A candidate again by a shorter way; see `search_level`.
+                    if rowless.knows(neighbor_id) {
+                        let within = if results.len() < ef {
+                            f32::INFINITY
+                        } else {
+                            worst_distance
+                        };
+                        if let Some(candidate) = self.rowless_candidate(
+                            &block,
+                            neighbor_id,
+                            neighbor_prepared.as_ref(),
+                            from,
+                            within,
+                            &mut rowless,
+                        ) {
+                            candidates.push(candidate);
+                        }
+                    }
                     continue;
                 }
                 // Tombstoned ids stay traversable (graph bridge) but never
                 // enter `results`; see `search_level`.
-                let filter_passes = !self.is_delete_tombstoned(neighbor_id)
-                    && filter.is_none_or(|fs| fs.iter().all(|f| f(neighbor_id)));
+                let passes = || {
+                    !self.is_delete_tombstoned(neighbor_id)
+                        && filter.is_none_or(|fs| fs.iter().all(|f| f(neighbor_id)))
+                };
+                let eager_passes = (!lazy_filter).then(passes);
 
                 let distance = if let Some(neighbor) = prefetched.remove(&neighbor_id) {
                     self.distance_between(neighbor.get_data(), query.get_data())?
@@ -10983,7 +14376,24 @@ impl VectorCore {
                         Some(ordinal_cache),
                     )? {
                         Some(d) => d,
-                        None => continue,
+                        None => {
+                            let within = if results.len() < ef {
+                                f32::INFINITY
+                            } else {
+                                worst_distance
+                            };
+                            if let Some(candidate) = self.rowless_candidate(
+                                &block,
+                                neighbor_id,
+                                neighbor_prepared.as_ref(),
+                                from,
+                                within,
+                                &mut rowless,
+                            ) {
+                                candidates.push(candidate);
+                            }
+                            continue;
+                        }
                     }
                 };
                 neighbor_edges_scored += 1;
@@ -10999,7 +14409,7 @@ impl VectorCore {
                         id: neighbor_id,
                         distance,
                     });
-                    if !filter_passes {
+                    if !eager_passes.unwrap_or_else(passes) {
                         filtered_out += 1;
                         continue;
                     }
@@ -11026,6 +14436,14 @@ impl VectorCore {
                 }
             }
         }
+
+        Self::observe_dry_restart(
+            "id_filter",
+            scored_at_restart,
+            neighbor_edges_scored,
+            results.len() >= ef,
+        );
+        Self::observe_deleted_lists_crossed("id_filter", &rowless);
 
         // Graph-entangled bridge for id-filtered HNSW search. Same shape as
         // the `search_level` bridge — on frontier dead-end, consult graph
@@ -11208,14 +14626,20 @@ impl VectorCore {
     where
         F: Fn(&HVector) -> bool,
     {
-        match self.index_mode(r)? {
+        let mut index_mode = self.index_mode(r)?;
+        let small_hnsw =
+            index_mode == IndexMode::Hnsw && self.is_small_hnsw_segment(r, filter.is_some())?;
+        if small_hnsw {
+            index_mode = IndexMode::Flat;
+        }
+        match index_mode {
             IndexMode::Flat => {
                 let flat_start = std::time::Instant::now();
                 let results = self.search_flat(r, query, k, filter)?;
                 if let Some(labels) = metrics_labels {
                     self.observe_flat_search(
                         labels,
-                        "hvector",
+                        if small_hnsw { "small_hnsw" } else { "hvector" },
                         self.rerank_target_k(k, selectivity_hint),
                         results.len(),
                         flat_start.elapsed(),
@@ -11288,6 +14712,7 @@ impl VectorCore {
                 None,
                 &[],
                 &mut ordinal_cache,
+                false,
             )?;
             if let Some(closest) = nearest.pop() {
                 entry_point = closest;
@@ -11311,6 +14736,7 @@ impl VectorCore {
             metrics_labels,
             &[],
             &mut ordinal_cache,
+            hnsw_walk_restart(),
         )?;
         let t_l0 = t_l0_start.elapsed();
         let total_elapsed = t0.elapsed();
@@ -11375,7 +14801,8 @@ impl VectorCore {
     where
         F: Fn(u128) -> bool,
     {
-        if !self.has_index(r)? {
+        let indexed = self.has_index(r)?;
+        if !indexed || self.is_small_hnsw_segment(r, filter.is_some())? {
             let flat_start = std::time::Instant::now();
             let raw_query = query.to_vec();
             let projected_query = project_for_search(&raw_query, &self.spindle)?;
@@ -11396,7 +14823,11 @@ impl VectorCore {
             if let Some(labels) = metrics_labels {
                 self.observe_flat_search(
                     labels,
-                    "id_filter",
+                    if indexed {
+                        "small_hnsw_id_filter"
+                    } else {
+                        "id_filter"
+                    },
                     target_k,
                     results.len(),
                     flat_start.elapsed(),
@@ -11441,6 +14872,7 @@ impl VectorCore {
                 None,
                 &[],
                 &mut ordinal_cache,
+                false,
             )?;
             if let Some(closest) = nearest.pop() {
                 entry_point = closest;
@@ -11464,6 +14896,7 @@ impl VectorCore {
             metrics_labels,
             &[],
             &mut ordinal_cache,
+            hnsw_walk_restart(),
         )?;
         let t_l0 = t_l0_start.elapsed();
         let total_elapsed = t0.elapsed();
@@ -11506,7 +14939,10 @@ impl VectorCore {
             }
         }
 
-        let mut results = if let Some(fs) = filter {
+        // A trickled filter already gated every level-0 result, so the recheck
+        // only repeats a payload read per result.
+        let recheck = filter.filter(|_| !(should_trickle && hnsw_lazy_filter_enabled()));
+        let mut results = if let Some(fs) = recheck {
             let mut out = Vec::with_capacity(target_k);
             while out.len() < target_k {
                 let Some(candidate) = candidates.pop() else {
@@ -11684,6 +15120,7 @@ impl HNSW for VectorCore {
                 None,
                 &[],
                 &mut ordinal_cache,
+                false,
             )?;
             if let Some(closest) = nearest.pop() {
                 entry_point = closest;
@@ -11705,6 +15142,7 @@ impl HNSW for VectorCore {
             None,
             &[],
             &mut ordinal_cache,
+            false,
         )?;
 
         let mut results = candidates.to_vec_with_filter(target_k, filter);
@@ -11732,6 +15170,12 @@ impl HNSW for VectorCore {
 
         let mut query = HVector::from_slice(id, 0, projected);
         self.put_raw_vector(txn, query.get_id(), 0, data)?;
+        // Only a small count goes stale as the graph grows.
+        if self.hnsw_rows_upto_small.load(AtomicOrdering::Relaxed) <= small_segment_exact_max_rows()
+        {
+            self.hnsw_rows_upto_small
+                .store(u64::MAX, AtomicOrdering::Relaxed);
+        }
 
         query.level = new_level;
         if new_level > 0 {
@@ -11772,6 +15216,7 @@ impl HNSW for VectorCore {
                     None,
                     &[],
                     &mut ordinal_cache,
+                    false,
                 )?;
                 // Empty only when the sole candidate was a tombstoned entry
                 // point (excluded from results); keep descending from it.
@@ -11783,7 +15228,7 @@ impl HNSW for VectorCore {
 
         // Phase 3: graph-entangled insert seeding. If the point being
         // inserted already has graph out-edges, feed those neighbor ids as
-        // bonus seeds into the level-0 HNSW walk. This is common in CE:
+        // bonus seeds into the level-0 HNSW walk. This is common in the client:
         // symbols are ingested as graph nodes with callers/callees edges
         // before their embeddings are computed, so the graph already
         // carries a strong semantic prior by the time we build the HNSW
@@ -11812,6 +15257,7 @@ impl HNSW for VectorCore {
                     None,
                     seeds,
                     &mut ordinal_cache,
+                    false,
                 )?;
                 // Capture the closest candidate before `nearest` is consumed by
                 // `select_neighbors` (preserves the original entry-point update).
@@ -11882,12 +15328,41 @@ impl HNSW for VectorCore {
         r: &AnyRead<'_>,
         level: Option<usize>,
     ) -> Result<Vec<HVector>, VectorError> {
+        Ok(self
+            .get_all_vector_rows(r, level)?
+            .into_iter()
+            .map(|(vector, _)| vector)
+            .collect())
+    }
+
+    fn load<F>(&self, txn: &mut RwTxn, data: Vec<&[f32]>) -> Result<(), VectorError>
+    where
+        F: Fn(&HVector) -> bool,
+    {
+        for v in data.iter() {
+            let _ = self.insert::<F>(txn, v, None, None);
+        }
+
+        // NOTE: need to txn.commit() outside of call
+
+        Ok(())
+    }
+}
+
+impl VectorCore {
+    /// What `get_all_vectors` returns and, beside each vector, whether its
+    /// stored row is the vector itself (`row_holds_the_vector`).
+    fn get_all_vector_rows(
+        &self,
+        r: &AnyRead<'_>,
+        level: Option<usize>,
+    ) -> Result<Vec<(HVector, bool)>, VectorError> {
         let mut vectors = Vec::new();
         // Collect rows first: non-marker values decode in-place (no DB access);
         // marker rows defer to `resolve_marker_vector` below, which re-reads the
         // DB through the seam and cannot run inside the scan closure.
         // `decoded` is `Some(vec)` for ready rows, `None` for markers.
-        let mut rows: Vec<(u128, usize, Option<Vec<f32>>)> = Vec::new();
+        let mut rows: Vec<(u128, usize, Option<Vec<f32>>, bool)> = Vec::new();
         let mut scan_err: Option<VectorError> = None;
         self.backend
             .scan(
@@ -11916,10 +15391,15 @@ impl HNSW for VectorCore {
                         return true;
                     }
                     if Self::is_vector_marker(value) {
-                        rows.push((id, vector_level, None));
+                        rows.push((id, vector_level, None, false));
                     } else {
                         match decode_vector(value) {
-                            Ok(decoded) => rows.push((id, vector_level, Some(decoded))),
+                            Ok(decoded) => rows.push((
+                                id,
+                                vector_level,
+                                Some(decoded),
+                                Self::row_holds_the_vector(value),
+                            )),
                             Err(e) => {
                                 scan_err = Some(e);
                                 return false;
@@ -11933,7 +15413,7 @@ impl HNSW for VectorCore {
         if let Some(err) = scan_err {
             return Err(err);
         }
-        for (id, vector_level, decoded) in rows {
+        for (id, vector_level, decoded, row_holds_the_vector) in rows {
             let decoded = match decoded {
                 Some(decoded) => decoded,
                 None => match self.resolve_marker_vector(r, id, vector_level) {
@@ -11959,24 +15439,18 @@ impl HNSW for VectorCore {
                     Err(err) => return Err(err),
                 },
             };
-            vectors.push(HVector::from_slice(id, vector_level, decoded));
+            vectors.push((
+                HVector::from_slice(id, vector_level, decoded),
+                row_holds_the_vector,
+            ));
         }
         Ok(vectors)
     }
-
-    fn load<F>(&self, txn: &mut RwTxn, data: Vec<&[f32]>) -> Result<(), VectorError>
-    where
-        F: Fn(&HVector) -> bool,
-    {
-        for v in data.iter() {
-            let _ = self.insert::<F>(txn, v, None, None);
-        }
-
-        // NOTE: need to txn.commit() outside of call
-
-        Ok(())
-    }
 }
+
+#[cfg(test)]
+#[path = "hnsw_diversity_tests.rs"]
+mod hnsw_diversity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -11987,6 +15461,303 @@ mod tests {
     use tempfile::TempDir;
 
     type VF = fn(&HVector) -> bool;
+
+    /// What a search can arrive at: the entry's upper links, then level 0
+    /// from every point those reached.
+    #[test]
+    fn unreached_ords_follow_the_upper_links_and_then_level_zero() {
+        let lists = |levels: Vec<Vec<u32>>| StdRwLock::new(levels);
+        // 0 is the entry, on two levels. Its upper link leads to 3, whose
+        // level-0 link leads to 4, and its level-0 link leads to 1. 2 links
+        // to 0 and to 5, and nothing links to 2.
+        let adjacency = vec![
+            lists(vec![vec![1], vec![3]]),
+            lists(vec![vec![0]]),
+            lists(vec![vec![0, 5]]),
+            lists(vec![vec![4], vec![0]]),
+            lists(vec![vec![3]]),
+            lists(vec![vec![2]]),
+        ];
+        assert_eq!(unreached_ords(&adjacency, 0), vec![2, 5]);
+        // No entry among the points: nothing to say.
+        assert_eq!(unreached_ords(&adjacency, 9), Vec::<u32>::new());
+        assert_eq!(unreached_ords(&adjacency[..0], 0), Vec::<u32>::new());
+    }
+
+    /// The parallel phase of a build gives every point it inserts a way in:
+    /// the 600 points on a circle of the gateway's fresh-and-cached test,
+    /// built 40 times with the linking at the end of the build off. Linked
+    /// from the top level down, one build in five on two threads left points
+    /// whose one link was written over by the half-inserted point they had
+    /// taken for their only neighbour.
+    #[test]
+    fn parallel_build_reaches_every_point() {
+        let config = HNSWConfig::new(None, None, None);
+        let permit = acquire_build_permit().unwrap();
+        let mut left = Vec::new();
+        for build in 0..40 {
+            let exported: Vec<(u128, Vec<f32>, HashMap<String, Value>)> = (1..=600u128)
+                .map(|id| {
+                    let angle = id as f32 * 0.37;
+                    (id, vec![angle.cos(), angle.sin(), 0.5], HashMap::new())
+                })
+                .collect();
+            let prepared = with_link_unreached_for_test(false, || {
+                VectorCore::build_hnsw_in_memory_owned_with_permit(
+                    exported,
+                    &config,
+                    DistanceMetric::Cosine,
+                    &permit,
+                )
+            })
+            .unwrap();
+            let adjacency: Vec<StdRwLock<Vec<Vec<u32>>>> = prepared
+                .adjacency
+                .iter()
+                .map(|lists| StdRwLock::new(lists.clone().unwrap()))
+                .collect();
+            let unreached = unreached_ords(&adjacency, prepared.entry_ord);
+            if !unreached.is_empty() {
+                left.push((build, unreached));
+            }
+        }
+        assert!(left.is_empty(), "(build, points with no way in): {left:?}");
+    }
+
+    /// Runs the pass and checks what it guarantees: every list after it
+    /// starts with the list it was; what follows, at level 0 only, are points
+    /// no link led to, each added once and into a list that stays within the
+    /// cap; every point it linked is one the links now lead to, and no other
+    /// point lost its way in. Returns how many it linked and the level-0
+    /// lists it left.
+    fn link_adding_only<DF: Fn(usize, usize) -> f32>(
+        graph: &[StdRwLock<Vec<Vec<u32>>>],
+        entry_ord: usize,
+        max_level: usize,
+        m_max_0: usize,
+        dist: &DF,
+    ) -> (usize, Vec<Vec<u32>>) {
+        let all = |graph: &[StdRwLock<Vec<Vec<u32>>>]| -> Vec<Vec<Vec<u32>>> {
+            graph.iter().map(|l| l.read().unwrap().clone()).collect()
+        };
+        let before = all(graph);
+        let unreached = unreached_ords(graph, entry_ord);
+        let linked = link_unreached_points(graph, entry_ord, max_level, m_max_0, dist);
+        let after = all(graph);
+        let left = unreached_ords(graph, entry_ord);
+        let mut added = Vec::new();
+        for (was, now) in before.iter().zip(&after) {
+            assert!(
+                now[0].starts_with(&was[0]) && now[1..] == was[1..],
+                "expected each list to start with the list it was: {was:?} became {now:?}"
+            );
+            assert!(
+                now[0].len() == was[0].len() || now[0].len() <= m_max_0,
+                "expected a list the pass added to within the cap of {m_max_0}: {now:?}"
+            );
+            added.extend_from_slice(&now[0][was[0].len()..]);
+        }
+        let mut once = added.clone();
+        once.sort_unstable();
+        once.dedup();
+        assert!(
+            once.len() == added.len() && added.iter().all(|ord| unreached.contains(ord)),
+            "expected only points no link led to, each once: {added:?} of {unreached:?}"
+        );
+        assert_eq!(added.len(), linked, "expected one link per linked point");
+        assert!(
+            added.iter().all(|ord| !left.contains(ord))
+                && left.iter().all(|ord| unreached.contains(ord)),
+            "expected each linked point reached and no other way in lost: linked {added:?}, \
+             left {left:?} of {unreached:?}"
+        );
+        let level_zero = after.into_iter().map(|lists| lists[0].clone()).collect();
+        (linked, level_zero)
+    }
+
+    /// The pass only ever adds a link, at the end of the list of the nearest
+    /// reached point that has room. With no room among the nearest it adds
+    /// none, takes none out, and the point stays counted.
+    #[test]
+    fn link_unreached_points_only_adds_a_link() {
+        let lists = |levels: Vec<Vec<u32>>| StdRwLock::new(levels);
+        let on = |at: &'static [f32]| move |a: usize, b: usize| (at[a] - at[b]).abs();
+
+        // The nearest reached point has room: the link goes there.
+        let room = vec![
+            lists(vec![vec![1]]),
+            lists(vec![vec![0, 2]]),
+            lists(vec![vec![1]]),
+            lists(vec![vec![2, 1]]),
+        ];
+        let dist = on(&[0.0, 1.0, 2.0, 2.4]);
+        assert_eq!(unreached_ords(&room, 0), vec![3]);
+        assert_eq!(
+            link_adding_only(&room, 0, 0, 2, &dist),
+            (1, vec![vec![1], vec![0, 2], vec![1, 3], vec![2, 1]])
+        );
+        // A second run has nothing to do.
+        assert_eq!(link_adding_only(&room, 0, 0, 2, &dist).0, 0);
+
+        // The two nearest are full: the link goes to the next one that has
+        // room, here the far end of the row.
+        let far = vec![
+            lists(vec![vec![1]]),
+            lists(vec![vec![0, 2]]),
+            lists(vec![vec![1, 0]]),
+            lists(vec![vec![2]]),
+        ];
+        assert_eq!(unreached_ords(&far, 0), vec![3]);
+        let (linked, after) = link_adding_only(&far, 0, 0, 2, &dist);
+        assert_eq!((linked, &after[0]), (1, &vec![1, 3]));
+
+        // Six points in a ring of links, full lists all round: nothing is
+        // added, nothing is taken out, and the point stays counted.
+        let mut full: Vec<StdRwLock<Vec<Vec<u32>>>> = (0..6u32)
+            .map(|i| lists(vec![vec![(i + 5) % 6, (i + 1) % 6]]))
+            .collect();
+        full.push(lists(vec![vec![2, 3]]));
+        let dist = on(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 2.5]);
+        assert_eq!(link_adding_only(&full, 0, 0, 2, &dist).0, 0);
+        assert_eq!(unreached_ords(&full, 0), vec![6]);
+
+        // Three points on one spot with no links of their own, and room for
+        // one link: the first takes it, the others find room behind the first.
+        let spot = vec![
+            lists(vec![vec![1]]),
+            lists(vec![vec![0, 2]]),
+            lists(vec![vec![1]]),
+            lists(vec![vec![]]),
+            lists(vec![vec![]]),
+            lists(vec![vec![]]),
+        ];
+        let dist = on(&[0.0, 1.0, 2.0, 9.0, 9.0, 9.0]);
+        assert_eq!(unreached_ords(&spot, 0), vec![3, 4, 5]);
+        let (linked, after) = link_adding_only(&spot, 0, 0, 2, &dist);
+        assert_eq!(
+            (linked, &after[2], &after[3]),
+            (3, &vec![1, 3], &vec![4, 5])
+        );
+        assert_eq!(unreached_ords(&spot, 0), Vec::<u32>::new());
+
+        // Two points that link to each other and out, with no link in: one
+        // link brings both.
+        let island = vec![
+            lists(vec![vec![1]]),
+            lists(vec![vec![0, 2]]),
+            lists(vec![vec![1]]),
+            lists(vec![vec![4, 2]]),
+            lists(vec![vec![3, 2]]),
+        ];
+        let dist = on(&[0.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(unreached_ords(&island, 0), vec![3, 4]);
+        let (linked, after) = link_adding_only(&island, 0, 0, 2, &dist);
+        assert_eq!((linked, &after[2]), (1, &vec![1, 3]));
+        assert_eq!(unreached_ords(&island, 0), Vec::<u32>::new());
+
+        // The entry sits on level 1 and the walk comes down through it.
+        let upper = vec![
+            lists(vec![vec![1], vec![2]]),
+            lists(vec![vec![0, 2]]),
+            lists(vec![vec![1], vec![0]]),
+            lists(vec![vec![2]]),
+        ];
+        let dist = on(&[0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(unreached_ords(&upper, 0), vec![3]);
+        let (linked, after) = link_adding_only(&upper, 0, 1, 2, &dist);
+        assert_eq!((linked, &after[2]), (1, &vec![1, 3]));
+    }
+
+    /// A real build over tight clusters with points far from all of them,
+    /// the shape that leaves points with no link coming in, built with the
+    /// linking off and then given to the pass. On that graph too the pass
+    /// only adds, every point it links is one the links then lead to, and no
+    /// list passes its cap. How many points it leaves is not asserted: the
+    /// build differs from run to run, and a point for which none of the
+    /// eight nearest has room stays counted.
+    ///
+    /// The rows are built once more with the linking on, which is the build's
+    /// own call of the pass. Of both builds the count that goes with the
+    /// index is the count of the graph that comes back.
+    #[test]
+    fn linking_pass_on_a_real_build_only_adds_and_reaches_what_it_links() {
+        use rand::Rng;
+        let dim = 32;
+        let unit = |v: Vec<f32>| {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.into_iter().map(|x| x / norm).collect::<Vec<f32>>()
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        let random_unit = |rng: &mut rand::rngs::StdRng| {
+            unit((0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect())
+        };
+        let centers: Vec<Vec<f32>> = (0..40).map(|_| random_unit(&mut rng)).collect();
+        let exported: Vec<(u128, Vec<f32>, HashMap<String, Value>)> = (0..3000u128)
+            .map(|id| {
+                let vector = if id % 50 == 49 {
+                    random_unit(&mut rng)
+                } else {
+                    let center = &centers[rng.random_range(0..centers.len())];
+                    unit(
+                        center
+                            .iter()
+                            .map(|c| c + 0.05 * rng.random_range(-1.0f32..1.0))
+                            .collect(),
+                    )
+                };
+                (id, vector, HashMap::new())
+            })
+            .collect();
+        let rows: Vec<Vec<f32>> = exported.iter().map(|row| row.1.clone()).collect();
+        let config = HNSWConfig::new(Some(16), Some(64), Some(64));
+        let permit = acquire_build_permit().unwrap();
+        // A build with the linking on or off. Either way the count it hands
+        // on with its index is of the graph it returns.
+        let build = |link: bool| {
+            let prepared = with_link_unreached_for_test(link, || {
+                VectorCore::build_hnsw_in_memory_owned_with_permit(
+                    exported.clone(),
+                    &config,
+                    DistanceMetric::Cosine,
+                    &permit,
+                )
+            })
+            .unwrap();
+            let adjacency: Vec<StdRwLock<Vec<Vec<u32>>>> = prepared
+                .adjacency
+                .iter()
+                .map(|lists| StdRwLock::new(lists.clone().unwrap()))
+                .collect();
+            assert_eq!(
+                prepared.unreached,
+                unreached_ords(&adjacency, prepared.entry_ord).len(),
+                "linking {link}"
+            );
+            (prepared, adjacency)
+        };
+        // The build's own call of the pass.
+        build(true);
+        let (prepared, adjacency) = build(false);
+        // The distance the build linked by: the SQ8 cosine of its rows.
+        let codes = crate::helix_engine::vector_core::simd::SQ8Params::fit(&rows)
+            .quantize_bulk(&rows)
+            .0;
+        let dist = |a: usize, b: usize| {
+            merge_build_distance(&DistanceMetric::Cosine, &rows, &codes, dim, a, b)
+        };
+        link_adding_only(
+            &adjacency,
+            prepared.entry_ord,
+            prepared.levels[prepared.entry_ord],
+            config.m_max_0,
+            &dist,
+        );
+        let longest = adjacency
+            .iter()
+            .map(|lists| lists.read().unwrap()[0].len())
+            .max();
+        assert!(longest <= Some(config.m_max_0), "{longest:?}");
+    }
 
     fn prefetch_test_core(backend: Arc<AnyBackend>, name: &str) -> VectorCore {
         VectorCore::new_named_lsm_with_dir(
@@ -12100,6 +15871,255 @@ mod tests {
         );
     }
 
+    /// `export_level_zero` as it read `VectorData` before the batched reads:
+    /// one point get per vector.
+    fn export_with_point_gets(
+        core: &VectorCore,
+        r: &AnyRead<'_>,
+    ) -> Result<Vec<(u128, Vec<f32>, HashMap<String, Value>)>, VectorError> {
+        let mut exported = Vec::new();
+        for vector in core.get_all_vectors(r, Some(0))? {
+            let stored = core.get_vector_data(r, vector.get_id())?;
+            let raw = stored
+                .original_vector
+                .clone()
+                .map(Ok)
+                .or_else(|| {
+                    core.read_sidecar_vector_if_available(
+                        r,
+                        vector.get_id(),
+                        Some(vector.get_data().len()),
+                    )
+                    .transpose()
+                })
+                .transpose()?
+                .unwrap_or_else(|| vector.get_data().to_vec());
+            exported.push((vector.get_id(), raw, stored.fields));
+        }
+        Ok(exported)
+    }
+
+    /// The payload the export fixtures give point `id`.
+    fn export_fields(id: u128) -> HashMap<String, Value> {
+        HashMap::from([("path".to_string(), Value::String(format!("src/f{id}.rs")))])
+    }
+
+    /// A current-format `VectorData` row for point `id`.
+    fn export_row(id: u128, original_vector: Option<Vec<f32>>) -> Vec<u8> {
+        bincode::serialize(&StoredVectorData {
+            fields: export_fields(id),
+            original_vector,
+        })
+        .unwrap()
+    }
+
+    /// Stages vector `[id, 1.0]` in `core` and, when given, its `VectorData` row.
+    fn put_export_point(
+        backend: &AnyBackend,
+        write: &mut AnyWrite<'_>,
+        core: &VectorCore,
+        id: u128,
+        row: Option<&[u8]>,
+    ) {
+        let vector = encode_vector(&[id as f32, 1.0], &core.spindle).unwrap();
+        backend
+            .put(
+                write,
+                core.seg_ns(SegmentDb::Vectors),
+                &VectorCore::vector_key(id, 0),
+                &vector,
+            )
+            .unwrap();
+        if let Some(row) = row {
+            backend
+                .put(
+                    write,
+                    core.seg_ns(SegmentDb::VectorData),
+                    &id.to_be_bytes(),
+                    row,
+                )
+                .unwrap();
+        }
+    }
+
+    /// A merge export reads `VectorData` a chunk of ids at a time. It must
+    /// hand the merge the rows the point gets did, in the same order, whatever
+    /// shape each row has, still refuse a row it cannot decode, and read
+    /// nothing else in the namespace.
+    #[test]
+    fn export_level_zero_batched_reads_return_what_the_per_vector_point_gets_did() {
+        use crate::helix_engine::storage_core::backend_lsm::{
+            lsm_round_trips_for_test, LsmBackend,
+        };
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("export-batched-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        ));
+        let AnyBackend::Lsm(lsm) = backend.as_ref() else {
+            unreachable!("opened on the LSM writer backend");
+        };
+
+        // Given a segment of more rows than one chunk, each with a
+        // current-format row, beside the three sidecar blobs an indexed
+        // segment keeps in the same namespace.
+        const ROWS: u128 = EXPORT_VECTOR_DATA_CHUNK as u128 + 88;
+        let uniform = prefetch_test_core(Arc::clone(&backend), "export_uniform");
+        // And one mixing every shape a row can take.
+        let mixed = prefetch_test_core(Arc::clone(&backend), "export_mixed");
+        let mut write = backend.begin_write().unwrap();
+        for id in 1..=ROWS {
+            let row = export_row(id, Some(vec![id as f32, 2.0]));
+            put_export_point(&backend, &mut write, &uniform, id, Some(&row));
+        }
+        for blob_key in [
+            HVTQ_SIDECAR_BLOB_KEY,
+            HVEC_SIDECAR_BLOB_KEY,
+            HVEC_SIDECAR_ORDINALS_BLOB_KEY,
+        ] {
+            backend
+                .put(
+                    &mut write,
+                    uniform.seg_ns(SegmentDb::VectorData),
+                    blob_key,
+                    &vec![0xab_u8; 64 * 1024],
+                )
+                .unwrap();
+        }
+        for id in 1..=8u128 {
+            let row = match id % 4 {
+                1 => Some(export_row(id, Some(vec![id as f32, 2.0]))),
+                2 => Some(export_row(id, None)),
+                // The legacy row: a bare field map.
+                3 => Some(bincode::serialize(&export_fields(id)).unwrap()),
+                // No row at all.
+                _ => None,
+            };
+            put_export_point(&backend, &mut write, &mixed, id, row.as_deref());
+        }
+        backend.commit(write).unwrap();
+        let read = backend.begin_read().unwrap();
+
+        // When both exports run, counting SlateDB round trips and rows read.
+        let before = lsm_round_trips_for_test();
+        let expected = export_with_point_gets(&uniform, &read).unwrap();
+        let point_get_trips = lsm_round_trips_for_test() - before;
+        let before = lsm_round_trips_for_test();
+        lsm.reset_read_count();
+        let exported = uniform.export_level_zero(&read).unwrap();
+        let batched_trips = lsm_round_trips_for_test() - before;
+        let reads = lsm.read_count();
+
+        // Then the rows are the same,
+        assert_eq!(exported, expected);
+        assert_eq!(
+            exported,
+            (1..=ROWS)
+                .map(|id| (id, vec![id as f32, 2.0], export_fields(id)))
+                .collect::<Vec<_>>()
+        );
+        // for one batched read per chunk instead of a point get per row,
+        assert_eq!(
+            (point_get_trips, batched_trips),
+            (ROWS as usize + 1, 3),
+            "the vector scan plus the payload reads"
+        );
+        // and only the vectors and their own rows were read: no sidecar blob.
+        assert_eq!(reads, 2 * ROWS as usize);
+
+        let exported = mixed.export_level_zero(&read).unwrap();
+        assert_eq!(exported, export_with_point_gets(&mixed, &read).unwrap());
+        assert_eq!(
+            exported,
+            (1..=8u128)
+                .map(|id| match id % 4 {
+                    1 => (id, vec![id as f32, 2.0], export_fields(id)),
+                    0 => (id, vec![id as f32, 1.0], HashMap::new()),
+                    _ => (id, vec![id as f32, 1.0], export_fields(id)),
+                })
+                .collect::<Vec<_>>()
+        );
+
+        // A row that decodes as neither format still fails the export.
+        let mut write = backend.begin_write().unwrap();
+        backend
+            .put(
+                &mut write,
+                mixed.seg_ns(SegmentDb::VectorData),
+                &2u128.to_be_bytes(),
+                &[0xff],
+            )
+            .unwrap();
+        backend.commit(write).unwrap();
+        let read = backend.begin_read().unwrap();
+        assert!(matches!(
+            export_with_point_gets(&mixed, &read),
+            Err(VectorError::InvalidVectorData)
+        ));
+        assert!(matches!(
+            mixed.export_level_zero(&read),
+            Err(VectorError::InvalidVectorData)
+        ));
+    }
+
+    /// Exporting a write batch's own view must use the batch's payload rows:
+    /// its overlay wins over the snapshot, row by row.
+    #[test]
+    fn export_level_zero_reads_payload_rows_through_the_write_overlay() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("export-overlay-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        ));
+        let core = prefetch_test_core(Arc::clone(&backend), "export_overlay");
+
+        // Given four committed points,
+        let mut write = backend.begin_write().unwrap();
+        for id in 1..=4u128 {
+            let row = export_row(id, Some(vec![id as f32, 2.0]));
+            put_export_point(&backend, &mut write, &core, id, Some(&row));
+        }
+        backend.commit(write).unwrap();
+        // and an open batch that rewrites one payload row, deletes another
+        // and adds a point.
+        let mut write = backend.begin_write().unwrap();
+        backend
+            .put(
+                &mut write,
+                core.seg_ns(SegmentDb::VectorData),
+                &2u128.to_be_bytes(),
+                &export_row(20, Some(vec![9.0, 9.0])),
+            )
+            .unwrap();
+        backend
+            .delete(
+                &mut write,
+                core.seg_ns(SegmentDb::VectorData),
+                &3u128.to_be_bytes(),
+            )
+            .unwrap();
+        let row = export_row(5, Some(vec![5.0, 2.0]));
+        put_export_point(&backend, &mut write, &core, 5, Some(&row));
+        let overlay = backend
+            .lsm_read_with_pending(write.lsm_pending().unwrap().clone())
+            .unwrap();
+
+        // When the batch's view is exported.
+        let exported = core.export_level_zero(&overlay).unwrap();
+
+        // Then it holds the batch's rows, as the point gets read them.
+        assert_eq!(exported, export_with_point_gets(&core, &overlay).unwrap());
+        assert_eq!(
+            exported,
+            vec![
+                (1, vec![1.0, 2.0], export_fields(1)),
+                (2, vec![9.0, 9.0], export_fields(20)),
+                (3, vec![3.0, 1.0], HashMap::new()),
+                (4, vec![4.0, 2.0], export_fields(4)),
+                (5, vec![5.0, 2.0], export_fields(5)),
+            ]
+        );
+    }
+
     #[test]
     fn hnsw_prefetch_preserves_reader_snapshot_and_shared_cache_isolation() {
         use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
@@ -12187,6 +16207,58 @@ mod tests {
             .is_empty());
     }
 
+    /// A reader replica's read that is not pinned to a snapshot (the switch
+    /// off, or a snapshot that failed to open) reads a row the writer has
+    /// deleted from the store, where it is gone. It used to fill the vector
+    /// cache and be answered from it, and nothing on a reader takes a
+    /// deleted row's vector out of that cache: a search went on scoring the
+    /// row and could return it.
+    #[test]
+    fn reader_replica_does_not_read_a_deleted_row_from_the_vector_cache() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+        use object_store::memory::InMemory;
+        use object_store::ObjectStore;
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = format!("reader-deleted-row-{}", uuid::Uuid::new_v4());
+        let writer = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_with_store(&path, Arc::clone(&store)).unwrap(),
+        ));
+        let core = prefetch_test_core(Arc::clone(&writer), "reader_deleted_row");
+        let row = VectorCore::vector_key(1, 0);
+        let mut write = writer.begin_write().unwrap();
+        let data = encode_vector(&[1.0, 0.0], &core.spindle).unwrap();
+        writer
+            .put(&mut write, core.seg_ns(SegmentDb::Vectors), &row, &data)
+            .unwrap();
+        writer.commit(write).unwrap();
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, Arc::clone(&store)).unwrap(),
+        ));
+        let reader_core = prefetch_test_core(Arc::clone(&reader), "reader_deleted_row");
+        let unpinned = AnyRead::LsmReader(None);
+        assert_eq!(
+            reader_core
+                .get_vector(&unpinned, 1, 0, true)
+                .unwrap()
+                .get_data(),
+            &[1.0, 0.0]
+        );
+
+        let mut write = writer.begin_write().unwrap();
+        writer
+            .delete(&mut write, core.seg_ns(SegmentDb::Vectors), &row)
+            .unwrap();
+        writer.commit(write).unwrap();
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        assert!(matches!(
+            reader_core.get_vector(&unpinned, 1, 0, true),
+            Err(VectorError::VectorNotFound(_))
+        ));
+    }
+
     #[test]
     fn hnsw_prefetch_traversal_matches_scalar_cache_with_filters_and_stale_links() {
         use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
@@ -12262,6 +16334,7 @@ mod tests {
                     None,
                     &[],
                     &mut expected_ordinals,
+                    false,
                 )
                 .unwrap();
             let actual = batch_core
@@ -12277,6 +16350,7 @@ mod tests {
                     None,
                     &[],
                     &mut actual_ordinals,
+                    false,
                 )
                 .unwrap();
             assert_eq!(summarize(actual), summarize(expected));
@@ -12300,6 +16374,7 @@ mod tests {
                     None,
                     &[],
                     &mut expected_ordinals,
+                    false,
                 )
                 .unwrap();
             let actual = batch_core
@@ -12315,6 +16390,7 @@ mod tests {
                     None,
                     &[],
                     &mut actual_ordinals,
+                    false,
                 )
                 .unwrap();
             assert_eq!(summarize(actual), summarize(expected));
@@ -12725,6 +16801,832 @@ mod tests {
         assert!(!core.sidecar_ordinals_loaded().unwrap());
     }
 
+    /// The one order of dense hits by brute force, with a rule of its own:
+    /// the rows that pass, the nearer first (a NaN the farthest, -0.0 as
+    /// 0.0) and of equally far ones the smaller id. Returns the ids of the
+    /// first `target_k` of them, and how many rows are met in that order up
+    /// to the last of those: the rows a filter asked last has to be asked
+    /// about, every row when fewer pass than are wanted.
+    fn nearest_by_distance_then_id(
+        rows: &[MmapFlatCandidate],
+        target_k: usize,
+        passes: impl Fn(u128) -> bool,
+    ) -> (Vec<u128>, usize) {
+        let key = |distance: f32| match distance {
+            distance if distance.is_nan() => f32::INFINITY,
+            distance if distance == 0.0 => 0.0,
+            distance => distance,
+        };
+        let mut nearest_first: Vec<(f32, u128)> =
+            rows.iter().map(|row| (key(row.distance), row.id)).collect();
+        nearest_first
+            .sort_by(|lhs, rhs| lhs.0.partial_cmp(&rhs.0).unwrap().then(lhs.1.cmp(&rhs.1)));
+        let (mut kept, mut met) = (Vec::new(), 0);
+        for (_, id) in nearest_first {
+            if kept.len() == target_k {
+                break;
+            }
+            met += 1;
+            if passes(id) {
+                kept.push(id);
+            }
+        }
+        (kept, met)
+    }
+
+    /// Whatever the filter passes, however many rows are equally far and in
+    /// whatever order the rows are handed over, asking the filter last
+    /// returns the nearest rows that pass, of equally far ones the smaller
+    /// ids, asks about no row twice and about none past the last it returns.
+    #[test]
+    fn asking_the_filter_last_returns_the_nearest_rows_by_distance_then_id() {
+        use rand::Rng;
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2026_1118);
+        let mut cut_among_equally_far_rows = 0;
+        for case in 0..6000usize {
+            let row_count = rng.random_range(0..48usize);
+            let target_k = rng.random_range(1..12usize);
+            // Two or five distances for all the rows of a case (equal vectors
+            // are common), or nearly as many as rows.
+            let distances = [2u32, 5, 4096][case % 3];
+            let odd_values = case % 40 == 39;
+            // The ids in no order of the rows.
+            let mut ids: Vec<u128> = (0..row_count as u128).map(|row| 1000 + row).collect();
+            for last in (1..ids.len()).rev() {
+                ids.swap(last, rng.random_range(0..=last));
+            }
+            let rows: Vec<MmapFlatCandidate> = ids
+                .iter()
+                .enumerate()
+                .map(|(row, &id)| MmapFlatCandidate {
+                    id,
+                    ordinal: row as u64,
+                    distance: match rng.random_range(0..if odd_values { 13u32 } else { 8 }) {
+                        8 => f32::NAN,
+                        9 => -0.0,
+                        10 => 0.0,
+                        11 => f32::INFINITY,
+                        12 => -f32::NAN,
+                        _ => rng.random_range(0..distances) as f32 / 8.0,
+                    },
+                })
+                .collect();
+            // From a filter that passes nothing to one that passes everything.
+            let one_in = [0u32, 1, 2, 4, 16][case % 5];
+            let passing: Vec<bool> = (0..row_count)
+                .map(|_| one_in != 0 && rng.random_range(0..one_in) == 0)
+                .collect();
+            let passes = |id: u128| passing[(id - 1000) as usize];
+            let (nearest, met) = nearest_by_distance_then_id(&rows, target_k, passes);
+            // One more row would be equally far as the last one returned.
+            let (with_one_more, _) = nearest_by_distance_then_id(&rows, target_k + 1, passes);
+            let distance_of = |id: &u128| rows.iter().find(|row| row.id == *id).unwrap().distance;
+            cut_among_equally_far_rows += usize::from(
+                with_one_more.len() > target_k
+                    && distance_of(&with_one_more[target_k]) == distance_of(&nearest[target_k - 1]),
+            );
+
+            let mut backwards = rows.clone();
+            backwards.reverse();
+            for (fed, rows) in [("in order", &rows), ("backwards", &backwards)] {
+                let asked = std::cell::RefCell::new(Vec::new());
+                let kept = nearest_passing_rows(rows, target_k, |id| {
+                    asked.borrow_mut().push(id);
+                    passes(id)
+                });
+                let mut asked = asked.into_inner();
+                let asks = asked.len();
+                asked.sort_unstable();
+                asked.dedup();
+                assert_eq!(
+                    asked.len(),
+                    asks,
+                    "case {case}, rows {fed}: a row was asked about twice"
+                );
+                assert_eq!(
+                    kept.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    nearest,
+                    "case {case}, rows {fed}"
+                );
+                assert_eq!(asks, met, "case {case}, rows {fed}: rows asked about");
+            }
+        }
+        // The cut fell among equally far rows many times.
+        assert!(
+            cut_among_equally_far_rows > 500,
+            "{cut_among_equally_far_rows}"
+        );
+    }
+
+    /// The order's two odd rules, each where the ids say the opposite of the
+    /// bits: a NaN of either sign is as far as infinity, and -0.0 is 0.0.
+    #[test]
+    fn a_nan_distance_is_the_farthest_and_both_zeros_are_one_distance() {
+        let row = |id: u128, distance: f32| MmapFlatCandidate {
+            id,
+            ordinal: 0,
+            distance,
+        };
+        let rows = [
+            row(9, -f32::NAN),
+            row(8, f32::INFINITY),
+            row(7, f32::NAN),
+            row(6, -0.0),
+            row(5, 0.0),
+            row(4, 1.0),
+            row(3, f32::NEG_INFINITY),
+        ];
+        let kept = nearest_passing_rows(&rows, rows.len(), |_| true);
+        assert_eq!(
+            kept.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [3, 5, 6, 4, 7, 8, 9]
+        );
+    }
+
+    /// A filtered flat scan scores the rows its file holds and asks the
+    /// filter last: about ten rows of six hundred when every row passes and
+    /// ten are wanted, about every row only when fewer pass than are wanted.
+    /// The rows it returns are the nearest that pass, as before.
+    #[test]
+    fn filtered_flat_scan_asks_the_filter_about_the_nearest_rows_only() {
+        use rand::Rng;
+
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(
+            AnyBackend::open_lsm_in_memory(&format!("filter-last-{}", uuid::Uuid::new_v4()))
+                .unwrap(),
+        );
+        let core = VectorCore::new_named_lsm_with_dir(
+            "filter_last",
+            HNSWConfig::new(Some(8), Some(16), Some(32)),
+            DistanceMetric::Euclid,
+            SpindleConfig {
+                mode: SpindleMode::None,
+                ..SpindleConfig::default()
+            },
+            Some(directory.path()),
+            4,
+            Arc::clone(&backend),
+        )
+        .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1792);
+        let rows: Vec<(u128, [f32; 4])> = (1..=600u128)
+            .map(|id| (id, std::array::from_fn(|_| rng.random_range(-1.0f32..1.0))))
+            .collect();
+        let mut write = backend.begin_write().unwrap();
+        for (id, row) in &rows {
+            core.insert_flat_be(&mut write, row, Some(*id), None)
+                .unwrap();
+        }
+        backend.commit(write).unwrap();
+        let read = backend.begin_read().unwrap();
+        let query = [0.3f32, -0.2, 0.1, 0.7];
+        let target_k = 10;
+        let nearest_passing = |passes: &dyn Fn(u128) -> bool| {
+            let mut kept: Vec<(f32, u128)> = rows
+                .iter()
+                .filter(|(id, _)| passes(*id))
+                .map(|(id, row)| (core.distance_between(row, &query).unwrap(), *id))
+                .collect();
+            kept.sort_by(|lhs, rhs| lhs.0.partial_cmp(&rhs.0).unwrap());
+            kept.truncate(target_k);
+            kept
+        };
+
+        type Passes = Box<dyn Fn(u128) -> bool>;
+        let cases: [(&str, Passes, std::ops::RangeInclusive<usize>); 5] = [
+            ("every row passes", Box::new(|_| true), 10..=10),
+            ("half pass", Box::new(|id| id % 2 == 0), 10..=60),
+            ("a tenth pass", Box::new(|id| id % 10 == 0), 10..=300),
+            // Fewer pass than are wanted: every row is asked about, as it
+            // was for any filter before.
+            ("three rows pass", Box::new(|id| id % 250 == 7), 600..=600),
+            ("no row passes", Box::new(|_| false), 600..=600),
+        ];
+        for (name, passes, asks) in cases {
+            let asked = std::cell::Cell::new(0usize);
+            let filter = |id: u128| {
+                asked.set(asked.get() + 1);
+                passes(id)
+            };
+            let results = core
+                .search_flat_mmap_ordinals_direct(&read, &query, target_k, Some(&[filter]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|hit| (hit.get_distance(), hit.get_id()))
+                    .collect::<Vec<_>>(),
+                nearest_passing(&*passes),
+                "{name}"
+            );
+            assert!(
+                asks.contains(&asked.get()),
+                "{name}: the filter was asked about {} of 600 rows",
+                asked.get()
+            );
+        }
+    }
+
+    /// Rows for the tests of equally far hits, at three kinds of distance
+    /// from `FLAT_QUERY`: 64 rows at 5 (ids 1 to 64, four vectors), 8 rows
+    /// at 1 with larger ids (101 to 108, four vectors), and 20 rows farther
+    /// off, each at a distance of its own (201 to 220). Handed over in no
+    /// order of the ids, so that neither the order they are written in nor
+    /// their slots in a sidecar follow the ids.
+    fn rows_with_equal_distances() -> Vec<(u128, [f32; 2])> {
+        let at_five = [[6.0, 0.0], [-4.0, 0.0], [1.0, 5.0], [1.0, -5.0]];
+        let at_one = [[2.0, 0.0], [0.0, 0.0], [1.0, 1.0], [1.0, -1.0]];
+        let mut rows: Vec<(u128, [f32; 2])> = (1..=64u128)
+            .map(|id| (id, at_five[id as usize % 4]))
+            .chain((101..=108u128).map(|id| (id, at_one[id as usize % 4])))
+            .chain((201..=220u128).map(|id| (id, [id as f32 - 194.0, 0.0])))
+            .collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2026_1120);
+        for last in (1..rows.len()).rev() {
+            rows.swap(last, rand::Rng::random_range(&mut rng, 0..=last));
+        }
+        rows
+    }
+
+    /// The ids of the `k` rows nearest to `FLAT_QUERY` that pass, of equally
+    /// far ones the smaller ids: the one order of dense hits, by brute force.
+    fn nearest_ids(
+        core: &VectorCore,
+        rows: &[(u128, [f32; 2])],
+        k: usize,
+        passes: impl Fn(u128) -> bool,
+    ) -> Vec<u128> {
+        let mut kept: Vec<(f32, u128)> = rows
+            .iter()
+            .filter(|(id, _)| passes(*id))
+            .map(|(id, row)| (core.distance_between(row, &FLAT_QUERY).unwrap(), *id))
+            .collect();
+        kept.sort_by(|lhs, rhs| lhs.0.partial_cmp(&rhs.0).unwrap().then(lhs.1.cmp(&rhs.1)));
+        kept.truncate(k);
+        kept.into_iter().map(|(_, id)| id).collect()
+    }
+
+    fn ids_of(hits: &[HVector]) -> Vec<u128> {
+        hits.iter().map(HVector::get_id).collect()
+    }
+
+    /// A writer's segment over `rows_with_equal_distances`, with a sidecar
+    /// (`with_sidecar`) or with rows alone.
+    fn segment_with_equal_distances(
+        with_sidecar: bool,
+    ) -> (VectorCore, Arc<AnyBackend>, Vec<(u128, [f32; 2])>, TempDir) {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let directory = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(with_sidecar.then(|| directory.path()), &writer);
+        let rows = rows_with_equal_distances();
+        commit_rows(&core, &writer, &rows);
+        assert_eq!(core.has_mmap_sidecar(), with_sidecar);
+        // The cut of 40 falls in the 64 rows at 5, behind the 8 at 1.
+        assert_eq!(
+            nearest_ids(&core, &rows, 40, |_| true),
+            (101..=108).chain(1..=32).collect::<Vec<u128>>()
+        );
+        (core, writer, rows, directory)
+    }
+
+    /// A flat scan over a sidecar returns equally far rows by id, without a
+    /// filter and with one, and a longer answer begins with the shorter one:
+    /// fed the rows by id, as a reader's scan and a writer's first ones meet
+    /// them, and fed them in the order of the hash map a writer walks once
+    /// it has loaded its ordinals.
+    #[test]
+    #[serial_test::serial]
+    fn a_sidecar_scan_returns_equally_far_rows_by_id() {
+        let (core, writer, rows, _directory) = segment_with_equal_distances(true);
+        let read = writer.begin_read().unwrap();
+        let scan = |k: usize, filter: Option<&[fn(u128) -> bool]>| {
+            ids_of(
+                &core
+                    .search_flat_mmap_ordinals_direct(&read, &FLAT_QUERY, k, filter)
+                    .unwrap()
+                    .expect("the sidecar serves the scan"),
+            )
+        };
+        let even: fn(u128) -> bool = |id| id % 2 == 0;
+        for fed_by_the_map in [false, true] {
+            if fed_by_the_map {
+                core.ensure_sidecar_ordinals_loaded(&read).unwrap();
+            }
+            assert_eq!(core.sidecar_ordinals_loaded().unwrap(), fed_by_the_map);
+            for (k, longer) in [(40, 48), (9, 10), (1, 2)] {
+                let nearest = nearest_ids(&core, &rows, k, |_| true);
+                assert_eq!(scan(k, None), nearest, "{k} rows");
+                assert_eq!(
+                    scan(longer, None)[..k],
+                    nearest,
+                    "{longer} rows, the first {k}"
+                );
+                let nearest = nearest_ids(&core, &rows, k, even);
+                assert_eq!(scan(k, Some(&[even])), nearest, "{k} even rows");
+                assert_eq!(
+                    scan(longer, Some(&[even]))[..k],
+                    nearest,
+                    "{longer} even rows, the first {k}"
+                );
+            }
+        }
+    }
+
+    /// A flat scan over rows, where a segment has no sidecar, returns the
+    /// same: it meets the rows by id, and a heap that compares distance
+    /// alone gives up the first it met of equally far rows, the smallest id.
+    #[test]
+    fn a_row_scan_returns_equally_far_rows_by_id() {
+        let (core, writer, rows, _directory) = segment_with_equal_distances(false);
+        let read = writer.begin_read().unwrap();
+        let scan = |k: usize, filter: Option<&[fn(u128) -> bool]>| {
+            ids_of(
+                &core
+                    .search_flat_id_filter_direct(
+                        &read,
+                        &FLAT_QUERY,
+                        &PreparedSpindleQuery::None,
+                        k,
+                        filter,
+                    )
+                    .unwrap(),
+            )
+        };
+        let even: fn(u128) -> bool = |id| id % 2 == 0;
+        for (k, longer) in [(40, 48), (9, 10), (1, 2)] {
+            let nearest = nearest_ids(&core, &rows, k, |_| true);
+            assert_eq!(scan(k, None), nearest, "{k} rows");
+            assert_eq!(
+                scan(longer, None)[..k],
+                nearest,
+                "{longer} rows, the first {k}"
+            );
+            let nearest = nearest_ids(&core, &rows, k, even);
+            assert_eq!(scan(k, Some(&[even])), nearest, "{k} even rows");
+            assert_eq!(
+                scan(longer, Some(&[even]))[..k],
+                nearest,
+                "{longer} even rows, the first {k}"
+            );
+        }
+        assert!(!core.has_mmap_sidecar(), "the scan was over rows");
+    }
+
+    /// The exact scorer returns the same rows in the same order whatever
+    /// order its candidates come in: a filtered search hands them over in
+    /// the order of a hash set made for the request.
+    #[test]
+    fn the_exact_scorer_returns_the_same_rows_for_any_order_of_its_candidates() {
+        for with_sidecar in [true, false] {
+            let (core, writer, rows, _directory) = segment_with_equal_distances(with_sidecar);
+            let read = writer.begin_read().unwrap();
+            let as_written: Vec<u128> = rows.iter().map(|(id, _)| *id).collect();
+            let mut ascending = as_written.clone();
+            ascending.sort_unstable();
+            let descending: Vec<u128> = ascending.iter().rev().copied().collect();
+            for k in [40, 48, 9, 1] {
+                let nearest = nearest_ids(&core, &rows, k, |_| true);
+                for (order, candidates) in [
+                    ("as written", &as_written),
+                    ("ascending", &ascending),
+                    ("descending", &descending),
+                ] {
+                    let hits = core
+                        .search_exact_ids_with_selectivity(
+                            &read,
+                            &FLAT_QUERY,
+                            candidates.iter().copied(),
+                            k,
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        ids_of(&hits),
+                        nearest,
+                        "{k} rows, candidates {order}, sidecar {with_sidecar}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The broad scan returns equally far members by id: from the nearest it
+    /// orders up front, and from the rest it orders once rechecks have
+    /// turned too many of those down. Fed the members by id, and fed them
+    /// in the order of the hash map a writer walks once it has loaded its
+    /// ordinals.
+    #[test]
+    #[serial_test::serial]
+    fn a_broad_scan_returns_equally_far_members_by_id() {
+        let (core, writer, rows, _directory) = segment_with_equal_distances(true);
+        let read = writer.begin_read().unwrap();
+        let every_row: HashSet<u128> = rows.iter().map(|(id, _)| *id).collect();
+        let even_rows: HashSet<u128> = every_row.iter().copied().filter(|id| id % 2 == 0).collect();
+        for fed_by_the_map in [false, true] {
+            if fed_by_the_map {
+                core.ensure_sidecar_ordinals_loaded(&read).unwrap();
+            }
+            assert_eq!(core.sidecar_ordinals_loaded().unwrap(), fed_by_the_map);
+            for (members, k) in [(&every_row, 40), (&every_row, 9), (&even_rows, 20)] {
+                let hits = core
+                    .search_broad_prefilter_scan::<fn(u128) -> bool>(
+                        &read,
+                        &FLAT_QUERY,
+                        k,
+                        members,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .expect("the sidecar serves the scan");
+                assert_eq!(
+                    ids_of(&hits),
+                    nearest_ids(&core, &rows, k, |id| members.contains(&id)),
+                    "{k} of {} members",
+                    members.len()
+                );
+            }
+            // Ten wanted: the forty ordered up front are the 8 rows at 1 and
+            // the 32 smallest ids at 5, and the recheck passes none of those
+            // 32.
+            let recheck: fn(u128) -> bool = |id| id > 40 && id < 200;
+            let hits = core
+                .search_broad_prefilter_scan(
+                    &read,
+                    &FLAT_QUERY,
+                    10,
+                    &every_row,
+                    Some(&[recheck]),
+                    None,
+                )
+                .unwrap()
+                .expect("the sidecar serves the scan");
+            assert_eq!(
+                ids_of(&hits),
+                [101, 102, 103, 104, 105, 106, 107, 108, 41, 42]
+            );
+        }
+    }
+
+    /// Rows a writer adds after a reader built its sidecar sit past the
+    /// reader's file. Where they are equally far as rows in the file they
+    /// come back by id all the same, not behind the file's rows.
+    #[test]
+    #[serial_test::serial]
+    fn a_reader_returns_rows_past_its_sidecar_by_id_among_equally_far_rows() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let writer_core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        // In the reader's file: two rows at 5 and one at 1.
+        commit_rows(
+            &writer_core,
+            &writer,
+            &[(50, [6.0, 0.0]), (60, [1.0, 5.0]), (70, [2.0, 0.0])],
+        );
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let scan = |read: &AnyRead<'_>, k: usize| {
+            ids_of(
+                &core
+                    .search_flat_id_filter_direct::<fn(u128) -> bool>(
+                        read,
+                        &FLAT_QUERY,
+                        &PreparedSpindleQuery::None,
+                        k,
+                        None,
+                    )
+                    .unwrap(),
+            )
+        };
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(scan(&read, 16), [70, 50, 60]);
+        assert_eq!(sidecar_slots(&core), 3, "the reader built its file");
+
+        // Past the file: two more rows at 5, with smaller ids.
+        commit_rows(&writer_core, &writer, &[(5, [-4.0, 0.0]), (6, [1.0, -5.0])]);
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(scan(&read, 16), [70, 5, 6, 50, 60]);
+        assert_eq!(scan(&read, 3), [70, 5, 6]);
+        assert_eq!(
+            sidecar_slots(&core),
+            3,
+            "the two new rows sit past the file"
+        );
+    }
+
+    /// A read that is not an LSM read has no batched row read, so the exact
+    /// path keeps its read of each id there.
+    #[test]
+    fn a_read_without_a_batched_row_read_keeps_the_read_of_each_id() {
+        let (env, _dir) = setup();
+        let core = core_with_mode(&env, "exact_rows_not_lsm", SpindleMode::None);
+        let mut txn = env.write_txn().unwrap();
+        core.insert_flat(&mut txn, &[1.0, 0.0], Some(7), None)
+            .unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.read_txn().unwrap();
+        let read = core.backend.read_borrowed(&txn);
+        assert!(core
+            .exact_hits_from_rows(&read, &[1.0, 0.0], &[7], 1, None)
+            .unwrap()
+            .is_none());
+        let by_each_id = core
+            .search_exact_ids_with_selectivity(&read, &[1.0, 0.0], [7u128], 1, None)
+            .unwrap();
+        assert_eq!(by_each_id.len(), 1);
+    }
+
+    #[test]
+    fn the_exact_rows_switch_is_on_until_it_is_set_off() {
+        for on in [None, Some("1"), Some("true"), Some(""), Some("2048")] {
+            assert!(exact_rows_enabled_of(on), "{on:?}");
+        }
+        for off in ["0", " 0 ", "false", "OFF", "no"] {
+            assert!(!exact_rows_enabled_of(Some(off)), "{off:?}");
+        }
+    }
+
+    /// A walked segment returns equally far rows by id: 120 vectors of five
+    /// rows each, the ids of one vector's rows 120 apart.
+    #[test]
+    fn a_walked_segment_returns_equally_far_rows_by_id() {
+        use rand::Rng;
+
+        let (env, _dir) = setup();
+        let core = core_with_mode(&env, "equal_rows_walked", SpindleMode::None);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2026_1120);
+        let vectors: Vec<Vec<f32>> = (0..120)
+            .map(|_| (0..16).map(|_| rng.random_range(-1.0f32..1.0)).collect())
+            .collect();
+        let mut txn = env.write_txn().unwrap();
+        for id in 1..=600u128 {
+            core.insert_flat(&mut txn, &vectors[id as usize % 120], Some(id), None)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+        let mut txn = env.write_txn().unwrap();
+        core.build_index_from_flat(&mut txn).unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.read_txn().unwrap();
+        let read = core.backend.read_borrowed(&txn);
+        let found = |hits: Vec<HVector>| -> Vec<(f32, u128)> {
+            hits.iter()
+                .map(|hit| (hit.get_distance(), hit.get_id()))
+                .collect()
+        };
+        // Both walks, for `k` rows: the ef of this segment is 64.
+        let walk = |k: usize| {
+            with_small_segment_exact_for_test(false, || {
+                [
+                    found(
+                        core.search_with_selectivity_ef::<VF>(
+                            &read,
+                            &vectors[7],
+                            k,
+                            None,
+                            false,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    ),
+                    found(
+                        core.search_with_id_filter_ef_observed::<fn(u128) -> bool>(
+                            &read,
+                            &vectors[7],
+                            k,
+                            None,
+                            false,
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap(),
+                    ),
+                ]
+            })
+        };
+        // Within ef a longer answer begins with the shorter one.
+        for (shorter, longer) in walk(30).into_iter().zip(walk(40)) {
+            assert_eq!(shorter.len(), 30, "{shorter:?}");
+            let equally_far = shorter
+                .windows(2)
+                .filter(|pair| pair[0].0 == pair[1].0)
+                .count();
+            assert!(
+                equally_far >= 10,
+                "expected an answer with equally far rows in it: {shorter:?}"
+            );
+            assert!(
+                shorter.windows(2).all(|pair| pair[0] < pair[1]),
+                "expected the nearer first and of equally far rows the smaller id: {shorter:?}"
+            );
+            assert_eq!(longer[..30], shorter, "40 rows, the first 30");
+        }
+    }
+
+    /// After a rescore equally far hits are by id, in whatever order their
+    /// approximate distances had put them.
+    #[test]
+    fn rescored_hits_that_are_equally_far_come_back_by_id() {
+        let (env, _dir) = setup();
+        let core = core_with_mode(&env, "rescored_equal_rows", SpindleMode::TurboProd);
+        let vector: Vec<f32> = (0..64).map(|at| (at as f32 * 0.37).sin()).collect();
+        let mut beside = vector.clone();
+        beside[0] += 0.5;
+        let mut txn = env.write_txn().unwrap();
+        for id in 1..=4u128 {
+            core.insert_flat(&mut txn, &vector, Some(id), None).unwrap();
+        }
+        core.insert_flat(&mut txn, &beside, Some(5), None).unwrap();
+        txn.commit().unwrap();
+
+        let txn = env.read_txn().unwrap();
+        let read = core.backend.read_borrowed(&txn);
+        // As a search hands them to the rescore: by approximate distance,
+        // here the four equal rows backwards and the fifth between them.
+        let hits: Vec<HVector> = [(4u128, 0.1f32), (3, 0.2), (5, 0.25), (2, 0.3), (1, 0.4)]
+            .into_iter()
+            .map(|(id, approximate)| {
+                let mut hit = HVector::from_slice(id, 0, Vec::new());
+                hit.set_distance(approximate);
+                hit
+            })
+            .collect();
+        let rescored = core.rescore_results(&read, &vector, hits).unwrap();
+        assert_eq!(ids_of(&rescored), [1, 2, 3, 4, 5]);
+        assert!(rescored[..4]
+            .windows(2)
+            .all(|pair| pair[0].get_distance() == pair[1].get_distance()));
+        assert!(rescored[3].get_distance() < rescored[4].get_distance());
+    }
+
+    /// An IVF segment returns equally far rows by id from both of its ends,
+    /// the exact scorer over its posting lists and, with a filter, its own
+    /// sort; and a longer answer begins with the shorter one. 150 vectors
+    /// and their images in one coordinate the query has nothing in: a vector
+    /// and its image are equally far, in lists of their own where k-means
+    /// parts them, and which of the two has the smaller id alternates.
+    #[test]
+    fn an_ivf_segment_returns_equally_far_rows_by_id() {
+        let (env, _dir) = setup();
+        let core = core_with_mode(&env, "ivf_equal_rows", SpindleMode::None);
+        let mut rows: Vec<Vec<f32>> = Vec::new();
+        for (pair, vector) in ivf_lcg_vectors(11, 150, 16).into_iter().enumerate() {
+            let mut image = vector.clone();
+            image[1] = -image[1];
+            if pair % 2 == 0 {
+                rows.extend([vector, image]);
+            } else {
+                rows.extend([image, vector]);
+            }
+        }
+        ivf_insert_flat(&env, &core, &rows);
+        ivf_build(&env, &core);
+
+        let txn = env.read_txn().unwrap();
+        let read = core.backend.read_borrowed(&txn);
+        let mut query = vec![0.0f32; 16];
+        query[0] = 1.0;
+        query[2] = 0.5;
+        let every_row: VF = |_| true;
+        for filter in [None, Some(&[every_row][..])] {
+            // Every list is probed, so every row is scored.
+            let nearest = |k: usize| -> Vec<(f32, u128)> {
+                core.search_ivf(&read, &query, k, filter, None, Some(usize::MAX))
+                    .unwrap()
+                    .iter()
+                    .map(|hit| (hit.get_distance(), hit.get_id()))
+                    .collect()
+            };
+            let every = nearest(300);
+            assert_eq!(every.len(), 300);
+            let equally_far = every
+                .windows(2)
+                .filter(|pair| pair[0].0 == pair[1].0)
+                .count();
+            assert!(equally_far >= 100, "{equally_far} equally far pairs");
+            assert!(
+                every.windows(2).all(|pair| pair[0] < pair[1]),
+                "expected the nearer first and of equally far rows the smaller id: {every:?}"
+            );
+            for k in [1, 2, 7, 40, 299] {
+                assert_eq!(nearest(k), every[..k], "{k} rows");
+            }
+        }
+    }
+
+    /// The quantized scan returns equally far rows by id, and a longer
+    /// answer begins with the shorter one: the query's own vector in the
+    /// first eighteen slots and two more vectors in three slots each, the
+    /// later the slot the smaller the id. The first of the scan's two heaps
+    /// lets sixteen rows through for one wanted, fewer than the eighteen.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[serial_test::serial]
+    fn the_quantized_scan_returns_equally_far_rows_by_id() {
+        use crate::helix_engine::storage_core::backend::StorageBackend;
+
+        let _fastscan = EnvGuard::set("HELIX_HVTQ_FASTSCAN", "1");
+        let dir = TempDir::new().unwrap();
+        let physical_name = "flat_equal_hvtq";
+        let hvtq_path = dir.path().join(physical_name).with_extension("hvtq");
+        let vectors: Vec<Vec<f32>> = (0..24)
+            .map(|slot| {
+                let t = match slot {
+                    0..=17 => 0.4f32,
+                    18..=20 => 0.0,
+                    _ => 1.2,
+                };
+                vec![t.cos(), t.sin(), 0.25, -0.25]
+            })
+            .collect();
+        let slices = vectors.iter().map(Vec::as_slice).collect::<Vec<&[f32]>>();
+        let spindle = SpindleConfig {
+            mode: SpindleMode::TurboProd,
+            keep_original: false,
+            ..SpindleConfig::default()
+        };
+        drop(MmapTurboQuantStore::create_from_slices(&hvtq_path, &slices, &spindle).unwrap());
+
+        let backend = Arc::new(AnyBackend::open_lsm_in_memory("/flat-equal-hvtq").unwrap());
+        let mut write = backend.begin_write().unwrap();
+        for ordinal in 0..vectors.len() as u64 {
+            let id = 100 - ordinal as u128;
+            let ns = |db| Namespace::Segment { physical_name, db };
+            backend
+                .put(
+                    &mut write,
+                    ns(SegmentDb::Ordinals),
+                    &id.to_be_bytes(),
+                    &ordinal.to_le_bytes(),
+                )
+                .unwrap();
+            backend
+                .put(
+                    &mut write,
+                    ns(SegmentDb::Vectors),
+                    &VectorCore::vector_key(id, 0),
+                    EXTERNALIZED_VECTOR_MARKER,
+                )
+                .unwrap();
+        }
+        backend.commit(write).unwrap();
+
+        let core = VectorCore::new_named_lsm_with_dir(
+            physical_name,
+            HNSWConfig::new(Some(8), Some(32), Some(64)),
+            DistanceMetric::Cosine,
+            spindle,
+            Some(dir.path()),
+            4,
+            backend,
+        )
+        .unwrap();
+        let prepared = prepare_query(&vectors[6], &core.spindle).unwrap();
+        let read = core.backend.begin_read().unwrap();
+        let nearest = |k: usize| -> Vec<(f32, u128)> {
+            core.search_flat_hvtq_fastscan_direct::<fn(u128) -> bool>(&read, &prepared, k, None)
+                .unwrap()
+                .expect("hvtq fastscan path must be active")
+                .iter()
+                .map(|hit| (hit.get_distance(), hit.get_id()))
+                .collect()
+        };
+        let every = nearest(24);
+        assert_eq!(every.len(), 24);
+        let equally_far = every
+            .windows(2)
+            .filter(|pair| pair[0].0 == pair[1].0)
+            .count();
+        assert!(equally_far >= 16, "{equally_far} equally far pairs");
+        assert!(
+            every.windows(2).all(|pair| pair[0] < pair[1]),
+            "expected the nearer first and of equally far rows the smaller id: {every:?}"
+        );
+        // Sixteen times as many rows as are wanted pass the first of the
+        // scan's two heaps: all 24 from two wanted on, and sixteen for one.
+        for k in [1, 2, 4, 7, 23] {
+            assert_eq!(nearest(k), every[..k], "{k} rows");
+        }
+    }
+
     #[test]
     fn sidecar_partial_ordinals_preserve_exact_scoring_and_flat_results() {
         use crate::helix_engine::vector_core::mmap_vectors::MmapVectorStore;
@@ -13018,6 +17920,20 @@ mod tests {
             1,
             "known ordinal miss on a level-0 marker should read only the marker row before returning the repairable error"
         );
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let counted = recorder.handle();
+        let from_rows = metrics::with_local_recorder(&recorder, || {
+            core.exact_hits_from_rows(&read, decoded_marker_fallback.as_slice(), &[66], 1, None)
+        });
+        assert!(
+            from_rows.unwrap().is_none(),
+            "a marker row is left to the read of its id, which marks it for repair"
+        );
+        let counted = counted.render();
+        assert!(
+            counted.contains(r#"helix_dense_exact_rows_total{outcome="declined_after_read"} 1"#),
+            "{counted}"
+        );
         core.clear_externalized_marker_repair_needed();
         let repaired = core
             .search_exact_ids_with_selectivity(
@@ -13258,6 +18174,124 @@ mod tests {
         assert_eq!(core.sidecar_format_label(), "hvec");
     }
 
+    /// The stored row wins only where the row is the vector. A marker's
+    /// vector is in the sidecar, and a spindle payload is a lossy form of it.
+    #[test]
+    fn only_a_raw_row_holds_the_vector() {
+        let vector = [0.25f32, -1.0, 0.5, 2.0];
+        let raw = SpindleConfig {
+            mode: SpindleMode::None,
+            ..SpindleConfig::default()
+        };
+        let raw = encode_vector(&vector, &raw).unwrap();
+        assert!(VectorCore::row_holds_the_vector(&raw));
+        assert!(!VectorCore::row_holds_the_vector(
+            EXTERNALIZED_VECTOR_MARKER
+        ));
+        for mode in [
+            SpindleMode::ScalarInt8,
+            SpindleMode::BinarySign,
+            SpindleMode::TurboInt4,
+            SpindleMode::TurboProd,
+        ] {
+            let spindle = SpindleConfig {
+                mode: mode.clone(),
+                binary_dims: vector.len(),
+                turbo_dims: vector.len(),
+                ..SpindleConfig::default()
+            };
+            let payload = encode_vector(&vector, &spindle).unwrap();
+            assert!(!VectorCore::row_holds_the_vector(&payload), "{mode:?}");
+        }
+    }
+
+    /// What a seal's build holds the writer's file to: a slot inside the file
+    /// whose bits are not its row's. A point without an ordinal, a row stored
+    /// without a slot and an ordinal past the file's end have no slot.
+    #[test]
+    fn sidecar_slot_differs_only_where_the_file_holds_other_bits() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &UNSORTED_ORDINAL_ROWS);
+        // Two more points the store gives an ordinal: one past the file's
+        // end, one stored without a slot.
+        let mut write = writer.begin_write().unwrap();
+        for (id, ordinal) in [(40u128, 7u64), (50, ROW_ONLY_SIDECAR_ORDINAL)] {
+            writer
+                .put(
+                    &mut write,
+                    core.seg_ns(SegmentDb::Ordinals),
+                    &id.to_be_bytes(),
+                    &ordinal.to_le_bytes(),
+                )
+                .unwrap();
+        }
+        writer.commit(write).unwrap();
+
+        let read = writer.begin_read().unwrap();
+        let differs = |id, row: &[f32]| core.exact_sidecar_slot_differs(&read, id, row).unwrap();
+        for (id, vector) in &UNSORTED_ORDINAL_ROWS {
+            assert!(!differs(*id, vector), "id {id}");
+        }
+        assert!(differs(10, &[0.5, 1.0]));
+        // Equal as floats, other bits: the blob is held to the row's bytes.
+        assert!(differs(10, &[-0.0, 1.0]));
+        assert!(!differs(99, &[9.0, 9.0]), "no ordinal");
+        assert!(!differs(40, &[9.0, 9.0]), "ordinal past the file's end");
+        assert!(!differs(50, &[9.0, 9.0]), "row stored without a slot");
+    }
+
+    /// Why taking the row is safe: over a sidecar that agrees with its rows,
+    /// the build's input and the export are, bit for bit, what the order
+    /// before gave (the sidecar's slot first, the row last).
+    #[test]
+    fn clean_sidecar_gives_build_and_export_what_the_slot_first_order_gave() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        commit_rows(&core, &writer, &UNSORTED_ORDINAL_ROWS);
+        let read = writer.begin_read().unwrap();
+        let bits = |vector: &[f32]| vector.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+
+        let rows = core.get_all_vector_rows(&read, Some(0)).unwrap();
+        assert_eq!(rows.len(), UNSORTED_ORDINAL_ROWS.len());
+        let slot_first: Vec<(u128, Vec<u32>)> = rows
+            .iter()
+            .map(|(vector, row_holds_the_vector)| {
+                assert!(*row_holds_the_vector);
+                let id = vector.get_id();
+                // The slot is there to be taken: this is not the row by default.
+                assert!(core
+                    .read_exact_sidecar_vector(&read, id, None)
+                    .unwrap()
+                    .is_some());
+                let stored = core.get_vector_data(&read, id).unwrap();
+                let slot = core
+                    .original_vector_for_rebuild(&read, vector, false, &stored)
+                    .unwrap();
+                (id, bits(&slot))
+            })
+            .collect();
+
+        let prepared = core.prepare_index_from_flat(&read).unwrap().unwrap();
+        let built: Vec<(u128, Vec<u32>)> = prepared
+            .point_ids
+            .iter()
+            .enumerate()
+            .map(|(at, id)| (*id, bits(prepared.raw_at(at).unwrap())))
+            .collect();
+        assert_eq!(built, slot_first);
+
+        let exported = core.export_level_zero(&read).unwrap();
+        assert_eq!(exported, export_with_point_gets(&core, &read).unwrap());
+        let exported: Vec<(u128, Vec<u32>)> = exported
+            .iter()
+            .map(|(id, vector, _)| (*id, bits(vector)))
+            .collect();
+        assert_eq!(exported, slot_first);
+    }
+
     fn unsorted_ordinal_writer() -> (
         Arc<dyn object_store::ObjectStore>,
         String,
@@ -13272,6 +18306,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn cold_reader_rebuilt_hvec_sidecar_matches_persisted_ordinals() {
         use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
 
@@ -13291,6 +18326,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn reopened_writer_rebuilt_hvec_sidecar_matches_persisted_ordinals() {
         let (_store, _path, writer, _writer_dir) = unsorted_ordinal_writer();
         // A writer that lost its local sidecar rebuilds it from rows; once
@@ -13373,6 +18409,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn reader_flat_search_scores_rows_written_after_its_rebuild() {
         use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
 
@@ -13419,6 +18456,525 @@ mod tests {
                 (30, vec![3.0, 0.0]),
                 (40, vec![2.0, 0.0]),
             ]
+        );
+    }
+
+    /// Rows whose distance to `FLAT_QUERY` grows with the id.
+    fn tail_rows(ids: std::ops::RangeInclusive<u128>) -> Vec<(u128, [f32; 2])> {
+        ids.map(|id| (id, [1.0 + id as f32, 0.0])).collect()
+    }
+
+    /// What `flat_hits` returns over `tail_rows(1..=n)` for any `n >= 16`.
+    fn nearest_tail_rows() -> Vec<(u128, Vec<f32>)> {
+        tail_rows(1..=16)
+            .into_iter()
+            .map(|(id, vector)| (id, vector.to_vec()))
+            .collect()
+    }
+
+    fn sidecar_slots(core: &VectorCore) -> u64 {
+        core.mmap_store
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |store| store.count())
+    }
+
+    /// Runs `during` while another thread holds the segment's file as a
+    /// search does.
+    fn while_the_file_is_held<T>(core: &VectorCore, during: impl FnOnce() -> T) -> T {
+        std::thread::scope(|scope| {
+            let (holding, held) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            scope.spawn(move || {
+                let _slot = core.mmap_store.read().unwrap();
+                holding.send(()).unwrap();
+                // A caller that waited for the file after all would end here.
+                let _ = released.recv_timeout(std::time::Duration::from_secs(30));
+            });
+            held.recv().unwrap();
+            let out = during();
+            drop(release);
+            out
+        })
+    }
+
+    #[test]
+    fn reader_sidecar_is_stale_past_the_floor_or_a_quarter_of_the_file() {
+        let ordinals = |range: std::ops::Range<u64>| {
+            range
+                .map(|ordinal| (u128::from(ordinal), ordinal))
+                .collect::<Vec<_>>()
+        };
+        // The floor, while a quarter of the file is below it.
+        assert!(!reader_sidecar_is_stale(2, &ordinals(0..66), 64));
+        assert!(reader_sidecar_is_stale(2, &ordinals(0..67), 64));
+        // A quarter of the file, once that is above the floor.
+        assert!(!reader_sidecar_is_stale(1040, &ordinals(0..1300), 64));
+        assert!(reader_sidecar_is_stale(1040, &ordinals(0..1301), 64));
+        // 0 turns the rebuild off.
+        assert!(!reader_sidecar_is_stale(2, &ordinals(0..5000), 0));
+
+        // Row-only rows get no slot from any rebuild.
+        let mut row_only = ordinals(0..2);
+        row_only.extend((0..100u64).map(|n| (u128::from(1000 + n), ROW_ONLY_SIDECAR_ORDINAL + n)));
+        assert!(!reader_sidecar_is_stale(2, &row_only, 64));
+
+        // Mostly dead ordinals: the rebuild would be refused.
+        let mut churned = ordinals(0..2);
+        churned.extend(ordinals(5000..5100));
+        assert!(!reader_sidecar_is_stale(2, &churned, 64));
+    }
+
+    // Serial, as are the two tests below: they set the rebuild's switch or rely
+    // on its default, and each needs a free materialization permit.
+    #[test]
+    #[serial_test::serial]
+    fn reader_rebuilds_a_sidecar_that_fell_behind_the_store() {
+        use crate::helix_engine::storage_core::backend_lsm::{
+            allow_lsm_blocking_cancellable, LsmReadCancellation,
+        };
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let writer_core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        commit_rows(&writer_core, &writer, &tail_rows(1..=2));
+
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let latest = || {
+            reader
+                .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+                .unwrap();
+            AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()))
+        };
+        // The first search may rebuild the sidecar; the second may use it.
+        assert_eq!(flat_hits(&core, &latest()).len(), 2);
+        assert_eq!(flat_hits(&core, &latest()).len(), 2);
+        assert_eq!(sidecar_slots(&core), 2);
+
+        // Up to the floor, rows appended after the rebuild are scored from the store.
+        commit_rows(&writer_core, &writer, &tail_rows(3..=66));
+        assert_eq!(flat_hits(&core, &latest()), nearest_tail_rows());
+        assert_eq!(sidecar_slots(&core), 2);
+
+        // One more and the search rebuilds the file first, unless switched off.
+        commit_rows(&writer_core, &writer, &tail_rows(67..=67));
+        {
+            let _off = EnvGuard::set("HELIX_LSM_READER_SIDECAR_STALE_ROWS", "0");
+            assert_eq!(flat_hits(&core, &latest()), nearest_tail_rows());
+            assert_eq!(sidecar_slots(&core), 2);
+        }
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let read = latest();
+        let search = || metrics::with_local_recorder(&recorder, || flat_hits(&core, &read));
+
+        // While another search holds the file, as a broad scan does through
+        // its row phase, this one does not wait for it: the short file serves.
+        assert_eq!(
+            while_the_file_is_held(&core, || search()),
+            nearest_tail_rows()
+        );
+        assert_eq!(sidecar_slots(&core), 2);
+
+        // A rebuild whose caller has left fails its reads. Nothing is wrong
+        // with it, so it holds no later search off the next one.
+        let gone = LsmReadCancellation::new();
+        gone.cancel();
+        let tried = metrics::with_local_recorder(&recorder, || {
+            allow_lsm_blocking_cancellable(gone, || core.rebuild_stale_reader_sidecar(2))
+        })
+        .unwrap();
+        assert!(!tried);
+        assert_eq!(sidecar_slots(&core), 2);
+        assert_eq!(
+            core.lsm_sidecar_miss_cached_at_secs
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+
+        assert_eq!(search(), nearest_tail_rows());
+        assert_eq!(sidecar_slots(&core), 67);
+        let rendered = handle.render();
+        for outcome in ["stale_busy", "stale_cancelled", "stale_rebuilt"] {
+            let line = format!(r#"helix_lsm_sidecar_materialize_total{{outcome="{outcome}"}} 1"#);
+            assert!(rendered.contains(&line), "{outcome}: {rendered}");
+        }
+        assert_eq!(flat_hits(&core, &read), nearest_tail_rows());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reader_rebuilds_a_short_sidecar_when_a_walk_scores_a_row_far_past_its_end() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        // Given a reader whose file was built when the segment held two rows.
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let writer_core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        commit_rows(&writer_core, &writer, &tail_rows(1..=2));
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(flat_hits(&core, &read).len(), 2);
+        assert_eq!(flat_hits(&core, &read).len(), 2);
+        assert_eq!(sidecar_slots(&core), 2);
+
+        // And a segment that took 65 more rows and is searched by its graph
+        // from then on: no flat scan comes to rebuild the file.
+        commit_rows(&writer_core, &writer, &tail_rows(3..=67));
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        let ordinal = |id: u128| core.sidecar_ordinal(&read, id).unwrap().unwrap();
+        let rebuilds = |scored: &dyn Fn()| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::with_local_recorder(&recorder, scored);
+            let rendered = handle.render();
+            let count = rendered
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(
+                        r#"helix_lsm_sidecar_materialize_total{outcome="stale_rebuilt"} "#,
+                    )
+                })
+                .map_or(0, |count| count.parse::<u64>().unwrap());
+            count
+        };
+
+        // When a walk scores a row within the allowance past the file's end,
+        // the row is left to the store.
+        assert_eq!(
+            rebuilds(&|| assert_eq!(
+                core.sidecar_distance(&read, ordinal(66), &FLAT_QUERY)
+                    .unwrap(),
+                None
+            )),
+            0
+        );
+        assert_eq!(sidecar_slots(&core), 2);
+
+        // When it scores one past the allowance, switched off: the same.
+        {
+            let _off = EnvGuard::set("HELIX_LSM_READER_SIDECAR_STALE_ROWS", "0");
+            assert_eq!(
+                core.sidecar_distance(&read, ordinal(67), &FLAT_QUERY)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(sidecar_slots(&core), 2);
+        }
+
+        // While a search holds the file the lookup does not wait for it, the
+        // rebuild is not tried, and that arms no backoff: the next lookup may
+        // rebuild.
+        let past = ordinal(67);
+        assert_eq!(
+            while_the_file_is_held(&core, || core.sidecar_distance(&read, past, &FLAT_QUERY))
+                .unwrap(),
+            None
+        );
+        assert_eq!(sidecar_slots(&core), 2);
+        assert_eq!(
+            core.lsm_sidecar_miss_cached_at_secs
+                .load(AtomicOrdering::Relaxed),
+            0
+        );
+
+        // Then, switched on, the file is rebuilt once and serves that row and
+        // every other.
+        assert_eq!(
+            rebuilds(&|| {
+                let scored = core
+                    .sidecar_distance(&read, ordinal(67), &FLAT_QUERY)
+                    .unwrap();
+                let expected = core.distance_between(&[68.0, 0.0], &FLAT_QUERY).unwrap();
+                assert!(scored.is_some_and(|distance| (distance - expected).abs() < 1e-3));
+                assert_eq!(core.sidecar_vec(ordinal(3)).unwrap(), Some(vec![4.0, 0.0]));
+            }),
+            1
+        );
+        assert_eq!(sidecar_slots(&core), 67);
+
+        // A row under a quarter of the file past its end, in a segment
+        // without a graph: it may be a tail that still grows. A fetch, the
+        // exact scoring of a filter's candidates and a walk's lookup all
+        // leave the file, as a flat scan would.
+        commit_rows(&writer_core, &writer, &tail_rows(68..=80));
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        let last = core.sidecar_ordinal(&read, 80).unwrap().unwrap();
+        let floor = EnvGuard::set("HELIX_LSM_READER_SIDECAR_STALE_ROWS", "8");
+        assert_eq!(
+            rebuilds(&|| {
+                assert_eq!(core.sidecar_vec(last).unwrap(), None);
+                let hits = core
+                    .search_exact_ids_with_selectivity(&read, &FLAT_QUERY, [80u128], 1, None)
+                    .unwrap();
+                assert_eq!(hits.len(), 1);
+                let scored = core.sidecar_distance(&read, last, &FLAT_QUERY).unwrap();
+                assert_eq!(scored, None);
+            }),
+            0
+        );
+        assert_eq!(sidecar_slots(&core), 67);
+
+        // Once the segment has a graph it takes no more rows: the first
+        // lookup that scores past the floor rebuilds the file, and a fetch
+        // still does not.
+        let mut write = writer.begin_write().unwrap();
+        writer
+            .put(
+                &mut write,
+                writer_core.seg_ns(SegmentDb::Vectors),
+                ENTRY_POINT_KEY.as_bytes(),
+                &80u128.to_be_bytes(),
+            )
+            .unwrap();
+        writer.commit(write).unwrap();
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(
+            rebuilds(&|| assert_eq!(core.sidecar_vec(last).unwrap(), None)),
+            0
+        );
+        assert_eq!(
+            rebuilds(&|| {
+                let scored = core.sidecar_distance(&read, last, &FLAT_QUERY).unwrap();
+                assert!(scored.is_some());
+            }),
+            1
+        );
+        assert_eq!(sidecar_slots(&core), 80);
+        drop(floor);
+
+        // A row no rebuild reaches costs one more rebuild, then none while
+        // the miss is remembered.
+        assert_eq!(
+            rebuilds(&|| {
+                for _ in 0..2 {
+                    let scored = core.sidecar_distance(&read, 10_000, &FLAT_QUERY).unwrap();
+                    assert_eq!(scored, None);
+                }
+            }),
+            1
+        );
+        assert_eq!(sidecar_slots(&core), 80);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reader_first_flat_search_is_scored_from_the_sidecar_it_builds() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        commit_rows(
+            &open_ordinal_test_core(Some(writer_dir.path()), &writer),
+            &writer,
+            &tail_rows(1..=20),
+        );
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        // Only the sidecar scan reports how many rows lie past the file's end.
+        let sidecar_scans = |core: &VectorCore| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let hits = metrics::with_local_recorder(&recorder, || flat_hits(core, &read));
+            assert_eq!(hits, nearest_tail_rows());
+            assert_eq!(sidecar_slots(core), 20);
+            handle
+                .render()
+                .contains(r#"helix_lsm_sidecar_past_end_rows_count{role="reader"} 1"#)
+        };
+
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        assert!(sidecar_scans(&core), "first search");
+        assert!(sidecar_scans(&core), "second search");
+
+        // Switched off, the first search scores row by row and still builds the file.
+        let _off = EnvGuard::set("HELIX_LSM_READER_SIDECAR_STALE_ROWS", "0");
+        let off_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(off_dir.path()), &reader);
+        assert!(!sidecar_scans(&core), "first search, switched off");
+        assert!(sidecar_scans(&core), "second search, switched off");
+    }
+
+    /// A reader core its reconcile found off the list builds no sidecar. The
+    /// build reads the newest view, where the writer reaps the segment, and a
+    /// read pinned before the merge would be scored from that file. Its first
+    /// search is scored from the rows instead, at the search's own view.
+    #[test]
+    #[serial_test::serial]
+    fn reader_builds_no_sidecar_for_a_retired_core() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        commit_rows(
+            &open_ordinal_test_core(Some(writer_dir.path()), &writer),
+            &writer,
+            &tail_rows(1..=20),
+        );
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        // What the reconcile does to a core whose segment left the list.
+        core.keep_sidecar_as_is();
+        assert_eq!(flat_hits(&core, &read), nearest_tail_rows());
+        assert_eq!(
+            sidecar_slots(&core),
+            0,
+            "a search built a retired core's sidecar"
+        );
+        assert!(!core.ensure_lsm_mmap_sidecar().unwrap());
+        assert_eq!(
+            sidecar_slots(&core),
+            0,
+            "a retired core built a sidecar when asked"
+        );
+
+        // A build already under way when the mark lands attaches nothing and
+        // leaves no file: the core's drop would not unlink it.
+        let stem = core.mmap_sidecar_stem.clone().unwrap();
+        let mut slot = core.mmap_store.write().unwrap();
+        assert!(!core
+            .do_lsm_sidecar_open_under_lock(&stem, &mut slot, false)
+            .unwrap());
+        assert!(slot.is_none(), "a build attached to a retired core");
+        drop(slot);
+        let left: Vec<_> = std::fs::read_dir(reader_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.file_stem() == stem.file_stem())
+            .collect();
+        assert!(left.is_empty(), "a retired core's build left {left:?}");
+    }
+
+    /// Nor does a retired core rebuild the sidecar it has, however far the
+    /// file falls behind the rows: it keeps the short file and scores the
+    /// rows past its end from the store.
+    #[test]
+    #[serial_test::serial]
+    fn reader_rebuilds_no_sidecar_for_a_retired_core() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let writer_core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        commit_rows(&writer_core, &writer, &tail_rows(1..=2));
+
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let latest = || {
+            reader
+                .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+                .unwrap();
+            AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()))
+        };
+        assert_eq!(flat_hits(&core, &latest()).len(), 2);
+        assert_eq!(flat_hits(&core, &latest()).len(), 2);
+        assert_eq!(sidecar_slots(&core), 2);
+
+        core.keep_sidecar_as_is();
+        // Far past the floor a rebuild waits for.
+        commit_rows(&writer_core, &writer, &tail_rows(3..=200));
+        assert_eq!(flat_hits(&core, &latest()), nearest_tail_rows());
+        assert_eq!(flat_hits(&core, &latest()), nearest_tail_rows());
+        assert_eq!(
+            sidecar_slots(&core),
+            2,
+            "a retired core rebuilt its sidecar"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reader_keeps_its_short_sidecar_when_the_rebuild_is_refused() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let writer_core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        commit_rows(&writer_core, &writer, &tail_rows(1..=2));
+
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_eq!(flat_hits(&core, &read).len(), 2);
+        assert_eq!(flat_hits(&core, &read).len(), 2);
+        assert_eq!(sidecar_slots(&core), 2);
+
+        commit_rows(&writer_core, &writer, &tail_rows(3..=67));
+        // A row without an ordinal: no rebuild can describe this store.
+        commit_rows(
+            &open_ordinal_test_core(None, &writer),
+            &writer,
+            &tail_rows(68..=68),
+        );
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // The second search must not scan the segment for another rebuild.
+        let hits = metrics::with_local_recorder(&recorder, || {
+            flat_hits(&core, &read);
+            flat_hits(&core, &read)
+        });
+        assert_eq!(hits, nearest_tail_rows());
+        assert_eq!(sidecar_slots(&core), 2);
+        let rendered = handle.render();
+        assert!(
+            rendered.contains(r#"helix_lsm_sidecar_materialize_total{outcome="stale_refused"} 1"#),
+            "{rendered}"
         );
     }
 
@@ -13476,6 +19032,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn row_only_writes_keep_reader_sidecars_current() {
         use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
 
@@ -13539,6 +19096,422 @@ mod tests {
         );
     }
 
+    /// A lookup past the end of a reader's file, as a graph walk makes for
+    /// each neighbour the file does not hold. No remap can bring the row, so
+    /// the lookup must not wait for the file's lock behind a search that
+    /// holds it. It is counted, by function. A lookup made after an append
+    /// has dropped the mapping still remaps.
+    #[test]
+    #[serial_test::serial]
+    fn sidecar_lookup_past_the_end_of_a_readers_file_does_not_wait_for_it() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let writer_core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        commit_rows(
+            &writer_core,
+            &writer,
+            &[(10, [0.0, 1.0]), (20, [-1.0, 0.0])],
+        );
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        // The reader's first search builds its file: two slots.
+        assert_eq!(flat_hits(&core, &read).len(), 2);
+        assert!(core.has_mmap_sidecar());
+
+        // The writer appends a third row. The reader's file stays at two.
+        commit_rows(&writer_core, &writer, &[(30, [1.0, 0.0])]);
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        let inside = core.sidecar_ordinal(&read, 10).unwrap().unwrap();
+        let past = core.sidecar_ordinal(&read, 30).unwrap().unwrap();
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            let (holding, held) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let held_core = &core;
+            scope.spawn(move || {
+                let _slot = held_core.mmap_store.read().unwrap();
+                holding.send(()).unwrap();
+                // A lookup that waited for the file would end here.
+                let _ = released.recv_timeout(std::time::Duration::from_secs(30));
+            });
+            held.recv().unwrap();
+            metrics::with_local_recorder(&recorder, || {
+                assert_eq!(
+                    core.sidecar_distance(&read, past, &FLAT_QUERY).unwrap(),
+                    None
+                );
+                assert_eq!(core.sidecar_vec(past).unwrap(), None);
+                // A row the file holds is no miss.
+                assert!(core
+                    .sidecar_distance(&read, inside, &FLAT_QUERY)
+                    .unwrap()
+                    .is_some());
+            });
+            drop(release);
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "a lookup waited for the file's lock"
+        );
+        let rendered = handle.render();
+        for function in ["sidecar_distance", "sidecar_vec"] {
+            let line = format!(r#"helix_sidecar_lookup_miss_total{{function="{function}"}} 1"#);
+            assert!(rendered.contains(&line), "{function}: {rendered}");
+        }
+
+        // An append drops the writer's mapping until a remap: there the lookup
+        // remaps and finds the row.
+        let appended = writer_core
+            .mmap_store
+            .write()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .append(&[9.0, 0.0])
+            .unwrap();
+        assert_eq!(
+            writer_core.sidecar_vec(appended).unwrap(),
+            Some(vec![9.0, 0.0])
+        );
+    }
+
+    /// A hit as (id, distance bits, vector bits).
+    fn hit_bits(hit: HVector) -> (u128, u32, Vec<u32>) {
+        (
+            hit.get_id(),
+            hit.get_distance().to_bits(),
+            hit.get_data().iter().map(|value| value.to_bits()).collect(),
+        )
+    }
+
+    /// Broad prefilter scan hits in the order returned, with rows read `batch`
+    /// at a time (0: one by one).
+    fn broad_scan_hits(
+        core: &VectorCore,
+        read: &AnyRead<'_>,
+        members: &HashSet<u128>,
+        k: usize,
+        batch: usize,
+    ) -> Vec<(u128, u32, Vec<u32>)> {
+        with_flat_scan_row_batch_for_test(batch, || {
+            core.search_broad_prefilter_scan::<fn(u128) -> bool>(
+                read,
+                &FLAT_QUERY,
+                k,
+                members,
+                None,
+                None,
+            )
+            .unwrap()
+            .expect("the segment has a sidecar")
+            .into_iter()
+            .map(hit_bits)
+            .collect()
+        })
+    }
+
+    /// Unfiltered flat search hits in the order returned, with rows read
+    /// `batch` at a time (0: one by one).
+    fn flat_scan_hits(
+        core: &VectorCore,
+        read: &AnyRead<'_>,
+        batch: usize,
+    ) -> Vec<(u128, u32, Vec<u32>)> {
+        with_flat_scan_row_batch_for_test(batch, || {
+            core.search_flat_id_filter_direct::<fn(u128) -> bool>(
+                read,
+                &FLAT_QUERY,
+                &PreparedSpindleQuery::None,
+                16,
+                None,
+            )
+            .unwrap()
+            .into_iter()
+            .map(hit_bits)
+            .collect()
+        })
+    }
+
+    /// Every kind of member a flat scan reads by row: a slot past the reader's
+    /// sidecar file, a row-only ordinal, and for the broad prefilter scan a row
+    /// with no ordinal row at all and members with no row in the segment.
+    /// Reading those rows in batches returns what reading them one by one
+    /// returns, to the bit, with multi-get on and off.
+    #[test]
+    #[serial_test::serial]
+    fn flat_scans_read_rows_the_same_batched_and_one_by_one() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let slotting_core = open_ordinal_test_core(Some(writer_dir.path()), &writer);
+        commit_rows(
+            &slotting_core,
+            &writer,
+            &[(10, [0.0, 1.0]), (20, [-1.0, 0.0]), (25, [0.5, 0.5])],
+        );
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let reader_dir = TempDir::new().unwrap();
+        let reader_core = open_ordinal_test_core(Some(reader_dir.path()), &reader);
+        // The reader lays its sidecar out from the three rows it holds now.
+        assert!(reader_core.ensure_lsm_mmap_sidecar().unwrap());
+        assert_eq!(reader_core.mmap_store_count(), Some(3));
+
+        // 40: a slot past the reader's file. 25: gone.
+        commit_rows(&slotting_core, &writer, &[(40, [3.0, 0.0])]);
+        let mut write = writer.begin_write().unwrap();
+        slotting_core
+            .delete_vectors_batch_be(&mut write, &[25])
+            .unwrap();
+        writer.commit(write).unwrap();
+        // 5: written with no sidecar attached, so it has no ordinal row.
+        commit_rows(
+            &open_ordinal_test_core(None, &writer),
+            &writer,
+            &[(5, [0.0, -1.0])],
+        );
+        // 10 and 30: that row makes a rebuild refuse, so this core stores
+        // rows with row-only ordinals.
+        let lost_dir = TempDir::new().unwrap();
+        let row_only_core = open_ordinal_test_core(Some(lost_dir.path()), &writer);
+        commit_rows(
+            &row_only_core,
+            &writer,
+            &[(10, [2.0, 0.0]), (30, [1.0, 0.0])],
+        );
+        assert!(!row_only_core.has_mmap_sidecar());
+
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        // 70 never existed.
+        let members: HashSet<u128> = [5, 10, 20, 25, 30, 40, 70].into_iter().collect();
+        let counted = |batch: usize| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let hits = metrics::with_local_recorder(&recorder, || {
+                broad_scan_hits(&reader_core, &read, &members, 16, batch)
+            });
+            let rendered = handle.render();
+            for line in [
+                r#"helix_broad_scan_row_lookups_total{outcome="past_file"} 3"#,
+                r#"helix_broad_scan_row_lookups_total{outcome="no_ordinal"} 1"#,
+                r#"helix_broad_scan_row_lookups_total{outcome="absent"} 2"#,
+            ] {
+                assert!(
+                    rendered.contains(line),
+                    "batch {batch}: no {line} in {rendered}"
+                );
+            }
+            hits
+        };
+
+        let one_by_one = counted(0);
+        let ids: Vec<u128> = one_by_one.iter().map(|hit| hit.0).collect();
+        // By distance to [1, 0]: 30 at 0, 10 with its rewritten row at 1, 5
+        // at 1.41, then 20 (scored from the reader's file) and 40 at 2.
+        assert_eq!(ids.len(), 5, "{ids:?}");
+        assert_eq!(ids[..3], [30, 10, 5], "{ids:?}");
+        let mut last = ids[3..].to_vec();
+        last.sort_unstable();
+        assert_eq!(last, [20, 40], "{ids:?}");
+        assert_eq!(
+            one_by_one[1].2,
+            [2.0_f32.to_bits(), 0.0_f32.to_bits()],
+            "10 is read from its row, not from the slot the reader's file holds"
+        );
+        for batch in [1, 2, 2048] {
+            assert_eq!(counted(batch), one_by_one, "batch {batch}");
+            assert_eq!(
+                broad_scan_hits(&reader_core, &read, &members, 2, batch),
+                broad_scan_hits(&reader_core, &read, &members, 2, 0),
+                "first two hits, batch {batch}"
+            );
+        }
+
+        // The unfiltered scan walks ordinals only (5 has none): 20 from the
+        // reader's file, 10, 30 and 40 from their rows.
+        let flat_one_by_one = flat_scan_hits(&reader_core, &read, 0);
+        let ids: Vec<u128> = flat_one_by_one.iter().map(|hit| hit.0).collect();
+        assert_eq!(ids.len(), 4, "{ids:?}");
+        assert_eq!(ids[..2], [30, 10], "{ids:?}");
+        let mut last = ids[2..].to_vec();
+        last.sort_unstable();
+        assert_eq!(last, [20, 40], "{ids:?}");
+        for batch in [1, 2, 2048] {
+            assert_eq!(
+                flat_scan_hits(&reader_core, &read, batch),
+                flat_one_by_one,
+                "unfiltered, batch {batch}"
+            );
+        }
+
+        // The same on the writer's own read.
+        let writer_read = writer.begin_read().unwrap();
+        let on_writer = broad_scan_hits(&slotting_core, &writer_read, &members, 16, 0);
+        let mut ids: Vec<u128> = on_writer.iter().map(|hit| hit.0).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, [5, 10, 20, 30, 40]);
+        for batch in [1, 2, 2048] {
+            assert_eq!(
+                broad_scan_hits(&slotting_core, &writer_read, &members, 16, batch),
+                on_writer,
+                "writer, batch {batch}"
+            );
+        }
+
+        // Production readers run with multi-get off: a batched read is then
+        // single gets in flight together. Only the lookups of members a
+        // segment does not list ask for a multi-get either way.
+        let _multi_get = EnvGuard::set("HELIX_LSM_MULTI_GET", "0");
+        for batch in [0, 1, 2, 2048] {
+            assert_eq!(counted(batch), one_by_one, "multi-get off, batch {batch}");
+            assert_eq!(
+                flat_scan_hits(&reader_core, &read, batch),
+                flat_one_by_one,
+                "multi-get off, unfiltered, batch {batch}"
+            );
+            assert_eq!(
+                broad_scan_hits(&slotting_core, &writer_read, &members, 16, batch),
+                on_writer,
+                "multi-get off, writer, batch {batch}"
+            );
+        }
+        drop(writer_read);
+
+        // 40's row becomes the marker of an externalized vector. Its slot is
+        // past the reader's file, so resolving it would refresh the mapping
+        // under the scan's own guard: the scan fails instead, read one by
+        // one or in a batch, and its caller answers from the graph walk.
+        let mut write = writer.begin_write().unwrap();
+        writer
+            .put(
+                &mut write,
+                slotting_core.seg_ns(SegmentDb::Vectors),
+                &VectorCore::vector_key(40, 0),
+                EXTERNALIZED_VECTOR_MARKER,
+            )
+            .unwrap();
+        writer.commit(write).unwrap();
+        reader
+            .refresh_lsm_reader_with_poll_interval(std::time::Duration::from_millis(100))
+            .unwrap();
+        let marked = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        for batch in [0, 2048] {
+            let error = with_flat_scan_row_batch_for_test(batch, || {
+                reader_core.search_broad_prefilter_scan::<fn(u128) -> bool>(
+                    &marked,
+                    &FLAT_QUERY,
+                    16,
+                    &members,
+                    None,
+                    None,
+                )
+            })
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+            assert!(
+                error.contains("externalized vector 40"),
+                "batch {batch}: the scan answered, or failed otherwise: {error:?}"
+            );
+        }
+    }
+
+    /// A segment that holds rows while its sidecar file has no slot, a state
+    /// made by hand here (rows written with no sidecar attached, then an
+    /// empty file put in place): every row is past the file's end, and the
+    /// scan reads them as it reads any row past it, which is what the read
+    /// of each id returns. The scan used to answer nothing for such a
+    /// segment before it had looked at a row.
+    #[test]
+    fn a_sidecar_scan_reads_the_rows_of_a_segment_whose_file_has_no_slot() {
+        use crate::helix_engine::vector_core::mmap_vectors::{MmapBackend, MmapVectorStore};
+
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        commit_rows(
+            &open_ordinal_test_core(None, &writer),
+            &writer,
+            &[(5, [1.0, 0.0]), (6, [0.0, 1.0])],
+        );
+        let dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(Some(dir.path()), &writer);
+        assert!(!core.has_mmap_sidecar());
+        let empty = MmapVectorStore::create(&dir.path().join("empty.hvec"), 2).unwrap();
+        assert_eq!(empty.count(), 0);
+        *core.mmap_store.write().unwrap() = Some(MmapBackend::Hvec(empty));
+
+        let read = writer.begin_read().unwrap();
+        let members: HashSet<u128> = [5, 6, 70].into_iter().collect();
+        let scanned: Vec<u128> = broad_scan_hits(&core, &read, &members, 16, 0)
+            .iter()
+            .map(|hit| hit.0)
+            .collect();
+        assert_eq!(scanned, [5, 6]);
+        let read_each: Vec<u128> = core
+            .search_exact_ids_with_selectivity(&read, &FLAT_QUERY, [5, 6, 70], 16, None)
+            .unwrap()
+            .iter()
+            .map(HVector::get_id)
+            .collect();
+        assert_eq!(read_each, scanned);
+    }
+
+    /// Waits, bounded, until no materialization permit is out. The counter is
+    /// the process's, and `#[serial]` keeps apart only the tests that carry it:
+    /// a test beside this one holds a permit for the moment of a
+    /// materialization, and an assert on the counter met it.
+    fn no_permit_out(what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire) != 0 {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// `n` materialization permits, taken once none is out. Where a test took
+    /// them with `try_acquire().unwrap()` it failed on a permit another test
+    /// held for a moment.
+    fn held_permits(n: usize) -> Vec<SidecarMaterializePermit> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire) == 0 {
+                let held: Vec<_> = (0..n)
+                    .map_while(|_| SidecarMaterializePermit::try_acquire())
+                    .collect();
+                if held.len() == n {
+                    return held;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "materialization permits of other tests stayed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// Insert 30 while every materialization permit is busy, free one, run
     /// `attach` in the same open batch, then commit it.
     fn insert_while_permits_busy_then(
@@ -13560,9 +19533,7 @@ mod tests {
         // The writer lost its local sidecar.
         let lost_dir = TempDir::new().unwrap();
         let core = open_ordinal_test_core(Some(lost_dir.path()), &writer);
-        let busy = (0..sidecar_materialize_concurrency())
-            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
-            .collect::<Vec<_>>();
+        let busy = held_permits(sidecar_materialize_concurrency());
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(200));
             drop(busy);
@@ -13707,7 +19678,10 @@ mod tests {
 
         // Arm the two-phase hook so the loader thread pauses between
         // scan and generation check.
-        ORDINAL_LOAD_POST_SCAN_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+        ORDINAL_LOAD_POST_SCAN_ARMED.store(
+            &core as *const VectorCore as usize,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         ORDINAL_LOAD_POST_SCAN_FIRED.store(false, std::sync::atomic::Ordering::SeqCst);
 
         let core_ref = &core;
@@ -13735,7 +19709,7 @@ mod tests {
             loader.join().unwrap();
         });
 
-        ORDINAL_LOAD_POST_SCAN_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+        ORDINAL_LOAD_POST_SCAN_ARMED.store(0, std::sync::atomic::Ordering::SeqCst);
 
         // With the fix: the generation moved during the scan so the loaded
         // map was discarded and ordinals remain unloaded.
@@ -13748,6 +19722,44 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn rebuilt_sidecar_map_is_discarded_when_a_delete_commits_during_open() {
+        let (_store, _path, writer) = in_memory_lsm_writer();
+        let dir = TempDir::new().unwrap();
+        let core = open_ordinal_test_core(None, &writer);
+        commit_rows(&core, &writer, &[(10, [0.0, 1.0]), (20, [-1.0, 0.0])]);
+        let stem = dir.path().join("dense__seg_000001");
+        ORDINAL_LOAD_POST_SCAN_ARMED
+            .store(&core as *const VectorCore as usize, AtomicOrdering::SeqCst);
+        ORDINAL_LOAD_POST_SCAN_FIRED.store(false, AtomicOrdering::SeqCst);
+
+        std::thread::scope(|scope| {
+            let loader = scope.spawn(|| {
+                let mut slot = core.mmap_store.write().unwrap();
+                core.do_lsm_sidecar_open_under_lock(&stem, &mut slot, false)
+            });
+            while !ORDINAL_LOAD_POST_SCAN_FIRED.load(AtomicOrdering::SeqCst)
+                && !loader.is_finished()
+            {
+                std::thread::yield_now();
+            }
+            let intercepted = ORDINAL_LOAD_POST_SCAN_FIRED.load(AtomicOrdering::SeqCst);
+            core.remove_cached_sidecar_ordinals(&[10]);
+            ORDINAL_LOAD_POST_SCAN_ARMED.store(0, AtomicOrdering::SeqCst);
+            ORDINAL_LOAD_POST_SCAN_FIRED.store(false, AtomicOrdering::Release);
+            assert!(loader.join().unwrap().unwrap());
+            assert!(
+                intercepted,
+                "the rebuild must return a map from vector rows"
+            );
+        });
+
+        assert!(core.has_mmap_sidecar());
+        assert!(!core.sidecar_ordinals_loaded().unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn write_path_sidecar_failure_stores_the_row_instead_of_failing_the_insert() {
         use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
 
@@ -13803,6 +19815,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn sidecar_verify_discards_and_republishes_id_sorted_sidecars() {
         use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
         use crate::helix_engine::vector_core::mmap_vectors::MmapVectorStore;
@@ -14637,8 +20650,8 @@ mod tests {
         let query: Vec<f32> = vec![0.5; 16];
 
         // With ef_override=96, effective_ef should be min(adaptive, 96) = 96
-        let results = core
-            .search_with_selectivity_ef::<VF>(
+        let results = with_small_segment_exact_for_test(false, || {
+            core.search_with_selectivity_ef::<VF>(
                 &core.backend.read_borrowed(&txn),
                 &query,
                 5,
@@ -14647,7 +20660,8 @@ mod tests {
                 Some(0.01), // very selective
                 Some(96),   // explicit cap
             )
-            .unwrap();
+        })
+        .unwrap();
         // The search should succeed (the cap doesn't break anything)
         assert!(!results.is_empty());
     }
@@ -14737,8 +20751,8 @@ mod tests {
 
         let txn = env.read_txn().unwrap();
         let query: Vec<f32> = vec![0.5; 16];
-        let results = core
-            .search_with_selectivity_ef::<VF>(
+        let results = with_small_segment_exact_for_test(false, || {
+            core.search_with_selectivity_ef::<VF>(
                 &core.backend.read_borrowed(&txn),
                 &query,
                 10,
@@ -14747,7 +20761,8 @@ mod tests {
                 None,
                 Some(4),
             )
-            .unwrap();
+        })
+        .unwrap();
 
         assert_eq!(results.len(), 10);
     }
@@ -14765,29 +20780,31 @@ mod tests {
         let hvector_filter = |v: &HVector| v.id % 2 == 0;
         let id_filter = |id: u128| id % 2 == 0;
 
-        let hvector_results = core
-            .search_with_selectivity_ef(
-                &core.backend.read_borrowed(&txn),
-                &query,
-                10,
-                Some(&[hvector_filter]),
-                true,
-                Some(0.5),
-                None,
+        let (hvector_results, id_results) = with_small_segment_exact_for_test(false, || {
+            (
+                core.search_with_selectivity_ef(
+                    &core.backend.read_borrowed(&txn),
+                    &query,
+                    10,
+                    Some(&[hvector_filter]),
+                    true,
+                    Some(0.5),
+                    None,
+                )
+                .unwrap(),
+                core.search_with_id_filter_ef_observed(
+                    &core.backend.read_borrowed(&txn),
+                    &query,
+                    10,
+                    Some(&[id_filter]),
+                    true,
+                    Some(0.5),
+                    None,
+                    None,
+                )
+                .unwrap(),
             )
-            .unwrap();
-        let id_results = core
-            .search_with_id_filter_ef_observed(
-                &core.backend.read_borrowed(&txn),
-                &query,
-                10,
-                Some(&[id_filter]),
-                true,
-                Some(0.5),
-                None,
-                None,
-            )
-            .unwrap();
+        });
 
         assert!(!id_results.is_empty());
         assert!(id_results.iter().all(|v| v.id % 2 == 0));
@@ -14824,8 +20841,8 @@ mod tests {
         let txn = env.read_txn().unwrap();
         assert!(core.has_index(&core.backend.read_borrowed(&txn)).unwrap());
         let only_three = |id: u128| id == 3;
-        let results = core
-            .search_with_id_filter_ef_observed(
+        let results = with_small_segment_exact_for_test(false, || {
+            core.search_with_id_filter_ef_observed(
                 &core.backend.read_borrowed(&txn),
                 &[0.0, 1.0, 0.0],
                 1,
@@ -14835,7 +20852,8 @@ mod tests {
                 Some(4),
                 None,
             )
-            .unwrap();
+        })
+        .unwrap();
 
         assert_eq!(results.iter().map(HVector::get_id).collect::<Vec<_>>(), [3]);
     }
@@ -17226,6 +23244,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn lsm_exact_hvec_opens_sidecar_on_first_raw_write() {
         use crate::helix_engine::storage_core::backend_any::AnyBackend;
         use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
@@ -17305,6 +23324,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn lsm_exact_hvec_materializes_from_slate_rows_and_scores_without_backend_reads() {
         use crate::helix_engine::storage_core::backend_any::AnyBackend;
         use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
@@ -17470,6 +23490,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn lsm_indexed_hvec_search_uses_hnsw_path_with_populated_sidecar() {
         use crate::helix_engine::storage_core::backend_any::AnyBackend;
         use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
@@ -17538,8 +23559,8 @@ mod tests {
             unreachable!("backend is LSM in this test");
         };
         lsm.reset_read_count();
-        let results = core
-            .search_with_id_filter_ef_observed::<fn(u128) -> bool>(
+        let results = with_small_segment_exact_for_test(false, || {
+            core.search_with_id_filter_ef_observed::<fn(u128) -> bool>(
                 &ro,
                 &[1.0, 0.0, 0.0, 0.0],
                 5,
@@ -17549,7 +23570,8 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+        })
+        .unwrap();
 
         assert!(!results.is_empty());
         assert!(
@@ -17559,7 +23581,127 @@ mod tests {
         );
     }
 
+    /// A sealed segment publishes its sidecar and ordinal map once, at
+    /// indexing; a later hard delete rewrites neither. A pod without the local
+    /// file restores that blob, and must then read what the writer reads with
+    /// the file present.
     #[test]
+    #[serial_test::serial]
+    fn restored_hvec_sidecar_does_not_serve_hard_deleted_ids() {
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+
+        const DELETED: u128 = 7;
+        let row = |id: u128| {
+            let scale = id as f32 / 32.0;
+            [scale, 1.0 - scale, (id % 3) as f32, (id % 5) as f32]
+        };
+        let segment = "dense__seg_restored_delete";
+        let open = |dir: &Path, backend: &Arc<AnyBackend>| {
+            VectorCore::new_named_lsm_with_dir(
+                segment,
+                HNSWConfig::new(Some(8), Some(16), Some(32)),
+                DistanceMetric::Cosine,
+                SpindleConfig {
+                    mode: SpindleMode::None,
+                    ..SpindleConfig::default()
+                },
+                Some(dir),
+                4,
+                Arc::clone(backend),
+            )
+            .unwrap()
+        };
+        // The deleted id is gone from point reads and flat search, and the
+        // survivors still resolve through the sidecar.
+        let assert_deleted_id_is_gone = |core: &VectorCore, read: &AnyRead<'_>, case: &str| {
+            assert!(
+                matches!(
+                    core.get_vector(read, DELETED, 0, true),
+                    Err(VectorError::VectorNotFound(_))
+                ),
+                "{case}: deleted id must not resolve"
+            );
+            let mut flat: Vec<u128> = core
+                .search_flat_id_filter_direct::<fn(u128) -> bool>(
+                    read,
+                    &[0.2, 0.8, 1.0, 2.0],
+                    &PreparedSpindleQuery::None,
+                    64,
+                    None,
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.get_id())
+                .collect();
+            flat.sort_unstable();
+            let survivors: Vec<u128> = (1..=32).filter(|id| *id != DELETED).collect();
+            assert_eq!(flat, survivors, "{case}");
+            assert_eq!(
+                core.get_vector(read, 8, 0, true).unwrap().get_data(),
+                row(8).as_slice(),
+                "{case}"
+            );
+            assert_eq!(core.sidecar_format_label(), "hvec", "{case}");
+        };
+
+        // Given an indexed segment with one id hard-deleted after indexing.
+        let (store, path, writer) = in_memory_lsm_writer();
+        let writer_dir = TempDir::new().unwrap();
+        let core = open(writer_dir.path(), &writer);
+        let mut w = writer.begin_write().unwrap();
+        for id in 1..=32u128 {
+            core.insert_flat_be(&mut w, &row(id), Some(id), None)
+                .unwrap();
+        }
+        writer.commit(w).unwrap();
+        let read = writer.begin_read().unwrap();
+        let mut prepared = core.prepare_index_from_flat(&read).unwrap().unwrap();
+        drop(read);
+        let mut w = writer.begin_write().unwrap();
+        let total = prepared.point_ids.len();
+        core.flush_prepared_index_chunk_be(&mut w, &mut prepared, 0, total)
+            .unwrap();
+        core.finalize_prepared_index_entry_be(&mut w, &prepared)
+            .unwrap();
+        writer.commit(w).unwrap();
+        let mut w = writer.begin_write().unwrap();
+        core.delete_vectors_batch_be(&mut w, &[DELETED]).unwrap();
+        writer.commit(w).unwrap();
+        drop(core);
+
+        // When the writer reopens it with its local sidecar, then without it.
+        let read = writer.begin_read().unwrap();
+        assert_deleted_id_is_gone(
+            &open(writer_dir.path(), &writer),
+            &read,
+            "writer, file kept",
+        );
+        let hvec_path = writer_dir.path().join(segment).with_extension("hvec");
+        std::fs::remove_file(&hvec_path).unwrap();
+        assert_deleted_id_is_gone(
+            &open(writer_dir.path(), &writer),
+            &read,
+            "writer, file lost",
+        );
+        assert!(
+            hvec_path.exists(),
+            "the lost sidecar is restored from its blob"
+        );
+
+        // And when a reader with no local sidecar opens it.
+        let reader = Arc::new(AnyBackend::LsmReader(
+            LsmReader::open_with_store(&path, store).unwrap(),
+        ));
+        let reader_dir = TempDir::new().unwrap();
+        let AnyBackend::LsmReader(lsm_reader) = &*reader else {
+            unreachable!()
+        };
+        let read = AnyRead::LsmReader(Some(lsm_reader.begin_snapshot().unwrap()));
+        assert_deleted_id_is_gone(&open(reader_dir.path(), &reader), &read, "reader");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn lsm_indexed_hvec_reopens_from_persisted_sidecar_blob_without_row_scan() {
         use crate::helix_engine::storage_core::backend_any::AnyBackend;
         use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
@@ -17684,14 +23826,18 @@ mod tests {
             hvec_path.exists(),
             "first score should restore the HVEC blob"
         );
+        // A writer reads the 32 ordinal rows twice (coverage check, then its
+        // live map) instead of trusting the published map; a scan of the
+        // vector rows would add at least 32 more reads.
         assert!(
-            lsm.read_count() <= 3,
+            lsm.read_count() <= 2 + 2 * 32,
             "restoring from the sidecar blob should avoid scanning all vector rows; read_count={}",
             lsm.read_count()
         );
     }
 
     #[test]
+    #[serial_test::serial]
     fn lsm_scalar_int8_materializes_hspn_from_slate_rows_and_scores_without_backend_reads() {
         use crate::helix_engine::storage_core::backend_any::AnyBackend;
         use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
@@ -17799,6 +23945,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn lsm_exact_hvec_rebuilds_empty_existing_sidecar_from_slate_rows() {
         use crate::helix_engine::storage_core::backend_any::AnyBackend;
         use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
@@ -18162,20 +24309,14 @@ mod tests {
         // acquisition fails at the cap and recovers after drop.
         let cap = sidecar_materialize_concurrency();
         assert!(cap >= 1, "default cap must admit at least one probe");
-        let mut held = Vec::new();
-        for _ in 0..cap {
-            held.push(
-                SidecarMaterializePermit::try_acquire()
-                    .expect("under-cap acquisition must succeed"),
-            );
-        }
+        let mut held = held_permits(cap);
         assert!(
             SidecarMaterializePermit::try_acquire().is_none(),
             "at-cap acquisition must defer, not block"
         );
         held.pop();
         assert!(
-            SidecarMaterializePermit::try_acquire().is_some(),
+            SidecarMaterializePermit::acquire_within(std::time::Duration::from_secs(5)).is_some(),
             "released permit must be reusable"
         );
     }
@@ -18193,11 +24334,7 @@ mod tests {
             (1..=64).contains(&cap),
             "test requires a finite materialization cap, got {cap}"
         );
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0,
-            "serial permit test must start without an in-flight materialization"
-        );
+        no_permit_out("serial permit test must start without an in-flight materialization");
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -18222,12 +24359,7 @@ mod tests {
         )
         .unwrap();
 
-        let held = (1..cap)
-            .map(|_| {
-                SidecarMaterializePermit::try_acquire()
-                    .expect("cap-minus-one setup acquisition must succeed")
-            })
-            .collect::<Vec<_>>();
+        let held = held_permits(cap - 1);
         let inflight_while_blocked = std::thread::scope(|scope| {
             let (lock_attempt_tx, lock_attempt_rx) = mpsc::sync_channel(0);
             let (continue_tx, continue_rx) = mpsc::sync_channel(0);
@@ -18270,11 +24402,7 @@ mod tests {
         );
 
         drop(held);
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0,
-            "all materialization permits must be released after the test"
-        );
+        no_permit_out("all materialization permits must be released after the test");
     }
 
     /// While the write-path materializer waits for a permit, the slot lock
@@ -18289,10 +24417,7 @@ mod tests {
 
         let cap = sidecar_materialize_concurrency();
         assert!(cap >= 1 && cap <= 64, "need finite cap, got {cap}");
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0
-        );
+        no_permit_out("a materialization permit stayed out");
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -18320,9 +24445,7 @@ mod tests {
         );
 
         // Exhaust all permits so the write path blocks in acquire_within.
-        let held: Vec<_> = (0..cap)
-            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
-            .collect();
+        let held = held_permits(cap);
 
         let (started_tx, started_rx) = mpsc::sync_channel(0);
         let core2 = Arc::clone(&core);
@@ -18348,10 +24471,7 @@ mod tests {
         // Release permits so the writer can finish.
         drop(held);
         let _ = writer.join().unwrap();
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0
-        );
+        no_permit_out("a materialization permit stayed out");
     }
 
     /// N concurrent writers to the same segment must consume at most 1
@@ -18366,10 +24486,7 @@ mod tests {
 
         let cap = sidecar_materialize_concurrency();
         assert!(cap >= 2 && cap <= 64, "need cap >= 2, got {cap}");
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0
-        );
+        no_permit_out("a materialization permit stayed out");
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -18398,9 +24515,7 @@ mod tests {
 
         // Hold cap-2 permits so only 2 remain. If two materializers tried
         // to acquire, one would succeed and one would contend.
-        let held: Vec<_> = (0..cap.saturating_sub(2))
-            .filter_map(|_| SidecarMaterializePermit::try_acquire())
-            .collect();
+        let held = held_permits(cap.saturating_sub(2));
 
         let n_writers = 4;
         let barrier = Arc::new(Barrier::new(n_writers));
@@ -18447,11 +24562,7 @@ mod tests {
         );
 
         drop(held);
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0,
-            "all permits must be released"
-        );
+        no_permit_out("all permits must be released");
     }
 
     /// Write-path pin emits `helix_lsm_sidecar_pinned_total` exactly once per
@@ -19479,8 +25590,8 @@ mod tests {
         );
 
         let id_filter = |_id: u128| true;
-        let results = core
-            .search_with_id_filter_ef_observed(
+        let results = with_small_segment_exact_for_test(false, || {
+            core.search_with_id_filter_ef_observed(
                 &r,
                 &query,
                 2,
@@ -19490,7 +25601,8 @@ mod tests {
                 None,
                 None,
             )
-            .unwrap();
+        })
+        .unwrap();
         let ids: Vec<u128> = results.iter().map(|v| v.get_id()).collect();
         assert!(ids.contains(&3), "id-filter search must reach C: {ids:?}");
         assert!(!ids.contains(&2), "id-filter search returned tombstoned B");
@@ -19619,6 +25731,30 @@ mod tests {
             })
             .collect();
         assert_eq!(worst.pop().unwrap().0.id, 1, "NaN must be evicted first");
+    }
+
+    /// The heap a walk hands its hits over in gives equally far hits by id:
+    /// both zeros are one distance and a NaN is as far as infinity.
+    #[test]
+    fn equally_far_hits_leave_the_result_heap_by_id() {
+        let mut heap = BinaryHeap::new();
+        for (id, distance) in [
+            (7u128, 0.5f32),
+            (3, 0.5),
+            (9, 0.5),
+            (1, 0.9),
+            (5, 0.1),
+            (4, f32::INFINITY),
+            (2, f32::NAN),
+            (8, -0.0),
+            (6, 0.0),
+        ] {
+            let mut hit = HVector::from_slice(id, 0, vec![0.0]);
+            hit.set_distance(distance);
+            heap.push(hit);
+        }
+        let popped: Vec<u128> = std::iter::from_fn(|| heap.pop().map(|hit| hit.get_id())).collect();
+        assert_eq!(popped, vec![6, 8, 5, 3, 7, 9, 1, 2, 4]);
     }
 
     #[test]
@@ -20129,15 +26265,10 @@ mod tests {
 
         let cap = sidecar_materialize_concurrency();
         assert!((1..=64).contains(&cap), "need a finite cap, got {cap}");
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0
-        );
+        no_permit_out("a materialization permit stayed out");
         let (_env, dir) = setup();
         let core = write_path_probe_core(dir.path());
-        let held = (1..cap)
-            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
-            .collect::<Vec<_>>();
+        let held = held_permits(cap - 1);
         let waits_before =
             WRITE_PATH_PERMIT_WAITS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -20185,10 +26316,7 @@ mod tests {
             lock_free_during_permit_wait,
             "worker holds the slot WRITE lock while waiting for a permit (searches blocked)"
         );
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0
-        );
+        no_permit_out("a materialization permit stayed out");
     }
 
     /// Reviewer probe `rr_hook_fires_before_lock_on_uncontended_write_path`:
@@ -20236,15 +26364,10 @@ mod tests {
 
         let cap = sidecar_materialize_concurrency();
         assert!((1..=64).contains(&cap), "need a finite cap, got {cap}");
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0
-        );
+        no_permit_out("a materialization permit stayed out");
         let (_env, dir) = setup();
         let core = write_path_probe_core(dir.path());
-        let held: Vec<_> = (1..cap)
-            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
-            .collect();
+        let held = held_permits(cap - 1);
 
         let (inflight_at_hook, locked_at_hook) = std::thread::scope(|scope| {
             let (a_tx, a_rx) = mpsc::sync_channel(0);
@@ -20281,10 +26404,7 @@ mod tests {
             "elected writer must release its permit on return"
         );
         drop(held);
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0
-        );
+        no_permit_out("a materialization permit stayed out");
     }
 
     /// N4: an elected writer that acquired a permit lock-free and then finds
@@ -20300,15 +26420,10 @@ mod tests {
 
         let cap = sidecar_materialize_concurrency();
         assert!((2..=64).contains(&cap), "need cap >= 2, got {cap}");
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0
-        );
+        no_permit_out("a materialization permit stayed out");
         let (_env, dir) = setup();
         let core = write_path_probe_core(dir.path());
-        let held: Vec<_> = (1..cap)
-            .map(|_| SidecarMaterializePermit::try_acquire().unwrap())
-            .collect();
+        let held = held_permits(cap - 1);
         let waits_before =
             WRITE_PATH_PERMIT_WAITS_FOR_TEST.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -20388,10 +26503,7 @@ mod tests {
             cap - 1
         );
         drop(held);
-        assert_eq!(
-            SIDECAR_MATERIALIZE_INFLIGHT.load(AtomicOrdering::Acquire),
-            0
-        );
+        no_permit_out("a materialization permit stayed out");
     }
 
     /// N9: the per-segment election flag is released when the elected
@@ -21097,5 +27209,274 @@ mod tests {
             core.get_vector(&read, 20, 0, true).unwrap().get_data(),
             &[0.0, -1.0]
         );
+    }
+
+    /// Lazy id-filter evaluation must return exactly the eager results (ids
+    /// and distances) while calling the filter — a payload node read on the
+    /// Qdrant path — only for neighbors that could enter the result set.
+    #[test]
+    fn lazy_id_filter_matches_eager_with_fewer_filter_calls() {
+        let (env, _dir) = setup();
+        let core = core_with_mode(&env, "lazy_filter_parity", SpindleMode::None);
+        insert_n(&env, &core, 1_500, 16);
+        let txn = env.read_txn().unwrap();
+        let rd = core.backend.read_borrowed(&txn);
+        assert!(core.has_index(&rd).unwrap());
+
+        let predicates: [(&str, fn(u128) -> bool); 3] = [
+            ("all_match", |_| true),
+            ("broad", |id| id % 10 != 0),
+            ("selective", |id| id % 13 == 0),
+        ];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for (label, predicate) in predicates {
+            let (mut eager_calls, mut lazy_calls) = (0usize, 0usize);
+            for _ in 0..8 {
+                let query: Vec<f32> = (0..16)
+                    .map(|_| rand::Rng::random_range(&mut rng, -1.0f32..1.0f32))
+                    .collect();
+                let run = |lazy: bool| {
+                    let calls = std::cell::Cell::new(0usize);
+                    let counted = |id: u128| {
+                        calls.set(calls.get() + 1);
+                        predicate(id)
+                    };
+                    let results = with_lazy_filter_for_test(lazy, || {
+                        core.search_with_id_filter_ef_observed(
+                            &rd,
+                            &query,
+                            10,
+                            Some(&[counted]),
+                            true,
+                            None,
+                            Some(64),
+                            None,
+                        )
+                    })
+                    .unwrap();
+                    let hits = results
+                        .iter()
+                        .map(|v| (v.get_id(), v.get_distance().to_bits()))
+                        .collect::<Vec<_>>();
+                    (hits, calls.get())
+                };
+                let (eager, eager_n) = run(false);
+                let (lazy, lazy_n) = run(true);
+                assert_eq!(lazy, eager, "{label}: lazy filter changed results");
+                assert!(!lazy.is_empty(), "{label}: no results");
+                assert!(lazy_n <= eager_n, "{label}: {lazy_n} > {eager_n}");
+                eager_calls += eager_n;
+                lazy_calls += lazy_n;
+            }
+            println!("{label}: filter calls eager={eager_calls} lazy={lazy_calls}");
+            // Broad filters fill the result set early, so most neighbors stop
+            // qualifying; selective ones keep admitting and save less.
+            if label != "selective" {
+                assert!(
+                    lazy_calls * 2 < eager_calls,
+                    "{label}: lazy {lazy_calls} vs eager {eager_calls}"
+                );
+            }
+        }
+    }
+
+    /// Release-build benchmark: `cargo test -p helixdb --release --lib --
+    /// bench_broad_filter_scan_vs_hnsw --ignored --nocapture`
+    ///
+    /// Prints latency and recall at 25%/10%/1% selectivity for scan vs
+    /// HNSW-filtered on 50k-point, 768-d and 64-d fixtures.
+    #[test]
+    #[ignore]
+    fn bench_broad_filter_scan_vs_hnsw() {
+        use heed3::EnvOpenOptions;
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+        use std::time::Instant;
+
+        let count = std::env::var("BROAD_BENCH_COUNT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50_000);
+        let k = 10usize;
+        let n_queries = 20usize;
+        let n_iters = 5usize;
+
+        fn lowrank_vectors(count: usize, dim: usize, rank: usize, seed: u64) -> Vec<Vec<f32>> {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let proj: Vec<Vec<f64>> = (0..rank)
+                .map(|_| {
+                    (0..dim)
+                        .map(|_| rng.random_range(-1.0..1.0) / (dim as f64).sqrt())
+                        .collect()
+                })
+                .collect();
+            let mut vecs = Vec::with_capacity(count);
+            for _ in 0..count {
+                let lat: Vec<f64> = (0..rank).map(|_| rng.random_range(-1.0..1.0)).collect();
+                let mut v = vec![0.0f64; dim];
+                for (r, &l) in lat.iter().enumerate() {
+                    for d in 0..dim {
+                        v[d] += l * proj[r][d];
+                    }
+                }
+                let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
+                vecs.push(v.iter().map(|x| (*x / norm) as f32).collect());
+            }
+            vecs
+        }
+
+        fn prefilter(count: usize, sel: f32, seed: u64) -> HashSet<u128> {
+            let target = (count as f32 * sel).round() as usize;
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut ids: Vec<u128> = (1..=count as u128).collect();
+            for i in 0..target.min(ids.len()) {
+                let j = rng.random_range(i..ids.len());
+                ids.swap(i, j);
+            }
+            ids.truncate(target);
+            ids.into_iter().collect()
+        }
+
+        for &dim in &[768usize, 64] {
+            let rank = dim.min(80);
+            let tmp = TempDir::new().unwrap();
+            let env = unsafe {
+                EnvOpenOptions::new()
+                    .map_size(4 * 1024 * 1024 * 1024)
+                    .max_dbs(64)
+                    .open(tmp.path())
+                    .unwrap()
+            };
+            let backend = Arc::new(AnyBackend::Lmdb(
+                crate::helix_engine::storage_core::backend_lmdb::LmdbBackend::from_env(env.clone()),
+            ));
+            let mut txn = env.write_txn().unwrap();
+            let name = format!("broad_{dim}d");
+            let core = VectorCore::new_named_with_dir(
+                &env,
+                &mut txn,
+                &name,
+                HNSWConfig::new(Some(16), Some(128), Some(128)),
+                DistanceMetric::Cosine,
+                SpindleConfig {
+                    mode: SpindleMode::None,
+                    keep_original: false,
+                    ..SpindleConfig::default()
+                },
+                Some(tmp.path()),
+                dim,
+                None,
+                Arc::clone(&backend),
+            )
+            .unwrap();
+            let vectors = lowrank_vectors(count, dim, rank, 42);
+            for (i, v) in vectors.iter().enumerate() {
+                core.insert_flat(&mut txn, v, Some((i + 1) as u128), None)
+                    .unwrap();
+            }
+            core.build_index_from_flat(&mut txn).unwrap();
+            txn.commit().unwrap();
+            core.flush_mmap().unwrap();
+
+            assert!(
+                core.has_mmap_sidecar(),
+                "benchmark core must have mmap sidecar"
+            );
+
+            let queries = lowrank_vectors(n_queries, dim, rank, 99);
+            let r = backend.begin_read().unwrap();
+
+            eprintln!("\n=== {dim}d, {count} points, k={k}, {n_iters} iterations ===");
+            eprintln!(
+                "{:<8} {:<14} {:<14} {:<10}",
+                "sel", "scan_ms", "hnsw_ms", "recall"
+            );
+
+            type NoRecheck = fn(u128) -> bool;
+            for &sel in &[0.25_f32, 0.10, 0.01] {
+                let pf = prefilter(count, sel, 7);
+                let sel_hint = Some(sel);
+
+                // Warmup
+                for q in &queries {
+                    let _ = core
+                        .search_broad_prefilter_scan::<NoRecheck>(&r, q, k, &pf, None, sel_hint);
+                }
+
+                // Scan timing
+                let t0 = Instant::now();
+                for _ in 0..n_iters {
+                    for q in &queries {
+                        let res = core
+                            .search_broad_prefilter_scan::<NoRecheck>(&r, q, k, &pf, None, sel_hint)
+                            .unwrap();
+                        std::hint::black_box(&res);
+                    }
+                }
+                let scan_total = t0.elapsed();
+                let scan_per_query =
+                    scan_total.as_secs_f64() * 1000.0 / (n_iters * n_queries) as f64;
+
+                // HNSW-filtered timing
+                let filter_fn = |id: u128| pf.contains(&id);
+                // Warmup
+                for q in &queries {
+                    let _ = core.search_with_id_filter_ef_observed(
+                        &r,
+                        q,
+                        k,
+                        Some(std::slice::from_ref(&filter_fn)),
+                        true,
+                        sel_hint,
+                        None,
+                        None,
+                    );
+                }
+                let t0 = Instant::now();
+                for _ in 0..n_iters {
+                    for q in &queries {
+                        let res = core
+                            .search_with_id_filter_ef_observed(
+                                &r,
+                                q,
+                                k,
+                                Some(std::slice::from_ref(&filter_fn)),
+                                true,
+                                sel_hint,
+                                None,
+                                None,
+                            )
+                            .unwrap();
+                        std::hint::black_box(&res);
+                    }
+                }
+                let hnsw_total = t0.elapsed();
+                let hnsw_per_query =
+                    hnsw_total.as_secs_f64() * 1000.0 / (n_iters * n_queries) as f64;
+
+                // Recall: scan vs exact brute force
+                let mut recall_sum = 0.0f64;
+                for q in &queries {
+                    let exact = core
+                        .search_exact_ids_with_selectivity(&r, q, pf.iter().copied(), k, sel_hint)
+                        .unwrap();
+                    let exact_ids: HashSet<u128> = exact.iter().map(|h| h.id).collect();
+                    let scan = core
+                        .search_broad_prefilter_scan::<NoRecheck>(&r, q, k, &pf, None, sel_hint)
+                        .unwrap()
+                        .unwrap_or_default();
+                    let scan_ids: HashSet<u128> = scan.iter().map(|h| h.id).collect();
+                    let overlap = exact_ids.intersection(&scan_ids).count();
+                    recall_sum += overlap as f64 / k as f64;
+                }
+                let recall = recall_sum / n_queries as f64;
+                eprintln!(
+                    "{:<8} {:<14.2} {:<14.2} {:<10.4}",
+                    format!("{:.0}%", sel * 100.0),
+                    scan_per_query,
+                    hnsw_per_query,
+                    recall
+                );
+            }
+        }
     }
 }

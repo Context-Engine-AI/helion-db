@@ -129,8 +129,8 @@ impl HelixGraphStorage {
                 if old_val == new_val {
                     continue;
                 }
-                self.deindex_node_payload_field_be(w, idx_name, &handle.schema, node.id, old_val)?;
-                self.index_node_payload_field_be(w, idx_name, &handle.schema, node.id, new_val)?;
+                self.deindex_node_payload_field_be(w, idx_name, handle, node.id, old_val)?;
+                self.index_node_payload_field_be(w, idx_name, handle, node.id, new_val)?;
             }
         } else {
             for idx_name in self.multi_indices.keys() {
@@ -157,7 +157,7 @@ impl HelixGraphStorage {
                 self.index_node_payload_field_be(
                     w,
                     idx_name,
-                    &handle.schema,
+                    handle,
                     node.id,
                     Self::payload_value_for_key(&node.properties, idx_name),
                 )?;

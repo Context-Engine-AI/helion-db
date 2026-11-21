@@ -311,10 +311,32 @@ impl StoredManifest {
         checkpoint_id: Uuid,
         options: &CheckpointOptions,
     ) -> Result<Checkpoint, SlateDBError> {
+        self.write_checkpoint_beside(None, checkpoint_id, options)
+            .await
+    }
+
+    /// HELION LOCAL PATCH: [`Self::write_checkpoint`] for a reader that holds
+    /// the checkpoint `held`. When the put meets another writer's, the update
+    /// loop loads the latest manifest at the path and applies the write to
+    /// that; after a drop and a create it is another database's, and the
+    /// reader's new checkpoint went into it. The write is refused with
+    /// `CheckpointMissing(held)` wherever the manifest it is applied to does
+    /// not hold `held`, on the first attempt and on every one after.
+    pub(crate) async fn write_checkpoint_beside(
+        &mut self,
+        held: Option<Uuid>,
+        checkpoint_id: Uuid,
+        options: &CheckpointOptions,
+    ) -> Result<Checkpoint, SlateDBError> {
         let clock = Arc::clone(&self.clock);
         self.inner
             .maybe_apply_update(|sr| {
                 let mut new_val = sr.object().clone();
+                if let Some(held) =
+                    held.filter(|held| new_val.core.find_checkpoint(*held).is_none())
+                {
+                    return Err(CheckpointMissing(held));
+                }
                 if new_val
                     .core
                     .checkpoints

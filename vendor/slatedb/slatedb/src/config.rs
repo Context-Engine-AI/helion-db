@@ -1586,6 +1586,31 @@ pub struct ObjectStoreCacheOptions {
     /// When the limit is reached, the least recently used handle is closed.
     /// Default is 1000.
     pub max_open_file_handles: usize,
+
+    /// HELION LOCAL PATCH: on a cache miss for a read of at most 1/16 of a part
+    /// (parts of 1 MiB or more), GET just the requested range and fill the whole
+    /// part in the background, instead of making the caller wait for the full
+    /// part. The cache layout is unchanged. Default is true.
+    #[serde(default = "default_ranged_miss")]
+    pub ranged_miss: bool,
+
+    /// HELION LOCAL PATCH: how many parts of one ranged read are read at once
+    /// when the range spans several parts. Parts are still returned in part
+    /// order, so the bytes of the read are unchanged. The number is lowered
+    /// until the parts in flight hold at most 32 MiB (and at least one part):
+    /// 8 with the default 4 MiB parts, 2 with 16 MiB parts, 1 from 32 MiB
+    /// parts up. 0 or 1 reads them one after the other, as upstream does.
+    /// Default is 8.
+    #[serde(default = "default_part_fetch_concurrency")]
+    pub part_fetch_concurrency: usize,
+}
+
+fn default_ranged_miss() -> bool {
+    true
+}
+
+pub(crate) fn default_part_fetch_concurrency() -> usize {
+    8
 }
 
 impl Default for ObjectStoreCacheOptions {
@@ -1601,6 +1626,8 @@ impl Default for ObjectStoreCacheOptions {
             preload_disk_cache_on_startup: None,
             scan_interval: Some(Duration::from_secs(3600)),
             max_open_file_handles: 1000,
+            ranged_miss: default_ranged_miss(),
+            part_fetch_concurrency: default_part_fetch_concurrency(),
         }
     }
 }

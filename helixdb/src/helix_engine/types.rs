@@ -41,6 +41,22 @@ pub enum GraphError {
     /// of its previously dropped incarnation is still pending. Transient:
     /// callers should retry later.
     PurgePending(String),
+    /// A collection was not opened now, for a reason that passes by itself:
+    /// the process has no room for another open collection, or its memory is
+    /// near the ceiling. No open was tried for this request; the caller
+    /// should repeat it after `retry_after_secs`. Not for an open that
+    /// failed: a caller told "later" for one that never heals retries it
+    /// without end.
+    OpenDeferred {
+        retry_after_secs: u64,
+        message: String,
+    },
+    /// The error of a name's last open, answered again without a new
+    /// attempt: its open-failure cooldown runs, or the name is in quarantine.
+    /// It reads and is answered as the error it repeats. The collection
+    /// manager writes one log line a cooldown for these, so that the gateway
+    /// need not write one a request.
+    OpenReplay(String),
     Default,
     New(String),
     Empty,
@@ -67,7 +83,9 @@ impl fmt::Display for GraphError {
             GraphError::EdgeNotFound => write!(f, "Edge not found"),
             GraphError::NodeNotFound => write!(f, "Node not found"),
             GraphError::LabelNotFound => write!(f, "Label not found"),
-            GraphError::New(msg) => write!(f, "Graph error: {}", msg),
+            GraphError::New(msg) | GraphError::OpenReplay(msg) => {
+                write!(f, "Graph error: {}", msg)
+            }
             GraphError::Default => write!(f, "Graph error"),
             GraphError::Empty => write!(f, "No Error"),
             GraphError::MultipleNodesWithSameId => write!(f, "Multiple nodes with same id"),
@@ -81,6 +99,9 @@ impl fmt::Display for GraphError {
             }
             GraphError::ResizeBackpressure(msg) => write!(f, "Resize backpressure: {}", msg),
             GraphError::PurgePending(msg) => write!(f, "Purge pending: {}", msg),
+            GraphError::OpenDeferred { message, .. } => {
+                write!(f, "Collection open deferred: {}", message)
+            }
             GraphError::EnvAlreadyOpen => write!(
                 f,
                 "LMDB environment already open in this process — retry after close"
@@ -355,6 +376,7 @@ impl GraphError {
         }
         match self {
             GraphError::New(message)
+            | GraphError::OpenReplay(message)
             | GraphError::StorageError(message)
             | GraphError::VectorError(message) => {
                 lsm_object_reference_is_missing(&message.to_ascii_lowercase())

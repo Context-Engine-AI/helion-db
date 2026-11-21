@@ -43,7 +43,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hasher;
 
 use twox_hash::XxHash64;
@@ -53,7 +53,7 @@ use crate::protocol::items::{v6_uuid, Edge, SerializedEdge};
 use crate::protocol::label_hash::hash_label;
 use crate::protocol::value::Value;
 
-use super::backend::{Namespace, StorageBackend};
+use super::backend::{BackendKind, Namespace, StorageBackend};
 use super::backend_any::AnyWrite;
 use super::metadata::MetadataCounter;
 use super::storage_core::HelixGraphStorage;
@@ -125,7 +125,7 @@ impl HelixGraphStorage {
     }
 
     /// Backend-routed twin of `upsert::upsert_edge` (deterministic-id edge
-    /// upsert, the CE graph-ingest write path). Mirrors `upsert_edge`'s exact
+    /// upsert, the client's graph-ingest write path). Mirrors `upsert_edge`'s exact
     /// effects — primary edge bytes, out/in adjacency with the
     /// put-new-before-delete-old ordering and the idempotent-repair no-op branch,
     /// edge-path index, edge counter — but routes every write through
@@ -148,17 +148,141 @@ impl HelixGraphStorage {
             })
             .map_err(|e| GraphError::New(e.to_string()))??;
 
-        let edge = Edge {
-            id: upsert.id,
-            label: upsert.label.clone(),
-            from_node: upsert.from_node,
-            to_node: upsert.to_node,
-            properties: upsert.properties.clone(),
+        let edge = derived_edge(upsert);
+        self.stage_edge_write_be(w, &edge, existing.as_ref())?;
+        Ok(edge)
+    }
+
+    /// Whether a rebuild leaves an edge that is stored exactly as its row
+    /// derives it, with its adjacency and path keys
+    /// ([`Self::upsert_derived_edges_be`]): on LSM, which reads the rows and
+    /// the keys in batches. With `HELIX_GRAPH_REWRITE_UNCHANGED_EDGES=1`, and
+    /// on LMDB, a rebuild keeps its loop of [`Self::upsert_edge_be`], one get
+    /// and one write an edge, as every rebuild ran before; read once a
+    /// request.
+    pub(crate) fn leaves_edges_stored_as_derived(&self) -> bool {
+        self.backend.kind() == BackendKind::Lsm
+            && !std::env::var("HELIX_GRAPH_REWRITE_UNCHANGED_EDGES")
+                .is_ok_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+    }
+
+    /// Stage the edges a rebuild derives from stored rows, leaving those that
+    /// are stored as derived; answers how many of `upserts` were left. For a
+    /// caller on [`Self::leaves_edges_stored_as_derived`]: any other keeps
+    /// its loop of [`Self::upsert_edge_be`].
+    ///
+    /// An edge is left, with nothing staged for it, where its stored row
+    /// equals the derived one (label, both ends and every property) and the
+    /// adjacency and path keys an upsert stages are stored. Any other is
+    /// staged whole, as [`Self::upsert_edge_be`] stages it: an equal row that
+    /// lacks a key gets the key back, the repair an upsert has always made.
+    ///
+    /// The rows come from ONE batched read in place of a get an edge, and
+    /// the keys of the equal ones from a second; both through `w`, so a row
+    /// or a key the batch puts is there and one it deletes is not. Of two
+    /// upserts with one id the later is the edge, as a loop of upserts ends:
+    /// they are one before the read, so a stored row that equals the later
+    /// is left though the earlier differs. Every key an edge's write stages
+    /// carries that edge's id, so what is staged for one changes nothing that
+    /// was read for another.
+    pub(crate) fn upsert_derived_edges_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        upserts: &[EdgeUpsert],
+    ) -> Result<usize, GraphError> {
+        let mut last: HashMap<u128, usize> = HashMap::with_capacity(upserts.len());
+        for (index, upsert) in upserts.iter().enumerate() {
+            last.insert(upsert.id, index);
+        }
+        let edges: Vec<Edge> = upserts
+            .iter()
+            .enumerate()
+            .filter(|(index, upsert)| last[&upsert.id] == *index)
+            .map(|(_, upsert)| derived_edge(upsert))
+            .collect();
+
+        let ids: Vec<Vec<u8>> = edges
+            .iter()
+            .map(|edge| edge.id.to_be_bytes().to_vec())
+            .collect();
+        let stored = self
+            .backend
+            .get_for_update_many(w, Namespace::Edges, &ids)
+            .map_err(|e| GraphError::New(e.to_string()))?
+            .into_iter()
+            .zip(&edges)
+            .map(|(bytes, edge)| {
+                bytes
+                    .map(|bytes| SerializedEdge::decode_edge(&bytes, edge.id))
+                    .transpose()
+            })
+            .collect::<Result<Vec<Option<Edge>>, GraphError>>()?;
+
+        // The keys of the edges whose row equals; none for any other.
+        let keys: Vec<Vec<EdgeKeyRow>> = edges
+            .iter()
+            .zip(&stored)
+            .map(|(edge, stored)| {
+                if stored.as_ref() == Some(edge) {
+                    edge_key_rows(edge)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        let rows: Vec<(Namespace<'_>, &[u8], Option<&[u8]>)> = keys
+            .iter()
+            .flatten()
+            .map(|(ns, key, value)| (*ns, key.as_slice(), value.as_deref()))
+            .collect();
+        // A read that fails is a key not seen: the edges are written as
+        // before. The graph write routes carry no read cancellation; on a
+        // route that did, a caller gone would write every equal edge here.
+        let (present, why) = match self.backend.present_for_update(w, &rows) {
+            Ok(present) => (present, "key_absent"),
+            Err(error) => {
+                tracing::warn!(
+                    collection = self.collection_display_name(),
+                    error = %error,
+                    "the keys of equal edges were not read; the edges are written"
+                );
+                (vec![false; rows.len()], "keys_unread")
+            }
         };
 
+        let mut present = present.into_iter();
+        let mut left: HashSet<u128> = HashSet::new();
+        for ((edge, stored), keys) in edges.iter().zip(&stored).zip(&keys) {
+            if !keys.is_empty() {
+                // Counted, not `all`: every edge takes its own answers.
+                let there = present.by_ref().take(keys.len()).filter(|key| *key);
+                if there.count() == keys.len() {
+                    left.insert(edge.id);
+                    continue;
+                }
+                metrics::counter!("helix_graph_equal_edge_rewritten_total", "why" => why)
+                    .increment(1);
+            }
+            self.stage_edge_write_be(w, edge, stored.as_ref())?;
+        }
+        Ok(upserts
+            .iter()
+            .filter(|upsert| left.contains(&upsert.id))
+            .count())
+    }
+
+    /// Stage `edge` whole over `existing`, its stored row as the caller read
+    /// it through `w`: the row, both adjacency rows, the path keys and, for
+    /// a new edge, the edge counter. The edge is not read again.
+    fn stage_edge_write_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        edge: &Edge,
+        existing: Option<&Edge>,
+    ) -> Result<(), GraphError> {
         // Adjacency keys derive from (label, from, to); only redo adjacency when
         // one of those changed (identical to the heed path's `adj_changed`).
-        let adj_changed = match &existing {
+        let adj_changed = match existing {
             None => true,
             Some(e) => {
                 e.label != edge.label || e.from_node != edge.from_node || e.to_node != edge.to_node
@@ -166,7 +290,7 @@ impl HelixGraphStorage {
         };
 
         let label_hash = hash_label(&edge.label, None);
-        let encoded_edge = SerializedEdge::encode_edge(&edge)?;
+        let encoded_edge = SerializedEdge::encode_edge(edge)?;
 
         // Primary write FIRST: if this fails, no adjacency state has been touched.
         self.backend
@@ -194,12 +318,12 @@ impl HelixGraphStorage {
                 .map_err(|e| GraphError::New(e.to_string()))?;
             // Path keys are `dir|path|edge_id`: delete the OLD keys before
             // writing the new ones so an unchanged from/to path keeps its key.
-            if let Some(existing) = &existing {
+            if let Some(existing) = existing {
                 self.delete_edge_paths_be(w, existing)?;
             }
-            self.index_edge_paths_be(w, &edge)?;
+            self.index_edge_paths_be(w, edge)?;
 
-            if let Some(existing) = &existing {
+            if let Some(existing) = existing {
                 let old_label_hash = hash_label(&existing.label, None);
                 self.backend
                     .delete_dup(
@@ -241,17 +365,17 @@ impl HelixGraphStorage {
                 .map_err(|e| GraphError::New(e.to_string()))?;
             // from_path/to_path are properties, so they can change even when
             // adjacency does not: drop the old path keys, then re-index.
-            if let Some(existing) = &existing {
+            if let Some(existing) = existing {
                 self.delete_edge_paths_be(w, existing)?;
             }
-            self.index_edge_paths_be(w, &edge)?;
+            self.index_edge_paths_be(w, edge)?;
         }
 
         if existing.is_none() {
             self.bump_edge_counter_be(w, 1)?;
         }
 
-        Ok(edge)
+        Ok(())
     }
 
     /// Backend-routed twin of `StorageMethods::drop_edge`. Removes the edge
@@ -338,14 +462,7 @@ impl HelixGraphStorage {
         w: &mut AnyWrite<'_>,
         edge: &Edge,
     ) -> Result<(), GraphError> {
-        if let Some(path) = edge_path_property(edge, "from_path") {
-            let key = edge_path_index_key(1, &path, &edge.id);
-            self.backend
-                .put(w, Namespace::EdgePathIdx, &key, &edge.id.to_be_bytes())
-                .map_err(|e| GraphError::New(e.to_string()))?;
-        }
-        if let Some(path) = edge_path_property(edge, "to_path") {
-            let key = edge_path_index_key(2, &path, &edge.id);
+        for key in edge_path_index_keys(edge) {
             self.backend
                 .put(w, Namespace::EdgePathIdx, &key, &edge.id.to_be_bytes())
                 .map_err(|e| GraphError::New(e.to_string()))?;
@@ -359,14 +476,7 @@ impl HelixGraphStorage {
         w: &mut AnyWrite<'_>,
         edge: &Edge,
     ) -> Result<(), GraphError> {
-        if let Some(path) = edge_path_property(edge, "from_path") {
-            let key = edge_path_index_key(1, &path, &edge.id);
-            self.backend
-                .delete(w, Namespace::EdgePathIdx, &key)
-                .map_err(|e| GraphError::New(e.to_string()))?;
-        }
-        if let Some(path) = edge_path_property(edge, "to_path") {
-            let key = edge_path_index_key(2, &path, &edge.id);
+        for key in edge_path_index_keys(edge) {
             self.backend
                 .delete(w, Namespace::EdgePathIdx, &key)
                 .map_err(|e| GraphError::New(e.to_string()))?;
@@ -386,6 +496,57 @@ fn edge_path_property(edge: &Edge, key: &str) -> Option<String> {
         Some(Value::String(path)) if !path.is_empty() => Some(path.clone()),
         _ => None,
     }
+}
+
+/// The path index keys of `edge`, its `from_path` key before its `to_path`
+/// key: what an upsert writes, a delete removes and an edge left as stored
+/// must still have.
+fn edge_path_index_keys(edge: &Edge) -> Vec<Vec<u8>> {
+    [(1, "from_path"), (2, "to_path")]
+        .into_iter()
+        .filter_map(|(dir, property)| {
+            edge_path_property(edge, property).map(|path| edge_path_index_key(dir, &path, &edge.id))
+        })
+        .collect()
+}
+
+/// The edge an upsert stores.
+fn derived_edge(upsert: &EdgeUpsert) -> Edge {
+    Edge {
+        id: upsert.id,
+        label: upsert.label.clone(),
+        from_node: upsert.from_node,
+        to_node: upsert.to_node,
+        properties: upsert.properties.clone(),
+    }
+}
+
+/// A row as `AnyBackend::present_for_update` reads it: a key, or one row of
+/// a multi-value namespace.
+type EdgeKeyRow = (Namespace<'static>, Vec<u8>, Option<Vec<u8>>);
+
+/// The rows beside its own that an upsert of `edge` stages: its outgoing
+/// and incoming adjacency rows, then its path keys. Never empty.
+fn edge_key_rows(edge: &Edge) -> Vec<EdgeKeyRow> {
+    let label_hash = hash_label(&edge.label, None);
+    let mut rows = vec![
+        (
+            Namespace::OutEdges,
+            HelixGraphStorage::out_edge_key(&edge.from_node, &label_hash).to_vec(),
+            Some(HelixGraphStorage::pack_edge_data(&edge.to_node, &edge.id).to_vec()),
+        ),
+        (
+            Namespace::InEdges,
+            HelixGraphStorage::in_edge_key(&edge.to_node, &label_hash).to_vec(),
+            Some(HelixGraphStorage::pack_edge_data(&edge.from_node, &edge.id).to_vec()),
+        ),
+    ];
+    rows.extend(
+        edge_path_index_keys(edge)
+            .into_iter()
+            .map(|key| (Namespace::EdgePathIdx, key, None)),
+    );
+    rows
 }
 
 /// Faithful copy of the module-private `HelixGraphStorage::compact_index_bytes`.
@@ -637,7 +798,7 @@ mod tests {
         assert_eq!(&in_b[0][0..16], &edge_b.id.to_be_bytes());
     }
 
-    /// `upsert_edge_be` (the LSM CE-ingest edge write path) produces on-disk state
+    /// `upsert_edge_be` (the LSM client-ingest edge write path) produces on-disk state
     /// byte-identical to the heed `upsert_edge`. Because upsert uses a
     /// DETERMINISTIC edge id, both stores get the SAME id — so edge bytes AND full
     /// adjacency values (all 32 bytes) must match exactly. Covers all three

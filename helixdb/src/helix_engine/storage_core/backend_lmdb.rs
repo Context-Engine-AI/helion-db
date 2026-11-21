@@ -75,6 +75,20 @@ impl CatalogSync {
         drop(guard);
     }
 
+    /// Wait for the pass the thread starts with. Bounded as a reader's wait
+    /// is: a caller that holds the env's write lock keeps that pass waiting.
+    fn await_first_pass(&self) {
+        let budget = Duration::from_millis(CATALOG_WAIT_BUDGET_MS);
+        let (guard, _timeout) = match self
+            .published
+            .wait_timeout_while(self.lock(), budget, |s| s.served == 0)
+        {
+            Ok(pair) => pair,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        drop(guard);
+    }
+
     fn await_work(&self, alive: &AtomicBool) {
         let state = self.lock();
         if state.served < state.requests || !alive.load(Ordering::Acquire) {
@@ -171,6 +185,13 @@ pub struct LmdbBackend {
     dbs: Arc<RwLock<HashMap<String, Database<Bytes, Bytes>>>>,
     refresher_alive: Arc<AtomicBool>,
     catalog_sync: Arc<CatalogSync>,
+    /// Held by the catalog thread for the length of a pass, and by a map
+    /// resize ([`Self::pause_catalog`]). The pass opens a write transaction
+    /// straight on the env, outside the storage's resize gate: LMDB refuses a
+    /// resize under an open write transaction (EINVAL), and a transaction that
+    /// begins while the map is swapped reads the meta page through the old
+    /// mapping (SIGBUS).
+    catalog_txn: Arc<parking_lot::Mutex<()>>,
     refresher_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -258,15 +279,18 @@ impl LmdbBackend {
             Arc::new(RwLock::new(HashMap::new()));
         let refresher_alive = Arc::new(AtomicBool::new(true));
         let catalog_sync = Arc::new(CatalogSync::new());
+        let catalog_txn = Arc::new(parking_lot::Mutex::new(()));
         let refresher_thread = {
             let env = env.clone();
             let dbs = Arc::clone(&dbs);
             let alive = Arc::clone(&refresher_alive);
             let sync = Arc::clone(&catalog_sync);
+            let no_resize = Arc::clone(&catalog_txn);
             std::thread::spawn(move || {
                 while alive.load(Ordering::Acquire) {
                     let snapshot = sync.begin_pass();
                     let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _no_resize = no_resize.lock();
                         Self::open_catalog(&env)
                     }));
                     match pass {
@@ -291,13 +315,42 @@ impl LmdbBackend {
                 }
             })
         };
-        Self {
+        let backend = Self {
             env,
             dbs,
             refresher_alive,
             catalog_sync,
+            catalog_txn,
             refresher_thread: Some(refresher_thread),
-        }
+        };
+        // Not handed out before the names the file holds are open. A reader
+        // that met a closed one opened it in its own read transaction, beside
+        // that pass and beside other readers, and LMDB allows `mdb_dbi_open`
+        // from one transaction of a process at a time: when such a read was
+        // aborted it freed names the others still held (a double free), and
+        // closed handles the pass had just cached (EINVAL on the next read).
+        backend.catalog_sync.await_first_pass();
+        backend
+    }
+
+    /// Keep the catalog thread out of the env while the caller resizes its
+    /// map: waits for a pass in hand and holds off the next. Take it last,
+    /// after the storage's resize gate, and for the resize alone.
+    pub(crate) fn pause_catalog(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.catalog_txn.lock()
+    }
+
+    /// What a resize meets when a catalog pass is in hand: the pass's lock
+    /// and an open write transaction on the env, while `while_open` runs.
+    #[cfg(test)]
+    pub(crate) fn hold_catalog_txn_for_test(
+        &self,
+        while_open: impl FnOnce(),
+    ) -> Result<(), BackendError> {
+        let _no_resize = self.catalog_txn.lock();
+        let wtxn = self.env.write_txn().map_err(io_at("catalog_txn"))?;
+        while_open();
+        wtxn.commit().map_err(io_at("catalog_commit"))
     }
 
     /// Open (creating if absent) an LMDB environment at `path`.
@@ -772,6 +825,56 @@ mod tests {
 
         LmdbBackend::open(dir.path(), 64, 10 * 1024 * 1024)
             .expect("dropping a backend must release its LMDB environment");
+    }
+
+    /// After a reopen every database is in the file and none is open. The
+    /// backend comes back with all of them open, so the readers that arrive
+    /// at once open none themselves, and each of their reads is answered.
+    #[test]
+    fn reopened_backend_has_every_database_open_before_its_readers() {
+        const NAMES: usize = 200;
+        let dir = TempDir::new().unwrap();
+        let names: Vec<String> = (0..NAMES).map(|i| format!("reopened_{i:03}")).collect();
+        {
+            let be = LmdbBackend::open(dir.path(), 512, 64 * 1024 * 1024).unwrap();
+            let mut w = be.begin_write().unwrap();
+            for name in &names {
+                be.put(&mut w, Namespace::SecondaryIndex(name), b"k", b"v")
+                    .unwrap();
+            }
+            be.commit(w).unwrap();
+        }
+        for _ in 0..20 {
+            let be = LmdbBackend::open(dir.path(), 512, 64 * 1024 * 1024).unwrap();
+            assert_eq!(be.dbs.read().unwrap().len(), NAMES, "open at once");
+            std::thread::scope(|scope| {
+                let readers: Vec<_> = (0..3)
+                    .map(|reader| {
+                        let (be, names) = (&be, &names);
+                        scope.spawn(move || {
+                            for round in 0..50 {
+                                let r = be.begin_read().unwrap();
+                                for step in 0..4 {
+                                    let name = &names[(reader * 67 + round * 4 + step) % NAMES];
+                                    let found = be
+                                        .get_with(&r, Namespace::SecondaryIndex(name), b"k", |v| {
+                                            v.is_some()
+                                        })
+                                        .unwrap();
+                                    assert!(found, "{name}");
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                // Joined here: the scope waits for the closures only, and
+                // LMDB gives a reader's slot back as its thread exits, which
+                // has to be before the backend below is dropped.
+                for reader in readers {
+                    reader.join().unwrap();
+                }
+            });
+        }
     }
 
     fn get_owned(

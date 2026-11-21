@@ -5,12 +5,11 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use log::error;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
-use super::{GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
+use super::{log_delete_error, GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
 use slatedb_common::object_metadata::IdentifiedObjectMetadata;
 
 /// Selects which class of WAL object a [`WalGcTask`] collects.
@@ -158,7 +157,7 @@ impl GcTask for WalGcTask {
         futures::stream::iter(sst_ids_to_delete)
             .for_each_concurrent(GC_DELETE_CONCURRENCY, |id| async move {
                 if let Err(e) = self.table_store.delete_sst(&id).await {
-                    error!("error deleting WAL SST [id={:?}, error={}]", id, e);
+                    log_delete_error("WAL SST", &id, &e);
                 } else {
                     match self.mode {
                         WalGcMode::Regular => self.stats.gc_wal_count.increment(1),

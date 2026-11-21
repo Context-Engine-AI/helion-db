@@ -19,7 +19,8 @@ use crate::helix_engine::storage_core::backend::{
     BackendKind, Namespace, StorageBackend, StorageBackendConfig,
 };
 use crate::helix_engine::storage_core::collection_manager::{
-    maintenance_process_resource_admission, CollectionManager, MaintenanceAdmission,
+    is_one_path_segment, maintenance_process_resource_admission, spawn_idle_gc_sweeper,
+    CollectionManager, MaintenanceAdmission,
 };
 use crate::helix_engine::storage_core::gateway_buffer::{
     GatewayBufferAck, GatewayBufferConfig, GatewayDurableBuffer,
@@ -30,9 +31,11 @@ use crate::helix_engine::storage_core::storage_core::HelixGraphStorage;
 use crate::helix_engine::storage_core::storage_methods::StorageMethods;
 use crate::helix_engine::storage_core::upsert::{EdgeUpsert, NodeUpsert};
 use crate::helix_engine::types::GraphError;
+#[cfg(test)]
+use crate::helix_engine::vector_core::named_vectors::DistanceMetric;
 use crate::helix_engine::vector_core::named_vectors::{
-    DenseDeletePlan, DenseMergeCandidateLimits, DenseSegmentDebt, DistanceMetric,
-    NamedVectorConfig, NamedVectorManager,
+    DenseDeletePlan, DenseLayoutChange, DenseMergeCandidateLimits, DenseSegmentDebt,
+    DenseVectorSpaceMetadata, NamedVectorConfig, NamedVectorManager, PreparedTailSeal,
 };
 use crate::helix_engine::vector_core::sparse::{SparseVector, SparseVectorConfig};
 use crate::helix_engine::vector_core::vector_core::{
@@ -221,6 +224,141 @@ fn index_subthreshold_quiesced_tails() -> bool {
         .unwrap_or(true)
 }
 
+/// How long a collection goes without a point mutation before its
+/// sub-threshold dense tails are sealed (`HELIX_INDEX_TAIL_QUIET_MS`, default
+/// 30000). A tail sealed at every short pause of an index run is a segment
+/// built, and later merged, per pause.
+fn index_tail_quiet_ms() -> u64 {
+    env_u64(
+        "HELIX_INDEX_TAIL_QUIET_MS",
+        if cfg!(test) { 100 } else { 30_000 },
+    )
+}
+
+/// Default of `index_tail_seal_min_vectors`. A tail is sealed by the job of
+/// the upsert that took it there, with the rows that came in until then (up
+/// to 252 more, measured), and a sealed segment is scored exactly up to
+/// 2,048 rows (`SMALL_SEGMENT_EXACT_MAX_ROWS`): 256 under that.
+const INDEX_TAIL_SEAL_MIN_VECTORS: usize = 1_792;
+
+/// Unindexed vectors at which a dense tail is sealed without waiting for
+/// quiet (`HELIX_INDEX_TAIL_SEAL_MIN_VECTORS`, default 1792, never above the
+/// flat-scan threshold; 0 = a sub-threshold tail is sealed by quiet only).
+/// `HELIX_INDEX_TAIL_QUIET_MS=1000` with 0 here is the rule before the debounce.
+fn index_tail_seal_min_vectors(flat_scan_threshold: usize) -> usize {
+    env_usize_or(
+        "HELIX_INDEX_TAIL_SEAL_MIN_VECTORS",
+        if cfg!(test) {
+            0
+        } else {
+            INDEX_TAIL_SEAL_MIN_VECTORS
+        },
+        0,
+    )
+    .min(flat_scan_threshold)
+}
+
+/// An index job waits out a quiet period up to this long, as it did before
+/// the debounce. A longer one would hold an index worker for the wait: the
+/// job ends instead, and the backlog sweeper submits the collection once it
+/// is quiet.
+const INDEX_TAIL_QUIET_WAIT_IN_JOB_MAX_MS: u64 = 2_000;
+
+fn epoch_millis_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// No point mutation is being applied and the last one ended at least
+/// `quiet_ms` ago, or none was applied since the collection was opened.
+fn point_mutations_quiet_for(storage: &HelixGraphStorage, quiet_ms: u64) -> bool {
+    storage.point_mutations_in_flight.load(Ordering::Acquire) == 0
+        && epoch_millis_now().saturating_sub(storage.last_upsert_at.load(Ordering::Acquire))
+            >= quiet_ms
+}
+
+/// `index_tail_quiet_ms` for this collection. One with a quantized dense
+/// space keeps the second of quiet it had before the debounce, and no seal
+/// minimum: its tail has no sidecar, so every tail row a reader replica
+/// scores is a point read, and a longer tail is a slower search. One
+/// difference remains: a mutation being applied is not quiet, where a job
+/// that ran over a second into a long upsert used to seal the tail under it.
+fn collection_tail_quiet_ms(storage: &HelixGraphStorage) -> u64 {
+    let quiet_ms = index_tail_quiet_ms();
+    if storage.named_vectors.has_spindle_dense_space() {
+        quiet_ms.min(1_000)
+    } else {
+        quiet_ms
+    }
+}
+
+/// `index_tail_seal_min_vectors` for this collection: 0 with a quantized
+/// dense space (see `collection_tail_quiet_ms`) and on LMDB, where the rows
+/// counted are every unindexed row and not the tail's alone.
+fn collection_tail_seal_min(storage: &HelixGraphStorage, flat_scan_threshold: usize) -> usize {
+    if storage.backend.kind() != BackendKind::Lsm || storage.named_vectors.has_spindle_dense_space()
+    {
+        0
+    } else {
+        index_tail_seal_min_vectors(flat_scan_threshold)
+    }
+}
+
+/// Whether a dense tail of `tail_rows` vectors below the flat-scan threshold
+/// is sealed now: the collection is quiet, or the tail reached the seal
+/// minimum.
+fn subthreshold_tail_is_sealable(tail_rows: u64, quiesced: bool, seal_min: usize) -> bool {
+    tail_rows > 0 && (quiesced || (seal_min > 0 && tail_rows as usize >= seal_min))
+}
+
+/// Waits until every point mutation that was being applied when this was
+/// called has ended; false when `give_up` says to stop waiting. A tail sealed
+/// under a mutation still takes the rows that mutation staged before the
+/// seal, and they commit after it: a read begun after this wait sees them.
+/// A collection's mutations run one at a time under its point-mutation gate,
+/// so a later one having started means the earlier one is over.
+fn point_mutation_in_flight_has_ended(
+    storage: &HelixGraphStorage,
+    give_up: impl Fn() -> bool,
+) -> bool {
+    let started = storage.point_mutations.load(Ordering::Acquire);
+    while storage.point_mutations_in_flight.load(Ordering::Acquire) > 0
+        && storage.point_mutations.load(Ordering::Acquire) == started
+    {
+        if give_up() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+/// Counts a point mutation as being applied until it is dropped, and stamps
+/// the time the tail-seal quiet period is measured from when it ends.
+struct PointMutationInFlight<'a>(&'a HelixGraphStorage);
+
+impl<'a> PointMutationInFlight<'a> {
+    fn begin(storage: &'a HelixGraphStorage) -> Self {
+        storage
+            .point_mutations_in_flight
+            .fetch_add(1, Ordering::AcqRel);
+        Self(storage)
+    }
+}
+
+impl Drop for PointMutationInFlight<'_> {
+    fn drop(&mut self) {
+        self.0
+            .last_upsert_at
+            .store(epoch_millis_now(), Ordering::Release);
+        self.0
+            .point_mutations_in_flight
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn env_usize_or(name: &str, default: usize, min: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -350,6 +488,17 @@ fn index_executor_max_drain_workers() -> usize {
         .unwrap_or(default_cap)
 }
 
+/// What a panic a worker caught said, for the one line it writes of it.
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(text) = panic.downcast_ref::<&'static str>() {
+        *text
+    } else if let Some(text) = panic.downcast_ref::<String>() {
+        text.as_str()
+    } else {
+        "a panic that carried no text"
+    }
+}
+
 impl IndexExecutor {
     fn new() -> Self {
         let workers = index_executor_worker_count();
@@ -369,7 +518,21 @@ impl IndexExecutor {
                 .spawn(move || loop {
                     let (key, job) = IndexExecutor::next_job(&state);
                     metrics::gauge!("helix_index_executor_active").increment(1.0);
-                    run_index_job(job);
+                    // Uncaught, a panic ended this thread with the gauge
+                    // raised and the collection still in `active`: every
+                    // later submit for it was parked where `next_job` does
+                    // not look, and every collection had a worker fewer.
+                    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_index_job(job)
+                    }));
+                    if let Err(panic) = ran {
+                        metrics::counter!("helix_index_executor_panics_total").increment(1);
+                        tracing::error!(
+                            collection = %key,
+                            panic = panic_text(&*panic),
+                            "index job panicked; its worker goes on and the collection's next job runs"
+                        );
+                    }
                     metrics::gauge!("helix_index_executor_active").decrement(1.0);
                     IndexExecutor::finish_job(&state, &key);
                 });
@@ -533,6 +696,43 @@ impl IndexExecutor {
 
 static INDEX_EXECUTOR: LazyLock<IndexExecutor> = LazyLock::new(IndexExecutor::new);
 
+/// True while the index executor holds a queued or running job for
+/// `collection`. A queued job has only a `Weak` to the storage, so nothing
+/// else keeps the collection loaded until the job runs.
+pub(crate) fn index_job_queued_or_active(collection: &str) -> bool {
+    let guard = INDEX_EXECUTOR
+        .state
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.queued_jobs.contains_key(collection) || guard.active.contains(collection)
+}
+
+/// Every collection the backlog sweeper loop handed to its submit.
+#[cfg(test)]
+static BACKLOG_SWEEPER_SUBMITS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Test-only: an index job of a collection named here, or a reaper turn of a
+/// segment named here, panics as it starts. Each entry is one panic.
+#[cfg(test)]
+static WORKER_PANICS_FOR_TEST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Test-only: panics if `name` has a panic left in [`WORKER_PANICS_FOR_TEST`],
+/// and takes that one out.
+#[cfg(test)]
+fn panic_once_for_test(name: &str) {
+    let due = {
+        let mut names = WORKER_PANICS_FOR_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let listed = names.iter().position(|listed| listed == name);
+        listed.map(|at| names.swap_remove(at)).is_some()
+    };
+    if due {
+        panic!("{name} panics for the test");
+    }
+}
+
 fn optimizer_backlog_sweep_ms() -> u64 {
     env_u64(
         "HELIX_OPTIMIZER_BACKLOG_SWEEP_MS",
@@ -561,6 +761,24 @@ fn optimizer_backlog_effective_per_sweep(
         configured
     } else {
         configured.min(pressure_budget)
+    }
+}
+
+/// How far down its list a sweep looks for candidates past their cooldown.
+/// Admitted, to the end: a cooling candidate takes none of its places. Under
+/// pressure, at as many candidates as it has places and no further, as it did
+/// before that rule. Going on past the cooling ones there submits a job at
+/// every sweep, each for another collection, where the first candidate's
+/// cooldown let one through an hour: on a pod that is short of memory, and
+/// the index job asks no admission of its own.
+fn optimizer_backlog_candidates_looked_at(
+    warm_per_sweep: usize,
+    admission: MaintenanceAdmission,
+) -> usize {
+    if admission.is_admitted() {
+        usize::MAX
+    } else {
+        warm_per_sweep
     }
 }
 
@@ -622,6 +840,11 @@ struct OptimizerDebtCandidate {
     name: String,
     debt: DenseSegmentDebt,
     priority_score: usize,
+    /// The segment debt alone makes it a candidate.
+    debt_work: bool,
+    /// `last_upsert_at` of a collection that has gone quiet since: the index
+    /// job its last upsert submitted did not wait the quiet period out.
+    quiet_since: Option<u64>,
 }
 
 impl OptimizerDebtCandidate {
@@ -630,8 +853,24 @@ impl OptimizerDebtCandidate {
     }
 }
 
-fn optimizer_debt_has_submit_work(debt: DenseSegmentDebt, min_segments: usize) -> bool {
-    debt.indexed_segments > min_segments
+/// `debt.indexed_segments` sums every dense space, so on its own it is over
+/// `min_segments` for a fully merged multi-space collection. Submit a backlog
+/// only when a space is over the merge target (`space_over_merge_target`, see
+/// `has_dense_space_over_merge_target`), which is what the index job merges on.
+/// A Building segment the job can build (`buildable_segment`, see
+/// `has_building_segment_with_core`) is submitted too: this is its retry when
+/// a job ended on an error. A job that starts with merge debt takes a
+/// merge-only turn first, so the build can take more than one turn.
+/// shortcut: the deleted-ratio vacuum merge (HELIX_LSM_DELETE_TOMBSTONES, off
+/// by default) needs a row count and is not swept; add it here if enabled.
+fn optimizer_debt_has_submit_work(
+    debt: DenseSegmentDebt,
+    min_segments: usize,
+    space_over_merge_target: bool,
+    buildable_segment: bool,
+) -> bool {
+    (debt.indexed_segments > min_segments && space_over_merge_target)
+        || buildable_segment
         || (debt.gate_debt > 0
             && debt.active_segments >= NamedVectorManager::segment_creation_gate_cap())
 }
@@ -669,12 +908,17 @@ fn spawn_optimizer_backlog_sweeper(collections: Arc<CollectionManager>, config: 
             let sweep = Duration::from_millis(sweep_ms);
             let cooldown = Duration::from_millis(optimizer_backlog_submit_cooldown_ms());
             let mut last_submit: HashMap<String, Instant> = HashMap::new();
+            // Per collection, the `last_upsert_at` whose quiet period was
+            // found to have no tail left to seal.
+            let mut quiet_settled: HashMap<String, u64> = HashMap::new();
             loop {
                 thread::sleep(sweep);
                 let Some(collections) = collections.upgrade() else {
                     return;
                 };
                 let started = Instant::now();
+                // Here because this thread wakes anyway: it reads counters.
+                crate::helix_engine::storage_core::backend_lsm::export_shared_block_cache_usage();
                 let target = NamedVectorManager::max_indexed_segments_target().max(1);
                 let min_segments = target.saturating_mul(optimizer_backlog_min_ratio());
                 let mut candidates: Vec<OptimizerDebtCandidate> = match collections.loaded_collection_names() {
@@ -707,6 +951,9 @@ fn spawn_optimizer_backlog_sweeper(collections: Arc<CollectionManager>, config: 
                                     return None;
                                 }
                             };
+                            // The last sidecar of a burst of changes waits
+                            // here for the put interval to pass.
+                            storage.upload_held_metadata_sidecar();
                             let debt = storage.named_vectors.dense_segment_debt();
                             let priority_score = optimizer_debt_priority_score(debt, segment_breaker_drain_floor());
                             metrics::gauge!(
@@ -735,6 +982,11 @@ fn spawn_optimizer_backlog_sweeper(collections: Arc<CollectionManager>, config: 
                             )
                             .set(debt.dirty_retired_segments as f64);
                             metrics::gauge!(
+                                "helix_collection_dense_dead_names",
+                                "collection" => name.clone()
+                            )
+                            .set(storage.named_vectors.dead_segment_count() as f64);
+                            metrics::gauge!(
                                 "helix_collection_optimizer_priority_score",
                                 "collection" => name.clone()
                             )
@@ -750,7 +1002,26 @@ fn spawn_optimizer_backlog_sweeper(collections: Arc<CollectionManager>, config: 
                             // (which needs strong_count==1). It loses nothing by
                             // waiting one sweep; the marker clears on compaction
                             // exit (RAII).
-                            if optimizer_debt_has_submit_work(debt, min_segments)
+                            let debt_work = optimizer_debt_has_submit_work(
+                                debt,
+                                min_segments,
+                                storage.named_vectors.has_dense_space_over_merge_target(),
+                                storage.named_vectors.has_building_segment_with_core(),
+                            );
+                            let last_mutation = storage.last_upsert_at.load(Ordering::Acquire);
+                            let quiet_ms = collection_tail_quiet_ms(&storage);
+                            // Indexing threshold 0 asks for a flat tail: an
+                            // upsert submits no job for it, and neither does quiet.
+                            let quiet_since = (quiet_ms > INDEX_TAIL_QUIET_WAIT_IN_JOB_MAX_MS
+                                && last_mutation != 0
+                                && quiet_settled.get(&name) != Some(&last_mutation)
+                                && storage
+                                    .named_vectors
+                                    .effective_indexing_threshold(config.vector_flat_scan_threshold())
+                                    > 0
+                                && point_mutations_quiet_for(&storage, quiet_ms))
+                            .then_some(last_mutation);
+                            if (debt_work || quiet_since.is_some())
                                 && !storage.optimizer_running.load(Ordering::Acquire)
                                 && !crate::helix_engine::storage_core::collection_manager::auto_compact_in_progress(&name)
                             {
@@ -758,6 +1029,8 @@ fn spawn_optimizer_backlog_sweeper(collections: Arc<CollectionManager>, config: 
                                     name,
                                     debt,
                                     priority_score,
+                                    debt_work,
+                                    quiet_since,
                                 })
                             } else {
                                 None
@@ -799,12 +1072,29 @@ fn spawn_optimizer_backlog_sweeper(collections: Arc<CollectionManager>, config: 
                 }
 
                 let mut submitted = 0usize;
-                for candidate in candidates.into_iter().take(warm_per_sweep) {
+                // A candidate in its cooldown takes none of the sweep's
+                // places: as many of those as a sweep takes, with debt that
+                // stands, would keep every collection after them from its
+                // submit, a quiet one from the one that seals its tail.
+                let mut past_cooldown = 0usize;
+                for candidate in
+                    candidates
+                        .into_iter()
+                        .take(optimizer_backlog_candidates_looked_at(
+                            warm_per_sweep,
+                            process_admission,
+                        ))
+                {
+                    if past_cooldown >= warm_per_sweep {
+                        break;
+                    }
                     let gate_blocked = candidate.is_gate_blocked();
                     let priority_score = candidate.priority_score;
                     let name = candidate.name;
                     let debt = candidate.debt;
-                    let effective_cooldown = if gate_blocked {
+                    let debt_work = candidate.debt_work;
+                    let quiet_since = candidate.quiet_since;
+                    let effective_cooldown = if gate_blocked || quiet_since.is_some() {
                         Duration::from_millis(optimizer_backlog_urgent_cooldown_ms())
                     } else {
                         cooldown
@@ -822,8 +1112,25 @@ fn spawn_optimizer_backlog_sweeper(collections: Arc<CollectionManager>, config: 
                         .increment(1);
                         continue;
                     }
-                    match submit_collection_optimizer(&collections, &config, &name) {
-                        Ok(_) => {
+                    past_cooldown += 1;
+                    #[cfg(test)]
+                    BACKLOG_SWEEPER_SUBMITS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(name.clone());
+                    match submit_loaded_collection_optimizer(&collections, &config, &name) {
+                        Ok(None) => {}
+                        Ok(Some(spaces)) => {
+                            // One submit answers a quiet period, whether it
+                            // found a tail to seal or not: the next mutation
+                            // starts another. Work a job cannot finish must
+                            // not bring a job back every sweep.
+                            if let Some(last_mutation) = quiet_since {
+                                quiet_settled.insert(name.clone(), last_mutation);
+                            }
+                            if spaces == 0 && !debt_work {
+                                continue;
+                            }
                             submitted = submitted.saturating_add(1);
                             last_submit.insert(name.clone(), Instant::now());
                             metrics::counter!(
@@ -1082,6 +1389,43 @@ pub fn submit_collection_optimizer(
     }
     let resolved_collection = collections.resolve_alias(collection);
     let storage = collections.get_collection(&resolved_collection)?;
+    submit_optimizer_for_storage(storage, config, resolved_collection, started)
+}
+
+/// Backlog-sweeper submit. The sweeper picks its candidates from the loaded
+/// set, and one may be evicted before its turn: `get_collection` would reopen
+/// it and reset its idle timer. `Ok(None)` when there is nothing to submit to,
+/// counted under its own sweeper outcome: `not_loaded` or `fenced_writer`.
+fn submit_loaded_collection_optimizer(
+    collections: &Arc<CollectionManager>,
+    config: &Config,
+    collection: &str,
+) -> Result<Option<usize>, GraphError> {
+    let started = Instant::now();
+    let Some(storage) = collections.peek_loaded_collection(collection)? else {
+        metrics::counter!("helix_optimizer_backlog_sweeper_total", "outcome" => "not_loaded")
+            .increment(1);
+        return Ok(None);
+    };
+    // `get_collection` refuses a fenced writer. It stays loaded and quarantined
+    // until the process restarts, and the optimizer cannot write through it.
+    if matches!(
+        storage.unhealthy_lsm_writer_close_reason(),
+        Some(slatedb::CloseReason::Fenced)
+    ) {
+        metrics::counter!("helix_optimizer_backlog_sweeper_total", "outcome" => "fenced_writer")
+            .increment(1);
+        return Ok(None);
+    }
+    submit_optimizer_for_storage(storage, config, collection.to_string(), started).map(Some)
+}
+
+fn submit_optimizer_for_storage(
+    storage: Arc<HelixGraphStorage>,
+    config: &Config,
+    resolved_collection: String,
+    started: Instant,
+) -> Result<usize, GraphError> {
     if let Some(error) = storage.degraded_collection_error() {
         metrics::counter!("helix_index_executor_submit_skipped_total", "reason" => "collection_degraded")
             .increment(1);
@@ -1111,22 +1455,7 @@ pub fn submit_collection_optimizer(
     let flat_scan_threshold = storage
         .named_vectors
         .effective_indexing_threshold(config.vector_flat_scan_threshold());
-    let overrides = if storage.backend.kind() == BackendKind::Lsm {
-        let r = storage
-            .backend
-            .begin_read()
-            .map_err(|e| GraphError::New(e.to_string()))?;
-        storage.get_hnsw_overrides_be(&r)?
-    } else {
-        let rtxn = storage.begin_resize_safe_read_txn()?;
-        storage.get_hnsw_overrides(&rtxn)?
-    };
-    let hnsw_config = HNSWConfig::with_overrides(
-        config.vector_config.m,
-        config.vector_config.ef_construction,
-        config.vector_config.ef_search,
-        overrides.as_ref(),
-    );
+    let hnsw_config = collection_hnsw_config(&storage, config)?;
 
     if !optimizer_has_pending_work(
         &storage,
@@ -1183,6 +1512,1198 @@ pub fn submit_collection_optimizer(
     Ok(submitted_spaces)
 }
 
+fn collection_hnsw_config(
+    storage: &HelixGraphStorage,
+    config: &Config,
+) -> Result<HNSWConfig, GraphError> {
+    let overrides = if storage.backend.kind() == BackendKind::Lsm {
+        let r = storage
+            .backend
+            .begin_read()
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        storage.get_hnsw_overrides_be(&r)?
+    } else {
+        let rtxn = storage.begin_resize_safe_read_txn()?;
+        storage.get_hnsw_overrides(&rtxn)?
+    };
+    Ok(HNSWConfig::with_overrides(
+        config.vector_config.m,
+        config.vector_config.ef_construction,
+        config.vector_config.ef_search,
+        overrides.as_ref(),
+    ))
+}
+
+// ─── Regraph ────────────────────────────────────────────────────────────────
+//
+// Rebuilds dense graphs built before diverse neighbors (2d2891c7) from their
+// stored vectors: each Indexed HNSW segment keeping at least
+// `HNSW_DIVERSE_MIN_POINTS` live rows is rebuilt alone into a new segment
+// through the merge publish (`write_merge_target`, `swap_in_merge_target`),
+// inside the collection's index job.
+// `POST /collections/{name}/regraph` queues it; the GET reports progress.
+
+/// `HELIX_REGRAPH_ENABLED=0` refuses regraph requests.
+fn regraph_enabled() -> bool {
+    !matches!(
+        std::env::var("HELIX_REGRAPH_ENABLED")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "no" | "off")
+    )
+}
+
+/// `HELIX_REGRAPH_SKIP_CURRENT=0` has a requested regraph rebuild the
+/// segments the current build made too.
+fn regraph_skips_current() -> bool {
+    !matches!(
+        std::env::var("HELIX_REGRAPH_SKIP_CURRENT")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "no" | "off")
+    )
+}
+
+/// Progress of a collection's regraph: `queued`, `running`, `done`, `busy`
+/// (writes landed during a rebuild, retry later) or `failed`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RegraphStatus {
+    pub state: &'static str,
+    pub segments_rebuilt: usize,
+    /// Left alone: their graph was made by the current build.
+    pub segments_current: usize,
+    /// Left alone: no graph, or fewer rows stored than a search walks.
+    pub segments_small: usize,
+    /// Taken out with nothing in their place: a rebuild would have kept no
+    /// row of them.
+    pub segments_retired: usize,
+    pub segments_busy: usize,
+    pub points_rebuilt: usize,
+    pub superseded_dropped: u64,
+    /// Rows left out because their point is gone.
+    pub nodeless_dropped: u64,
+    /// Milliseconds summed over the run's segments: export and graph build,
+    /// target write (no write gate), and the swap the write gate is held for.
+    pub build_ms: u64,
+    pub write_ms: u64,
+    pub swap_ms: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum RegraphRefusal {
+    Disabled,
+    ReaderReplica,
+    NotLsm,
+    /// The link pass alone: a named vector of the collection is quantized.
+    Quantized,
+    InProgress(&'static str),
+    Storage(GraphError),
+}
+
+/// Status, point-mutation gate and dense spaces per collection, in memory
+/// only: a restart forgets `done`, which the driver's state file covers.
+type RegraphRequest = (RegraphStatus, Arc<Mutex<()>>, Vec<String>);
+static REGRAPH_REQUESTS: LazyLock<Mutex<HashMap<String, RegraphRequest>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn set_regraph_status(collection: &str, status: RegraphStatus) {
+    let mut requests = REGRAPH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = requests.get_mut(collection) {
+        entry.0 = status;
+    }
+}
+
+/// Fails a regraph its index job left queued or running (early return,
+/// error or panic), so the next request can queue it again.
+struct RegraphJobGuard(String);
+
+impl Drop for RegraphJobGuard {
+    fn drop(&mut self) {
+        let mut requests = REGRAPH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((status, ..)) = requests.get_mut(&self.0) {
+            if matches!(status.state, "queued" | "running") {
+                status.state = "failed";
+                status.error = Some("index job ended before the regraph finished".into());
+            }
+        }
+    }
+}
+
+pub fn regraph_status(collections: &CollectionManager, collection: &str) -> Option<RegraphStatus> {
+    let resolved = collections.resolve_alias(collection);
+    REGRAPH_REQUESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&resolved)
+        .map(|(status, ..)| status.clone())
+}
+
+/// Queue a regraph of `collection` on the writer. A collection already done
+/// since this process started returns its status without new work.
+pub fn submit_collection_regraph(
+    collections: &Arc<CollectionManager>,
+    config: &Config,
+    collection: &str,
+) -> Result<RegraphStatus, RegraphRefusal> {
+    if !regraph_enabled() {
+        return Err(RegraphRefusal::Disabled);
+    }
+    if lsm_config_is_reader(config) {
+        return Err(RegraphRefusal::ReaderReplica);
+    }
+    let resolved = collections.resolve_alias(collection);
+    let storage = collections
+        .get_collection(&resolved)
+        .map_err(RegraphRefusal::Storage)?;
+    if storage.backend.is_reader_replica() {
+        return Err(RegraphRefusal::ReaderReplica);
+    }
+    if storage.backend.kind() != BackendKind::Lsm {
+        return Err(RegraphRefusal::NotLsm);
+    }
+    storage
+        .ensure_not_degraded()
+        .map_err(RegraphRefusal::Storage)?;
+    let mut requests = REGRAPH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    match requests.get(&resolved).map(|(status, ..)| status.state) {
+        Some("done") => return Ok(requests[&resolved].0.clone()),
+        Some(state @ ("queued" | "running")) => return Err(RegraphRefusal::InProgress(state)),
+        _ => {}
+    }
+    if storage.optimizer_running.load(Ordering::Acquire) {
+        return Err(RegraphRefusal::InProgress("optimizing"));
+    }
+    let spaces_to_check: Vec<String> = storage
+        .named_vectors
+        .list_dense_vector_spaces()
+        .into_keys()
+        .collect();
+    let job = IndexJob {
+        collection: resolved.clone(),
+        storage: Arc::downgrade(&storage),
+        spaces_to_check: spaces_to_check.clone(),
+        hnsw_config: collection_hnsw_config(&storage, config).map_err(RegraphRefusal::Storage)?,
+        flat_scan_threshold: storage
+            .named_vectors
+            .effective_indexing_threshold(config.vector_flat_scan_threshold()),
+    };
+    let status = RegraphStatus {
+        state: "queued",
+        ..RegraphStatus::default()
+    };
+    requests.insert(
+        resolved.clone(),
+        (
+            status.clone(),
+            collections.point_mutation_gate(&resolved),
+            spaces_to_check,
+        ),
+    );
+    drop(requests);
+    if let Err(e) = INDEX_EXECUTOR.submit(job) {
+        REGRAPH_REQUESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&resolved);
+        return Err(RegraphRefusal::Storage(GraphError::New(format!(
+            "failed to submit regraph job: {e}"
+        ))));
+    }
+    Ok(status)
+}
+
+/// Runs a queued regraph for `collection` (index job tail) over the spaces
+/// it was requested for, recording the outcome. No-op when none is queued.
+fn run_queued_regraph(
+    storage: &Arc<HelixGraphStorage>,
+    collection: &str,
+    hnsw_config: &HNSWConfig,
+) -> Result<(), GraphError> {
+    let (gate, spaces) = {
+        let mut requests = REGRAPH_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+        match requests.get_mut(collection) {
+            Some((status, gate, spaces)) if status.state == "queued" => {
+                status.state = "running";
+                (Arc::clone(gate), spaces.clone())
+            }
+            _ => return Ok(()),
+        }
+    };
+    let result = regraph_segments(
+        storage,
+        collection,
+        &spaces,
+        hnsw_config,
+        &gate,
+        regraph_skips_current(),
+    );
+    set_regraph_status(
+        collection,
+        match &result {
+            Ok(status) => status.clone(),
+            Err(e) => RegraphStatus {
+                state: "failed",
+                error: Some(e.to_string()),
+                ..RegraphStatus::default()
+            },
+        },
+    );
+    result.map(|_| ())
+}
+
+/// How many unreached rows one call of the link pass looks at, a walk and at
+/// most a link each: what bounds the walks it makes, the lists it writes and
+/// the time it holds the write gate.
+pub const LINK_PASS_ROWS_A_CALL: usize = 256;
+
+/// What one call of the link pass over a collection did: `done`, or `busy`
+/// when the collection was written to or an index job started while it
+/// planned (nothing is written then; ask again).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LinkPassStatus {
+    pub state: &'static str,
+    /// The segment this call read, none when the pass has none left to do;
+    /// the served rows of it no stored link led to; of the rows this call
+    /// looked at, those it wrote a link for and those no row had room for,
+    /// near them or among the rows the pass has linked below them (a list
+    /// has room up to its bound, a quarter past what a build fills it to),
+    /// which stay unreached: the pass comes back to them only when it comes
+    /// back to the segment, after a hard delete there. `without_room` also
+    /// counts the rows left because eight rows with their own vector are
+    /// arrived at already.
+    pub segment: Option<String>,
+    pub unreached: usize,
+    pub linked: usize,
+    pub without_room: usize,
+    /// Segments the pass has still to do after this call, the one it read
+    /// counted where rows are left to look at in it. Call again until it is
+    /// 0.
+    pub remaining: usize,
+    /// When a reader replica walks the new links: it keeps the lists it has
+    /// cached until then. Its count of unreached rows is read from the store
+    /// and falls with the writer's all the same, so that count does not say
+    /// that its searches arrive at them.
+    pub readers_see_after: &'static str,
+    /// Milliseconds reading and planning (no write gate), and writing (the
+    /// write gate is held).
+    pub plan_ms: u64,
+    pub write_ms: u64,
+}
+
+/// One call of the link pass over `collection`'s graphs as they are stored,
+/// on the writer. An Indexed segment a search walks, and the pass has not
+/// marked, gets a link to each served row no stored link leads to, at the
+/// end of the list of a near row with room (`plan_stored_links_be`). It
+/// adds links and removes none, writes one list a linked row, and marks the
+/// segment so that later calls read one key for it.
+///
+/// A list has room up to a quarter past the `m_max_0` ids a build fills it
+/// to (`link_pass_list_bound`): 40 ids at an `m` of 16. The graphs built
+/// before the builds linked their own unreached rows have every near list
+/// full, and the pass that linked only under `m_max_0` left their rows as
+/// they were: a segment it marked is due again.
+///
+/// Where a row's eight nearest rows are all at the bound, its link comes
+/// from a row the pass has linked below one of them, the nearest first, one
+/// of this call's links among them. The pass before this one left such a
+/// row, as it left most of a group of rows with one vector, which share
+/// their eight nearest. Its mark does not say whether it left any, so a
+/// segment it marked is due again too, and is read once more.
+///
+/// A call takes one segment: the first that is due. It reads that
+/// segment's ids and lists and no other segment's, and looks at no more
+/// than `max_rows` of its unreached rows: a walk each, a link where a near
+/// row has room, so it holds the gate for at most that many lists. With the
+/// links it writes the row it has come to, and the next call goes on after
+/// that row; the segment is marked when a call comes to the end. A row is
+/// looked at once: one that found no room is counted (`without_room`) and
+/// left. `remaining` is the number of segments that are due, which the
+/// marks give with no list read. `HELIX_REGRAPH_ENABLED=0` refuses it, as it
+/// refuses a regraph.
+///
+/// A marked segment is due again once a hard delete has taken a row of its
+/// graph: a walk crosses no list a delete leaves, so what only that row led
+/// to is unreached again, and a row the pass linked from can be such a row.
+/// The mark keeps the count of deleted rows the pass began at, and a
+/// segment whose count has grown is read again, all of it, as one without a
+/// mark is. A segment that is not due costs one more point read a call, of
+/// that count.
+///
+/// A collection with a quantized named vector is refused whole, its other
+/// spaces with it: such a space scores its rows from the codes in the files
+/// its readers build (`.hspn`, `.hvtq`), and the pass has been run over
+/// none.
+///
+/// The plan holds the collection's cores for reading while it reads the
+/// segment and walks, as the count route and a regraph's export do for a
+/// segment: a write that needs them for writing (a seal, a merge's swap)
+/// waits that long, and searches behind it. `plan_ms` says how long.
+///
+/// The reading and the walks run without the point-mutation gate. The gate
+/// is held to check that nothing was written meanwhile and to write: a
+/// collection that was written to answers `busy` with nothing changed. A
+/// merge that retires a segment meanwhile is seen in the layout, and its
+/// segment is left out.
+///
+/// This is the one writer of a list in a segment a search already walks:
+/// every other list is written once, before its segment's entry point is.
+/// The writer drops the lists it changed from its cache. A reader replica
+/// has no such step: one that has a changed list cached walks the older,
+/// shorter one until it evicts it or restarts. Its walks do not follow the
+/// new link until then, though its count of unreached rows, which is read
+/// from the store, falls with the writer's; and nothing it returns is
+/// wrong, since the older list is a part of the newer. So roll the readers
+/// after a run over the stock of old segments. A segment built since links
+/// its rows at the build, so the pass finds little to do there: a row the
+/// build found no room for under `m_max_0`, or one a delete has cut off
+/// since.
+// shortcut: the optimizer flag is read, not held. An index job that starts
+// after the check and retires a segment before the commit leaves this
+// pass's few keys in a namespace the reaper may already have cleared; they
+// are never read. Run it as an index job's tail if that is ever seen.
+pub fn link_stored_unreached(
+    collections: &Arc<CollectionManager>,
+    config: &Config,
+    collection: &str,
+    max_rows: usize,
+) -> Result<LinkPassStatus, RegraphRefusal> {
+    if !regraph_enabled() {
+        return Err(RegraphRefusal::Disabled);
+    }
+    if lsm_config_is_reader(config) {
+        return Err(RegraphRefusal::ReaderReplica);
+    }
+    let resolved = collections.resolve_alias(collection);
+    let storage = collections
+        .get_collection(&resolved)
+        .map_err(RegraphRefusal::Storage)?;
+    if storage.backend.is_reader_replica() {
+        return Err(RegraphRefusal::ReaderReplica);
+    }
+    if storage.backend.kind() != BackendKind::Lsm {
+        return Err(RegraphRefusal::NotLsm);
+    }
+    // A poisoned lock on the configs is an error here and not "none".
+    if storage
+        .named_vectors
+        .quantizes_a_dense_space()
+        .map_err(|e| RegraphRefusal::Storage(GraphError::from(e)))?
+    {
+        return Err(RegraphRefusal::Quantized);
+    }
+    storage
+        .ensure_not_degraded()
+        .map_err(RegraphRefusal::Storage)?;
+    if storage.optimizer_running.load(Ordering::Acquire) {
+        return Err(RegraphRefusal::InProgress("optimizing"));
+    }
+    let gate = collections.point_mutation_gate(&resolved);
+    let started = Instant::now();
+    // Snapshot and write count are taken together, between batches.
+    let (mutations, r) = {
+        let _held = lock_point_mutation_gate(&gate, &resolved, "link_pass");
+        let r = storage
+            .backend
+            .begin_read()
+            .map_err(|e| RegraphRefusal::Storage(GraphError::New(e.to_string())))?;
+        (storage.point_mutations.load(Ordering::Acquire), r)
+    };
+    let (plan, due) = storage
+        .named_vectors
+        .plan_stored_links_be(&r, max_rows)
+        .map_err(|e| RegraphRefusal::Storage(GraphError::from(e)))?;
+    drop(r);
+    let written = Instant::now();
+    let mut status = LinkPassStatus {
+        state: "done",
+        remaining: due,
+        readers_see_after: "restart",
+        plan_ms: (written - started).as_millis() as u64,
+        ..LinkPassStatus::default()
+    };
+    let Some(plan) = plan else {
+        return Ok(status);
+    };
+    status.segment = Some(plan.segment.clone());
+    status.unreached = plan.unreached;
+    let changed = {
+        let _held = lock_point_mutation_gate(&gate, &resolved, "link_pass");
+        if storage.point_mutations.load(Ordering::Acquire) != mutations
+            || storage.optimizer_running.load(Ordering::Acquire)
+        {
+            // Nothing is written: the segment is still to do.
+            status.state = "busy";
+            return Ok(status);
+        }
+        storage
+            .with_write_backend(|w| {
+                storage
+                    .named_vectors
+                    .apply_stored_links_be(w, std::slice::from_ref(&plan))
+                    .map_err(GraphError::from)
+            })
+            .map_err(RegraphRefusal::Storage)?
+    };
+    // Counted once the plan is written: a busy call's rows are looked at
+    // again by the next.
+    status.without_room = plan.without_room;
+    // The segment stays counted where a delete took a row of it between two
+    // calls of its pass: the mark just written reads as due.
+    status.remaining -= usize::from(plan.marks_done());
+    storage.named_vectors.forget_stored_links(&changed);
+    status.linked = changed.iter().map(|(_, rows)| rows.len()).sum();
+    status.write_ms = written.elapsed().as_millis() as u64;
+    tracing::info!(collection = %resolved, ?status, "link pass finished");
+    Ok(status)
+}
+
+/// One exported dense row: id, vector and what the row keeps of the payload
+/// it was written with, which is that payload or its digest.
+type ExportedRow = (u128, Vec<f32>, HashMap<String, Value>);
+
+/// What every key a digest is kept under begins with: those of the lists this
+/// image has ([`KeyLists::row_digest_key`]) and those of rules it does not
+/// have. Such a key is the one key of a dense row's `fields` when the row
+/// keeps the digest of the payload it was written with in place of the
+/// payload, and its value is a `Value::U64`. An upsert's payload reaches a
+/// row through `json_to_value`, which makes every JSON number an `I64` or an
+/// `F64`, so no payload copy reads as a digest, whatever keys a client sends.
+///
+/// A stored digest is frozen, and [`row_payload_digest`] is the content hash:
+/// it moves with the hash and with the lists of keys the hash leaves out. A
+/// change to any of them needs a new key of this family (a test pins them),
+/// or a row digested before it would read as written with another payload
+/// and lose its point to the other row of a pair.
+const ROW_PAYLOAD_DIGEST_FAMILY: &str = "__helix_row_payload_digest";
+
+/// What a dense row keeps of the payload it was written with.
+#[derive(Debug, PartialEq)]
+enum RowKeeps<'a> {
+    /// No `VectorData` row, or an empty one.
+    Nothing,
+    /// The payload.
+    Payload(&'a HashMap<String, Value>),
+    /// Its digest, and the lists of keys the digest was made without.
+    Digest(KeyLists, u64),
+    /// A digest under another key of the family: a later image's rule, which
+    /// this one cannot check and must not replace.
+    DigestOfAnotherRule,
+}
+
+fn row_keeps(fields: &HashMap<String, Value>) -> RowKeeps<'_> {
+    if fields.is_empty() {
+        return RowKeeps::Nothing;
+    }
+    if let (1, Some((key, Value::U64(digest)))) = (fields.len(), fields.iter().next()) {
+        for lists in [KeyLists::First, KeyLists::Second] {
+            if key == lists.row_digest_key() {
+                return RowKeeps::Digest(lists, *digest);
+            }
+        }
+        if key.starts_with(ROW_PAYLOAD_DIGEST_FAMILY) {
+            return RowKeeps::DigestOfAnotherRule;
+        }
+    }
+    RowKeeps::Payload(fields)
+}
+
+/// `HELIX_DENSE_ROW_PAYLOAD=0` makes an LSM dense row keep the digest of its
+/// point's payload where it kept the payload: an upsert writes the digest,
+/// and a merge or regraph turns the copy of a row it rewrites into one. With
+/// six dense spaces the payload was stored seven times, and every merge wrote
+/// the six copies again. Only [`keep_the_copies_of_their_points`] reads what
+/// a row keeps, and it reads both, so the switch decides what is written and
+/// a row has its shape until its segment is next rewritten.
+///
+/// The copy is still the default: an image without this rule reads a digest
+/// as a payload that is not the point's and would keep the other row of a
+/// pair. Turn the switch on once no such image is rolled back to.
+fn dense_row_payload_enabled() -> bool {
+    !matches!(
+        std::env::var("HELIX_DENSE_ROW_PAYLOAD")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
+/// The content hash of `payload` alone: the keys the content hash covers
+/// under `lists` and no vector.
+fn row_payload_digest(lists: KeyLists, payload: &HashMap<String, Value>) -> u64 {
+    content_hash_of(lists, payload, &HashMap::new(), &HashMap::new())
+}
+
+/// The digest a row is written with: today's lists, under their key.
+fn row_digest_fields(payload: &HashMap<String, Value>) -> HashMap<String, Value> {
+    HashMap::from([(
+        KeyLists::CURRENT.row_digest_key().to_string(),
+        Value::U64(row_payload_digest(KeyLists::CURRENT, payload)),
+    )])
+}
+
+/// What an upsert writes beside each dense vector of a point with `payload`.
+fn dense_row_fields(payload: &HashMap<String, Value>) -> HashMap<String, Value> {
+    if dense_row_payload_enabled() {
+        payload.clone()
+    } else {
+        row_digest_fields(payload)
+    }
+}
+
+/// Under `HELIX_DENSE_ROW_PAYLOAD=0` the rows a merge or regraph is about to
+/// write keep the digest of the payload copy they carry, so a row rewritten
+/// away from its pair can still be told from it. A row that has a digest, of
+/// this rule or another, or that keeps nothing, stays as it is.
+fn digest_in_place_of_a_payload_copy(rows: &mut [ExportedRow]) {
+    if dense_row_payload_enabled() {
+        return;
+    }
+    for (_, _, fields) in rows {
+        let digest = match row_keeps(fields) {
+            RowKeeps::Payload(payload) => row_digest_fields(payload),
+            _ => continue,
+        };
+        *fields = digest;
+    }
+}
+
+/// What a dense row says about the payload it was written with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WrittenWith {
+    /// The point's payload: the row keeps that payload or its digest.
+    ThePointsPayload,
+    /// Another payload, or the digest of another.
+    AnotherPayload,
+    /// The row keeps neither, or a digest this image cannot check: it says
+    /// nothing.
+    Unknown,
+}
+
+/// `properties` is the point's payload as its node has it and `payload` the
+/// same on the keys the content hash covers today; `digest` is worked out
+/// for the first row that keeps one of today's lists.
+///
+/// A payload is compared with numbers of different kinds equal (`Value`'s
+/// equality) and a digest is not. An upsert and the node's codec keep a
+/// number's kind, so the two agree for a point as its upsert left it. A
+/// `set_payload` puts a non-negative integer on the node as a `U64` where the
+/// upsert made an `I64`: if it rewrites a key the hash covers with the number
+/// it had, a row with the payload still reads as the point's and a row with
+/// the digest as another's.
+fn row_written_with(
+    fields: &HashMap<String, Value>,
+    properties: &HashMap<String, Value>,
+    payload: &HashMap<String, Value>,
+    digest: &mut Option<u64>,
+) -> WrittenWith {
+    let the_points = match row_keeps(fields) {
+        RowKeeps::Nothing | RowKeeps::DigestOfAnotherRule => return WrittenWith::Unknown,
+        RowKeeps::Digest(KeyLists::CURRENT, kept) => {
+            kept == *digest.get_or_insert_with(|| row_payload_digest(KeyLists::CURRENT, payload))
+        }
+        // Older lists cover keys a node write may have changed since with no
+        // row written: equal, the row was written with the point's payload;
+        // unequal, it may still have been, and says nothing.
+        RowKeeps::Digest(lists, kept) => {
+            if kept != row_payload_digest(lists, properties) {
+                return WrittenWith::Unknown;
+            }
+            true
+        }
+        RowKeeps::Payload(kept) => payload_without_content_hash_payload_only_keys(kept) == *payload,
+    };
+    if the_points {
+        WrittenWith::ThePointsPayload
+    } else {
+        WrittenWith::AnotherPayload
+    }
+}
+
+/// Which copy of a point a merge keeps: the one search serves, the other
+/// copy at this index, or the one search serves because the rows do not say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeptCopy {
+    Search,
+    Other(usize),
+    Undecided,
+}
+
+/// The copy written with the point's payload where exactly one was. A row
+/// that says nothing leaves its pair undecided: read as "another payload" it
+/// would hand the point to whichever row was rewritten last.
+fn copy_to_keep(served: WrittenWith, others: &[WrittenWith]) -> KeptCopy {
+    if served == WrittenWith::Unknown || others.contains(&WrittenWith::Unknown) {
+        return KeptCopy::Undecided;
+    }
+    let mut the_points = others
+        .iter()
+        .enumerate()
+        .filter(|(_, other)| **other == WrittenWith::ThePointsPayload)
+        .map(|(at, _)| at);
+    match (served, the_points.next(), the_points.next()) {
+        (WrittenWith::ThePointsPayload, None, _) => KeptCopy::Search,
+        (WrittenWith::AnotherPayload, Some(other), None) => KeptCopy::Other(other),
+        _ => KeptCopy::Undecided,
+    }
+}
+
+/// Two sources of a merge can each hold a row of one id: until an upsert
+/// removed the rows it replaces, a changed re-upsert left the old one where
+/// it was. `rows` has the copy search serves, which is the old one when its
+/// segment is numbered above the new one's (a merge target made while the
+/// new row's tail was mutable). A row keeps the payload of the write that
+/// made it, or that payload's digest, so the copy to keep is the one written
+/// with the point's payload, compared on the keys the content hash covers:
+/// `rows` gets that copy where exactly one has it. Where none or several have
+/// it (a rewrite that changed vectors only), or a row keeps neither, the copy
+/// search serves stays. Counted by which copy stayed: `search_copy` (it was
+/// the point's own), `other_copy` (search was serving an older one) or
+/// `undecided`. The points are read `NODE_CHECK_CHUNK` to a batched read: a
+/// collection indexed again before upserts removed old rows has a second copy
+/// of every rewritten point.
+fn keep_the_copies_of_their_points(
+    storage: &HelixGraphStorage,
+    r: &super::backend_any::AnyRead<'_>,
+    rows: &mut [ExportedRow],
+    row_of: &HashMap<u128, usize>,
+    mut other_copies: HashMap<u128, Vec<(Vec<f32>, HashMap<String, Value>)>>,
+) -> Result<(), GraphError> {
+    if other_copies.is_empty() {
+        return Ok(());
+    }
+    let started = Instant::now();
+    let (mut search_copy, mut other_copy, mut undecided) = (0u64, 0u64, 0u64);
+    let ids: Vec<u128> = other_copies.keys().copied().collect();
+    for chunk in ids.chunks(NODE_CHECK_CHUNK) {
+        let keys: Vec<Vec<u8>> = chunk.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+        let nodes = storage
+            .backend
+            .get_many(r, Namespace::Nodes, &keys)
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        for (id, node) in chunk.iter().zip(nodes) {
+            // No point: the node check that follows leaves the row out.
+            let Some(node) = node.and_then(|bytes| SerializedNode::decode_node(&bytes, *id).ok())
+            else {
+                continue;
+            };
+            let Some(&at) = row_of.get(id) else {
+                continue;
+            };
+            let Some(row) = rows.get_mut(at) else {
+                continue;
+            };
+            let payload = payload_without_content_hash_payload_only_keys(&node.properties);
+            let mut digest = None;
+            let served = row_written_with(&row.2, &node.properties, &payload, &mut digest);
+            let mut others = other_copies.remove(id).unwrap_or_default();
+            let said: Vec<WrittenWith> = others
+                .iter()
+                .map(|(_, fields)| {
+                    row_written_with(fields, &node.properties, &payload, &mut digest)
+                })
+                .collect();
+            match copy_to_keep(served, &said) {
+                KeptCopy::Search => search_copy += 1,
+                KeptCopy::Other(at) => {
+                    let (data, fields) = others.swap_remove(at);
+                    row.1 = data;
+                    row.2 = fields;
+                    other_copy += 1;
+                }
+                KeptCopy::Undecided => undecided += 1,
+            }
+        }
+    }
+    for (kept, ids) in [
+        ("search_copy", search_copy),
+        ("other_copy", other_copy),
+        ("undecided", undecided),
+    ] {
+        if ids > 0 {
+            metrics::counter!("helix_dense_merge_duplicate_ids_total", "kept" => kept)
+                .increment(ids);
+        }
+    }
+    record_dense_merge_publish_phase("copy_choice", started);
+    Ok(())
+}
+
+/// The rows a regraph read of ids a more recent segment holds too (`doubled`:
+/// each with the fields of those copies, the one search serves first).
+/// Carried into the rebuilt segment a row outranks them all, so it goes to
+/// `rows` only where `keep_the_copies_of_their_points` would keep it in a
+/// merge of those segments: where it alone was written with the point's
+/// payload. Returns how many stay out.
+fn keep_the_doubled_rows_of_their_points(
+    storage: &HelixGraphStorage,
+    r: &super::backend_any::AnyRead<'_>,
+    rows: &mut Vec<ExportedRow>,
+    doubled: Vec<(ExportedRow, Vec<HashMap<String, Value>>)>,
+) -> Result<u64, GraphError> {
+    let exported = rows.len() + doubled.len();
+    // The copy search serves stands in with no vector: a row that has one
+    // after the choice is the rebuilt segment's.
+    let mut served: Vec<ExportedRow> = Vec::with_capacity(doubled.len());
+    let mut row_of = HashMap::new();
+    let mut other_copies = HashMap::new();
+    for ((id, data, fields), copies) in doubled {
+        let mut copies = copies.into_iter();
+        row_of.insert(id, served.len());
+        served.push((id, Vec::new(), copies.next().unwrap_or_default()));
+        let mut others = vec![(data, fields)];
+        others.extend(copies.map(|fields| (Vec::new(), fields)));
+        other_copies.insert(id, others);
+    }
+    keep_the_copies_of_their_points(storage, r, &mut served, &row_of, other_copies)?;
+    rows.extend(served.into_iter().filter(|(_, data, _)| !data.is_empty()));
+    Ok((exported - rows.len()) as u64)
+}
+
+/// `HELIX_LSM_MERGE_NODE_CHECK=0` lets merges and regraphs carry rows without
+/// a point along again. The check costs a node read per exported row and
+/// finds nothing once every segment written before it has merged.
+fn lsm_merge_node_check_enabled() -> bool {
+    !matches!(
+        std::env::var("HELIX_LSM_MERGE_NODE_CHECK")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
+/// Node keys per batched read of [`retain_rows_with_a_node`]: the node rows
+/// of one chunk are held while it is checked, beside an export that holds
+/// every row anyway.
+const NODE_CHECK_CHUNK: usize = 512;
+
+/// Leaves out the exported `rows` whose point is gone and returns how many.
+/// A merge used to republish the row of a point deleted while it was building
+/// (see `merge_windows`), and no delete reaches that row again, so it would
+/// be merged forward for good. `r` is the export's own snapshot: in it a row
+/// has its node unless the point is gone, because an upsert writes both in
+/// one batch and a delete removes both in one. The rows stay where there is
+/// no batched read (the kill switch for those, or another backend).
+fn retain_rows_with_a_node(
+    storage: &HelixGraphStorage,
+    r: &super::backend_any::AnyRead<'_>,
+    rows: &mut Vec<ExportedRow>,
+) -> Result<u64, GraphError> {
+    if !lsm_merge_node_check_enabled() {
+        return Ok(0);
+    }
+    let started = Instant::now();
+    let mut present = Vec::with_capacity(rows.len());
+    for chunk in rows.chunks(NODE_CHECK_CHUNK) {
+        let keys: Vec<(Namespace<'_>, Vec<u8>)> = chunk
+            .iter()
+            .map(|(id, _, _)| (Namespace::Nodes, id.to_be_bytes().to_vec()))
+            .collect();
+        match storage
+            .backend
+            .contains_many(r, &keys)
+            .map_err(|e| GraphError::New(e.to_string()))?
+        {
+            Some(found) => present.extend(found),
+            None => return Ok(0),
+        }
+    }
+    let exported = rows.len();
+    let mut present = present.into_iter();
+    rows.retain(|_| present.next().unwrap_or(true));
+    let gone = (exported - rows.len()) as u64;
+    if gone > 0 {
+        metrics::counter!("helix_dense_merge_nodeless_rows_total").increment(gone);
+    }
+    metrics::counter!("helix_dense_merge_node_checked_rows_total").increment(exported as u64);
+    record_dense_merge_publish_phase("node_check", started);
+    Ok(gone)
+}
+
+/// `regraph_segments` over every eligible segment, also those the current
+/// build made.
+#[cfg(test)]
+fn regraph_collection(
+    storage: &Arc<HelixGraphStorage>,
+    collection: &str,
+    spaces: &[String],
+    hnsw_config: &HNSWConfig,
+    gate: &Arc<Mutex<()>>,
+) -> Result<RegraphStatus, GraphError> {
+    regraph_segments(storage, collection, spaces, hnsw_config, gate, false)
+}
+
+/// Rebuild every eligible segment of `spaces` one at a time; with
+/// `skip_current`, not those whose graph the current build made. Export,
+/// graph build and target write run without the point-mutation gate; it is
+/// held only to re-check the write count and swap, so an upsert or delete
+/// either lands before the export (and is in it), stands this segment down
+/// as `busy` (its target dropped), or waits and lands on the swapped layout.
+fn regraph_segments(
+    storage: &Arc<HelixGraphStorage>,
+    collection: &str,
+    spaces: &[String],
+    hnsw_config: &HNSWConfig,
+    gate: &Arc<Mutex<()>>,
+    skip_current: bool,
+) -> Result<RegraphStatus, GraphError> {
+    use crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole;
+    use crate::helix_engine::vector_core::vector_core::HNSW_DIVERSE_MIN_POINTS;
+    let mut status = RegraphStatus::default();
+    for vec_name in spaces {
+        let Some(distance) = storage
+            .named_vectors
+            .get_config(vec_name)
+            .map(|config| config.distance)
+        else {
+            continue;
+        };
+        let indexed: Vec<String> = storage
+            .named_vectors
+            .list_dense_vector_spaces()
+            .remove(vec_name)
+            .map(|space| space.segments)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|segment| segment.role == DenseVectorSegmentRole::Indexed)
+            .map(|segment| segment.physical_name)
+            .collect();
+        for phys in indexed {
+            if skip_current && has_current_graph(storage, &phys)? {
+                status.segments_current += 1;
+                continue;
+            }
+            crate::helix_engine::vector_core::vector_core::defer_build_start_under_pressure();
+            let build_permit = acquire_build_permit().map_err(GraphError::from)?;
+            let started = Instant::now();
+            // Snapshot and write count are taken together, between batches.
+            let (mutations, r) = {
+                let _held = lock_point_mutation_gate(gate, collection, "regraph");
+                let r = storage
+                    .backend
+                    .begin_read()
+                    .map_err(|e| GraphError::New(e.to_string()))?;
+                (storage.point_mutations.load(Ordering::Acquire), r)
+            };
+            let exported = storage
+                .named_vectors
+                .export_for_regraph_be(&r, vec_name, &phys, HNSW_DIVERSE_MIN_POINTS)
+                .map_err(GraphError::from)?;
+            let Some(exported) = exported else {
+                status.segments_small += 1;
+                continue;
+            };
+            let mut rows = exported.rows;
+            let dropped = exported.dropped
+                + keep_the_doubled_rows_of_their_points(storage, &r, &mut rows, exported.doubled)?;
+            status.nodeless_dropped += retain_rows_with_a_node(storage, &r, &mut rows)?;
+            digest_in_place_of_a_payload_copy(&mut rows);
+            drop(r);
+            #[cfg(test)]
+            test_support::reached("regraph_exported");
+            // No row stays: every search walks the segment and it serves
+            // nothing, so it goes with no target in its place.
+            if rows.is_empty() {
+                let held = lock_point_mutation_gate(gate, collection, "regraph");
+                if storage.point_mutations.load(Ordering::Acquire) != mutations {
+                    status.segments_busy += 1;
+                    continue;
+                }
+                retire_dense_segment(storage, vec_name, &phys)?;
+                storage.refresh_metadata_snapshot_best_effort();
+                drop(held);
+                status.segments_retired += 1;
+                status.superseded_dropped += dropped;
+                continue;
+            }
+            let points = rows.len();
+            let prepared_index = VectorCore::build_hnsw_in_memory_owned_with_permit(
+                rows,
+                hnsw_config,
+                distance.clone(),
+                &build_permit,
+            )
+            .map_err(GraphError::from)?;
+            let written = Instant::now();
+            status.build_ms += (written - started).as_millis() as u64;
+            // Already stale: skip the target write rather than write and drop it.
+            if storage.point_mutations.load(Ordering::Acquire) != mutations {
+                status.segments_busy += 1;
+                continue;
+            }
+            let target = write_merge_target(storage, vec_name, hnsw_config, prepared_index)?;
+            let swap_started = Instant::now();
+            status.write_ms += (swap_started - written).as_millis() as u64;
+            let held = lock_point_mutation_gate(gate, collection, "regraph");
+            if storage.point_mutations.load(Ordering::Acquire) != mutations {
+                drop(held);
+                retire_dense_segment(storage, vec_name, &target)?;
+                status.segments_busy += 1;
+                continue;
+            }
+            swap_in_merge_target(storage, vec_name, &target, vec![phys])?;
+            drop(held);
+            status.swap_ms += swap_started.elapsed().as_millis() as u64;
+            status.segments_rebuilt += 1;
+            status.points_rebuilt += points;
+            status.superseded_dropped += dropped;
+        }
+    }
+    status.state = if status.segments_busy > 0 {
+        "busy"
+    } else {
+        "done"
+    };
+    tracing::info!(collection, ?status, "regraph finished");
+    Ok(status)
+}
+
+/// True when dense segment `phys` carries the current build's number.
+fn has_current_graph(storage: &HelixGraphStorage, phys: &str) -> Result<bool, GraphError> {
+    let r = storage
+        .backend
+        .begin_read()
+        .map_err(|e| GraphError::New(e.to_string()))?;
+    let cores = storage
+        .named_vectors
+        .cores_read()
+        .map_err(GraphError::from)?;
+    match cores.get(phys) {
+        Some(core) => core.has_current_graph(&r).map_err(GraphError::from),
+        None => Ok(false),
+    }
+}
+
+/// Stores the dense layout of an LSM collection: the one its memory has when
+/// the transaction runs, with `seal` in it where the caller is a seal whose
+/// next tail memory does not have yet. Every other caller has changed memory
+/// under `held` and passes none.
+///
+/// This is every store of the layout on LSM, and it is made under the
+/// collection's [`DenseLayoutChange`]: no two cross, so the store that lands
+/// last read memory last. Memory is read inside the transaction because a
+/// conflict runs the transaction again (another writer of the metadata row:
+/// a payload index, a sparse space), and the second run stores what memory
+/// has then.
+///
+/// It is also the one place that records a dead segment name
+/// ([`DeadNamesOfAStore`]): the names this store takes off the stored layout
+/// get their keys in its transaction, and memory hears of them once it has
+/// committed.
+fn store_dense_layout(
+    storage: &HelixGraphStorage,
+    _held: &DenseLayoutChange<'_>,
+    w: &mut super::backend_any::AnyWrite<'_>,
+    seal: Option<&PreparedTailSeal>,
+) -> Result<(), GraphError> {
+    let mut dead = None;
+    storage.update_metadata_be_with_rows(w, |metadata| {
+        let mut layout = storage
+            .named_vectors
+            .dense_vector_spaces_to_store()
+            .map_err(GraphError::from)?;
+        #[cfg(test)]
+        test_support::reached("layout_read");
+        if let Some(seal) = seal {
+            seal.flip_in(&mut layout);
+        }
+        report_dense_layout_faults(storage, &metadata.dense_vector_spaces, &layout);
+        // Of this run of the transaction: a run a conflict makes reads the
+        // stored layout again and decides again.
+        dead = DeadNamesOfAStore::of(storage, &metadata.dense_vector_spaces, &layout);
+        let rows = dead
+            .as_ref()
+            .map(DeadNamesOfAStore::rows)
+            .unwrap_or_default();
+        metadata.set_dense_vector_spaces(layout);
+        Ok(rows)
+    })?;
+    if let Some(dead) = dead {
+        dead.committed(storage);
+    }
+    Ok(())
+}
+
+/// What a store of the dense layout does to the dead segment names
+/// (`DEAD_SEGMENT_KEY_PREFIX` in named_vectors.rs), decided from the layout
+/// the store replaces as its transaction read it.
+///
+/// A segment the stored layout lists and the next one does not gets a key.
+/// That is every way a name leaves the layout (a merge's sources, a retire,
+/// a merge target nothing published, an emptied segment) with no site
+/// counted, and it holds where a site took the name out of memory and its
+/// own store then failed: the name is still in the stored layout, and the
+/// next store that lands records it, whichever site makes it.
+///
+/// A segment the next layout lists that has a key loses the key: a listed
+/// segment is served, whatever a key says.
+///
+/// Where a store takes every stored segment of a space off at once, none of
+/// them gets a key. No change of a healthy space does that (its tail stays
+/// through a seal, a build, a merge and a removal of empties): it is a fault,
+/// or the removal of the emptied segments of a space that had no tail, and
+/// keys for them would call every row the space ever had dead.
+struct DeadNamesOfAStore {
+    recorded: Vec<(String, u64)>,
+    listed_again: Vec<String>,
+    withheld: usize,
+}
+
+impl DeadNamesOfAStore {
+    /// None where the collection keeps no record of dead names.
+    fn of(
+        storage: &HelixGraphStorage,
+        stored: &HashMap<String, DenseVectorSpaceMetadata>,
+        next: &HashMap<String, DenseVectorSpaceMetadata>,
+    ) -> Option<Self> {
+        fn names(space: &DenseVectorSpaceMetadata) -> impl Iterator<Item = &str> {
+            space
+                .segments
+                .iter()
+                .map(|segment| segment.physical_name.as_str())
+        }
+        let listed_again = storage
+            .named_vectors
+            .dead_among(next.values().flat_map(names))?;
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let mut dead = Self {
+            recorded: Vec::new(),
+            listed_again,
+            withheld: 0,
+        };
+        for (space, had) in stored {
+            let now: HashSet<&str> = next.get(space).into_iter().flat_map(names).collect();
+            let lost: Vec<&str> = names(had).filter(|name| !now.contains(name)).collect();
+            if lost.len() == had.segments.len() {
+                dead.withheld += lost.len();
+                continue;
+            }
+            dead.recorded
+                .extend(lost.into_iter().map(|name| (name.to_string(), at)));
+        }
+        Some(dead)
+    }
+
+    /// The rows of the metadata table that go into the store's transaction.
+    fn rows(&self) -> Vec<super::backend::TransactionRow> {
+        use crate::helix_engine::vector_core::named_vectors::dead_segment_key;
+        let puts = self
+            .recorded
+            .iter()
+            .map(|(name, at)| (dead_segment_key(name), Some(at.to_be_bytes().to_vec())));
+        let deletes = self
+            .listed_again
+            .iter()
+            .map(|name| (dead_segment_key(name), None));
+        puts.chain(deletes).collect()
+    }
+
+    /// Once the store has committed: memory takes the names, and they are
+    /// counted and said.
+    fn committed(self, storage: &HelixGraphStorage) {
+        storage
+            .named_vectors
+            .dead_segments_stored(&self.recorded, &self.listed_again);
+        if !self.recorded.is_empty() {
+            metrics::counter!("helix_dense_dead_names_recorded_total")
+                .increment(self.recorded.len() as u64);
+        }
+        if self.withheld > 0 {
+            metrics::counter!("helix_dense_dead_names_withheld_total")
+                .increment(self.withheld as u64);
+            tracing::error!(
+                collection = storage.collection_display_name(),
+                segments = self.withheld,
+                "A store of the dense layout took every stored segment of a space off at once; none of them was recorded as dead"
+            );
+        }
+        for name in &self.listed_again {
+            metrics::counter!("helix_dense_dead_names_cleared_total", "reason" => "listed_again")
+                .increment(1);
+            tracing::error!(
+                collection = storage.collection_display_name(),
+                segment = %name,
+                "A dense segment with a dead key is in the layout that was stored; its key was deleted with that store"
+            );
+        }
+    }
+}
+
+/// Says at ERROR what a layout about to be stored should never show. A
+/// space that has segments stored and none now: stored so, it opens as its
+/// bare name alone and every segment it had is unlisted. A space with
+/// segments and no mutable tail: no append can reach it. Neither stops the
+/// store: a space whose segments were all emptied and removed comes to the
+/// first with nothing lost, and what passes through the second is not known.
+fn report_dense_layout_faults(
+    storage: &HelixGraphStorage,
+    stored: &HashMap<String, DenseVectorSpaceMetadata>,
+    next: &HashMap<String, DenseVectorSpaceMetadata>,
+) {
+    use crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole;
+    for (space, had) in stored {
+        if !had.segments.is_empty() && next.get(space).is_none_or(|now| now.segments.is_empty()) {
+            metrics::counter!("helix_dense_layout_store_fault_total", "fault" => "space_without_segments")
+                .increment(1);
+            tracing::error!(
+                collection = storage.collection_display_name(),
+                vector = %space,
+                segments_stored = had.segments.len(),
+                "Dense layout store: a space that has segments stored is stored with none"
+            );
+        }
+    }
+    for (space, now) in next {
+        let has_tail = now
+            .segments
+            .iter()
+            .any(|segment| segment.role == DenseVectorSegmentRole::Mutable);
+        if !now.segments.is_empty() && !has_tail {
+            metrics::counter!("helix_dense_layout_store_fault_total", "fault" => "space_without_tail")
+                .increment(1);
+            tracing::error!(
+                collection = storage.collection_display_name(),
+                vector = %space,
+                segments = now.segments.len(),
+                "Dense layout store: a space has segments and no mutable tail"
+            );
+        }
+    }
+}
+
+/// Retires an obsolete segment: persist its removal before unlinking sidecars
+/// and handing its pages to the reaper.
+fn retire_dense_segment(
+    storage: &Arc<HelixGraphStorage>,
+    vec_name: &str,
+    target: &str,
+) -> Result<(), GraphError> {
+    let names = [target.to_string()];
+    {
+        let held = storage.named_vectors.begin_dense_layout_change();
+        storage
+            .named_vectors
+            .apply_dense_segment_removal(vec_name, &names)
+            .map_err(GraphError::from)?;
+        storage.with_write_backend(|w| store_dense_layout(storage, &held, w, None))?;
+    }
+    let sidecars = storage
+        .named_vectors
+        .unlink_sidecar_files_for_segments(storage.path(), &names);
+    if sidecars.error_count > 0 {
+        tracing::warn!(
+            errors = sidecars.error_count,
+            "sidecar unlink for a retired dense segment had errors"
+        );
+    }
+    SEGMENT_REAPER.submit(Arc::clone(storage), target.to_string());
+    Ok(())
+}
+
 pub(crate) fn submit_post_open_vector_maintenance(
     storage: &Arc<HelixGraphStorage>,
     config: &Config,
@@ -1214,6 +2735,7 @@ pub(crate) fn submit_post_open_vector_maintenance(
         );
         return Ok(0);
     }
+    let _ = storage.submit_payload_marker_backfill(collection);
     let spaces_to_check: Vec<String> = storage
         .named_vectors
         .list_dense_vector_spaces()
@@ -1232,22 +2754,20 @@ pub(crate) fn submit_post_open_vector_maintenance(
     let flat_scan_threshold = storage
         .named_vectors
         .effective_indexing_threshold(config.vector_flat_scan_threshold());
-    let overrides = if storage.backend.kind() == BackendKind::Lsm {
-        let r = storage
-            .backend
-            .begin_read()
-            .map_err(|e| GraphError::New(e.to_string()))?;
-        storage.get_hnsw_overrides_be(&r)?
-    } else {
-        let rtxn = storage.begin_resize_safe_read_txn()?;
-        storage.get_hnsw_overrides(&rtxn)?
-    };
-    let hnsw_config = HNSWConfig::with_overrides(
-        config.vector_config.m,
-        config.vector_config.ef_construction,
-        config.vector_config.ef_search,
-        overrides.as_ref(),
-    );
+    if !optimizer_has_pending_work(
+        storage,
+        &spaces_to_check,
+        flat_scan_threshold,
+        index_subthreshold_quiesced_tails(),
+    ) {
+        metrics::counter!(
+            "helix_post_open_vector_maintenance_total",
+            "outcome" => "no_pending_work"
+        )
+        .increment(1);
+        return Ok(0);
+    }
+    let hnsw_config = collection_hnsw_config(storage, config)?;
 
     if let Err(err) = INDEX_EXECUTOR.submit(IndexJob {
         collection: collection.to_string(),
@@ -1329,13 +2849,16 @@ struct SegmentReaper {
 
 impl SegmentReaper {
     fn new() -> Self {
+        Self::with_workers(segment_reaper_threads())
+    }
+
+    fn with_workers(worker_count: usize) -> Self {
         let state = Arc::new((
             Mutex::new(ReaperQueueState::default()),
             std::sync::Condvar::new(),
         ));
         let queue_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let queued_or_running = Arc::new(Mutex::new(HashSet::new()));
-        let worker_count = segment_reaper_threads();
         for worker_id in 0..worker_count {
             let state_for_thread = Arc::clone(&state);
             let queue_depth_for_thread = Arc::clone(&queue_depth);
@@ -1385,7 +2908,22 @@ impl SegmentReaper {
 
             let yield_ms = reaper_yield_ms();
             let scale = reaper_chunk_scale();
-            let outcome = Self::run_job_turn(&mut job, yield_ms, scale);
+            // Uncaught, a panic ended this thread and dropped the job with
+            // its key still in `queued_or_running`, so its segment was never
+            // submitted again. Caught, the job takes the failed path.
+            let turn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::run_job_turn(&mut job, yield_ms, scale)
+            }));
+            let outcome = turn.unwrap_or_else(|panic| {
+                metrics::counter!("helix_segment_reaper_panics_total").increment(1);
+                tracing::error!(
+                    collection = %job.storage.path().display(),
+                    segment = %job.physical_name,
+                    panic = panic_text(&*panic),
+                    "segment reaper turn panicked; its worker goes on and the job is tried again as one that failed"
+                );
+                ReaperJobOutcome::Failed
+            });
 
             let elapsed_ms = started.elapsed().as_millis() as f64;
             metrics::histogram!("helix_segment_reaper_clear_ms").record(elapsed_ms);
@@ -1405,6 +2943,8 @@ impl SegmentReaper {
     }
 
     fn run_job_turn(job: &mut ReaperJob, yield_ms: u64, scale: f32) -> ReaperJobOutcome {
+        #[cfg(test)]
+        panic_once_for_test(&job.physical_name);
         let Some(db_index) = next_reaper_db_index(job) else {
             return Self::finalize_reaper_job(job);
         };
@@ -1468,6 +3008,18 @@ impl SegmentReaper {
     }
 
     fn finalize_reaper_job(job: &ReaperJob) -> ReaperJobOutcome {
+        use crate::helix_engine::vector_core::named_vectors::dead_segment_key;
+        // The segment's dead key, where this job has shown its rows gone. On
+        // LSM a table counts as drained for a segment with no core open
+        // without being read; with the core open, each of the eight was read
+        // empty by a step of this job, and only that takes the key away.
+        let named = &job.storage.named_vectors;
+        let dead_key = (job.storage.backend.kind() == BackendKind::Lsm
+            && named.is_dead_segment(&job.physical_name)
+            && named
+                .cores_read()
+                .is_ok_and(|cores| cores.contains_key(&job.physical_name)))
+        .then(|| dead_segment_key(&job.physical_name));
         match job
             .storage
             .named_vectors
@@ -1488,7 +3040,8 @@ impl SegmentReaper {
                 // Re-upsert tombstones: this is the universal retire chokepoint
                 // (merge Phase E, segment breaker, collection delete), so clear
                 // the retired segment's tombstones in one place. Best-effort:
-                // leftover keys are harmless and reconstructed/ignored.
+                // leftover keys are harmless and reconstructed/ignored. The
+                // dead key goes in the same write: no commit of its own.
                 let cleared = if job.storage.backend.kind() == BackendKind::Lsm {
                     job.storage
                         .backend
@@ -1496,6 +3049,12 @@ impl SegmentReaper {
                         .map_err(|e| GraphError::New(e.to_string()))
                         .and_then(|r| {
                             job.storage.with_write_backend(|w| {
+                                if let Some(key) = &dead_key {
+                                    job.storage
+                                        .backend
+                                        .delete(w, Namespace::Metadata, key)
+                                        .map_err(|e| GraphError::New(e.to_string()))?;
+                                }
                                 job.storage
                                     .named_vectors
                                     .clear_tombstones_for_segment_be(&r, w, &job.physical_name)
@@ -1511,12 +3070,26 @@ impl SegmentReaper {
                     })
                 };
                 match cleared {
-                    Ok(n) if n > 0 => {
-                        metrics::counter!("helix_reupsert_tombstones_cleared_on_retire_total")
-                            .increment(n as u64);
+                    Ok(n) => {
+                        if n > 0 {
+                            metrics::counter!("helix_reupsert_tombstones_cleared_on_retire_total")
+                                .increment(n as u64);
+                        }
+                        if dead_key.is_some() {
+                            named.dead_segments_stored(
+                                &[],
+                                std::slice::from_ref(&job.physical_name),
+                            );
+                            metrics::counter!(
+                                "helix_dense_dead_names_cleared_total",
+                                "reason" => "read_empty"
+                            )
+                            .increment(1);
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => {
+                        // Its dead key, if it has one, stays with it: the
+                        // name is passed over by the allocator and no more.
                         tracing::debug!(
                             error = %e,
                             segment = %job.physical_name,
@@ -2203,21 +3776,87 @@ fn segment_reaper_retry_attempts() -> usize {
 /// If the worker dies between phases A and D the partially-written
 /// segment has no metadata reference; `gc_orphan_building_segments`
 /// reaps it on next startup or next index pass.
+///
+/// `window` was opened before the merge read its sources: the points removed
+/// since then are deleted from the target between phases C and D, so the swap
+/// never publishes their rows.
 fn run_chunked_merge_publish(
     storage: &Arc<HelixGraphStorage>,
     vec_name: &str,
     hnsw_config: &HNSWConfig,
     prepared_merge: crate::helix_engine::vector_core::named_vectors::PreparedMerge,
+    window: Option<&crate::helix_engine::vector_core::merge_windows::MergeWindow<'_>>,
 ) -> Result<(), GraphError> {
     let publish_started = Instant::now();
-    use crate::helix_engine::vector_core::named_vectors::PreparedMerge;
-    let PreparedMerge {
-        merge_targets,
-        mut prepared_index,
-    } = prepared_merge;
+    // The ids the target gets a row for: a removal of any other id left
+    // nothing in it.
+    let exported: HashSet<u128> = match window {
+        Some(_) => prepared_merge
+            .prepared_index
+            .point_ids
+            .iter()
+            .copied()
+            .collect(),
+        None => HashSet::new(),
+    };
+    let merged_name = write_merge_target(
+        storage,
+        vec_name,
+        hnsw_config,
+        prepared_merge.prepared_index,
+    )?;
+    #[cfg(test)]
+    test_support::reached("written");
+    if let Some(window) = window {
+        let phase_started = Instant::now();
+        loop {
+            let mut removed = window.removed();
+            if removed.is_empty() {
+                break;
+            }
+            removed.retain(|id| exported.contains(id));
+            if removed.is_empty() {
+                continue;
+            }
+            let staged = storage.with_write_backend(|w| {
+                storage
+                    .named_vectors
+                    .delete_from_segment_be(w, &merged_name, &removed)
+                    .map_err(GraphError::from)
+            })?;
+            storage.named_vectors.apply_delete_tombstones(&staged);
+            metrics::counter!("helix_dense_merge_removed_ids_total")
+                .increment(removed.len() as u64);
+        }
+        record_dense_merge_publish_phase("removed_rows", phase_started);
+    }
+    #[cfg(test)]
+    test_support::reached("drained");
+    swap_in_merge_target(
+        storage,
+        vec_name,
+        &merged_name,
+        prepared_merge.merge_targets,
+    )?;
+    metrics::histogram!("helix_dense_merge_publish_duration_ms")
+        .record(publish_started.elapsed().as_secs_f64() * 1000.0);
+    Ok(())
+}
 
+/// Phases A-C of `run_chunked_merge_publish`: writes the merge target, an
+/// unmarked `Building` segment search does not see, and returns its name.
+fn write_merge_target(
+    storage: &Arc<HelixGraphStorage>,
+    vec_name: &str,
+    hnsw_config: &HNSWConfig,
+    mut prepared_index: crate::helix_engine::vector_core::vector_core::PreparedIndex,
+) -> Result<String, GraphError> {
     let max_chunk_size = merge_chunk_size();
     let segment_format = dense_segment_format();
+    // Group commit: the commits after phase A go out buffered and one durable
+    // flush ends the write, so a swap only ever sees a durable target. A crash
+    // before the flush leaves phase A's marked target, which the index job reaps.
+    let buffered = storage.backend.kind() == BackendKind::Lsm && lsm_group_commit_enabled();
 
     // Phase A: allocate + create LMDB databases. `create_merge_target` now
     // registers the segment in `space.segments` as `Building` so the ID is
@@ -2227,16 +3866,22 @@ fn run_chunked_merge_publish(
     // `SEGMENT_REAPER` on the next index cycle.
     let phase_started = Instant::now();
     let merged_name = if storage.backend.kind() == BackendKind::Lsm {
+        let held = storage.named_vectors.begin_dense_layout_change();
         let name = storage
             .named_vectors
-            .create_merge_target_lsm(storage.collection_path(), vec_name, hnsw_config.clone())
+            .create_merge_target_lsm(
+                &held,
+                storage.collection_path(),
+                vec_name,
+                hnsw_config.clone(),
+            )
             .map_err(GraphError::from)?;
         storage.with_write_backend(|w| {
-            storage.set_dense_vector_spaces_metadata_be(
-                w,
-                storage.named_vectors.list_dense_vector_spaces(),
-            )?;
-            Ok(())
+            storage
+                .named_vectors
+                .mark_merge_target_be(w, &name)
+                .map_err(GraphError::from)?;
+            store_dense_layout(storage, &held, w, None)
         })?;
         name
     } else {
@@ -2332,7 +3977,7 @@ fn run_chunked_merge_publish(
     if direct_tq_materialized {
         let phase_started = Instant::now();
         if storage.backend.kind() == BackendKind::Lsm {
-            storage.with_write_backend(|w| {
+            with_merge_target_write(storage, buffered, |w| {
                 storage
                     .named_vectors
                     .attach_merge_target_sidecar_ordinals_be(w, &merged_name, &prepared_index)
@@ -2372,7 +4017,7 @@ fn run_chunked_merge_publish(
         let prepared_ref = &mut prepared_index;
         let chunk_started = Instant::now();
         if storage.backend.kind() == BackendKind::Lsm {
-            storage.with_write_backend(|w| {
+            with_merge_target_write(storage, buffered, |w| {
                 storage
                     .named_vectors
                     .flush_merge_flat_chunk_be(w, merged_ref, prepared_ref, flat_start, flat_end)
@@ -2403,6 +4048,8 @@ fn run_chunked_merge_publish(
         "chunked_merge",
         &format!("{}_{}", merged_name, total),
     );
+    #[cfg(test)]
+    test_support::reached("flat_written");
 
     // Phase C: flush the prepared HNSW in chunks. Final chunk also
     // writes the entry point. Same shared-guard rationale as phase B —
@@ -2417,7 +4064,7 @@ fn run_chunked_merge_publish(
         let prepared_ref = &mut prepared_index;
         let chunk_started = Instant::now();
         if storage.backend.kind() == BackendKind::Lsm {
-            storage.with_write_backend(|w| {
+            with_merge_target_write(storage, buffered, |w| {
                 storage
                     .named_vectors
                     .flush_merge_index_chunk_be(w, merged_ref, prepared_ref, start, end)
@@ -2443,7 +4090,7 @@ fn run_chunked_merge_publish(
         start = end;
     }
     if storage.backend.kind() == BackendKind::Lsm {
-        storage.with_write_backend(|w| {
+        with_merge_target_write(storage, buffered, |w| {
             storage
                 .named_vectors
                 .finalize_merge_index_be(w, &merged_name, &prepared_index)
@@ -2468,7 +4115,7 @@ fn run_chunked_merge_publish(
         let phase_started = Instant::now();
         if direct_hvs8_materialized {
             let attach_result = if storage.backend.kind() == BackendKind::Lsm {
-                storage.with_write_backend(|w| {
+                with_merge_target_write(storage, buffered, |w| {
                     storage
                         .named_vectors
                         .attach_merge_target_sidecar_ordinals_be(w, &merged_name, &prepared_index)
@@ -2516,7 +4163,38 @@ fn run_chunked_merge_publish(
         record_dense_merge_publish_phase("hvs8_quantize", phase_started);
     }
     drop(prepared_index);
+    if buffered {
+        let phase_started = Instant::now();
+        storage
+            .backend
+            .flush_durable()
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        record_dense_merge_publish_phase("group_flush", phase_started);
+    }
+    Ok(merged_name)
+}
 
+/// `with_write_backend`, or its buffered form when `buffered` (group commit).
+fn with_merge_target_write<T>(
+    storage: &HelixGraphStorage,
+    buffered: bool,
+    f: impl FnOnce(&mut super::backend_any::AnyWrite<'_>) -> Result<T, GraphError>,
+) -> Result<T, GraphError> {
+    if buffered {
+        storage.with_write_backend_buffered(f)
+    } else {
+        storage.with_write_backend(f)
+    }
+}
+
+/// Phases D-E of `run_chunked_merge_publish`: swaps `merged_name` in for
+/// `merge_targets` and hands the retired segments to the reaper.
+fn swap_in_merge_target(
+    storage: &Arc<HelixGraphStorage>,
+    vec_name: &str,
+    merged_name: &str,
+    merge_targets: Vec<String>,
+) -> Result<(), GraphError> {
     // Phase D: atomic metadata swap + persist metadata blob in one
     // small write txn. Must hold the exclusive resize guard so readers
     // walking `space.segments` see the new merged segment + the absence
@@ -2537,21 +4215,16 @@ fn run_chunked_merge_publish(
             .named_vectors
             .cleanup_empty_dense_segments_locate_be(&r, vec_name)
             .map_err(GraphError::from)?;
+        let held = storage.named_vectors.begin_dense_layout_change();
         storage
             .named_vectors
-            .publish_merge_target_be(&r, vec_name, &merged_name, &merge_targets)
+            .publish_merge_target_be(&r, vec_name, merged_name, &merge_targets)
             .map_err(GraphError::from)?;
         storage
             .named_vectors
             .apply_dense_segment_removal(vec_name, &deferred_empties)
             .map_err(GraphError::from)?;
-        storage.with_write_backend(|w| {
-            storage.set_dense_vector_spaces_metadata_be(
-                w,
-                storage.named_vectors.list_dense_vector_spaces(),
-            )?;
-            Ok(())
-        })?;
+        storage.with_write_backend(|w| store_dense_layout(storage, &held, w, None))?;
         deferred_empties
     } else {
         let deferred_empties = storage.with_read_txn(|rtxn| {
@@ -2563,7 +4236,7 @@ fn run_chunked_merge_publish(
         storage.with_exclusive_write_txn(|txn| {
             storage
                 .named_vectors
-                .publish_merge_target(txn, vec_name, &merged_name, &merge_targets)
+                .publish_merge_target(txn, vec_name, merged_name, &merge_targets)
                 .map_err(GraphError::from)?;
             storage
                 .named_vectors
@@ -2579,7 +4252,7 @@ fn run_chunked_merge_publish(
     };
     storage.refresh_metadata_snapshot_best_effort();
     record_dense_merge_publish_phase("metadata_swap", phase_started);
-    crate::diag::log("phase_d_done", "chunked_merge", &merged_name);
+    crate::diag::log("phase_d_done", "chunked_merge", merged_name);
 
     // Sidecar vector files are outside LMDB, so remove retired file entries
     // immediately after the metadata swap commits. The LMDB page drain can
@@ -2616,11 +4289,76 @@ fn run_chunked_merge_publish(
         SEGMENT_REAPER.submit(Arc::clone(storage), phys);
     }
     record_dense_merge_publish_phase("reaper_submit", phase_started);
-    metrics::histogram!("helix_dense_merge_publish_duration_ms")
-        .record(publish_started.elapsed().as_secs_f64() * 1000.0);
-    crate::diag::log("phase_e_done", "chunked_merge", &merged_name);
+    crate::diag::log("phase_e_done", "chunked_merge", merged_name);
 
     Ok(())
+}
+
+/// Seal an LSM space's mutable tail to `Building` and persist the layout,
+/// keeping the sealed points searchable (flat) until the build promotes them.
+///
+/// In three steps under one layout change. The next tail is opened and
+/// memory is left as it is; the layout with the seal in it is stored; only
+/// then does memory get the seal, and with it the next append its tail. An
+/// upsert applied beside a seal takes its tail from memory, so a row is
+/// never under a tail that the store does not name yet: with memory changed
+/// first, a writer that died before the store, or whose store failed, had
+/// acknowledged rows the next writer could not find. A step that fails
+/// leaves memory unchanged. Rows appended between the store and the change
+/// of memory go to the sealed tail, as the rows of an upsert that was being
+/// applied when it was sealed always did: the build waits for those.
+///
+/// The sealed-tail marker commits before the layout that shows the tail
+/// `Building`, so neither a writer-side search nor a reader that sees the new
+/// layout can observe an unmarked sealed tail (which would hide its points
+/// and let a stale older copy of a re-upserted id win).
+pub(super) fn seal_lsm_dense_tail(
+    storage: &Arc<HelixGraphStorage>,
+    vec_name: &str,
+    hnsw_config: &HNSWConfig,
+) -> Result<bool, GraphError> {
+    let begin_read = || {
+        storage
+            .backend
+            .begin_read()
+            .map_err(|e| GraphError::New(e.to_string()))
+    };
+    let held = storage.named_vectors.begin_dense_layout_change();
+    let Some(seal) = storage
+        .named_vectors
+        .prepare_tail_seal_lsm(
+            &held,
+            &begin_read()?,
+            storage.collection_path(),
+            vec_name,
+            hnsw_config.clone(),
+        )
+        .map_err(GraphError::from)?
+    else {
+        return Ok(false);
+    };
+    if !storage
+        .named_vectors
+        .sealed_tail_marked_be(&begin_read()?, seal.sealed())
+        .map_err(GraphError::from)?
+    {
+        storage.with_write_backend(|w| {
+            storage
+                .named_vectors
+                .mark_sealed_tail_be(w, seal.sealed())
+                .map_err(GraphError::from)
+        })?;
+    }
+    #[cfg(test)]
+    test_support::reached("seal_prepared");
+    // The batch stays empty, and the commit of an empty batch writes nothing
+    // and cannot fail: once the layout's own transaction is in, nothing
+    // before the change of memory fails or waits.
+    storage.with_write_backend(|w| store_dense_layout(storage, &held, w, Some(&seal)))?;
+    #[cfg(test)]
+    test_support::reached("seal_midway");
+    storage.named_vectors.apply_tail_seal(&held, seal);
+    Ok(true)
 }
 
 /// Chunked replacement for `flush_prepared_indices`. The non-merge index
@@ -2634,10 +4372,19 @@ fn run_chunked_merge_publish(
 ///   - one small txn finalizing the entry point + flipping
 ///     Building→Indexed
 ///
-/// The segment is in `Building` role throughout, so search excludes it
-/// until the final flip. Worker death between chunks leaves a Building
-/// segment with partial HNSW; gc_orphan_building_segments / next pass
-/// re-prepares from level zero (idempotent).
+/// The segment is in `Building` role throughout; dense search either skips
+/// it or, for a marked sealed tail, scans its level-0 rows flat (it has no
+/// entry point until the final chunk). Worker death between chunks leaves a
+/// Building segment with partial HNSW; gc_orphan_building_segments / next
+/// pass re-prepares from level zero (idempotent).
+///
+/// Group commit on LSM, as in `write_merge_target`: a durable commit does not
+/// flush the WAL, it waits for the next flush tick, so a durable commit per
+/// chunk published two chunks a second. The chunks go out buffered and one
+/// flush makes them durable before the entry point is written. The entry
+/// point is the only thing a restart promotes a Building segment on, and it
+/// is still committed durably, after every chunk, so a crash at any point
+/// leaves either no entry point (re-prepared) or the whole graph.
 fn run_chunked_indices_publish(
     storage: &Arc<HelixGraphStorage>,
     vec_name: &str,
@@ -2647,6 +4394,7 @@ fn run_chunked_indices_publish(
     )>,
 ) -> Result<bool, GraphError> {
     let max_chunk_size = merge_chunk_size();
+    let buffered = storage.backend.kind() == BackendKind::Lsm && lsm_group_commit_enabled();
     let mut any_flushed = false;
     let mut flushed_names = HashSet::new();
 
@@ -2700,7 +4448,7 @@ fn run_chunked_indices_publish(
             let idx_ref = &mut idx;
             let chunk_started = Instant::now();
             if storage.backend.kind() == BackendKind::Lsm {
-                storage.with_write_backend(|w| {
+                with_merge_target_write(storage, buffered, |w| {
                     storage
                         .named_vectors
                         .flush_merge_index_chunk_be(w, seg_ref, idx_ref, start, end)
@@ -2724,6 +4472,14 @@ fn run_chunked_indices_publish(
                 elapsed,
             );
             start = end;
+        }
+        if buffered {
+            let phase_started = Instant::now();
+            storage
+                .backend
+                .flush_durable()
+                .map_err(|e| storage.backend_error(e, "indices_group_flush"))?;
+            record_dense_merge_publish_phase("indices_group_flush", phase_started);
         }
         let seg_ref = seg_name.as_str();
         let idx_ref = &idx;
@@ -2753,17 +4509,12 @@ fn run_chunked_indices_publish(
                 .backend
                 .begin_read()
                 .map_err(|e| GraphError::New(e.to_string()))?;
+            let held = storage.named_vectors.begin_dense_layout_change();
             storage
                 .named_vectors
                 .promote_building_segments_to_indexed_be(&r, vec_name, &flushed_names)
                 .map_err(GraphError::from)?;
-            storage.with_write_backend(|w| {
-                storage.set_dense_vector_spaces_metadata_be(
-                    w,
-                    storage.named_vectors.list_dense_vector_spaces(),
-                )?;
-                Ok(())
-            })?;
+            storage.with_write_backend(|w| store_dense_layout(storage, &held, w, None))?;
         } else {
             storage.with_read_txn(|rtxn| {
                 storage
@@ -2803,6 +4554,7 @@ fn recover_indexed_building_segments(
         return Ok(0);
     }
 
+    let held = storage.named_vectors.begin_dense_layout_change();
     let changed = if storage.backend.kind() == BackendKind::Lsm {
         let read = storage
             .backend
@@ -2825,13 +4577,7 @@ fn recover_indexed_building_segments(
     }
 
     if storage.backend.kind() == BackendKind::Lsm {
-        storage.with_write_backend(|write| {
-            storage.set_dense_vector_spaces_metadata_be(
-                write,
-                storage.named_vectors.list_dense_vector_spaces(),
-            )?;
-            Ok(())
-        })?;
+        storage.with_write_backend(|write| store_dense_layout(storage, &held, write, None))?;
     } else {
         storage.with_write_txn(|txn| {
             storage.set_dense_vector_spaces_metadata(
@@ -2841,6 +4587,7 @@ fn recover_indexed_building_segments(
             Ok(())
         })?;
     }
+    drop(held);
 
     metrics::counter!(
         "helix_index_job_recovered_building_segments_total",
@@ -2865,6 +4612,9 @@ fn run_index_job(job: IndexJob) {
         hnsw_config,
         flat_scan_threshold,
     } = job;
+    let _regraph = RegraphJobGuard(collection.clone());
+    #[cfg(test)]
+    panic_once_for_test(&collection);
     let Some(storage) = storage.upgrade() else {
         metrics::counter!("helix_index_job_skipped_total", "reason" => "collection_evicted")
             .increment(1);
@@ -2898,7 +4648,8 @@ fn run_index_job(job: IndexJob) {
         .swap(false, std::sync::atomic::Ordering::AcqRel)
     {
         let flush_result = if storage.backend.kind() == BackendKind::Lsm {
-            storage.with_write_backend(|w| storage.flush_dense_metadata_be(w))
+            let held = storage.named_vectors.begin_dense_layout_change();
+            storage.with_write_backend(|w| store_dense_layout(&storage, &held, w, None))
         } else {
             storage.with_write_txn(|wtxn| storage.flush_dense_metadata(wtxn))
         };
@@ -2933,9 +4684,11 @@ fn run_index_job(job: IndexJob) {
     let _guard = OptimizerGuard(Arc::clone(&storage));
 
     let result = (|| -> Result<(), GraphError> {
-        const QUIESCE_MS: u64 = if cfg!(test) { 100 } else { 1000 };
         const MAX_PASSES: usize = 20;
         let index_quiesced_tails = index_subthreshold_quiesced_tails();
+        let quiet_ms = collection_tail_quiet_ms(&storage);
+        let seal_min = collection_tail_seal_min(&storage, flat_scan_threshold);
+        let waits_for_quiet = quiet_ms <= INDEX_TAIL_QUIET_WAIT_IN_JOB_MAX_MS;
         let start_debt = storage.named_vectors.dense_segment_debt();
         let indexed_segments = start_debt.indexed_segments;
         let breaker_drain_merge_fan_in =
@@ -3050,6 +4803,8 @@ fn run_index_job(job: IndexJob) {
                 // restarts. Deferred to SEGMENT_REAPER — no inline core.clear on
                 // the index-job path.
                 for vec_name in &spaces_to_check {
+                    // Until the store of what the cleanup drops from memory.
+                    let held = storage.named_vectors.begin_dense_layout_change();
                     let orphans = if storage.backend.kind() == BackendKind::Lsm {
                         storage
                             .backend
@@ -3079,11 +4834,7 @@ fn run_index_job(job: IndexJob) {
                             let deferred = if storage.backend.kind() == BackendKind::Lsm {
                                 storage
                                     .with_write_backend(|w| {
-                                        storage.set_dense_vector_spaces_metadata_be(
-                                            w,
-                                            storage.named_vectors.list_dense_vector_spaces(),
-                                        )?;
-                                        Ok(())
+                                        store_dense_layout(&storage, &held, w, None)
                                     })
                                     .map(|_| names.clone())
                             } else {
@@ -3095,6 +4846,7 @@ fn run_index_job(job: IndexJob) {
                                     Ok(names.clone())
                                 })
                             };
+                            drop(held);
                             if let Ok(phys_names) = deferred {
                                 let sidecars = storage
                                     .named_vectors
@@ -3228,26 +4980,26 @@ fn run_index_job(job: IndexJob) {
                     if had_building_debt {
                         break false;
                     }
-                    let now_ms = {
-                        use std::time::{SystemTime, UNIX_EPOCH};
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64
-                    };
-                    let last_upsert = storage
-                        .last_upsert_at
-                        .load(std::sync::atomic::Ordering::Acquire);
-                    let elapsed = now_ms.saturating_sub(last_upsert);
-                    if elapsed >= QUIESCE_MS {
+                    if point_mutations_quiet_for(&storage, quiet_ms) {
                         break true;
                     }
+                    if !waits_for_quiet {
+                        break false;
+                    }
                     let above_threshold = spaces_to_check.iter().any(|name| {
-                        let stats = if storage.backend.kind() == BackendKind::Lsm {
+                        // LSM counts the tail's rows only, and only up to the
+                        // threshold: this runs every 100 ms, and the full
+                        // stats scan every row of every segment.
+                        let unindexed = if storage.backend.kind() == BackendKind::Lsm {
                             storage.backend.begin_read().ok().and_then(|r| {
                                 storage
                                     .named_vectors
-                                    .get_dense_space_stats_be(&r, name)
+                                    .mutable_tail_count_upto_be(
+                                        &r,
+                                        name,
+                                        u64::try_from(flat_scan_threshold.max(1))
+                                            .unwrap_or(u64::MAX),
+                                    )
                                     .ok()
                             })
                         } else {
@@ -3256,12 +5008,14 @@ fn run_index_job(job: IndexJob) {
                                     .named_vectors
                                     .get_dense_space_stats(&rtxn, name)
                                     .ok()
+                                    .map(|stats| {
+                                        stats
+                                            .vectors_count
+                                            .saturating_sub(stats.indexed_vectors_count)
+                                    })
                             })
                         };
-                        if let Some(stats) = stats {
-                            let unindexed = stats
-                                .vectors_count
-                                .saturating_sub(stats.indexed_vectors_count);
+                        if let Some(unindexed) = unindexed {
                             return unindexed as usize >= flat_scan_threshold;
                         }
                         false
@@ -3285,14 +5039,16 @@ fn run_index_job(job: IndexJob) {
                         .map_err(|e| GraphError::New(e.to_string()))?;
                     let mut to_seal = Vec::new();
                     for vec_name in &spaces_to_check {
-                        if let Ok(stats) =
-                            storage.named_vectors.get_dense_space_stats_be(&r, vec_name)
-                        {
-                            let unindexed = stats
-                                .vectors_count
-                                .saturating_sub(stats.indexed_vectors_count);
-                            let above_threshold = unindexed as usize >= flat_scan_threshold;
-                            let quiesced_tail = index_quiesced_tails && quiesced && unindexed > 0;
+                        // The tail's own rows, counted up to max(threshold, 1):
+                        // enough for both tests below.
+                        if let Ok(tail_rows) = storage.named_vectors.mutable_tail_count_upto_be(
+                            &r,
+                            vec_name,
+                            u64::try_from(flat_scan_threshold.max(1)).unwrap_or(u64::MAX),
+                        ) {
+                            let above_threshold = tail_rows as usize >= flat_scan_threshold;
+                            let quiesced_tail = index_quiesced_tails
+                                && subthreshold_tail_is_sealable(tail_rows, quiesced, seal_min);
                             if above_threshold || quiesced_tail {
                                 to_seal.push(vec_name.clone());
                             }
@@ -3310,8 +5066,8 @@ fn run_index_job(job: IndexJob) {
                                     .vectors_count
                                     .saturating_sub(stats.indexed_vectors_count);
                                 let above_threshold = unindexed as usize >= flat_scan_threshold;
-                                let quiesced_tail =
-                                    index_quiesced_tails && quiesced && unindexed > 0;
+                                let quiesced_tail = index_quiesced_tails
+                                    && subthreshold_tail_is_sealable(unindexed, quiesced, seal_min);
                                 if above_threshold || quiesced_tail {
                                     to_seal.push(vec_name.clone());
                                 }
@@ -3331,29 +5087,7 @@ fn run_index_job(job: IndexJob) {
                     // is `unreachable!()` on the LSM arm), so persist it via
                     // `with_write_backend` after the heed txn commits.
                     let _sealed = if storage.backend.kind() == BackendKind::Lsm {
-                        let r = storage
-                            .backend
-                            .begin_read()
-                            .map_err(|e| GraphError::New(e.to_string()))?;
-                        let sealed = storage
-                            .named_vectors
-                            .seal_mutable_tail_lsm(
-                                &r,
-                                storage.collection_path(),
-                                vec_name,
-                                hnsw_config.clone(),
-                            )
-                            .map_err(GraphError::from)?;
-                        if sealed {
-                            storage.with_write_backend(|w| {
-                                storage.set_dense_vector_spaces_metadata_be(
-                                    w,
-                                    storage.named_vectors.list_dense_vector_spaces(),
-                                )?;
-                                Ok(())
-                            })?;
-                        }
-                        sealed
+                        seal_lsm_dense_tail(&storage, vec_name, &hnsw_config)?
                     } else {
                         storage.with_exclusive_write_txn(|txn| {
                             let sealed = storage
@@ -3414,6 +5148,15 @@ fn run_index_job(job: IndexJob) {
                             // of its callers hold the LMDB writer.
                             crate::helix_engine::vector_core::vector_core::defer_build_start_under_pressure();
                             let prepared = if storage.backend.kind() == BackendKind::Lsm {
+                                // The export is every row the graph will
+                                // reach. A batch being applied when the tail
+                                // was sealed commits its rows afterwards.
+                                if !point_mutation_in_flight_has_ended(&storage, || {
+                                    budget.elapsed_exceeded()
+                                }) {
+                                    needs_reschedule = true;
+                                    break 'build_spaces;
+                                }
                                 let r = storage
                                     .backend
                                     .begin_read()
@@ -3498,6 +5241,7 @@ fn run_index_job(job: IndexJob) {
                         // path is `unreachable!()` on the LSM arm, so route the
                         // persist through the backend seam there.
                         if storage.backend.kind() == BackendKind::Lsm {
+                            let held = storage.named_vectors.begin_dense_layout_change();
                             let mut removal_layout_changed = false;
                             for (vec_name, empties) in &empties_per_space {
                                 let removed = storage
@@ -3508,11 +5252,7 @@ fn run_index_job(job: IndexJob) {
                             }
                             if build_layout_changed || removal_layout_changed {
                                 storage.with_write_backend(|w| {
-                                    storage.set_dense_vector_spaces_metadata_be(
-                                        w,
-                                        storage.named_vectors.list_dense_vector_spaces(),
-                                    )?;
-                                    Ok(())
+                                    store_dense_layout(&storage, &held, w, None)
                                 })?;
                             }
                         } else {
@@ -3627,6 +5367,11 @@ fn run_index_job(job: IndexJob) {
                     // peak RSS; if workers wait for the permit after export,
                     // queued merge jobs can still stack multi-GB working sets.
                     let build_permit = acquire_build_permit().map_err(GraphError::from)?;
+                    // Open from before the sources are read until the target
+                    // is published: a point deleted or rewritten meanwhile
+                    // must not come back in the target.
+                    let merge_window = (storage.backend.kind() == BackendKind::Lsm)
+                        .then(|| storage.named_vectors.merge_windows.open());
                     let exported = if storage.backend.kind() == BackendKind::Lsm {
                         let r = storage
                             .backend
@@ -3637,9 +5382,14 @@ fn run_index_job(job: IndexJob) {
                             .cores_read()
                             .map_err(GraphError::from)?;
                         let mut exported = Vec::new();
-                        let mut seen = std::collections::HashSet::new();
+                        // Where each id's row is in `exported`, and the other
+                        // copies of an id two sources hold.
+                        let mut seen: HashMap<u128, usize> = HashMap::new();
+                        let mut other_copies: HashMap<u128, Vec<_>> = HashMap::new();
                         let mut dropped_tombstoned = 0u64;
-                        for phys in &targets {
+                        // Newest first, so `exported` gets the copy search
+                        // serves when two sources hold an id.
+                        for phys in &NamedVectorManager::newest_first(vec_name, &targets) {
                             if let Some(core) = cores.get(phys) {
                                 for (id, data, fields) in
                                     core.export_level_zero(&r).map_err(GraphError::from)?
@@ -3660,7 +5410,10 @@ fn run_index_job(job: IndexJob) {
                                         dropped_tombstoned += 1;
                                         continue;
                                     }
-                                    if seen.insert(id) {
+                                    if seen.contains_key(&id) {
+                                        other_copies.entry(id).or_default().push((data, fields));
+                                    } else {
+                                        seen.insert(id, exported.len());
                                         exported.push((id, data, fields));
                                     }
                                 }
@@ -3674,6 +5427,16 @@ fn run_index_job(job: IndexJob) {
                             )
                             .increment(dropped_tombstoned);
                         }
+                        keep_the_copies_of_their_points(
+                            &storage,
+                            &r,
+                            &mut exported,
+                            &seen,
+                            other_copies,
+                        )?;
+                        retain_rows_with_a_node(&storage, &r, &mut exported)?;
+                        // After the choice, which reads the copies as stored.
+                        digest_in_place_of_a_payload_copy(&mut exported);
                         exported
                     } else {
                         storage.with_read_txn(|rtxn| {
@@ -3755,6 +5518,16 @@ fn run_index_job(job: IndexJob) {
                             Ok(exported)
                         })?
                     };
+                    #[cfg(test)]
+                    test_support::reached("exported");
+                    // Tombstones can leave no live row to publish; retire the sources directly.
+                    if exported.is_empty() {
+                        for target in &targets {
+                            retire_dense_segment(&storage, vec_name, target)?;
+                        }
+                        budget.record_merge();
+                        continue;
+                    }
                     let prepared_index = VectorCore::build_hnsw_in_memory_owned_with_permit(
                         exported,
                         &hnsw_config,
@@ -3783,8 +5556,13 @@ fn run_index_job(job: IndexJob) {
                             "ensure_map_headroom failed before merge flush; proceeding"
                         );
                     }
-                    let flush_outcome =
-                        run_chunked_merge_publish(&storage, vec_name, &hnsw_config, prepared_merge);
+                    let flush_outcome = run_chunked_merge_publish(
+                        &storage,
+                        vec_name,
+                        &hnsw_config,
+                        prepared_merge,
+                        merge_window.as_ref(),
+                    );
                     match flush_outcome {
                         Ok(()) => {
                             budget.record_merge();
@@ -3827,12 +5605,11 @@ fn run_index_job(job: IndexJob) {
             let has_unindexed_tail = spaces_to_check.iter().any(|name| {
                 if storage.backend.kind() == BackendKind::Lsm {
                     if let Ok(r) = storage.backend.begin_read() {
-                        if let Ok(stats) = storage.named_vectors.get_dense_space_stats_be(&r, name)
+                        if let Ok(tail_rows) = storage
+                            .named_vectors
+                            .mutable_tail_count_upto_be(&r, name, 1)
                         {
-                            let unindexed = stats
-                                .vectors_count
-                                .saturating_sub(stats.indexed_vectors_count);
-                            return unindexed > 0;
+                            return tail_rows > 0;
                         }
                     }
                 } else if let Ok(rtxn) = storage.begin_resize_safe_read_txn() {
@@ -3854,18 +5631,15 @@ fn run_index_job(job: IndexJob) {
                 break;
             }
 
-            let now_check = {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64
-            };
-            let lu = storage
-                .last_upsert_at
-                .load(std::sync::atomic::Ordering::Acquire);
-            if now_check.saturating_sub(lu) >= QUIESCE_MS {
+            if point_mutations_quiet_for(&storage, quiet_ms) {
                 continue;
+            }
+            if !waits_for_quiet {
+                // The next pass would only wait. A turn that spent its budget
+                // hands over as it does at the top of a pass; a tail that
+                // outgrew the seal minimum meanwhile is then pending work.
+                needs_reschedule |= budget.should_yield();
+                break;
             }
 
             thread::sleep(std::time::Duration::from_millis(200));
@@ -3900,6 +5674,7 @@ fn run_index_job(job: IndexJob) {
         }
         if !empties_per_space.is_empty() {
             if storage.backend.kind() == BackendKind::Lsm {
+                let held = storage.named_vectors.begin_dense_layout_change();
                 let mut layout_changed = false;
                 for (vec_name, empties) in &empties_per_space {
                     let removed = storage
@@ -3909,13 +5684,7 @@ fn run_index_job(job: IndexJob) {
                     layout_changed |= removed;
                 }
                 if layout_changed {
-                    storage.with_write_backend(|w| {
-                        storage.set_dense_vector_spaces_metadata_be(
-                            w,
-                            storage.named_vectors.list_dense_vector_spaces(),
-                        )?;
-                        Ok(())
-                    })?;
+                    storage.with_write_backend(|w| store_dense_layout(&storage, &held, w, None))?;
                 }
             } else {
                 storage.with_exclusive_write_txn(|txn| {
@@ -3978,6 +5747,7 @@ fn run_index_job(job: IndexJob) {
 
         Ok(())
     })();
+    let result = result.and_then(|()| run_queued_regraph(&storage, &collection, &hnsw_config));
 
     let status = if result.is_ok() { "ok" } else { "error" };
     if let Err(e) = result {
@@ -3987,6 +5757,14 @@ fn run_index_job(job: IndexJob) {
                 error = %e,
                 collection = %collection,
                 "background optimizer deferred cycle (MapFull); next cycle retries on larger map"
+            );
+        } else if storage.closing_for_shutdown.load(Ordering::Acquire) {
+            // The shutdown step closed the database under this job. The next
+            // start runs it again; it is not an optimizer failure to alert on.
+            tracing::debug!(
+                error = %e,
+                collection = %collection,
+                "background optimizer stopped by the shutdown close"
             );
         } else {
             tracing::error!(error = %e, collection = %collection, "background optimizer failed");
@@ -4007,10 +5785,11 @@ fn optimizer_has_pending_work(
     }
 
     if spaces_to_check.iter().any(|name| {
-        !storage
+        let building = storage.named_vectors.building_segment_names(name);
+        storage
             .named_vectors
-            .building_segment_names(name)
-            .is_empty()
+            .cores_read()
+            .is_ok_and(|cores| building.iter().any(|segment| cores.contains_key(segment)))
     }) {
         return true;
     }
@@ -4038,7 +5817,8 @@ fn optimizer_has_pending_work(
         }
     }
 
-    if externalized_marker_repair_limit_per_segment() > 0
+    if storage.backend.kind() != BackendKind::Lsm
+        && externalized_marker_repair_limit_per_segment() > 0
         && spaces_to_check.iter().any(|name| {
             storage
                 .named_vectors
@@ -4049,6 +5829,12 @@ fn optimizer_has_pending_work(
         return true;
     }
 
+    // The index job's sealing rule: a tail it would leave flat is not work.
+    // A job that waits a short quiet period out seals any tail it is given.
+    let quiet_ms = collection_tail_quiet_ms(storage);
+    let quiesced = quiet_ms <= INDEX_TAIL_QUIET_WAIT_IN_JOB_MAX_MS
+        || point_mutations_quiet_for(storage, quiet_ms);
+    let seal_min = collection_tail_seal_min(storage, flat_scan_threshold);
     let merge_ceiling = NamedVectorManager::max_indexed_segments_target();
     if storage.backend.kind() == BackendKind::Lsm {
         (|| -> Result<bool, GraphError> {
@@ -4057,12 +5843,21 @@ fn optimizer_has_pending_work(
                 .begin_read()
                 .map_err(|e| GraphError::New(e.to_string()))?;
             for vec_name in spaces_to_check {
-                if let Ok(stats) = storage.named_vectors.get_dense_space_stats_be(&r, vec_name) {
-                    let unindexed = stats
-                        .vectors_count
-                        .saturating_sub(stats.indexed_vectors_count);
-                    if (unindexed as usize) >= flat_scan_threshold
-                        || (index_quiesced_tails && unindexed > 0)
+                // One row answers a quiet collection; otherwise count up to
+                // the threshold, which the seal minimum never exceeds.
+                let limit = if index_quiesced_tails && quiesced {
+                    1
+                } else {
+                    flat_scan_threshold.max(1)
+                };
+                if let Ok(tail_rows) = storage.named_vectors.mutable_tail_count_upto_be(
+                    &r,
+                    vec_name,
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                ) {
+                    if (tail_rows as usize) >= flat_scan_threshold
+                        || (index_quiesced_tails
+                            && subthreshold_tail_is_sealable(tail_rows, quiesced, seal_min))
                     {
                         return Ok(true);
                     }
@@ -4095,7 +5890,8 @@ fn optimizer_has_pending_work(
                             .vectors_count
                             .saturating_sub(stats.indexed_vectors_count);
                         if (unindexed as usize) >= flat_scan_threshold
-                            || (index_quiesced_tails && unindexed > 0)
+                            || (index_quiesced_tails
+                                && subthreshold_tail_is_sealable(unindexed, quiesced, seal_min))
                         {
                             return Ok(true);
                         }
@@ -5083,6 +6879,7 @@ impl ReplicationManager {
         transport: Arc<dyn RaftTransport>,
     ) -> Result<Self, GraphError> {
         spawn_optimizer_backlog_sweeper(Arc::clone(&collections), config.clone());
+        spawn_idle_gc_sweeper(&collections);
         let runtime = if config.graph_config.raft.enabled {
             Some(Arc::new(RuntimeHandle::new(
                 Arc::clone(&collections),
@@ -5835,7 +7632,7 @@ fn raft_state_path(data_dir: &std::path::Path, node_id: u64) -> PathBuf {
     data_dir.join("raft").join(format!("node-{}.bin", node_id))
 }
 
-fn apply_mutation(
+pub(super) fn apply_mutation(
     collections: &Arc<CollectionManager>,
     config: &Config,
     mutation: &ReplicatedMutation,
@@ -5917,6 +7714,32 @@ fn algorithm_cache_collection_for_mutation(mutation: &ReplicatedMutation) -> Opt
     }
 }
 
+/// How the error for a dense vector space's name that cannot be a sidecar
+/// file's stem ends ([`refuse_unusable_vector_names`]). The gateway answers
+/// it with 400, as it does a collection's name that is not one path segment.
+pub(crate) const VECTOR_NAME_REFUSAL: &str =
+    "is not one path segment without a dot and cannot name a vector space";
+
+/// A dense vector space's name is the stem of its segments' sidecar files
+/// under the collection's directory, joined as it comes
+/// (`VectorCore::new_named_lsm_with_dir`): `../x` names files beside the
+/// directory and an absolute name files anywhere. A sidecar's file is that
+/// stem `with_extension`, which cuts it at its last dot, so every segment of
+/// a space with a dot in its name gets one file name. Refused before
+/// anything is opened or created: a refused create leaves no collection.
+/// A sparse space's name is no file's.
+fn refuse_unusable_vector_names(
+    vectors: &HashMap<String, NamedVectorConfig>,
+) -> Result<(), GraphError> {
+    let unusable = |name: &&String| !is_one_path_segment(name) || name.contains('.');
+    match vectors.keys().filter(unusable).min() {
+        Some(name) => Err(GraphError::New(format!(
+            "Vector name {name:?} {VECTOR_NAME_REFUSAL}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn apply_create_collection(
     collections: &Arc<CollectionManager>,
     config: &Config,
@@ -5925,6 +7748,7 @@ fn apply_create_collection(
     sparse_vectors: &HashMap<String, SparseVectorConfig>,
     hnsw_overrides: Option<&HnswOverrides>,
 ) -> Result<(), GraphError> {
+    refuse_unusable_vector_names(vectors)?;
     let storage = collections.get_or_create_collection(name)?;
     // On the LSM backend the metadata/config write path (`put_metadata` →
     // `put_heed`) `unreachable!`s, so the heed `set_*_metadata` /
@@ -5948,6 +7772,15 @@ fn apply_create_collection(
             merged_overrides.as_ref(),
         );
 
+        // A create that makes a dense space holds the layout change from
+        // before it makes one to the end of its store. One that makes none
+        // takes nothing the index job takes, unless it finds a space that is
+        // not stored: then it takes the change for that store.
+        let mut held = vectors
+            .keys()
+            .any(|vec_name| storage.named_vectors.get_config(vec_name).is_none())
+            .then(|| storage.named_vectors.begin_dense_layout_change());
+        let mut created_dense = false;
         for (vec_name, vector_config) in vectors {
             if let Some(existing) = storage.named_vectors.get_config(vec_name) {
                 if existing != *vector_config {
@@ -5956,6 +7789,12 @@ fn apply_create_collection(
                         vec_name
                     )));
                 }
+                // In memory and not stored: the store of the create that
+                // made it failed. This create stores it; no seal stores a
+                // named vector's config.
+                created_dense |= !storage
+                    .metadata_snapshot()
+                    .is_ok_and(|stored| stored.named_vectors.contains_key(vec_name));
                 continue;
             }
             storage
@@ -5968,6 +7807,7 @@ fn apply_create_collection(
                     None,
                 )
                 .map_err(GraphError::from)?;
+            created_dense = true;
         }
 
         let mut created_sparse: Vec<&str> = Vec::new();
@@ -6001,12 +7841,14 @@ fn apply_create_collection(
             if let Some(merged) = merged_overrides.as_ref() {
                 storage.set_hnsw_overrides_be(w, merged)?;
             }
-            if !vectors.is_empty() {
+            // Only when this create made a space, or found one that is not
+            // stored. A create of a collection that has its spaces changes
+            // no layout and stores none.
+            if created_dense {
                 storage.set_named_vectors_metadata_be(w, storage.named_vectors.list_vectors())?;
-                storage.set_dense_vector_spaces_metadata_be(
-                    w,
-                    storage.named_vectors.list_dense_vector_spaces(),
-                )?;
+                let held =
+                    held.get_or_insert_with(|| storage.named_vectors.begin_dense_layout_change());
+                store_dense_layout(&storage, held, w, None)?;
             }
             if !sparse_vectors.is_empty() {
                 storage.set_sparse_vectors_metadata_be(
@@ -6134,10 +7976,8 @@ fn apply_create_collection(
             }
             if publish_dense_metadata {
                 storage.set_named_vectors_metadata_be(w, storage.named_vectors.list_vectors())?;
-                storage.set_dense_vector_spaces_metadata_be(
-                    w,
-                    storage.named_vectors.list_dense_vector_spaces(),
-                )?;
+                let held = storage.named_vectors.begin_dense_layout_change();
+                store_dense_layout(&storage, &held, w, None)?;
             }
             if publish_sparse_metadata {
                 storage.set_sparse_vectors_metadata_be(
@@ -6160,6 +8000,7 @@ fn apply_update_collection(
     vectors: &HashMap<String, NamedVectorConfig>,
     sparse_vectors: &HashMap<String, SparseVectorConfig>,
 ) -> Result<(), GraphError> {
+    refuse_unusable_vector_names(vectors)?;
     let storage = collections.get_collection(name)?;
     if storage.backend.kind() == BackendKind::Lsm {
         let overrides = {
@@ -6172,6 +8013,12 @@ fn apply_update_collection(
         let mut dense_changed = false;
         let mut sparse_changed = false;
 
+        // As in `apply_create_collection`: from before a dense space is made
+        // to the end of its store.
+        let mut held = vectors
+            .keys()
+            .any(|vec_name| storage.named_vectors.get_config(vec_name).is_none())
+            .then(|| storage.named_vectors.begin_dense_layout_change());
         for (vec_name, vector_config) in vectors {
             if let Some(existing) = storage.named_vectors.get_config(vec_name) {
                 if existing != *vector_config {
@@ -6230,10 +8077,9 @@ fn apply_update_collection(
                 if dense_changed {
                     storage
                         .set_named_vectors_metadata_be(w, storage.named_vectors.list_vectors())?;
-                    storage.set_dense_vector_spaces_metadata_be(
-                        w,
-                        storage.named_vectors.list_dense_vector_spaces(),
-                    )?;
+                    let held = held
+                        .get_or_insert_with(|| storage.named_vectors.begin_dense_layout_change());
+                    store_dense_layout(&storage, held, w, None)?;
                 }
                 if sparse_changed {
                     storage.set_sparse_vectors_metadata_be(
@@ -6409,7 +8255,7 @@ const CONTENT_HASH_PAYLOAD_ONLY_KEYS: &[&str] = &[
     "caller_point_id",
     "_pending_prune",
     "_pending_prune_at",
-    // Display / graph-coordinate fields. CE can refresh these without
+    // Display / graph-coordinate fields. The client can refresh these without
     // changing the dense/sparse index content for a point.
     "start_line",
     "end_line",
@@ -6418,7 +8264,7 @@ const CONTENT_HASH_PAYLOAD_ONLY_KEYS: &[&str] = &[
 ];
 const CONTENT_HASH_METADATA_KEY: &str = "metadata";
 /// Subkeys of the top-level `metadata` payload value that are written by
-/// CE ingest/backfill jobs but are not used as part of the index-relevant
+/// the client ingest/backfill jobs but are not used as part of the index-relevant
 /// surface (they get refreshed on every upsert via the payload-only update
 /// path, so consumers still see fresh values). Stripping them from the
 /// content hash lets unchanged-document re-ingests skip the dense delete +
@@ -6431,9 +8277,9 @@ const CONTENT_HASH_METADATA_PAYLOAD_ONLY_SUBKEYS: &[&str] = &[
     "_graph_backfilled_version",
     "_pseudo_backfilled",
     // host_path is the developer's local filesystem path
-    // (e.g. /Users/jopad/Downloads/...) and container_path embeds a
+    // (e.g. /Users/example/Downloads/...) and container_path embeds a
     // content-addressed slug that flips every ingest run. Both are
-    // unindexed per CE's tests/test_qdrant_delete_paths.py:57 — display
+    // unindexed by the client's contract — display
     // only, never used in filter clauses, never mutated by set_payload.
     "host_path",
     "container_path",
@@ -6449,6 +8295,66 @@ const CONTENT_HASH_METADATA_PAYLOAD_ONLY_SUBKEYS: &[&str] = &[
     "start_col",
     "end_col",
 ];
+/// Left out as well under [`KeyLists::Second`]: what the client writes new on a chunk
+/// whose text, and so whose vectors, did not change when the file around it
+/// did. `document` and `information` are one display line that names the
+/// chunk's lines. A change to any of these is a node write, which rewrites
+/// the node row and its payload-index rows; no dense row, sparse posting or
+/// index job is derived from a payload.
+const CONTENT_HASH_MOVED_CHUNK_KEYS: &[&str] = &["document", "information"];
+/// The same under `metadata`: where the chunk's symbol sits, the import and
+/// inheritance maps of its file, which the client repeats on every chunk of the file,
+/// and the markers a client graph repair sets through `set_payload`, which does
+/// not stamp the hash again.
+const CONTENT_HASH_METADATA_MOVED_CHUNK_SUBKEYS: &[&str] = &[
+    "symbol_start_line",
+    "symbol_end_line",
+    "import_map",
+    "inheritance_map",
+    "_graph_repair_backfilled",
+    "_graph_repair_backfilled_version",
+];
+
+/// The lists of keys a content hash, or the digest a dense row keeps of its
+/// payload, was made without. A stored hash and a stored digest are frozen,
+/// so a list that grows is a new member here and the older members stay as
+/// they are: a hash of older lists reads as a mismatch (one full write, as on
+/// an image that does not have the newer lists), and a digest is kept under
+/// the key of its lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyLists {
+    /// `CONTENT_HASH_PAYLOAD_ONLY_KEYS` and
+    /// `CONTENT_HASH_METADATA_PAYLOAD_ONLY_SUBKEYS`.
+    First,
+    /// Those and the two `MOVED_CHUNK` lists.
+    Second,
+}
+
+impl KeyLists {
+    /// What an upsert stamps and a row is digested with.
+    const CURRENT: Self = Self::Second;
+
+    fn leaves_out(self, key: &str) -> bool {
+        key == CONTENT_HASH_KEY
+            || CONTENT_HASH_PAYLOAD_ONLY_KEYS.contains(&key)
+            || (self == Self::Second && CONTENT_HASH_MOVED_CHUNK_KEYS.contains(&key))
+    }
+
+    fn leaves_out_of_metadata(self, key: &str) -> bool {
+        CONTENT_HASH_METADATA_PAYLOAD_ONLY_SUBKEYS.contains(&key)
+            || (self == Self::Second && CONTENT_HASH_METADATA_MOVED_CHUNK_SUBKEYS.contains(&key))
+    }
+
+    /// The one key of a dense row that keeps a digest made without these
+    /// lists. An image that does not have the lists reads the key as another
+    /// rule's (`ROW_PAYLOAD_DIGEST_FAMILY`) and leaves the row's pair as it is.
+    fn row_digest_key(self) -> &'static str {
+        match self {
+            Self::First => "__helix_row_payload_digest__",
+            Self::Second => "__helix_row_payload_digest_2__",
+        }
+    }
+}
 
 fn content_hash_skip_enabled() -> bool {
     std::env::var("HELIX_CONTENT_HASH_SKIP")
@@ -6479,7 +8385,7 @@ fn content_hash_skip_enabled() -> bool {
 /// look like a content change. Quantizing to f16 keeps ~11 bits of
 /// mantissa, which is more precision than the downstream int8 storage
 /// anyway, so hash equality under f16 matches semantic equality for
-/// CE's purposes.
+/// the client's purposes.
 ///
 /// `None` keeps full f32 bit precision (old behavior); use when
 /// debugging determinism. Default is `F16`.
@@ -6576,6 +8482,22 @@ fn f32_to_f16_bits(f: f32) -> u16 {
 }
 
 fn compute_content_hash(point: &ReplicatedPoint) -> u64 {
+    content_hash_of(
+        KeyLists::CURRENT,
+        &point.payload,
+        &point.vectors,
+        &point.sparse_vectors,
+    )
+}
+
+/// The content hash of a point with this payload and these vectors, made
+/// without the keys `lists` leave out.
+fn content_hash_of(
+    lists: KeyLists,
+    payload: &HashMap<String, Value>,
+    vectors: &HashMap<String, Vec<f32>>,
+    sparse_vectors: &HashMap<String, SparseVector>,
+) -> u64 {
     use std::hash::Hasher;
     use twox_hash::XxHash64;
     let mut hasher = XxHash64::with_seed(0);
@@ -6670,14 +8592,14 @@ fn compute_content_hash(point: &ReplicatedPoint) -> u64 {
     // Exclude payload-only operational fields from the index hash. They
     // must still be persisted on the node, but changing them alone
     // should not delete/rewrite dense or sparse vectors.
-    let payload_without_marker = payload_without_content_hash_payload_only_keys(&point.payload);
+    let payload_without_marker = payload_covered_under(lists, payload);
     hash_payload_map(&mut hasher, &payload_without_marker);
 
     // Dense vectors: sort by vector name for determinism. Floats go
     // through `f32_to_quantized_bytes(q)` so embedder ULP noise
     // (common with CPU-fp32 ONNX/fastembed re-runs) doesn't flip the
     // hash when the semantic vector is effectively identical.
-    let mut dense_names: Vec<&String> = point.vectors.keys().collect();
+    let mut dense_names: Vec<&String> = vectors.keys().collect();
     dense_names.sort();
     hasher.write_u8(0xD1);
     hasher.write_u64(dense_names.len() as u64);
@@ -6685,7 +8607,7 @@ fn compute_content_hash(point: &ReplicatedPoint) -> u64 {
         hasher.write_u8(0xD2);
         hasher.write_u64(name.len() as u64);
         hasher.write(name.as_bytes());
-        let v = &point.vectors[name];
+        let v = &vectors[name];
         hasher.write_u64(v.len() as u64);
         for &f in v {
             hasher.write(&f32_to_quantized_bytes(f, q));
@@ -6697,7 +8619,7 @@ fn compute_content_hash(point: &ReplicatedPoint) -> u64 {
     // doesn't enforce order; sort defensively). Sparse values go
     // through the same quantization — they're also f32 and subject to
     // the same embedder ULP noise on re-runs.
-    let mut sparse_names: Vec<&String> = point.sparse_vectors.keys().collect();
+    let mut sparse_names: Vec<&String> = sparse_vectors.keys().collect();
     sparse_names.sort();
     hasher.write_u8(0xE1);
     hasher.write_u64(sparse_names.len() as u64);
@@ -6705,7 +8627,7 @@ fn compute_content_hash(point: &ReplicatedPoint) -> u64 {
         hasher.write_u8(0xE2);
         hasher.write_u64(name.len() as u64);
         hasher.write(name.as_bytes());
-        let sv = &point.sparse_vectors[name];
+        let sv = &sparse_vectors[name];
         let mut pairs: Vec<(u32, f32)> = sv
             .indices
             .iter()
@@ -6731,25 +8653,17 @@ fn payload_without_content_hash_marker(payload: &HashMap<String, Value>) -> Hash
         .collect()
 }
 
-fn is_content_hash_payload_only_key(key: &str) -> bool {
-    key == CONTENT_HASH_KEY || CONTENT_HASH_PAYLOAD_ONLY_KEYS.contains(&key)
-}
-
-fn is_metadata_payload_only_subkey(key: &str) -> bool {
-    CONTENT_HASH_METADATA_PAYLOAD_ONLY_SUBKEYS.contains(&key)
-}
-
 /// Strip operational subkeys from a `metadata` Value::Object so the content
 /// hash ignores fields that are refreshed on every upsert (timestamps,
 /// backfill markers, derived stats). Leaves non-Object metadata values
 /// untouched so we don't change hashing for collections that happen to use
 /// `metadata` as a non-object field.
-fn metadata_without_payload_only_subkeys(value: &Value) -> Value {
+fn metadata_without_payload_only_subkeys(lists: KeyLists, value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let filtered: HashMap<String, Value> = map
                 .iter()
-                .filter(|(k, _)| !is_metadata_payload_only_subkey(k.as_str()))
+                .filter(|(k, _)| !lists.leaves_out_of_metadata(k.as_str()))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             Value::Object(filtered)
@@ -6758,15 +8672,23 @@ fn metadata_without_payload_only_subkeys(value: &Value) -> Value {
     }
 }
 
+/// `payload` on the keys the content hash covers today.
 fn payload_without_content_hash_payload_only_keys(
+    payload: &HashMap<String, Value>,
+) -> HashMap<String, Value> {
+    payload_covered_under(KeyLists::CURRENT, payload)
+}
+
+fn payload_covered_under(
+    lists: KeyLists,
     payload: &HashMap<String, Value>,
 ) -> HashMap<String, Value> {
     payload
         .iter()
-        .filter(|(k, _)| !is_content_hash_payload_only_key(k.as_str()))
+        .filter(|(k, _)| !lists.leaves_out(k.as_str()))
         .map(|(k, v)| {
             if k.as_str() == CONTENT_HASH_METADATA_KEY {
-                (k.clone(), metadata_without_payload_only_subkeys(v))
+                (k.clone(), metadata_without_payload_only_subkeys(lists, v))
             } else {
                 (k.clone(), v.clone())
             }
@@ -6787,6 +8709,43 @@ fn content_hash_from_properties(properties: &HashMap<String, Value>) -> Option<u
         Some(Value::U64(h)) => Some(*h),
         _ => None,
     }
+}
+
+/// Whether an upsert of `point` leaves the dense rows and sparse postings of
+/// its stored point as they are, and writes the node at most. `stored` is
+/// the node's payload as the upsert read it and `incoming_hash` the content
+/// hash of `point`: the stamp says so when it equals that hash.
+///
+/// A stamp of the first lists, as every point has that was last written by
+/// an image without the second, never equals it for a payload with one of
+/// the keys only the second leave out. Such a stamp is told by hashing the
+/// stored payload with the incoming vectors as that image did. The same
+/// value says three things: the stamp is of those lists; the node still has
+/// the payload it was stamped with on the keys they cover (a `set_payload`
+/// on one of them since leaves the stamp another payload's); and the
+/// incoming vectors are the stamped ones. The two payloads are then compared
+/// on the keys today's lists cover.
+///
+/// This reads nothing: the node is the one the upsert has. It costs a point
+/// whose stamp is not the incoming hash one more content hash.
+fn keeps_its_vectors(
+    stored: &HashMap<String, Value>,
+    point: &ReplicatedPoint,
+    incoming_hash: u64,
+) -> bool {
+    let stamp = content_hash_from_properties(stored);
+    if stamp == Some(incoming_hash) {
+        return true;
+    }
+    let of_the_first_lists = content_hash_of(
+        KeyLists::First,
+        stored,
+        &point.vectors,
+        &point.sparse_vectors,
+    );
+    stamp == Some(of_the_first_lists)
+        && payload_without_content_hash_payload_only_keys(stored)
+            == payload_without_content_hash_payload_only_keys(&point.payload)
 }
 
 fn content_hash_mismatch_log_every() -> u64 {
@@ -7333,6 +9292,36 @@ fn lsm_group_commit_enabled() -> bool {
     )
 }
 
+/// `HELIX_LSM_REUPSERT_DELETE=0` puts an LSM upsert back to appending only:
+/// the dense rows a changed re-upsert replaces stay where they are.
+fn lsm_reupsert_delete_enabled() -> bool {
+    !matches!(
+        std::env::var("HELIX_LSM_REUPSERT_DELETE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
+/// Kill switch for flushing a delete's and a set_payload's commits at once,
+/// and the one write of an index create on an empty collection.
+/// Enabled by default: they commit BUFFERED and issue one durability barrier
+/// before they return, as an upsert does. A durable commit waits for the next
+/// WAL flush tick instead (`HELIX_LSM_FLUSH_INTERVAL_MS`, 500 ms in
+/// production), which was 400 of the 579 ms a 64-id delete chunk took there,
+/// and the whole second of an index create, which made two such commits.
+/// `HELIX_LSM_FLUSH_POINT_WRITES=0` (or `false`/`off`/`no`) waits again.
+pub(crate) fn lsm_point_write_flush_enabled() -> bool {
+    !matches!(
+        std::env::var("HELIX_LSM_FLUSH_POINT_WRITES")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
+}
+
 fn apply_upsert_points_lsm_chunk(
     storage: &HelixGraphStorage,
     points: &[ReplicatedPoint],
@@ -7340,6 +9329,10 @@ fn apply_upsert_points_lsm_chunk(
 ) -> Result<HashMap<String, usize>, GraphError> {
     let mut dense_batch_counts: HashMap<String, usize> = HashMap::new();
     let hash_skip_on = content_hash_skip_enabled();
+    let reupsert_delete_on = lsm_reupsert_delete_enabled();
+    let mut replaced_rows = Vec::new();
+    // The rewritten ids, for the merges building from their old rows.
+    let mut removal = None;
 
     // Group-commit (#1): when `buffered`, commit this chunk visible-but-not-yet-
     // durable; `apply_upsert_points` issues ONE `flush_durable` barrier after the
@@ -7347,6 +9340,17 @@ fn apply_upsert_points_lsm_chunk(
     // non-durable write. When disabled, commit fully durable per chunk.
     let run = |w: &mut super::backend_any::AnyWrite<'_>| -> Result<(), GraphError> {
         let mut sparse_buckets: HashMap<String, Vec<(u128, &SparseVector)>> = HashMap::new();
+        let read_node = |w: &mut super::backend_any::AnyWrite<'_>,
+                         id: u128|
+         -> Result<Option<crate::protocol::items::Node>, GraphError> {
+            storage
+                .backend
+                .get_for_update(w, Namespace::Nodes, &id.to_be_bytes(), |v| {
+                    v.map(|bytes| SerializedNode::decode_node(bytes, id))
+                })
+                .map_err(|e| GraphError::New(e.to_string()))?
+                .transpose()
+        };
         // One multi-get reads every point's node when the chunk's ids are
         // unique; a repeated id must see its own earlier write, so per point.
         let mut seen_ids = HashSet::with_capacity(points.len());
@@ -7359,47 +9363,137 @@ fn apply_upsert_points_lsm_chunk(
                 .backend
                 .get_for_update_many(w, Namespace::Nodes, &keys)
                 .map_err(|e| GraphError::New(e.to_string()))?;
-            Some(values.into_iter())
+            Some(
+                values
+                    .into_iter()
+                    .zip(points)
+                    .map(|(row, point)| {
+                        row.map(|bytes| SerializedNode::decode_node(&bytes, point.id))
+                            .transpose()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
         } else {
             None
         };
+        let incoming_hashes: Vec<Option<u64>> = points
+            .iter()
+            .map(|point| hash_skip_on.then(|| compute_content_hash(point)))
+            .collect();
+
+        // The stored points this chunk rewrites.
+        let mut replaced = Vec::new();
+        if reupsert_delete_on {
+            for (index, point) in points.iter().enumerate() {
+                let read;
+                let stored = match prefetched_nodes.as_ref() {
+                    Some(nodes) => nodes[index].as_ref(),
+                    None => {
+                        read = read_node(w, point.id)?;
+                        read.as_ref()
+                    }
+                };
+                let Some(stored) = stored.filter(|node| node.label == "point") else {
+                    continue;
+                };
+                if let Some(incoming_hash) = incoming_hashes[index] {
+                    if keeps_its_vectors(&stored.properties, point, incoming_hash) {
+                        continue;
+                    }
+                    observe_content_hash_mismatch(
+                        point,
+                        Some(&stored.properties),
+                        content_hash_from_properties(&stored.properties),
+                        incoming_hash,
+                    );
+                }
+                if !replaced.contains(&point.id) {
+                    replaced.push(point.id);
+                }
+            }
+        }
+        // They lose their older dense rows in this batch, as on LMDB
+        // (`plan_dense_delete_for_upsert`): the appends below write to the
+        // mutable tail only, and a row left in another segment is what
+        // search, the by-id read or a merge may pick instead. Staged ahead
+        // of the appends, so its reads do not hold an appended row back from
+        // its commit. `kept`: the rows left for the appends to overwrite.
+        let mut kept = Vec::new();
+        if !replaced.is_empty() {
+            // What an append or the sparse upsert below would refuse is
+            // refused first. A removal takes its row out of the writer's
+            // cached ordinals when it is staged and nothing puts it back, so
+            // a chunk failing later would leave a stored row out of the
+            // writer's flat scan until the collection is opened again.
+            for point in points {
+                for (name, data) in &point.vectors {
+                    storage
+                        .named_vectors
+                        .check_dense_append(name, data)
+                        .map_err(GraphError::from)?;
+                }
+                for (name, sparse) in &point.sparse_vectors {
+                    storage
+                        .named_vectors
+                        .with_sparse_core(name, |_| sparse.validate())
+                        .map_err(GraphError::from)?;
+                }
+            }
+            // Before the plan below: a merge that has written its target
+            // leaves the rows there to this write.
+            let begun = storage.named_vectors.merge_windows.begin_removal();
+            let plan = {
+                let r = storage
+                    .backend
+                    .begin_read()
+                    .map_err(|e| GraphError::New(e.to_string()))?;
+                storage
+                    .named_vectors
+                    .plan_delete_vectors_batch_be(&r, &replaced)
+                    .map_err(GraphError::from)?
+            };
+            let (staged, in_tail) = storage
+                .named_vectors
+                .delete_replaced_vectors_be(w, &plan, &|space, id| {
+                    points
+                        .iter()
+                        .any(|point| point.id == id && point.vectors.contains_key(space))
+                })
+                .map_err(GraphError::from)?;
+            replaced_rows.push(staged);
+            kept = in_tail;
+            removal = Some((begun, replaced));
+        }
+        #[cfg(test)]
+        test_support::reached("upsert_prepared");
         // Counter bumps fold into one merge each after the loop: every per-point
         // bump re-read the counter key from SlateDB (merges are not pending reads).
         let mut created_nodes = 0i64;
         let mut created_vectors = 0i64;
-        for point in points {
-            let existing_raw = match prefetched_nodes.as_mut() {
-                Some(values) => values.next().flatten(),
-                None => storage
-                    .backend
-                    .get_for_update(w, Namespace::Nodes, &point.id.to_be_bytes(), |v| {
-                        v.map(<[u8]>::to_vec)
-                    })
-                    .map_err(|e| GraphError::New(e.to_string()))?,
+        for (index, point) in points.iter().enumerate() {
+            let existing_node = match prefetched_nodes.as_mut() {
+                Some(nodes) => nodes[index].take(),
+                None => read_node(w, point.id)?,
             };
-            let existing_node = existing_raw
-                .map(|bytes| SerializedNode::decode_node(&bytes, point.id))
-                .transpose()?;
             let existing_is_point = existing_node
                 .as_ref()
                 .map(|node| node.label == "point")
                 .unwrap_or(false);
 
-            let incoming_hash = if hash_skip_on {
-                Some(compute_content_hash(point))
-            } else {
-                None
-            };
+            let incoming_hash = incoming_hashes[index];
             let mut payload_only_update = false;
-            if hash_skip_on && existing_is_point {
-                let stored = existing_node
-                    .as_ref()
-                    .and_then(|node| content_hash_from_properties(&node.properties));
-                if stored == incoming_hash {
-                    if payloads_equal_without_content_hash_marker(
-                        &existing_node.as_ref().unwrap().properties,
-                        &point.payload,
-                    ) {
+            // The same call that planned `replaced` above, so the two agree
+            // on which points keep their rows.
+            if let (Some(stored), Some(incoming_hash)) = (
+                existing_node.as_ref().filter(|_| existing_is_point),
+                incoming_hash,
+            ) {
+                let stored = &stored.properties;
+                if keeps_its_vectors(stored, point, incoming_hash) {
+                    // A node under an older stamp is written for today's.
+                    if content_hash_from_properties(stored) == Some(incoming_hash)
+                        && payloads_equal_without_content_hash_marker(stored, &point.payload)
+                    {
                         metrics::counter!("helix_upsert_content_hash_skipped_total").increment(1);
                         continue;
                     }
@@ -7409,7 +9503,6 @@ fn apply_upsert_points_lsm_chunk(
                 }
             }
 
-            let fields = point.payload.clone();
             let mut props = point.payload.clone();
             if let Some(h) = incoming_hash {
                 props.insert(CONTENT_HASH_KEY.to_string(), Value::U64(h));
@@ -7432,11 +9525,17 @@ fn apply_upsert_points_lsm_chunk(
                 continue;
             }
 
+            // The payload or its digest; the hash stamped on the node is in neither.
+            let fields = dense_row_fields(&point.payload);
             for (vec_name, vec_data) in &point.vectors {
-                storage
+                let tail = storage
                     .named_vectors
                     .dense_append_to_mutable_be(w, vec_name, vec_data, point.id, fields.clone())
                     .map_err(GraphError::from)?;
+                // Overwritten, unless the tail was sealed since the row was kept.
+                kept.retain(|(space, kept_in, id)| {
+                    *id != point.id || space != vec_name || *kept_in != tail
+                });
                 *dense_batch_counts.entry(vec_name.clone()).or_default() += 1;
             }
 
@@ -7458,6 +9557,17 @@ fn apply_upsert_points_lsm_chunk(
             storage.adjust_metadata_counter_be(w, MetadataCounter::Vectors, created_vectors)?;
         }
 
+        // A tail sealed in between: the append went to the next one, and the
+        // row kept for it is an older copy like the others.
+        for (_, sealed_tail, id) in kept {
+            replaced_rows.push(
+                storage
+                    .named_vectors
+                    .delete_from_segment_be(w, &sealed_tail, &[id])
+                    .map_err(GraphError::from)?,
+            );
+        }
+
         for (name, items) in &sparse_buckets {
             storage
                 .named_vectors
@@ -7471,6 +9581,12 @@ fn apply_upsert_points_lsm_chunk(
         storage.with_write_backend_buffered(run)?;
     } else {
         storage.with_write_backend(run)?;
+    }
+    for staged in &replaced_rows {
+        storage.named_vectors.apply_delete_tombstones(staged);
+    }
+    if let Some((removal, replaced)) = removal {
+        removal.committed(&replaced);
     }
 
     // Drain pending sparse df/max metadata AFTER the postings batch above has
@@ -7502,13 +9618,13 @@ fn apply_upsert_points_lsm_chunk(
 
 /// Per-batch upsert chunk size: how many points commit per write txn.
 /// Tunable via `HELIX_UPSERT_APPLY_CHUNK`. Default 64 keeps each
-/// `apply_upsert_points_in_txn` under ~250 ms for typical CE workloads
+/// `apply_upsert_points_in_txn` under ~250 ms for typical client workloads
 /// (1536-dim vectors + payload index puts).
 fn upsert_apply_chunk_size() -> usize {
     env_usize_at_least("HELIX_UPSERT_APPLY_CHUNK", 1).unwrap_or(64)
 }
 
-/// Cap on total sparse posting count per upsert chunk. CE workloads write
+/// Cap on total sparse posting count per upsert chunk. Client workloads write
 /// inverted-index postings via DUPSORT during `apply_upsert_points_in_txn`,
 /// and live measurements show `fresh_posting_put` averaging ~4.5 s even
 /// with 16-doc chunks — sparse cost scales with total postings, not docs.
@@ -7532,7 +9648,7 @@ fn upsert_apply_sparse_posting_budget() -> usize {
 /// sparse DUPSORT writes, and dense delete reverse-edge patching.
 ///
 /// `0` disables write-budget chunking. Tunable via
-/// `HELIX_UPSERT_WRITE_BUDGET`. Default 32K is intentionally above normal CE
+/// `HELIX_UPSERT_WRITE_BUDGET`. Default 32K is intentionally above normal client
 /// chunks while splitting payload-index-heavy or sparse-frontier-heavy chunks
 /// before they can pin LMDB's single writer for minutes.
 fn upsert_apply_write_budget() -> usize {
@@ -7688,7 +9804,7 @@ fn delete_apply_chunk_size(indexed_segments: usize) -> usize {
     scaled.max(floor).min(base.max(floor))
 }
 
-fn lock_point_mutation_gate<'a>(
+pub(crate) fn lock_point_mutation_gate<'a>(
     gate: &'a Arc<Mutex<()>>,
     collection: &str,
     operation: &'static str,
@@ -7729,6 +9845,8 @@ fn apply_upsert_points(
     let phase_start = Instant::now();
     let storage = collections.get_collection(&resolved_collection)?;
     storage.ensure_not_degraded()?;
+    storage.point_mutations.fetch_add(1, Ordering::AcqRel);
+    let _in_flight = PointMutationInFlight::begin(&storage);
     let observe_hot_metrics = crate::telemetry::hot_path_metrics_enabled();
     if observe_hot_metrics {
         metrics::histogram!("helix_apply_upsert_phase_ms", "phase" => "get_collection")
@@ -7954,6 +10072,10 @@ fn apply_delete_points(
         lock_point_mutation_gate(&point_mutation_gate, &resolved_collection, "delete");
     let storage = collections.get_collection(&resolved_collection)?;
     storage.ensure_not_degraded()?;
+    storage.point_mutations.fetch_add(1, Ordering::AcqRel);
+    // A delete is a write too: the tail of a collection still being reindexed
+    // is not sealed between a file's delete and its upsert.
+    let _in_flight = PointMutationInFlight::begin(&storage);
 
     // Chunk the per-id delete work.
     //
@@ -7976,6 +10098,10 @@ fn apply_delete_points(
     let metrics_enabled = crate::telemetry::hot_path_metrics_enabled();
     let segs = storage.named_vectors.indexed_dense_segment_count();
     let chunk_size = delete_apply_chunk_size(segs);
+    // Chunks commit visible but not yet durable; the barrier after the loop
+    // makes them durable before the delete is acknowledged.
+    let flush_at_once =
+        storage.backend.kind() == BackendKind::Lsm && lsm_point_write_flush_enabled();
     if metrics_enabled {
         metrics::histogram!("helix_delete_indexed_segments").record(segs as f64);
         metrics::histogram!("helix_delete_chunk_size_effective").record(chunk_size as f64);
@@ -8015,19 +10141,27 @@ fn apply_delete_points(
         // rescan, which is what actually keeps this correct rather than the gate.
         if storage.backend.kind() == BackendKind::Lsm {
             let plan_start = metrics_enabled.then(Instant::now);
+            // Before the plan below: a merge that has written its target
+            // leaves the rows there to this delete.
+            let removal = storage.named_vectors.merge_windows.begin_removal();
             let r = storage
                 .backend
                 .begin_read()
                 .map_err(|e| GraphError::New(e.to_string()))?;
+            // One multi-get reads the chunk's node rows, not a round trip per id.
+            let node_keys: Vec<Vec<u8>> = delete_ids
+                .iter()
+                .map(|id| id.to_be_bytes().to_vec())
+                .collect();
+            let node_rows = storage
+                .backend
+                .get_many(&r, Namespace::Nodes, &node_keys)
+                .map_err(|e| GraphError::New(e.to_string()))?;
             let mut existing_point_ids = HashSet::with_capacity(delete_ids.len());
-            for id in &delete_ids {
-                let existing_is_point = storage
-                    .backend
-                    .get_with(&r, Namespace::Nodes, &id.to_be_bytes(), |v| {
-                        v.map(|bytes| SerializedNode::decode_node(bytes, *id))
-                            .transpose()
-                    })
-                    .map_err(|e| GraphError::New(e.to_string()))??
+            for (id, row) in delete_ids.iter().zip(node_rows) {
+                let existing_is_point = row
+                    .map(|bytes| SerializedNode::decode_node(&bytes, *id))
+                    .transpose()?
                     .map(|node| node.label == "point")
                     .unwrap_or(false);
                 if existing_is_point {
@@ -8047,7 +10181,7 @@ fn apply_delete_points(
 
             let txn_start = metrics_enabled.then(Instant::now);
             let mut staged_tombstones = None;
-            storage.with_write_backend(|w| {
+            let delete = |w: &mut super::backend_any::AnyWrite<'_>| -> Result<(), GraphError> {
                 let t = metrics_enabled.then(Instant::now);
                 staged_tombstones = Some(
                     storage
@@ -8066,9 +10200,7 @@ fn apply_delete_points(
                     .map_err(GraphError::from)?;
                 record_delete_step("lsm_sparse_delete", t);
                 let t = metrics_enabled.then(Instant::now);
-                for id in &delete_ids {
-                    storage.drop_node_be(w, id)?;
-                }
+                storage.drop_nodes_be(w, &delete_ids)?;
                 record_delete_step("lsm_drop_nodes", t);
                 if !existing_point_ids.is_empty() {
                     storage.adjust_metadata_counter_be(
@@ -8078,10 +10210,18 @@ fn apply_delete_points(
                     )?;
                 }
                 Ok(())
-            })?;
+            };
+            if flush_at_once {
+                storage.with_write_backend_buffered(delete)?;
+            } else {
+                storage.with_write_backend(delete)?;
+            }
             if let Some(staged) = staged_tombstones {
                 storage.named_vectors.apply_delete_tombstones(&staged);
             }
+            // After the tombstones are in memory: a merge waiting for this
+            // delete reads its sources next.
+            removal.committed(&delete_ids);
             record_delete_step("chunk_lsm_delete_txn", txn_start);
             continue;
         }
@@ -8148,6 +10288,15 @@ fn apply_delete_points(
         }
     }
 
+    if flush_at_once && !ids.is_empty() {
+        let t = metrics_enabled.then(Instant::now);
+        storage
+            .backend
+            .flush_durable()
+            .map_err(|e| storage.backend_error(e, "delete_points_flush_durable"))?;
+        record_delete_step("lsm_flush_durable", t);
+    }
+
     // The optimizer's convergence loop already runs cleanup_empty_dense_segments_deferred
     // and defers reclamation to SEGMENT_REAPER. Running it here too means every
     // delete batch holds an exclusive write txn for O(total_vectors) prefix scans
@@ -8202,8 +10351,180 @@ fn apply_ingest_batch(
     Ok(ops.len())
 }
 
+/// Optimizer steps for tests outside this module, run on the calling thread.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    thread_local! {
+        /// `(stage, action)` for the next merge or upsert on this thread.
+        static HOOK: std::cell::RefCell<Option<(&'static str, Box<dyn FnOnce()>)>> =
+            const { std::cell::RefCell::new(None) };
+        /// `(stage, action)` run every time this thread reaches `stage`.
+        static HOOK_EACH_TIME: std::cell::RefCell<Option<(&'static str, Box<dyn FnMut()>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called at `stage`. A merge, none of them published: "exported" once it
+    /// has read its sources, "flat_written" once its target has its flat rows
+    /// and no graph yet, "written" once the target is whole, "drained" once
+    /// it has taken the removed ids out of the target and closed its window.
+    /// An LSM upsert chunk: "upsert_prepared" once it has read its points'
+    /// nodes and before it appends. A regraph: "regraph_exported" once it has
+    /// read a segment's rows and before it takes the gate again. A store of
+    /// an LSM collection's dense layout: "layout_read" inside its
+    /// transaction, once it has read the layout from memory. A seal of an
+    /// LSM tail: "seal_prepared" once its next tail is open and before the
+    /// layout with the seal in it is stored, "seal_midway" once that is
+    /// stored and before memory has the seal.
+    pub(super) fn reached(stage: &str) {
+        let hook = HOOK.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            if hook.as_ref().map(|(at, _)| *at) == Some(stage) {
+                hook.take()
+            } else {
+                None
+            }
+        });
+        if let Some((_, action)) = hook {
+            action();
+        }
+        // Out of its place while it runs: a stage reached inside it finds none.
+        let each_time = HOOK_EACH_TIME.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            if hook.as_ref().map(|(at, _)| *at) == Some(stage) {
+                hook.take()
+            } else {
+                None
+            }
+        });
+        if let Some((at, mut action)) = each_time {
+            action();
+            HOOK_EACH_TIME.with(|hook| *hook.borrow_mut() = Some((at, action)));
+        }
+    }
+
+    /// Seals `space`'s mutable tail: flat rows only, until its index is built.
+    pub(crate) fn seal_tail(storage: &Arc<HelixGraphStorage>, space: &str) {
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        assert!(seal_lsm_dense_tail(storage, space, &hnsw).unwrap());
+    }
+
+    /// Seals `space`'s mutable tail and builds its index.
+    pub(crate) fn seal_and_index(storage: &Arc<HelixGraphStorage>, space: &str) {
+        seal_tail(storage, space);
+        let prepared = {
+            let read = storage.backend.begin_read().unwrap();
+            storage
+                .named_vectors
+                .prepare_building_indices_limited_be(&read, space, 1)
+                .unwrap()
+        };
+        assert_eq!(prepared.len(), 1);
+        run_chunked_indices_publish(storage, space, prepared).unwrap();
+    }
+
+    /// One optimizer job over `space`.
+    pub(crate) fn optimize(storage: &Arc<HelixGraphStorage>, collection: &str, space: &str) {
+        run_index_job(IndexJob {
+            collection: collection.into(),
+            storage: Arc::downgrade(storage),
+            spaces_to_check: vec![space.into()],
+            hnsw_config: HNSWConfig::new(Some(16), Some(64), Some(128)),
+            flat_scan_threshold: 1_000,
+        });
+    }
+
+    /// One regraph of `space`, with no other writer; what it reports.
+    pub(crate) fn regraph(
+        storage: &Arc<HelixGraphStorage>,
+        collection: &str,
+        space: &str,
+    ) -> RegraphStatus {
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        let gate = Arc::new(Mutex::new(()));
+        regraph_collection(storage, collection, &[space.to_string()], &hnsw, &gate).unwrap()
+    }
+
+    /// `run`, with `action` run inside it at `stage` (see `reached`).
+    pub(crate) fn with_hook(
+        stage: &'static str,
+        action: impl FnOnce() + 'static,
+        run: impl FnOnce(),
+    ) {
+        let action: Box<dyn FnOnce()> = Box::new(action);
+        HOOK.with(|hook| *hook.borrow_mut() = Some((stage, action)));
+        run();
+        assert!(
+            HOOK.with(|hook| hook.borrow_mut().take()).is_none(),
+            "nothing reached {stage}"
+        );
+    }
+
+    /// `run`, with `action` run inside it every time `stage` is reached.
+    pub(crate) fn with_hook_each_time(
+        stage: &'static str,
+        action: impl FnMut() + 'static,
+        run: impl FnOnce(),
+    ) {
+        let action: Box<dyn FnMut()> = Box::new(action);
+        HOOK_EACH_TIME.with(|hook| *hook.borrow_mut() = Some((stage, action)));
+        run();
+        assert!(
+            HOOK_EACH_TIME
+                .with(|hook| hook.borrow_mut().take())
+                .is_some(),
+            "the hook at {stage} was taken and not put back"
+        );
+    }
+
+    /// Whether a dense row's `fields` are the digest of a payload, not a payload.
+    pub(crate) fn row_keeps_a_digest(fields: &HashMap<String, Value>) -> bool {
+        matches!(row_keeps(fields), RowKeeps::Digest(..))
+    }
+
+    /// The content hash an image that had only the first lists stamped on
+    /// `point`.
+    pub(crate) fn stamp_of_the_first_lists(point: &ReplicatedPoint) -> u64 {
+        content_hash_of(
+            KeyLists::First,
+            &point.payload,
+            &point.vectors,
+            &point.sparse_vectors,
+        )
+    }
+
+    /// `optimize`, with `action` run inside its merge at `stage`.
+    pub(crate) fn optimize_with(
+        storage: &Arc<HelixGraphStorage>,
+        collection: &str,
+        space: &str,
+        stage: &'static str,
+        action: impl FnOnce() + 'static,
+    ) {
+        with_hook(stage, action, || optimize(storage, collection, space));
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    mod backlog_sweeper;
+    mod bounded_optimizer_reads;
+    mod dead_segment_names;
+    mod empty_index_create;
+    mod empty_merge;
+    mod fenced_index_store;
+    mod optimizer_followups;
+    mod publish_crash;
+    mod regraph_retire;
+    mod reupsert_copy_choice;
+    mod reupsert_stamps;
+    mod seal_store_order;
+    mod stored_row_wins;
+    mod tail_seal_debounce;
+    mod vector_space_names;
+    mod worker_panics;
+
     use super::*;
     use crate::helix_engine::graph_core::config::{
         Config, GraphConfig, RaftConfig, RaftPeerConfig, VectorConfig,
@@ -8214,7 +10535,38 @@ mod tests {
     use std::sync::Weak;
     use tempfile::TempDir;
 
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    /// The lock shared by the tests that set the process environment. `lock`
+    /// hands the guard out of a poisoned lock too: a test that panics while
+    /// it holds the lock puts the environment back as its guards drop, and
+    /// is one failure. On a plain mutex every test after it failed as well,
+    /// on the lock (as `ENV_TEST_LOCK` of the collection manager's tests).
+    struct EnvLock(Mutex<()>);
+
+    impl EnvLock {
+        fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ()>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner))
+        }
+    }
+
+    static ENV_LOCK: EnvLock = EnvLock(Mutex::new(()));
+
+    #[test]
+    fn env_lock_is_handed_out_after_a_test_panicked_holding_it() {
+        let lock = EnvLock(Mutex::new(()));
+        let panicked = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = lock.lock().unwrap();
+                    panic!("a test that fails while it holds the lock");
+                })
+                .join()
+        });
+        assert!(panicked.is_err() && lock.0.is_poisoned());
+        drop(lock.lock().unwrap());
+    }
 
     fn gateway_request(method: &str, path: &str) -> Request {
         Request {
@@ -8316,6 +10668,8 @@ mod tests {
         assert!(gateway_retryable_reader_status(404));
         assert!(gateway_retryable_reader_status(500));
         assert!(gateway_retryable_reader_status(502));
+        // What a reader answers for a collection it could not open now.
+        assert!(gateway_retryable_reader_status(503));
         assert!(gateway_retryable_reader_status(504));
         assert!(!gateway_retryable_reader_status(400));
     }
@@ -8360,6 +10714,21 @@ mod tests {
         assert_eq!(
             second_plan,
             vec![reader_target("reader-b"), reader_target("reader-a")]
+        );
+    }
+
+    /// The sparse statistics route is a POST, and the gateway still plans it
+    /// as the read it is: readers, never the writer while one is healthy.
+    #[test]
+    fn cloud_gateway_routes_sparse_stats_to_readers() {
+        let router = gateway_router_for_tests(false);
+        let request = gateway_request("POST", "/collections/repo/sparse/stats");
+
+        let plan = router.target_plan(&request, Instant::now()).unwrap();
+
+        assert_eq!(
+            plan,
+            vec![reader_target("reader-a"), reader_target("reader-b")]
         );
     }
 
@@ -9103,7 +11472,7 @@ mod tests {
         ];
         let merge = prepared_merge_for_rows(&rows, Some(&spindle));
 
-        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge).unwrap();
+        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge, None).unwrap();
 
         let hvtq_path = tq_sidecar_path(&temp_dir);
         assert!(hvtq_path.exists());
@@ -9276,7 +11645,7 @@ mod tests {
         ];
         let merge = prepared_merge_for_rows(&rows, Some(&spindle));
 
-        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge).unwrap();
+        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge, None).unwrap();
 
         let hvtq_path = storage
             .collection_path()
@@ -9349,7 +11718,7 @@ mod tests {
         ];
         let merge = prepared_merge_for_rows(&rows, None);
 
-        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge).unwrap();
+        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge, None).unwrap();
 
         assert!(
             hvs8_sidecar_path(&temp_dir).exists(),
@@ -9385,10 +11754,11 @@ mod tests {
                 adjacency: vec![Some(vec![Vec::new()]), Some(vec![Vec::new()])],
                 entry_ord: 0,
                 level_zero_preflushed: false,
+                unreached: 0,
             },
         };
 
-        let err = run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge)
+        let err = run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge, None)
             .unwrap_err();
 
         assert!(
@@ -9447,24 +11817,75 @@ mod tests {
             gate_debt: 6,
             dirty_retired_segments: 0,
         };
+        // Every active segment Indexed: a Building one is submitted by itself.
         let below_cap_gate = DenseSegmentDebt {
+            indexed_segments: cap.saturating_sub(1),
             active_segments: cap.saturating_sub(1),
             ..gate_only
         };
         let cap_hit_gate = DenseSegmentDebt {
+            indexed_segments: cap,
             active_segments: cap,
             ..gate_only
         };
         let merge_backlog = DenseSegmentDebt {
             indexed_segments: 3,
+            active_segments: 3,
+            gate_debt: 0,
+            ..gate_only
+        };
+        let building_only = DenseSegmentDebt {
+            active_segments: 1,
             gate_debt: 0,
             ..gate_only
         };
 
-        assert!(!optimizer_debt_has_submit_work(gate_only, 1));
-        assert!(!optimizer_debt_has_submit_work(below_cap_gate, 1));
-        assert!(optimizer_debt_has_submit_work(cap_hit_gate, 1));
-        assert!(optimizer_debt_has_submit_work(merge_backlog, 1));
+        assert!(!optimizer_debt_has_submit_work(gate_only, 1, true, false));
+        assert!(!optimizer_debt_has_submit_work(
+            below_cap_gate,
+            1,
+            false,
+            false
+        ));
+        // The gate term does not depend on a space being over the merge target.
+        assert!(optimizer_debt_has_submit_work(
+            cap_hit_gate,
+            1,
+            false,
+            false
+        ));
+        assert!(optimizer_debt_has_submit_work(
+            building_only,
+            1,
+            false,
+            true
+        ));
+        assert!(!optimizer_debt_has_submit_work(
+            building_only,
+            1,
+            false,
+            false
+        ));
+        assert!(optimizer_debt_has_submit_work(
+            merge_backlog,
+            1,
+            true,
+            false
+        ));
+        // Segments summed over spaces exceed the ratio, but no space has a merge.
+        assert!(!optimizer_debt_has_submit_work(
+            merge_backlog,
+            1,
+            false,
+            false
+        ));
+        // A space over the target, still under the collection-wide ratio.
+        assert!(!optimizer_debt_has_submit_work(
+            merge_backlog,
+            3,
+            true,
+            false
+        ));
         assert!(!optimizer_debt_can_expand_build_budget(gate_only));
         assert!(!optimizer_debt_can_expand_build_budget(below_cap_gate));
         assert!(optimizer_debt_can_expand_build_budget(cap_hit_gate));
@@ -9677,6 +12098,19 @@ mod tests {
         );
     }
 
+    /// With memory to spare a sweep looks down its whole list for candidates
+    /// past their cooldown. Under pressure it has one place and looks at one
+    /// candidate: while that one is in its cooldown the sweep submits
+    /// nothing, where looking further would submit another collection's job
+    /// at every sweep.
+    #[test]
+    fn optimizer_backlog_sweep_under_pressure_looks_no_further_than_its_places() {
+        let looked_at = optimizer_backlog_candidates_looked_at;
+        assert_eq!(looked_at(32, MaintenanceAdmission::Admitted), usize::MAX);
+        assert_eq!(looked_at(1, MaintenanceAdmission::Rejected("memory")), 1);
+        assert_eq!(looked_at(0, MaintenanceAdmission::Rejected("fds")), 0);
+    }
+
     struct EnvVarGuard {
         name: &'static str,
         previous: Option<std::ffi::OsString>,
@@ -9782,6 +12216,7 @@ mod tests {
                 adjacency: vec![Some(vec![Vec::new()]); n],
                 entry_ord: 0,
                 level_zero_preflushed: false,
+                unreached: 0,
             },
         }
     }
@@ -10472,7 +12907,7 @@ mod tests {
         SparseVector { indices, values }
     }
 
-    /// LSM collection shaped like a CE code collection: `dense` + `mini` dense
+    /// LSM collection shaped like a client code collection: `dense` + `mini` dense
     /// vectors, the given Idf sparse vectors, and a keyword index on `path`.
     fn ce_shaped_lsm_collection(
         temp_dir: &TempDir,
@@ -10689,12 +13124,78 @@ mod tests {
         let few_terms = delete_round_trips(20);
         let many_terms = delete_round_trips(280);
         assert!(
-            few_terms > 64,
+            few_terms > 0,
             "the delete must run on this thread: {few_terms}"
         );
         assert!(
             many_terms <= few_terms + 8,
             "delete round trips grew with sparse terms per point: {few_terms} (20 terms) vs {many_terms} (280 terms)"
+        );
+    }
+
+    /// A file delete used to pay one SlateDB round trip per id for its node
+    /// row, one per (dense segment, id) for the ownership probe and three per
+    /// owned (segment, id) for the rows to remove. Batched, those reads cost a
+    /// fixed number of round trips, and leave exactly what the one-at-a-time
+    /// reads leave.
+    #[test]
+    fn apply_delete_points_lsm_batches_its_reads_without_changing_the_result() {
+        use crate::helix_engine::storage_core::backend_lsm::lsm_round_trips_for_test as round_trips;
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _hard_deletes = EnvVarGuard::unset("HELIX_LSM_DELETE_TOMBSTONES");
+        let delete = |batch_reads: &'static str| {
+            let _knob = EnvVarGuard::set("HELIX_LSM_DELETE_BATCH_READS", batch_reads);
+            let temp_dir = TempDir::new().unwrap();
+            let (collections, config) =
+                ce_shaped_lsm_collection(&temp_dir, 1..=64, 20, &["lex_sparse"]);
+            let storage = collections.get_collection("repo").unwrap();
+            let before = round_trips();
+            apply_mutation(
+                &collections,
+                &config,
+                &ReplicatedMutation::DeletePoints {
+                    collection: "repo".into(),
+                    ids: (1..=48).collect(),
+                },
+            )
+            .unwrap();
+            let spent = round_trips() - before;
+
+            let r = storage.backend.begin_read().unwrap();
+            let cores = storage.named_vectors.cores_read().unwrap();
+            let state: Vec<(u128, bool, bool)> = (1..=64u128)
+                .map(|id| {
+                    let node = storage
+                        .backend
+                        .get_with(&r, Namespace::Nodes, &id.to_be_bytes(), |v| v.is_some())
+                        .unwrap();
+                    let dense = cores
+                        .values()
+                        .any(|core| core.contains_id(&r, id).unwrap_or(false));
+                    (id, node, dense)
+                })
+                .collect();
+            let stats = storage
+                .with_read_backend(|r| storage.get_metadata_be(r))
+                .unwrap()
+                .stats;
+            (spent, state, (stats.node_count, stats.vector_count))
+        };
+        let (batched, batched_state, batched_counts) = delete("1");
+        let (serial, serial_state, serial_counts) = delete("0");
+
+        assert_eq!(batched_state, serial_state);
+        assert_eq!(batched_counts, (16, 16), "48 of 64 points deleted");
+        assert_eq!(batched_counts, serial_counts);
+        for (id, node, dense) in &batched_state {
+            assert_eq!(*node, *id > 48, "node row of {id}");
+            assert_eq!(*dense, *id > 48, "dense vector of {id}");
+        }
+        // Serial: 48 node reads + 2 segments x 48 probes + 2 x 48 x 3 dense
+        // scans, then 48 node reads + 2 x 48 edge scans to drop the nodes.
+        assert!(
+            batched + 300 <= serial,
+            "batched delete reads saved too few round trips: {batched} batched vs {serial} serial"
         );
     }
 
@@ -10790,7 +13291,7 @@ mod tests {
             .collect()
     }
 
-    /// LSM collection shaped like a CE code collection on the prod writer at
+    /// LSM collection shaped like a client code collection on the prod writer at
     /// reduced scale: `points` dense points sealed into `rounds` Indexed HNSW
     /// segments by the real optimizer, plus `edges` graph edges among the
     /// points above `protected_below` (so a delete of `1..=protected_below`
@@ -11821,7 +14322,11 @@ mod tests {
     fn optimizer_builds_existing_lsm_segment_before_waiting_for_tail_quiescence() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _runtime = EnvVarGuard::set("HELIX_INDEX_JOB_MAX_RUNTIME_MS", "50");
-        let _quiesced_tails = EnvVarGuard::set("HELIX_INDEX_SUBTHRESHOLD_QUIESCED_TAILS", "1");
+        // The upsert below queues an index job of its own. It must leave the
+        // tail flat and be gone before this test seals the tail and runs a job
+        // by hand: alongside that job it can build the sealed segment first
+        // and still hold it `Building` when the test looks.
+        let _flat_tail = EnvVarGuard::set("HELIX_INDEX_SUBTHRESHOLD_QUIESCED_TAILS", "0");
 
         let temp_dir = TempDir::new().unwrap();
         let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
@@ -11865,6 +14370,8 @@ mod tests {
             },
         )
         .unwrap();
+        wait_for_index_executor("repo");
+        let _quiesced_tails = EnvVarGuard::set("HELIX_INDEX_SUBTHRESHOLD_QUIESCED_TAILS", "1");
 
         let storage = collections.get_collection("repo").unwrap();
         let read = storage.backend.begin_read().unwrap();
@@ -11876,7 +14383,8 @@ mod tests {
                 "dense",
                 HNSWConfig::new(Some(8), Some(32), Some(64)),
             )
-            .unwrap());
+            .unwrap()
+            .is_some());
         drop(read);
         storage
             .with_write_backend(|write| {
@@ -11914,6 +14422,2906 @@ mod tests {
             .named_vectors
             .building_segment_names("dense")
             .is_empty());
+    }
+
+    /// A sealed LSM tail is `Building` until its build publishes; its points
+    /// live in no other segment, so every dense path must keep returning them
+    /// (newest copy wins on re-upsert, deletes stay deleted), while a merge
+    /// target's `Building` copy stays hidden.
+    #[test]
+    fn sealed_lsm_tail_stays_searchable_until_its_build_publishes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        // 0 keeps upserts from queueing background index jobs; the explicit
+        // job run below may still reschedule one, so layout checks name
+        // segments instead of counting them.
+        config.vector_config.flat_scan_threshold = Some(0);
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: "repo".into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: 4,
+                        distance:
+                            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        let upsert = |points: Vec<(u128, [f32; 4])>| {
+            apply_mutation(
+                &collections,
+                &config,
+                &ReplicatedMutation::UpsertPoints {
+                    collection: "repo".into(),
+                    points: points
+                        .into_iter()
+                        .map(|(id, vector)| ReplicatedPoint {
+                            id,
+                            vectors: HashMap::from([("dense".into(), vector.to_vec())]),
+                            sparse_vectors: HashMap::new(),
+                            payload: HashMap::new(),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        };
+        upsert(
+            (1..=6u128)
+                .map(|id| (id, [id as f32, 1.0, 0.0, 0.0]))
+                .collect(),
+        );
+        let storage = collections.get_collection("repo").unwrap();
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        let query = [0.0, 1.0, 0.0, 0.0];
+        // (id, distance bits) from every LSM dense path, sorted by id.
+        let search_all = || {
+            let read = storage.backend.begin_read().unwrap();
+            let nv = &storage.named_vectors;
+            let ids = (1..=99u128).collect::<HashSet<_>>();
+            let paths = [
+                nv.dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                    &read, "dense", &query, 10, None, true, None, None,
+                ),
+                nv.dense_search_candidate_set_filter_ef_be(
+                    &read, "dense", &query, 10, &ids, true, None, None,
+                ),
+                nv.dense_search_candidate_ids_exact_be(
+                    &read,
+                    "dense",
+                    &query,
+                    10,
+                    ids.iter().copied(),
+                    None,
+                ),
+            ];
+            paths
+                .into_iter()
+                .map(|hits| {
+                    let mut hits = hits
+                        .unwrap()
+                        .into_iter()
+                        .map(|v| (v.get_id(), v.get_distance().to_bits()))
+                        .collect::<Vec<_>>();
+                    hits.sort_unstable();
+                    hits
+                })
+                .collect::<Vec<_>>()
+        };
+        let ids_of = |hits: &[(u128, u32)]| hits.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+
+        let tail = storage
+            .named_vectors
+            .mutable_dense_segment_name("dense")
+            .unwrap();
+        assert!(seal_lsm_dense_tail(&storage, "dense", &hnsw).unwrap());
+        assert_eq!(
+            storage.named_vectors.building_segment_names("dense"),
+            vec![tail.clone()]
+        );
+        for hits in search_all() {
+            assert_eq!(
+                ids_of(&hits),
+                (1..=6).collect::<Vec<_>>(),
+                "sealed points vanished"
+            );
+        }
+
+        // Re-upsert id 1 onto the query into the fresh tail; delete id 2.
+        upsert(vec![(1, [0.0, 1.0, 0.0, 0.0])]);
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::DeletePoints {
+                collection: "repo".into(),
+                ids: vec![2],
+            },
+        )
+        .unwrap();
+        let building = search_all();
+        for hits in &building {
+            assert_eq!(ids_of(hits), vec![1, 3, 4, 5, 6]);
+            assert!(
+                f32::from_bits(hits[0].1) < 1e-4,
+                "stale sealed copy of id 1 won"
+            );
+        }
+        assert_eq!(building[0], building[1]);
+        assert_eq!(building[0], building[2]);
+
+        // Mid-publish states stay exact: half the adjacency flushed (no entry
+        // point, still flat), then a complete index not yet promoted.
+        let (name, mut prepared) = {
+            let read = storage.backend.begin_read().unwrap();
+            storage
+                .named_vectors
+                .prepare_building_indices_limited_be(&read, "dense", 1)
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        assert_eq!(name, tail);
+        let total = prepared.point_ids.len();
+        for range in [0..total / 2, total / 2..total] {
+            let finalize = range.end == total;
+            storage
+                .with_write_backend(|w| {
+                    let cores = storage.named_vectors.cores_read().unwrap();
+                    let core = cores.get(&tail).unwrap();
+                    core.flush_prepared_index_chunk_be(w, &mut prepared, range.start, range.end)?;
+                    if finalize {
+                        core.finalize_prepared_index_entry_be(w, &prepared)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let read = storage.backend.begin_read().unwrap();
+            let indexed = storage
+                .named_vectors
+                .cores_read()
+                .unwrap()
+                .get(&tail)
+                .unwrap()
+                .has_index(&read)
+                .unwrap();
+            assert_eq!(indexed, finalize);
+            assert_eq!(search_all(), building, "mid-publish state changed results");
+        }
+
+        run_index_job(IndexJob {
+            collection: "repo".to_string(),
+            storage: Arc::downgrade(&storage),
+            spaces_to_check: vec!["dense".to_string()],
+            hnsw_config: hnsw.clone(),
+            flat_scan_threshold: 1_000,
+        });
+        assert!(!storage
+            .named_vectors
+            .building_segment_names("dense")
+            .contains(&tail));
+        assert_eq!(search_all(), building, "promotion changed results");
+
+        // An in-flight merge target is Building too, but unmarked: hidden.
+        let target = storage
+            .named_vectors
+            .create_merge_target_lsm(
+                &storage.named_vectors.begin_dense_layout_change(),
+                storage.collection_path(),
+                "dense",
+                hnsw,
+            )
+            .unwrap();
+        storage
+            .with_write_backend(|w| {
+                let cores = storage.named_vectors.cores_read().unwrap();
+                cores
+                    .get(&target)
+                    .unwrap()
+                    .insert_flat_be(w, &query, Some(99), None)
+                    .map_err(GraphError::from)?;
+                drop(cores);
+                storage.set_dense_vector_spaces_metadata_be(
+                    w,
+                    storage.named_vectors.list_dense_vector_spaces(),
+                )
+            })
+            .unwrap();
+        assert!(storage
+            .named_vectors
+            .building_segment_names("dense")
+            .contains(&target));
+        assert_eq!(search_all(), building, "merge target leaked into search");
+    }
+
+    /// A search whose read began before the index job sealed the tail still
+    /// finds the tail's points on every dense path. The seal commits the
+    /// sealed-tail marker and then flips the tail to `Building` in the
+    /// writer's layout; that read lists the flipped layout and has no marker
+    /// at its own snapshot.
+    #[test]
+    fn lsm_writer_read_begun_before_a_seal_finds_the_tail_on_every_dense_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        // 0 keeps upserts from queueing background index jobs.
+        config.vector_config.flat_scan_threshold = Some(0);
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: "repo".into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: 4,
+                        distance:
+                            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::UpsertPoints {
+                collection: "repo".into(),
+                points: (1..=6u128)
+                    .map(|id| ReplicatedPoint {
+                        id,
+                        vectors: HashMap::from([("dense".into(), vec![id as f32, 1.0, 0.0, 0.0])]),
+                        sparse_vectors: HashMap::new(),
+                        payload: HashMap::new(),
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        let storage = collections.get_collection("repo").unwrap();
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        let query = [0.0, 1.0, 0.0, 0.0];
+        // Ids from every LSM dense path for one read, sorted.
+        let found = |read: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>| {
+            let nv = &storage.named_vectors;
+            let ids = (1..=99u128).collect::<HashSet<_>>();
+            [
+                nv.dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                    read, "dense", &query, 10, None, true, None, None,
+                ),
+                nv.dense_search_candidate_set_filter_ef_be(
+                    read, "dense", &query, 10, &ids, true, None, None,
+                ),
+                nv.dense_search_candidate_ids_exact_be(
+                    read,
+                    "dense",
+                    &query,
+                    10,
+                    ids.iter().copied(),
+                    None,
+                ),
+            ]
+            .into_iter()
+            .map(|hits| {
+                let mut ids = hits
+                    .unwrap()
+                    .into_iter()
+                    .map(|v| v.get_id())
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids
+            })
+            .collect::<Vec<_>>()
+        };
+        let all = vec![(1..=6u128).collect::<Vec<_>>(); 3];
+
+        // A request that has its snapshot and has not listed the segments yet.
+        let before = storage.backend.begin_read().unwrap();
+        assert_eq!(found(&before), all, "before the seal");
+        assert!(seal_lsm_dense_tail(&storage, "dense", &hnsw).unwrap());
+        let after = storage.backend.begin_read().unwrap();
+        assert_eq!(found(&after), all, "a read begun after the seal");
+        assert_eq!(
+            found(&before),
+            all,
+            "a read begun before the seal lost the sealed tail's points"
+        );
+    }
+
+    /// The LSM open builds its snapshot from the metadata blob, and the
+    /// counts live in counter keys beside it. A collection that was just
+    /// opened must answer its stats with those counts, on a reader and on a
+    /// writer, before any commit or later refresh.
+    #[test]
+    fn lsm_metadata_snapshot_has_the_counts_right_after_an_open() {
+        use crate::helix_engine::storage_core::backend_any;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "stats_after_open_lsm");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let lsm = |role| StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role,
+        };
+        let config = Config::new(16, 64, 128, 1).with_storage_backend(lsm(LsmRole::Writer));
+        let reader_config = Config::new(16, 64, 128, 1).with_storage_backend(lsm(LsmRole::Reader));
+        let name = "stats_repo";
+        let counts = |manager: &CollectionManager| {
+            let stats = manager.collection_stats(name).unwrap();
+            (stats.node_count, stats.edge_count, stats.vector_count)
+        };
+
+        let written = {
+            let dir = TempDir::new().unwrap();
+            let writer =
+                Arc::new(CollectionManager::new(dir.path().to_path_buf(), config.clone()).unwrap());
+            apply_mutation(
+                &writer,
+                &config,
+                &ReplicatedMutation::CreateCollection {
+                    name: name.into(),
+                    vectors: HashMap::from([(
+                        "dense".into(),
+                        NamedVectorConfig {
+                            size: 4,
+                            distance:
+                                crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                            spindle:
+                                crate::helix_engine::vector_core::spindle::SpindleConfig::default(),
+                        },
+                    )]),
+                    sparse_vectors: HashMap::new(),
+                    hnsw_overrides: None,
+                },
+            )
+            .unwrap();
+            apply_mutation(
+                &writer,
+                &config,
+                &ReplicatedMutation::UpsertPoints {
+                    collection: name.into(),
+                    points: (1..=3u128)
+                        .map(|id| ReplicatedPoint {
+                            id,
+                            vectors: HashMap::from([(
+                                "dense".into(),
+                                vec![1.0, 0.0, 0.0, id as f32],
+                            )]),
+                            sparse_vectors: HashMap::new(),
+                            payload: HashMap::new(),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+            counts(&writer)
+        };
+        assert_ne!(written, (0, 0, 0), "the upsert is counted");
+
+        for config in [reader_config, config] {
+            let dir = TempDir::new().unwrap();
+            let manager = CollectionManager::new(dir.path().to_path_buf(), config).unwrap();
+            drop(manager.get_collection(name).unwrap());
+            assert_eq!(counts(&manager), written);
+        }
+    }
+
+    /// A nearest-M segment rebuilt by regraph from its stored vectors: recall
+    /// rises on clustered data, live rows keep their vectors and payloads,
+    /// deleted and superseded copies stay gone, a reader replica serves the
+    /// new segment after refresh, upserts and a delete racing a rebuild hold,
+    /// and the route path refuses, queues once, then does no work.
+    #[test]
+    fn regraph_rebuilds_nearest_m_segments_from_stored_vectors() {
+        use crate::helix_engine::storage_core::backend_any;
+        use crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole;
+        use crate::helix_engine::vector_core::vector_core::with_diverse_neighbors_for_test;
+        use crate::protocol::value::Value;
+        use rand::{Rng, SeedableRng};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "regraph_lsm");
+        let _enabled = EnvVarGuard::unset("HELIX_REGRAPH_ENABLED");
+        let _diverse = EnvVarGuard::unset("HELIX_HNSW_DIVERSE_NEIGHBORS");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let lsm = |role| StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role,
+        };
+        let mut config = Config::new(16, 64, 128, 1).with_storage_backend(lsm(LsmRole::Writer));
+        config.vector_config.flat_scan_threshold = Some(0);
+        let reader_config = Config::new(16, 64, 128, 1).with_storage_backend(lsm(LsmRole::Reader));
+        let (writer_dir, reader_dir) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let writer = Arc::new(
+            CollectionManager::new(writer_dir.path().to_path_buf(), config.clone()).unwrap(),
+        );
+        let reader = Arc::new(
+            CollectionManager::new(reader_dir.path().to_path_buf(), reader_config.clone()).unwrap(),
+        );
+        let name = "regraph_repo";
+        let dim = 32;
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: name.into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: dim,
+                        distance:
+                            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        let point = |id: u128, vector: &[f32]| ReplicatedPoint {
+            id,
+            vectors: HashMap::from([("dense".into(), vector.to_vec())]),
+            sparse_vectors: HashMap::new(),
+            payload: HashMap::from([("path".into(), Value::String(format!("src/f{id}.rs")))]),
+        };
+        let upsert = |points: Vec<ReplicatedPoint>| {
+            apply_mutation(
+                &writer,
+                &config,
+                &ReplicatedMutation::UpsertPoints {
+                    collection: name.into(),
+                    points,
+                },
+            )
+            .unwrap();
+        };
+
+        // Tight topic clusters, as in `diverse_neighbors_lift_recall_on_clustered_data`.
+        let unit = |v: Vec<f32>| {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.into_iter().map(|x| x / norm).collect::<Vec<f32>>()
+        };
+        let mut rng = rand::rngs::StdRng::seed_from_u64(41);
+        let centers: Vec<Vec<f32>> = (0..60)
+            .map(|_| unit((0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect()))
+            .collect();
+        let clustered = |rng: &mut rand::rngs::StdRng| {
+            let center = &centers[rng.random_range(0..centers.len())];
+            unit(
+                center
+                    .iter()
+                    .map(|c| c + 0.05 * rng.random_range(-1.0f32..1.0))
+                    .collect(),
+            )
+        };
+        let rows: Vec<Vec<f32>> = (0..3000).map(|_| clustered(&mut rng)).collect();
+        for (chunk_index, chunk) in rows.chunks(500).enumerate() {
+            upsert(
+                chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| point((chunk_index * 500 + i + 1) as u128, v))
+                    .collect(),
+            );
+        }
+        let mut live: HashMap<u128, Vec<f32>> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as u128 + 1, v.clone()))
+            .collect();
+        let storage = writer.get_collection(name).unwrap();
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        // The graph production built before diverse neighbors.
+        with_diverse_neighbors_for_test(None, || {
+            seal_lsm_dense_tail(&storage, "dense", &hnsw).unwrap();
+            run_index_job(IndexJob {
+                collection: name.into(),
+                storage: Arc::downgrade(&storage),
+                spaces_to_check: vec!["dense".into()],
+                hnsw_config: hnsw.clone(),
+                flat_scan_threshold: 1_000,
+            });
+        });
+        let indexed = |s: &HelixGraphStorage| {
+            s.named_vectors.list_dense_vector_spaces()["dense"]
+                .segments
+                .iter()
+                .filter(|segment| segment.role == DenseVectorSegmentRole::Indexed)
+                .map(|segment| segment.physical_name.clone())
+                .collect::<Vec<_>>()
+        };
+        let old = indexed(&storage);
+        assert_eq!(old.len(), 1, "{old:?}");
+        // id -> (vector bits, payload fields) of one segment's level 0.
+        let export = |segment: &str| {
+            let r = storage.backend.begin_read().unwrap();
+            let cores = storage.named_vectors.cores_read().unwrap();
+            cores[segment]
+                .export_level_zero(&r)
+                .unwrap()
+                .into_iter()
+                .map(|(id, v, fields)| (id, (v.iter().map(|x| x.to_bits()).collect(), fields)))
+                .collect::<HashMap<u128, (Vec<u32>, HashMap<String, Value>)>>()
+        };
+        let before_rows = export(&old[0]);
+        assert_eq!(before_rows.len(), 3000);
+        let search = |s: &HelixGraphStorage, query: &[f32], k: usize| {
+            let r = s.backend.begin_read().unwrap();
+            s.named_vectors
+                .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                    &r,
+                    "dense",
+                    query,
+                    k,
+                    None,
+                    false,
+                    None,
+                    Some(128),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|v| (v.get_id(), v.get_distance().to_bits()))
+                .collect::<Vec<_>>()
+        };
+        let mut qrng = rand::rngs::StdRng::seed_from_u64(43);
+        let queries: Vec<Vec<f32>> = (0..60)
+            .map(|_| {
+                let a = &rows[qrng.random_range(0..rows.len())];
+                let b = &rows[qrng.random_range(0..rows.len())];
+                unit(a.iter().zip(b).map(|(x, y)| x + y).collect())
+            })
+            .collect();
+        let recall = |live: &HashMap<u128, Vec<f32>>| {
+            queries
+                .iter()
+                .map(|query| {
+                    let mut scored: Vec<(u128, f32)> = live
+                        .iter()
+                        .map(|(id, v)| (*id, v.iter().zip(query).map(|(a, b)| a * b).sum()))
+                        .collect();
+                    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let truth: HashSet<u128> = scored[..10].iter().map(|(id, _)| *id).collect();
+                    search(&storage, query, 10)
+                        .iter()
+                        .filter(|(id, _)| truth.contains(id))
+                        .count() as f64
+                        / 10.0
+                })
+                .sum::<f64>()
+                / queries.len() as f64
+        };
+        // Measured before deletes: one of them leaves the graph flat-searched.
+        let before = recall(&live);
+        // The graph's entry point is deleted too: LSM deletes leave its key
+        // behind (`has_index` false), and the segment must still be rebuilt.
+        let entry = {
+            let r = storage.backend.begin_read().unwrap();
+            storage.named_vectors.cores_read().unwrap()[&old[0]]
+                .get_entry_point(&r)
+                .unwrap()
+                .get_id()
+        };
+        let reupserted = |id: u128| id == 11 || (20..=40).contains(&id);
+        let deleted: Vec<u128> = (1..=10)
+            .chain(41..=50)
+            .chain((!reupserted(entry)).then_some(entry))
+            .collect();
+
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::DeletePoints {
+                collection: name.into(),
+                ids: (1..=10).chain([entry]).collect(),
+            },
+        )
+        .unwrap();
+        let fresh_11 = clustered(&mut rng);
+        upsert(vec![point(11, &fresh_11)]);
+        live.retain(|id, _| *id > 10 && *id != entry);
+        live.insert(11, fresh_11.clone());
+
+        let replica = reader.get_collection(name).unwrap();
+        assert_eq!(indexed(&replica), old);
+        assert_eq!(
+            search(&replica, &queries[0], 10),
+            search(&storage, &queries[0], 10)
+        );
+
+        // Upserts (new ids and re-upserts) and a delete race a rebuild.
+        let racing: Vec<(u128, Vec<f32>)> = (5001..=5200u128)
+            .chain(20..=40)
+            .map(|id| (id, clustered(&mut rng)))
+            .collect();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let racer = {
+            let (writer, config, racing) = (Arc::clone(&writer), config.clone(), racing.clone());
+            std::thread::spawn(move || {
+                for (i, batch) in racing.chunks(11).enumerate() {
+                    apply_mutation(
+                        &writer,
+                        &config,
+                        &ReplicatedMutation::UpsertPoints {
+                            collection: name.into(),
+                            points: batch.iter().map(|(id, v)| point(*id, v)).collect(),
+                        },
+                    )
+                    .unwrap();
+                    if i == 0 {
+                        started_tx.send(()).unwrap();
+                    }
+                    if i == 1 {
+                        apply_mutation(
+                            &writer,
+                            &config,
+                            &ReplicatedMutation::DeletePoints {
+                                collection: name.into(),
+                                ids: (41..=50).collect(),
+                            },
+                        )
+                        .unwrap();
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        started_rx.recv().unwrap();
+        let gate = writer.point_mutation_gate(name);
+        let spaces = ["dense".to_string()];
+        let raced = regraph_collection(&storage, name, &spaces, &hnsw, &gate).unwrap();
+        racer.join().unwrap();
+        assert!(matches!(raced.state, "busy" | "done"), "{raced:?}");
+        live.extend(racing.iter().cloned());
+        live.retain(|id, _| !(41..=50).contains(id));
+        for (id, v) in racing.iter().chain([(11, fresh_11.clone())].iter()) {
+            let hit = search(&storage, v, 1);
+            assert_eq!(hit[0].0, *id, "upsert of {id} lost");
+            assert!(f32::from_bits(hit[0].1) < 1e-4, "stale copy of {id} served");
+        }
+
+        let quiet = regraph_collection(&storage, name, &spaces, &hnsw, &gate).unwrap();
+        assert_eq!(quiet.state, "done", "{quiet:?}");
+        let rebuilt = indexed(&storage);
+        assert_eq!(rebuilt.len(), 1, "{rebuilt:?}");
+        assert_ne!(
+            rebuilt,
+            old,
+            "raced {raced:?} quiet {quiet:?} layout {:?}",
+            storage.named_vectors.list_dense_vector_spaces()["dense"].segments
+        );
+        let superseded: HashSet<u128> = (1..=11).chain(20..=50).chain([entry]).collect();
+        let expected: HashMap<_, _> = before_rows
+            .into_iter()
+            .filter(|(id, _)| !superseded.contains(id))
+            .collect();
+        assert_eq!(quiet.points_rebuilt, expected.len(), "{quiet:?}");
+        assert!(
+            export(&rebuilt[0]) == expected,
+            "rebuilt rows differ from the live stored rows"
+        );
+        let after = recall(&live);
+        println!("regraph recall@10: before {before:.3} after {after:.3}; raced {raced:?}");
+        assert!(
+            after >= 0.65 && after >= before + 0.15,
+            "{before} -> {after}"
+        );
+
+        let served = |s: &HelixGraphStorage| {
+            for &id in &deleted {
+                assert!(
+                    search(s, &rows[id as usize - 1], 10)
+                        .iter()
+                        .all(|(hit, _)| *hit != id),
+                    "deleted {id} came back"
+                );
+            }
+            for id in (11..=11).chain(20..=40u128) {
+                assert!(
+                    !search(s, &rows[id as usize - 1], 10)
+                        .iter()
+                        .any(|(hit, d)| *hit == id && f32::from_bits(*d) < 1e-4),
+                    "superseded copy of {id} came back"
+                );
+            }
+        };
+        served(&storage);
+
+        // The replica opened on the old segment serves the new one after a refresh.
+        replica
+            .backend
+            .refresh_lsm_reader_with_poll_interval(Duration::from_millis(100))
+            .unwrap();
+        replica.refresh_reader_view_best_effort();
+        assert_eq!(indexed(&replica), rebuilt);
+        for query in &queries {
+            assert_eq!(search(&replica, query, 10), search(&storage, query, 10));
+        }
+        served(&replica);
+
+        // Route path: refusals, one queued job, then no work.
+        {
+            let _off = EnvVarGuard::set("HELIX_REGRAPH_ENABLED", "0");
+            assert!(matches!(
+                submit_collection_regraph(&writer, &config, name),
+                Err(RegraphRefusal::Disabled)
+            ));
+        }
+        assert!(matches!(
+            submit_collection_regraph(&reader, &reader_config, name),
+            Err(RegraphRefusal::ReaderReplica)
+        ));
+        storage.optimizer_running.store(true, Ordering::Release);
+        assert!(matches!(
+            submit_collection_regraph(&writer, &config, name),
+            Err(RegraphRefusal::InProgress("optimizing"))
+        ));
+        storage.optimizer_running.store(false, Ordering::Release);
+        assert_eq!(
+            submit_collection_regraph(&writer, &config, name)
+                .unwrap()
+                .state,
+            "queued"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let done = loop {
+            let status = regraph_status(&writer, name).unwrap();
+            if !matches!(status.state, "queued" | "running") {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "regraph never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(done.state, "done", "{done:?}");
+        // The segment the quiet regraph built is the current build's.
+        assert_eq!(
+            (done.segments_rebuilt, done.segments_current),
+            (0, 1),
+            "{done:?}"
+        );
+        let again = submit_collection_regraph(&writer, &config, name).unwrap();
+        assert_eq!(format!("{again:?}"), format!("{done:?}"));
+        assert_eq!(
+            format!("{:?}", regraph_status(&writer, name).unwrap()),
+            format!("{done:?}"),
+            "a done collection was queued again"
+        );
+        while storage.optimizer_running.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "index job never ended"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// A merge that died after writing part of its target leaves an
+    /// unmarked `Building` segment (hidden from search) holding copies of the
+    /// source's ids. Regraph must not count those copies as newer live ones:
+    /// every live id must still be served after the rebuild.
+    #[test]
+    fn regraph_keeps_ids_copied_into_a_hidden_building_segment() {
+        use crate::helix_engine::storage_core::backend_any;
+        use crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole;
+        use crate::helix_engine::vector_core::vector_core::with_diverse_neighbors_for_test;
+        use crate::protocol::value::Value;
+        use rand::{Rng, SeedableRng};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "regraph_orphan_lsm");
+        let _enabled = EnvVarGuard::unset("HELIX_REGRAPH_ENABLED");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let mut config =
+            Config::new(16, 64, 128, 1).with_storage_backend(StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Writer,
+            });
+        config.vector_config.flat_scan_threshold = Some(0);
+        let writer_dir = TempDir::new().unwrap();
+        let writer = Arc::new(
+            CollectionManager::new(writer_dir.path().to_path_buf(), config.clone()).unwrap(),
+        );
+        let name = "regraph_orphan";
+        let dim = 16;
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: name.into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: dim,
+                        distance:
+                            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let rows: Vec<Vec<f32>> = (0..1200)
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect())
+            .collect();
+        for (chunk_index, chunk) in rows.chunks(400).enumerate() {
+            apply_mutation(
+                &writer,
+                &config,
+                &ReplicatedMutation::UpsertPoints {
+                    collection: name.into(),
+                    points: chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| ReplicatedPoint {
+                            id: (chunk_index * 400 + i + 1) as u128,
+                            vectors: HashMap::from([("dense".into(), v.clone())]),
+                            sparse_vectors: HashMap::new(),
+                            payload: HashMap::from([(
+                                "path".into(),
+                                Value::String(format!("src/f{chunk_index}_{i}.rs")),
+                            )]),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        }
+        let storage = writer.get_collection(name).unwrap();
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        with_diverse_neighbors_for_test(None, || {
+            seal_lsm_dense_tail(&storage, "dense", &hnsw).unwrap();
+            run_index_job(IndexJob {
+                collection: name.into(),
+                storage: Arc::downgrade(&storage),
+                spaces_to_check: vec!["dense".into()],
+                hnsw_config: hnsw.clone(),
+                flat_scan_threshold: 1_000,
+            });
+        });
+        let roles = |s: &HelixGraphStorage| {
+            s.named_vectors.list_dense_vector_spaces()["dense"]
+                .segments
+                .iter()
+                .map(|segment| (segment.physical_name.clone(), segment.role))
+                .collect::<Vec<_>>()
+        };
+        let indexed: Vec<String> = roles(&storage)
+            .into_iter()
+            .filter(|(_, role)| *role == DenseVectorSegmentRole::Indexed)
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(indexed.len(), 1, "{:?}", roles(&storage));
+
+        // A merge of that segment that died in phase B: target allocated and
+        // persisted as `Building`, half its rows flushed, never published.
+        let exported = {
+            let r = storage.backend.begin_read().unwrap();
+            let cores = storage.named_vectors.cores_read().unwrap();
+            cores[&indexed[0]].export_level_zero(&r).unwrap()
+        };
+        let orphan = storage
+            .named_vectors
+            .create_merge_target_lsm(
+                &storage.named_vectors.begin_dense_layout_change(),
+                storage.collection_path(),
+                "dense",
+                hnsw.clone(),
+            )
+            .unwrap();
+        storage
+            .with_write_backend(|w| {
+                storage.set_dense_vector_spaces_metadata_be(
+                    w,
+                    storage.named_vectors.list_dense_vector_spaces(),
+                )
+            })
+            .unwrap();
+        let mut prepared = {
+            let permit =
+                crate::helix_engine::vector_core::vector_core::acquire_build_permit().unwrap();
+            VectorCore::build_hnsw_in_memory_owned_with_permit(
+                exported,
+                &hnsw,
+                crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                &permit,
+            )
+            .unwrap()
+        };
+        let half = prepared.point_ids.len() / 2;
+        storage
+            .with_write_backend(|w| {
+                storage
+                    .named_vectors
+                    .flush_merge_flat_chunk_be(w, &orphan, &mut prepared, 0, half)
+                    .map_err(GraphError::from)
+            })
+            .unwrap();
+        assert!(roles(&storage)
+            .iter()
+            .any(|(n, role)| *n == orphan && *role == DenseVectorSegmentRole::Building));
+
+        let search_top = |query: &[f32]| {
+            let r = storage.backend.begin_read().unwrap();
+            storage
+                .named_vectors
+                .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                    &r,
+                    "dense",
+                    query,
+                    1,
+                    None,
+                    false,
+                    None,
+                    Some(128),
+                )
+                .unwrap()
+                .first()
+                .map(|v| v.get_id())
+        };
+        let served = || {
+            (1..=rows.len() as u128)
+                .filter(|id| search_top(&rows[*id as usize - 1]) == Some(*id))
+                .count()
+        };
+        let before = served();
+        let gate = writer.point_mutation_gate(name);
+        let status =
+            regraph_collection(&storage, name, &["dense".to_string()], &hnsw, &gate).unwrap();
+        let after = served();
+        println!(
+            "regraph orphan: served before {before}/{} after {after}/{}; {status:?}; layout {:?}",
+            rows.len(),
+            rows.len(),
+            roles(&storage)
+        );
+        let rebuilt = roles(&storage)
+            .into_iter()
+            .find(|(_, role)| *role == DenseVectorSegmentRole::Indexed)
+            .map(|(name, _)| name)
+            .unwrap();
+        let kept: HashSet<u128> = {
+            let r = storage.backend.begin_read().unwrap();
+            let cores = storage.named_vectors.cores_read().unwrap();
+            cores[&rebuilt]
+                .export_level_zero(&r)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect()
+        };
+        assert_eq!(kept.len(), rows.len(), "{status:?}");
+        // Top-1 self-hits vary by up to ~1.5% between graph builds; a lost
+        // half does not.
+        assert!(
+            after + rows.len() / 20 >= before,
+            "regraph lost live points: {before} -> {after}"
+        );
+    }
+
+    /// A requested regraph leaves a segment the current build made alone: one
+    /// built without diverse neighbours is rebuilt once, one built as builds
+    /// are now is not, and without the skip both are rebuilt.
+    #[test]
+    fn regraph_leaves_the_segments_the_current_build_made() {
+        use crate::helix_engine::storage_core::backend_any;
+        use crate::helix_engine::vector_core::vector_core::with_diverse_neighbors_for_test;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "regraph_current_lsm");
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        let spaces = ["dense".to_string()];
+        let mut seen = Vec::new();
+        for (name, as_now) in [
+            ("regraph_old_build", false),
+            ("regraph_current_build", true),
+        ] {
+            let store: Arc<dyn slatedb::object_store::ObjectStore> =
+                Arc::new(slatedb::object_store::memory::InMemory::new());
+            let _store = backend_any::set_lsm_test_object_store(store);
+            let dir = TempDir::new().unwrap();
+            let build = || indexed_lsm_collection(dir.path(), name, 16, 600);
+            let (writer, _config, storage, _rows) = if as_now {
+                build()
+            } else {
+                with_diverse_neighbors_for_test(None, build)
+            };
+            let gate = writer.point_mutation_gate(name);
+            let regraph = |skip_current| {
+                let status =
+                    regraph_segments(&storage, name, &spaces, &hnsw, &gate, skip_current).unwrap();
+                (status.segments_rebuilt, status.segments_current)
+            };
+            seen.push((name, [regraph(true), regraph(true), regraph(false)]));
+        }
+        assert_eq!(
+            seen,
+            [
+                ("regraph_old_build", [(1, 0), (0, 1), (1, 0)]),
+                ("regraph_current_build", [(0, 1), (0, 1), (1, 0)]),
+            ]
+        );
+    }
+
+    /// An LSM writer collection `name` with `n` random `dim`-wide rows (ids
+    /// 1..=n, payload `path`), sealed and indexed into one HNSW segment.
+    fn indexed_lsm_collection(
+        dir: &std::path::Path,
+        name: &str,
+        dim: usize,
+        n: usize,
+    ) -> (
+        Arc<CollectionManager>,
+        Config,
+        Arc<HelixGraphStorage>,
+        Vec<Vec<f32>>,
+    ) {
+        let (writer, config, storage, rows) = sealed_lsm_collection(dir, name, &["dense"], dim, n);
+        run_index_job(IndexJob {
+            collection: name.into(),
+            storage: Arc::downgrade(&storage),
+            spaces_to_check: vec!["dense".into()],
+            hnsw_config: HNSWConfig::new(Some(16), Some(64), Some(128)),
+            flat_scan_threshold: 1_000,
+        });
+        (writer, config, storage, rows)
+    }
+
+    /// `indexed_lsm_collection` before its index job: the same rows in each of
+    /// `spaces`, every space sealed into one `Building` segment.
+    fn sealed_lsm_collection(
+        dir: &std::path::Path,
+        name: &str,
+        spaces: &[&str],
+        dim: usize,
+        n: usize,
+    ) -> (
+        Arc<CollectionManager>,
+        Config,
+        Arc<HelixGraphStorage>,
+        Vec<Vec<f32>>,
+    ) {
+        use rand::{Rng, SeedableRng};
+        let mut config =
+            Config::new(16, 64, 128, 1).with_storage_backend(StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Writer,
+            });
+        config.vector_config.flat_scan_threshold = Some(0);
+        let writer = Arc::new(CollectionManager::new(dir.to_path_buf(), config.clone()).unwrap());
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: name.into(),
+                vectors: spaces
+                    .iter()
+                    .map(|space| {
+                        (
+                            space.to_string(),
+                            NamedVectorConfig {
+                                size: dim,
+                                distance: DistanceMetric::Cosine,
+                                spindle: Default::default(),
+                            },
+                        )
+                    })
+                    .collect(),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let rows: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect())
+            .collect();
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::UpsertPoints {
+                collection: name.into(),
+                points: rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| ReplicatedPoint {
+                        id: i as u128 + 1,
+                        vectors: spaces
+                            .iter()
+                            .map(|space| (space.to_string(), v.clone()))
+                            .collect(),
+                        sparse_vectors: HashMap::new(),
+                        payload: HashMap::from([(
+                            "path".into(),
+                            crate::protocol::value::Value::String(format!("src/f{i}.rs")),
+                        )]),
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        let storage = writer.get_collection(name).unwrap();
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        // An index job queued by the create would build the sealed segments.
+        wait_for_index_executor(name);
+        for space in spaces {
+            seal_lsm_dense_tail(&storage, space, &hnsw).unwrap();
+        }
+        (writer, config, storage, rows)
+    }
+
+    /// Waits until the index executor holds no job for collection `name`.
+    fn wait_for_index_executor(name: &str) {
+        let busy = || {
+            let state = INDEX_EXECUTOR.state.0.lock().unwrap();
+            state.queued_jobs.contains_key(name) || state.active.contains(name)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while busy() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!busy(), "index executor still holds a job for {name}");
+    }
+
+    fn dense_layout(
+        storage: &HelixGraphStorage,
+    ) -> Vec<(
+        String,
+        crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole,
+    )> {
+        storage.named_vectors.list_dense_vector_spaces()["dense"]
+            .segments
+            .iter()
+            .map(|segment| (segment.physical_name.clone(), segment.role))
+            .collect()
+    }
+
+    fn sole_indexed_segment(storage: &HelixGraphStorage) -> String {
+        use crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole;
+        let indexed: Vec<String> = dense_layout(storage)
+            .into_iter()
+            .filter(|(_, role)| *role == DenseVectorSegmentRole::Indexed)
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(indexed.len(), 1, "{:?}", dense_layout(storage));
+        indexed[0].clone()
+    }
+
+    /// A merge's prepared graph over every row of `segment`.
+    fn prepared_merge_of(
+        storage: &HelixGraphStorage,
+        segment: &str,
+    ) -> crate::helix_engine::vector_core::vector_core::PreparedIndex {
+        let exported = {
+            let r = storage.backend.begin_read().unwrap();
+            storage.named_vectors.cores_read().unwrap()[segment]
+                .export_level_zero(&r)
+                .unwrap()
+        };
+        let permit = acquire_build_permit().unwrap();
+        VectorCore::build_hnsw_in_memory_owned_with_permit(
+            exported,
+            &HNSWConfig::new(Some(16), Some(64), Some(128)),
+            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+            &permit,
+        )
+        .unwrap()
+    }
+
+    /// Every key and value under a dense segment's keyspace.
+    fn segment_dump(
+        storage: &HelixGraphStorage,
+        physical_name: &str,
+    ) -> Vec<(usize, Vec<u8>, Vec<u8>)> {
+        use crate::helix_engine::storage_core::backend::{KeyRange, SegmentDb};
+        let r = storage.backend.begin_read().unwrap();
+        let mut rows = Vec::new();
+        for (i, db) in [
+            SegmentDb::Vectors,
+            SegmentDb::VectorData,
+            SegmentDb::HnswOut,
+            SegmentDb::HnswNeighbors,
+            SegmentDb::Ordinals,
+            SegmentDb::IvfCentroids,
+            SegmentDb::IvfPostings,
+            SegmentDb::SimHash,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            storage
+                .backend
+                .scan(
+                    &r,
+                    Namespace::Segment { physical_name, db },
+                    KeyRange::all(),
+                    |k, v| {
+                        rows.push((i, k.to_vec(), v.to_vec()));
+                        true
+                    },
+                )
+                .unwrap();
+        }
+        rows
+    }
+
+    /// Merge targets group-commit their chunks: the same prepared graph
+    /// written durably per chunk and group-committed gives byte-identical
+    /// segments, and each chunk stops waiting for a WAL flush (prod cadence
+    /// and chunk budgets). Merges and regraph share `write_merge_target`.
+    #[test]
+    fn merge_target_group_commit_writes_the_same_segment_without_per_chunk_flushes() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "merge_group_commit_lsm");
+        let _flush = EnvVarGuard::set("HELIX_LSM_FLUSH_INTERVAL_MS", "500");
+        let _flat = EnvVarGuard::set("HELIX_MERGE_FLAT_BYTE_BUDGET", "524288");
+        let _index = EnvVarGuard::set("HELIX_MERGE_INDEX_BYTE_BUDGET", "524288");
+        let _edges = EnvVarGuard::set("HELIX_MERGE_INDEX_HNSW_EDGE_BUDGET", "1024");
+        let _group = EnvVarGuard::unset("HELIX_LSM_GROUP_COMMIT");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store =
+            crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store(store);
+        let dir = TempDir::new().unwrap();
+        let (_writer, _config, storage, _rows) =
+            indexed_lsm_collection(dir.path(), "merge_group_commit", 64, 600);
+        let prepared = prepared_merge_of(&storage, &sole_indexed_segment(&storage));
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        // (target, write ms, mean chunk ms, chunks, group_flush ms)
+        let write = |prepared| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let started = std::time::Instant::now();
+            let target = metrics::with_local_recorder(&recorder, || {
+                write_merge_target(&storage, "dense", &hnsw, prepared)
+            })
+            .unwrap();
+            let write_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let (mut sum, mut count, mut flush_ms) = (0.0, 0.0, 0.0);
+            for line in handle.render().lines() {
+                let value = || line.rsplit(' ').next().unwrap().parse::<f64>().unwrap();
+                if line.starts_with("helix_dense_merge_publish_chunk_ms_sum") {
+                    sum += value();
+                } else if line.starts_with("helix_dense_merge_publish_chunk_ms_count") {
+                    count += value();
+                } else if line.starts_with("helix_dense_merge_publish_phase_ms_sum")
+                    && line.contains("group_flush")
+                {
+                    flush_ms += value();
+                }
+            }
+            (target, write_ms, sum / count, count, flush_ms)
+        };
+        let durable = {
+            let _off = EnvVarGuard::set("HELIX_LSM_GROUP_COMMIT", "0");
+            write(prepared.clone())
+        };
+        let grouped = write(prepared);
+        println!(
+            "merge target write, {} chunks: durable chunks {:.1} ms each, {:.0} ms total; \
+             group commit {:.2} ms each, {:.0} ms total ({:.0} ms group_flush)",
+            durable.3, durable.2, durable.1, grouped.2, grouped.1, grouped.4
+        );
+        assert_eq!(durable.3, grouped.3);
+        assert!(durable.3 >= 10.0, "{durable:?}");
+        let dump = segment_dump(&storage, &durable.0);
+        assert!(dump.len() > 600);
+        assert!(
+            segment_dump(&storage, &grouped.0) == dump,
+            "the group-committed target differs"
+        );
+        assert!(
+            grouped.2 * 10.0 < durable.2 && grouped.1 * 5.0 < durable.1,
+            "durable {durable:?} grouped {grouped:?}"
+        );
+    }
+
+    /// A delete commits its chunks buffered and one flush makes them durable
+    /// before it returns: it stops waiting out the WAL flush interval once per
+    /// chunk, and writes no more WAL objects than a durable commit per chunk.
+    #[test]
+    fn point_write_flush_makes_delete_chunks_durable_without_a_wal_tick_each() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "delete_flush_lsm");
+        let _interval = EnvVarGuard::set("HELIX_LSM_FLUSH_INTERVAL_MS", "500");
+        let _chunk = EnvVarGuard::unset("HELIX_DELETE_APPLY_CHUNK");
+        let _min_chunk = EnvVarGuard::unset("HELIX_DELETE_APPLY_MIN_CHUNK");
+        let _upsert_chunk = EnvVarGuard::unset("HELIX_UPSERT_APPLY_CHUNK");
+        let _switch = EnvVarGuard::unset("HELIX_LSM_FLUSH_POINT_WRITES");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store(
+            Arc::clone(&store),
+        );
+        let dir = TempDir::new().unwrap();
+        let name = "delete_flush";
+        let (writer, config, storage, _rows) = indexed_lsm_collection(dir.path(), name, 16, 1_100);
+        let wal_objects = || {
+            use futures::TryStreamExt;
+            futures::executor::block_on(store.list(None).try_collect::<Vec<_>>())
+                .unwrap()
+                .iter()
+                .filter(|object| object.location.as_ref().contains("/wal/"))
+                .count()
+        };
+        // (elapsed, WAL objects written) for a delete of 512 ids: eight chunks.
+        let delete = |first: u128| {
+            let before = wal_objects();
+            let started = std::time::Instant::now();
+            apply_mutation(
+                &writer,
+                &config,
+                &ReplicatedMutation::DeletePoints {
+                    collection: name.into(),
+                    ids: (first..first + 512).collect(),
+                },
+            )
+            .unwrap();
+            (started.elapsed(), wal_objects() - before)
+        };
+        let waited = {
+            let _off = EnvVarGuard::set("HELIX_LSM_FLUSH_POINT_WRITES", "0");
+            delete(1)
+        };
+        // The delete above returned on a WAL tick, so the next tick is a whole
+        // interval away: a WAL object written by this one is its own flush.
+        let flushed = delete(513);
+        println!(
+            "delete of 512 ids: a durable commit per chunk {:?} and {} WAL objects; \
+             buffered chunks and one flush {:?} and {} WAL objects",
+            waited.0, waited.1, flushed.0, flushed.1
+        );
+        let read = storage.backend.begin_read().unwrap();
+        for id in [1u128, 512, 513, 1_024] {
+            assert!(storage.get_node_be(&read, &id).is_err(), "{id} is deleted");
+        }
+        assert!(storage.get_node_be(&read, &1_025).is_ok());
+        assert!(
+            waited.0 >= std::time::Duration::from_millis(2_500),
+            "{waited:?}"
+        );
+        assert!(
+            flushed.0 * 5 < waited.0,
+            "waited {waited:?}, flushed {flushed:?}"
+        );
+        assert!(waited.1 >= 8, "a WAL object per durable chunk: {waited:?}");
+        assert!(
+            flushed.1 >= 1 && flushed.1 <= waited.1,
+            "WAL objects: waited {waited:?}, flushed {flushed:?}"
+        );
+    }
+
+    /// A merge or regraph that dies after its buffered target chunks, before
+    /// the group-commit flush, leaves phase A's marked target; after a
+    /// restart the index job reaps it. Nothing deleted comes back and the
+    /// source keeps every live row.
+    #[test]
+    fn unflushed_merge_target_is_reaped_after_a_crash() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "merge_crash_lsm");
+        let _group = EnvVarGuard::unset("HELIX_LSM_GROUP_COMMIT");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store =
+            crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store(store);
+        let name = "merge_crash";
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        let dir = TempDir::new().unwrap();
+        let (writer, config, storage, rows) = indexed_lsm_collection(dir.path(), name, 16, 1200);
+        let source = sole_indexed_segment(&storage);
+        let mut prepared = prepared_merge_of(&storage, &source);
+        let deleted: Vec<u128> = (1..=20).collect();
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::DeletePoints {
+                collection: name.into(),
+                ids: deleted.clone(),
+            },
+        )
+        .unwrap();
+        storage.backend.flush_durable().unwrap();
+
+        // `write_merge_target` up to its final flush: phase A durable and
+        // marked, then every row and edge (deleted ones included) buffered.
+        let target = storage
+            .named_vectors
+            .create_merge_target_lsm(
+                &storage.named_vectors.begin_dense_layout_change(),
+                storage.collection_path(),
+                "dense",
+                hnsw.clone(),
+            )
+            .unwrap();
+        storage
+            .with_write_backend(|w| {
+                storage
+                    .named_vectors
+                    .mark_merge_target_be(w, &target)
+                    .map_err(GraphError::from)?;
+                storage.set_dense_vector_spaces_metadata_be(
+                    w,
+                    storage.named_vectors.list_dense_vector_spaces(),
+                )
+            })
+            .unwrap();
+        let total = prepared.point_ids.len();
+        storage
+            .with_write_backend_buffered(|w| {
+                let nv = &storage.named_vectors;
+                nv.flush_merge_flat_chunk_be(w, &target, &mut prepared, 0, total)?;
+                nv.flush_merge_index_chunk_be(w, &target, &mut prepared, 0, total)?;
+                nv.finalize_merge_index_be(w, &target, &prepared)
+                    .map_err(GraphError::from)
+            })
+            .unwrap();
+        // Rows of `segment`, or None once it is gone.
+        let rows_in = |storage: &HelixGraphStorage, segment: &str| {
+            let r = storage.backend.begin_read().unwrap();
+            storage
+                .named_vectors
+                .cores_read()
+                .unwrap()
+                .get(segment)
+                .map(|core| core.level_zero_count(&r).unwrap())
+        };
+        assert_eq!(rows_in(&storage, &target), Some(1200));
+
+        // Crash and restart on a fresh pod.
+        let restart = |writer: Arc<CollectionManager>, storage: Arc<HelixGraphStorage>| {
+            drop(storage);
+            drop(writer);
+            let dir = TempDir::new().unwrap();
+            let writer =
+                Arc::new(CollectionManager::new(dir.path().to_path_buf(), config.clone()).unwrap());
+            let storage = writer.get_collection(name).unwrap();
+            (writer, storage, dir)
+        };
+        let (_writer, storage, _dir2) = restart(writer, storage);
+        // None if the reopen's own maintenance job reaped it first.
+        let survived = rows_in(&storage, &target);
+        let index_job = |storage: &Arc<HelixGraphStorage>| {
+            run_index_job(IndexJob {
+                collection: name.into(),
+                storage: Arc::downgrade(storage),
+                spaces_to_check: vec!["dense".into()],
+                hnsw_config: hnsw.clone(),
+                flat_scan_threshold: 1_000,
+            })
+        };
+        index_job(&storage);
+        let after = dense_layout(&storage);
+        assert!(
+            !after.iter().any(|(segment, _)| *segment == target),
+            "{after:?}"
+        );
+        assert_eq!(sole_indexed_segment(&storage), source);
+        let live: HashSet<u128> = {
+            let r = storage.backend.begin_read().unwrap();
+            storage.named_vectors.cores_read().unwrap()[&source]
+                .export_level_zero(&r)
+                .unwrap()
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect()
+        };
+        assert_eq!(live, (21..=1200).collect::<HashSet<u128>>());
+        let resurrected: Vec<u128> = deleted
+            .iter()
+            .copied()
+            .filter(|id| {
+                let r = storage.backend.begin_read().unwrap();
+                storage
+                    .named_vectors
+                    .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                        &r,
+                        "dense",
+                        &rows[*id as usize - 1],
+                        3,
+                        None,
+                        false,
+                        None,
+                        Some(128),
+                    )
+                    .unwrap()
+                    .iter()
+                    .any(|hit| hit.get_id() == *id)
+            })
+            .collect();
+        assert!(resurrected.is_empty(), "{resurrected:?}");
+
+        // A full write is durable when it returns: a reader replica, which
+        // sees only flushed data, has every row of the unswapped target.
+        let written = write_merge_target(
+            &storage,
+            "dense",
+            &hnsw,
+            prepared_merge_of(&storage, &source),
+        )
+        .unwrap();
+        let reader_dir = TempDir::new().unwrap();
+        let reader = CollectionManager::new(
+            reader_dir.path().to_path_buf(),
+            Config::new(16, 64, 128, 1).with_storage_backend(StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Reader,
+            }),
+        )
+        .unwrap();
+        let replica = reader.get_collection(name).unwrap();
+        println!(
+            "unflushed target kept {survived:?}/1200 rows across the crash; the written one {:?} on a replica",
+            rows_in(&replica, &written)
+        );
+        assert_eq!(rows_in(&replica, &written), Some(1180));
+    }
+
+    /// A replica query pinned before a merge swap keeps searching the source
+    /// after another read's reconcile has moved the shared segment list to
+    /// the target, which has no rows at its snapshot, and after the
+    /// reconciles that follow, for as long as the replica keeps the source's
+    /// core. Past that it loses the source and counts it as its own loss,
+    /// not as a segment the metadata names and nothing can serve. One source
+    /// is swapped for its rebuilt copy, as regraph does; a merge of several
+    /// publishes through the same swap.
+    #[test]
+    fn lsm_reader_read_pinned_before_a_merge_swap_keeps_its_points() {
+        use crate::helix_engine::vector_core::named_vectors::PreparedMerge;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "reader_pinned_before_merge");
+        let _poll = EnvVarGuard::set("HELIX_LSM_READER_MANIFEST_POLL_MS", "60000");
+        let _pinned = EnvVarGuard::set("HELIX_LSM_READER_SNAPSHOT_READS", "1");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store =
+            crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store(store);
+        let name = "pinned_before_merge";
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        let dir = TempDir::new().unwrap();
+        let (_writer, _config, storage, rows) = indexed_lsm_collection(dir.path(), name, 16, 600);
+        let source = sole_indexed_segment(&storage);
+
+        let reader_dir = TempDir::new().unwrap();
+        let reader = CollectionManager::new(
+            reader_dir.path().to_path_buf(),
+            Config::new(16, 64, 128, 1).with_storage_backend(StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Reader,
+            }),
+        )
+        .unwrap();
+        let replica = reader.get_collection(name).unwrap();
+        replica
+            .named_vectors
+            .set_retired_core_grace(Duration::from_secs(3600));
+        let search = |read: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>| {
+            let mut ids = replica
+                .named_vectors
+                .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                    read,
+                    "dense",
+                    &rows[0],
+                    10,
+                    None,
+                    false,
+                    None,
+                    Some(128),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.get_id())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        };
+        // Pinned on the source, as a query in its filter stage is.
+        let before_merge = replica.backend.begin_read().unwrap();
+        let expected = search(&before_merge);
+        assert_eq!(expected.len(), 10, "{expected:?}");
+
+        let merge = PreparedMerge {
+            merge_targets: vec![source.clone()],
+            prepared_index: prepared_merge_of(&storage, &source),
+        };
+        run_chunked_merge_publish(&storage, "dense", &hnsw, merge, None).unwrap();
+
+        // The view moves (a reopen stands in for the poll), then another
+        // read arrives and reconciles.
+        replica
+            .backend
+            .refresh_lsm_reader_with_poll_interval(Duration::from_secs(60))
+            .unwrap();
+        drop(reader.get_collection(name).unwrap());
+        let layout = dense_layout(&replica);
+        assert!(
+            !layout.iter().any(|(segment, _)| *segment == source),
+            "the shared segment list did not follow the view: {layout:?}"
+        );
+        let after_merge = replica.backend.begin_read().unwrap();
+        assert_eq!(search(&after_merge).len(), 10, "the target is not searched");
+        assert_eq!(
+            search(&before_merge),
+            expected,
+            "a read pinned before the merge searched the segment list of a newer view"
+        );
+
+        // Two more reconciles: the source is off both the list and the one
+        // before it, and its core stays for the grace.
+        replica.refresh_reader_view_best_effort();
+        replica.refresh_reader_view_best_effort();
+        assert_eq!(
+            search(&before_merge),
+            expected,
+            "a later reconcile took the source's core from a read inside the grace"
+        );
+
+        // Past the grace the core goes with the next reconcile. The search
+        // is a filtered one: those run their segments on the calling thread,
+        // where the recorder is.
+        replica.named_vectors.set_retired_core_grace(Duration::ZERO);
+        replica.refresh_reader_view_best_effort();
+        use crate::helix_engine::vector_core::named_vectors::{
+            take_missing_segment_note, take_retired_segment_sightings,
+        };
+        // Whatever an earlier test of this process left under the same names.
+        let _ = take_retired_segment_sightings(name, &source);
+        let _ = take_missing_segment_note(name, "dense", &source);
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let any = |_: u128| true;
+        let late = metrics::with_local_recorder(&recorder, || {
+            replica
+                .named_vectors
+                .dense_search_with_id_filter_ef_be(
+                    &before_merge,
+                    "dense",
+                    &rows[0],
+                    10,
+                    Some(&[any][..]),
+                    false,
+                    None,
+                    Some(128),
+                )
+                .unwrap()
+        });
+        assert_eq!(late.len(), 0, "the source was searched past its grace");
+        let counted = handle.render();
+        assert!(
+            counted.contains("helix_dense_read_segment_list_total{outcome=\"own_core_missing\"} 1"),
+            "{counted}"
+        );
+        assert!(
+            !counted.contains("helix_dense_segment_missing_total"),
+            "{counted}"
+        );
+        // The read searched its own list and lost one segment of it. A list
+        // that had dropped the segment beforehand would count one or the other.
+        assert!(
+            counted.contains("helix_dense_read_segment_list_total{outcome=\"own\"} 1"),
+            "{counted}"
+        );
+
+        // Every other dense path loses the source the same way, each at its
+        // own place, and none warns of a segment the metadata names and
+        // nothing can serve. The unfiltered and the candidate-set search run
+        // their segments on worker threads, so both registries are asked.
+        let vectors = &replica.named_vectors;
+        let ids: std::collections::HashSet<u128> = expected.iter().copied().collect();
+        let mut seen = Vec::new();
+        let mut ask = |path: &'static str| {
+            seen.push((
+                path,
+                take_retired_segment_sightings(name, &source),
+                take_missing_segment_note(name, "dense", &source),
+            ));
+        };
+        ask("filtered search");
+        assert_eq!(search(&before_merge).len(), 0, "unfiltered search");
+        ask("unfiltered search");
+        let hits = vectors
+            .dense_search_candidate_set_filter_ef_be(
+                &before_merge,
+                "dense",
+                &rows[0],
+                10,
+                &ids,
+                false,
+                None,
+                Some(128),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 0, "candidate-set search");
+        ask("candidate-set search");
+        let hits = vectors
+            .dense_search_candidate_ids_exact_be(
+                &before_merge,
+                "dense",
+                &rows[0],
+                10,
+                expected.iter().copied(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 0, "exact-id search");
+        ask("exact-id search");
+        // The scan declines at a segment without a sidecar; the source comes
+        // before that one.
+        let _ = vectors.dense_search_broad_prefilter_scan_be::<fn(u128) -> bool>(
+            &before_merge,
+            "dense",
+            &rows[0],
+            10,
+            &ids,
+            None,
+            None,
+        );
+        ask("broad prefilter scan");
+        assert_eq!(
+            seen,
+            [
+                ("filtered search", vec![("search", true)], false),
+                ("unfiltered search", vec![("search", false)], false),
+                (
+                    "candidate-set search",
+                    vec![("candidate_filter_search", false)],
+                    false
+                ),
+                ("exact-id search", vec![("exact_id_search", true)], false),
+                (
+                    "broad prefilter scan",
+                    vec![("broad_prefilter_scan", true)],
+                    false
+                ),
+            ],
+            "per path: the sites that found the source retired and without a core (true: on \
+             the calling thread), then whether the missing-segment warning fired"
+        );
+    }
+
+    /// A writer search whose read began before a merge target was written
+    /// still finds the merged points after the swap. The publish swaps the
+    /// target in for its sources in the writer's layout; that read lists the
+    /// target, which has no rows at its snapshot, and no longer lists the
+    /// sources, which still hold the points at its snapshot.
+    #[test]
+    fn lsm_writer_read_begun_before_a_merge_swap_finds_the_merged_points() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        // 0 keeps upserts from queueing background index jobs.
+        config.vector_config.flat_scan_threshold = Some(0);
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: "repo".into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: 4,
+                        distance:
+                            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::UpsertPoints {
+                collection: "repo".into(),
+                points: (1..=6u128)
+                    .map(|id| ReplicatedPoint {
+                        id,
+                        vectors: HashMap::from([("dense".into(), vec![id as f32, 1.0, 0.0, 0.0])]),
+                        sparse_vectors: HashMap::new(),
+                        payload: HashMap::new(),
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        let storage = collections.get_collection("repo").unwrap();
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        let query = [0.0, 1.0, 0.0, 0.0];
+        // Ids from every LSM dense path for one read, sorted.
+        let found = |read: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>| {
+            let nv = &storage.named_vectors;
+            let ids = (1..=99u128).collect::<HashSet<_>>();
+            [
+                nv.dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                    read, "dense", &query, 10, None, true, None, None,
+                ),
+                nv.dense_search_candidate_set_filter_ef_be(
+                    read, "dense", &query, 10, &ids, true, None, None,
+                ),
+                nv.dense_search_candidate_ids_exact_be(
+                    read,
+                    "dense",
+                    &query,
+                    10,
+                    ids.iter().copied(),
+                    None,
+                ),
+            ]
+            .into_iter()
+            .map(|hits| {
+                let mut ids = hits
+                    .unwrap()
+                    .into_iter()
+                    .map(|v| v.get_id())
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids
+            })
+            .collect::<Vec<_>>()
+        };
+        let all = vec![(1..=6u128).collect::<Vec<_>>(); 3];
+
+        // The points in one published segment: seal the tail and promote it.
+        let source = storage
+            .named_vectors
+            .mutable_dense_segment_name("dense")
+            .unwrap();
+        assert!(seal_lsm_dense_tail(&storage, "dense", &hnsw).unwrap());
+        run_index_job(IndexJob {
+            collection: "repo".to_string(),
+            storage: Arc::downgrade(&storage),
+            spaces_to_check: vec!["dense".to_string()],
+            hnsw_config: hnsw.clone(),
+            flat_scan_threshold: 1_000,
+        });
+        assert!(!storage
+            .named_vectors
+            .building_segment_names("dense")
+            .contains(&source));
+
+        // A request that has its snapshot and has not listed the segments yet.
+        let before = storage.backend.begin_read().unwrap();
+        assert_eq!(found(&before), all, "before the merge");
+
+        // The merge: a target that holds the source's rows, then the swap.
+        let target = storage
+            .named_vectors
+            .create_merge_target_lsm(
+                &storage.named_vectors.begin_dense_layout_change(),
+                storage.collection_path(),
+                "dense",
+                hnsw,
+            )
+            .unwrap();
+        storage
+            .with_write_backend(|w| {
+                let cores = storage.named_vectors.cores_read().unwrap();
+                let core = cores.get(&target).unwrap();
+                for id in 1..=6u128 {
+                    core.insert_flat_be(w, &[id as f32, 1.0, 0.0, 0.0], Some(id), None)
+                        .map_err(GraphError::from)?;
+                }
+                drop(cores);
+                storage.set_dense_vector_spaces_metadata_be(
+                    w,
+                    storage.named_vectors.list_dense_vector_spaces(),
+                )
+            })
+            .unwrap();
+        let swap_read = storage.backend.begin_read().unwrap();
+        storage
+            .named_vectors
+            .publish_merge_target_be(&swap_read, "dense", &target, &[source.clone()])
+            .unwrap();
+        drop(swap_read);
+        storage
+            .with_write_backend(|w| {
+                storage.set_dense_vector_spaces_metadata_be(
+                    w,
+                    storage.named_vectors.list_dense_vector_spaces(),
+                )
+            })
+            .unwrap();
+
+        let after = storage.backend.begin_read().unwrap();
+        assert_eq!(found(&after), all, "a read begun after the swap");
+        assert_eq!(
+            found(&before),
+            all,
+            "a read begun before the merge target was written lost the merged points"
+        );
+    }
+
+    /// Points `1..=6` with vectors `[id, second, 0, 0]` in collection `name`.
+    fn upsert_six_points(
+        collections: &Arc<CollectionManager>,
+        config: &Config,
+        name: &str,
+        second: f32,
+    ) {
+        apply_mutation(
+            collections,
+            config,
+            &ReplicatedMutation::UpsertPoints {
+                collection: name.into(),
+                points: (1..=6u128)
+                    .map(|id| ReplicatedPoint {
+                        id,
+                        vectors: HashMap::from([(
+                            "dense".into(),
+                            vec![id as f32, second, 0.0, 0.0],
+                        )]),
+                        sparse_vectors: HashMap::new(),
+                        payload: HashMap::new(),
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// A writer over an in-memory LSM store whose collection `name` holds the
+    /// six points in its mutable tail. Its upserts queue no index job.
+    fn six_point_lsm_writer(
+        name: &str,
+    ) -> (
+        TempDir,
+        Config,
+        Arc<CollectionManager>,
+        Arc<HelixGraphStorage>,
+    ) {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config::new(8, 32, 64, 1).with_lsm_in_memory();
+        config.vector_config.flat_scan_threshold = Some(0);
+        let collections =
+            Arc::new(CollectionManager::new(temp_dir.path().join("data"), config.clone()).unwrap());
+        apply_mutation(
+            &collections,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: name.into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: 4,
+                        distance:
+                            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        upsert_six_points(&collections, &config, name, 1.0);
+        let storage = collections.get_collection(name).unwrap();
+        (temp_dir, config, collections, storage)
+    }
+
+    /// Seals the tail of `dense` and builds it: the points sit in one
+    /// published segment, whose name this returns.
+    fn publish_dense_tail(name: &str, storage: &Arc<HelixGraphStorage>) -> String {
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        let sealed = storage
+            .named_vectors
+            .mutable_dense_segment_name("dense")
+            .unwrap();
+        assert!(seal_lsm_dense_tail(storage, "dense", &hnsw).unwrap());
+        run_index_job(IndexJob {
+            collection: name.to_string(),
+            storage: Arc::downgrade(storage),
+            spaces_to_check: vec!["dense".to_string()],
+            hnsw_config: hnsw,
+            flat_scan_threshold: 1_000,
+        });
+        assert!(!storage
+            .named_vectors
+            .building_segment_names("dense")
+            .contains(&sealed));
+        sealed
+    }
+
+    /// The ids each of the three LSM dense paths returns for `read`, sorted.
+    fn dense_path_ids(
+        storage: &HelixGraphStorage,
+        read: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+    ) -> Vec<Vec<u128>> {
+        let nv = &storage.named_vectors;
+        let query = [0.0, 1.0, 0.0, 0.0];
+        let ids = (1..=99u128).collect::<HashSet<_>>();
+        [
+            nv.dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                read, "dense", &query, 10, None, true, None, None,
+            ),
+            nv.dense_search_candidate_set_filter_ef_be(
+                read, "dense", &query, 10, &ids, true, None, None,
+            ),
+            nv.dense_search_candidate_ids_exact_be(
+                read,
+                "dense",
+                &query,
+                10,
+                ids.iter().copied(),
+                None,
+            ),
+        ]
+        .into_iter()
+        .map(|hits| {
+            let mut ids = hits
+                .unwrap()
+                .into_iter()
+                .map(|v| v.get_id())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        })
+        .collect()
+    }
+
+    /// Runs `search` and returns its answer with the lines the counter of
+    /// searches answered on a newer read left.
+    fn with_newer_read_lines<T>(search: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let answer = metrics::with_local_recorder(&recorder, search);
+        let lines = handle
+            .render()
+            .lines()
+            .filter(|line| line.starts_with("helix_dense_search_newer_read_total"))
+            .map(str::to_string)
+            .collect();
+        (answer, lines)
+    }
+
+    /// A seal and the index build after it move no writer search to a newer
+    /// read: the list they leave is still right for a read begun before them.
+    #[test]
+    fn lsm_seal_and_index_build_leave_an_older_writer_read_on_its_own_read() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (_dir, _config, _collections, storage) = six_point_lsm_writer("repo");
+        let before = storage.backend.begin_read().unwrap();
+        publish_dense_tail("repo", &storage);
+
+        let (found, newer_read) = with_newer_read_lines(|| dense_path_ids(&storage, &before));
+        assert_eq!(found, vec![(1..=6u128).collect::<Vec<_>>(); 3]);
+        assert!(newer_read.is_empty(), "{newer_read:?}");
+    }
+
+    /// A segment whose points were all rewritten is dropped from the writer's
+    /// list as empty. A read begun before the rewrites still has its rows
+    /// there, and its search finds the points all the same.
+    #[test]
+    fn lsm_writer_read_begun_before_an_emptied_segment_is_dropped_finds_its_points() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (_dir, config, collections, storage) = six_point_lsm_writer("repo");
+        let source = publish_dense_tail("repo", &storage);
+        let all = vec![(1..=6u128).collect::<Vec<_>>(); 3];
+        let before = storage.backend.begin_read().unwrap();
+        assert_eq!(
+            dense_path_ids(&storage, &before),
+            all,
+            "before the rewrites"
+        );
+
+        // Every point rewritten: the segment is empty and leaves the list.
+        upsert_six_points(&collections, &config, "repo", 2.0);
+        let located = storage.backend.begin_read().unwrap();
+        let empties = storage
+            .named_vectors
+            .cleanup_empty_dense_segments_locate_be(&located, "dense")
+            .unwrap();
+        drop(located);
+        assert!(empties.contains(&source), "{empties:?}");
+        assert!(storage
+            .named_vectors
+            .apply_dense_segment_removal("dense", &empties)
+            .unwrap());
+
+        let after = storage.backend.begin_read().unwrap();
+        assert_eq!(
+            dense_path_ids(&storage, &after),
+            all,
+            "a read begun after the drop"
+        );
+        let (found, newer_read) = with_newer_read_lines(|| dense_path_ids(&storage, &before));
+        assert_eq!(
+            found, all,
+            "a read begun before the rewrites lost the points"
+        );
+        assert!(
+            !newer_read.is_empty(),
+            "the older read was not moved to a newer one"
+        );
+    }
+
+    /// The real merge, then the reaper. A writer search on a read begun
+    /// before the merge answers like one begun after it, right after the swap
+    /// and again once the reaper has taken the source's core.
+    #[test]
+    fn lsm_writer_read_begun_before_a_real_merge_answers_like_one_begun_after() {
+        use crate::helix_engine::vector_core::named_vectors::PreparedMerge;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "writer_read_before_real_merge");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store =
+            crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store(store);
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        let dir = TempDir::new().unwrap();
+        let (_writer, _config, storage, rows) =
+            indexed_lsm_collection(dir.path(), "before_real_merge", 16, 600);
+        let source = sole_indexed_segment(&storage);
+        let search = |read: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>| {
+            let mut ids = storage
+                .named_vectors
+                .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                    read,
+                    "dense",
+                    &rows[0],
+                    10,
+                    None,
+                    false,
+                    None,
+                    Some(128),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.get_id())
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        };
+        let before = storage.backend.begin_read().unwrap();
+        assert_eq!(search(&before).len(), 10, "before the merge");
+
+        let merge = PreparedMerge {
+            merge_targets: vec![source.clone()],
+            prepared_index: prepared_merge_of(&storage, &source),
+        };
+        run_chunked_merge_publish(&storage, "dense", &hnsw, merge, None).unwrap();
+
+        let after = storage.backend.begin_read().unwrap();
+        let expected = search(&after);
+        assert_eq!(expected.len(), 10, "the merge target is not searched");
+        assert_eq!(search(&before), expected, "right after the swap");
+
+        let reaped = || {
+            !storage
+                .named_vectors
+                .cores_read()
+                .unwrap()
+                .contains_key(&source)
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !reaped() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(reaped(), "the reaper did not take the merge source");
+        assert_eq!(search(&before), expected, "once the reaper took the source");
+    }
+
+    /// A sealed tail whose points are all rewritten before its build leaves
+    /// the list through the orphan clean-up at the top of an index pass. A
+    /// read begun before the rewrites still has its rows there, and its
+    /// search finds the points all the same.
+    #[test]
+    fn lsm_writer_read_begun_before_an_emptied_sealed_tail_is_dropped_finds_its_points() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let (_dir, config, collections, storage) = six_point_lsm_writer("repo");
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        let all = vec![(1..=6u128).collect::<Vec<_>>(); 3];
+        let sealed = storage
+            .named_vectors
+            .mutable_dense_segment_name("dense")
+            .unwrap();
+        assert!(seal_lsm_dense_tail(&storage, "dense", &hnsw).unwrap());
+        let before = storage.backend.begin_read().unwrap();
+        assert_eq!(
+            dense_path_ids(&storage, &before),
+            all,
+            "before the rewrites"
+        );
+
+        // Every point rewritten while the sealed tail waits for its build.
+        upsert_six_points(&collections, &config, "repo", 2.0);
+        let located = storage.backend.begin_read().unwrap();
+        let orphans = storage
+            .named_vectors
+            .gc_orphan_building_segments_deferred_be(&located, "dense")
+            .unwrap();
+        drop(located);
+        assert_eq!(
+            orphans,
+            vec![sealed],
+            "the emptied sealed tail did not leave as an orphan"
+        );
+
+        let after = storage.backend.begin_read().unwrap();
+        assert_eq!(
+            dense_path_ids(&storage, &after),
+            all,
+            "a read begun after the drop"
+        );
+        let (found, newer_read) = with_newer_read_lines(|| dense_path_ids(&storage, &before));
+        assert_eq!(
+            found, all,
+            "a read begun before the rewrites lost the points"
+        );
+        assert!(
+            !newer_read.is_empty(),
+            "the older read was not moved to a newer one"
+        );
+    }
+
+    /// Index publishing group-commits its chunks: the same prepared graph
+    /// published with a durable commit per chunk and group-committed gives
+    /// byte-identical segments, with one durable flush before the entry point
+    /// instead of a WAL-tick wait per chunk.
+    #[test]
+    fn indices_publish_group_commit_writes_the_same_segment_without_per_chunk_flushes() {
+        use crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "indices_group_commit_lsm");
+        let _flush = EnvVarGuard::set("HELIX_LSM_FLUSH_INTERVAL_MS", "200");
+        let _index = EnvVarGuard::set("HELIX_MERGE_INDEX_BYTE_BUDGET", "524288");
+        let _edges = EnvVarGuard::set("HELIX_MERGE_INDEX_HNSW_EDGE_BUDGET", "1024");
+        let _group = EnvVarGuard::unset("HELIX_LSM_GROUP_COMMIT");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store =
+            crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store(store);
+        let dir = TempDir::new().unwrap();
+        // Two spaces with the same rows: two Building segments for one graph.
+        let (_writer, _config, storage, _rows) = sealed_lsm_collection(
+            dir.path(),
+            "indices_group_commit",
+            &["durable", "grouped"],
+            64,
+            300,
+        );
+        let building = |space: &str| {
+            let names = storage.named_vectors.building_segment_names(space);
+            assert_eq!(names.len(), 1, "{space}: {names:?}");
+            names[0].clone()
+        };
+        let (durable_segment, grouped_segment) = (building("durable"), building("grouped"));
+        let graph = {
+            let r = storage.backend.begin_read().unwrap();
+            let mut prepared = storage
+                .named_vectors
+                .prepare_building_indices_limited_be(&r, "durable", 1)
+                .unwrap();
+            assert_eq!(prepared.len(), 1);
+            prepared.remove(0).1
+        };
+        // (publish ms, mean chunk ms, chunks, group flushes)
+        let publish = |space: &str, segment: &str, graph| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            let started = std::time::Instant::now();
+            let published = metrics::with_local_recorder(&recorder, || {
+                run_chunked_indices_publish(&storage, space, vec![(segment.to_string(), graph)])
+            })
+            .unwrap();
+            assert!(published);
+            let publish_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let (mut sum, mut count, mut flushes) = (0.0, 0.0, 0.0);
+            for line in handle.render().lines() {
+                let value = || line.rsplit(' ').next().unwrap().parse::<f64>().unwrap();
+                if line.starts_with("helix_dense_merge_publish_chunk_ms_sum") {
+                    sum += value();
+                } else if line.starts_with("helix_dense_merge_publish_chunk_ms_count") {
+                    count += value();
+                } else if line.starts_with("helix_dense_merge_publish_phase_ms_count")
+                    && line.contains("indices_group_flush")
+                {
+                    flushes += value();
+                }
+            }
+            (publish_ms, sum / count, count, flushes)
+        };
+        let durable = {
+            let _off = EnvVarGuard::set("HELIX_LSM_GROUP_COMMIT", "0");
+            publish("durable", &durable_segment, graph.clone())
+        };
+        let grouped = publish("grouped", &grouped_segment, graph);
+        println!(
+            "index publish, {} chunks: durable chunks {:.1} ms each, {:.0} ms total; \
+             group commit {:.2} ms each, {:.0} ms total",
+            durable.2, durable.1, durable.0, grouped.1, grouped.0
+        );
+        assert_eq!(durable.2, grouped.2);
+        assert!(durable.2 >= 6.0, "{durable:?}");
+        assert_eq!((durable.3, grouped.3), (0.0, 1.0));
+        for (space, segment) in [("durable", &durable_segment), ("grouped", &grouped_segment)] {
+            let layout = storage.named_vectors.list_dense_vector_spaces();
+            let role = layout[space]
+                .segments
+                .iter()
+                .find(|entry| entry.physical_name == *segment)
+                .map(|entry| entry.role);
+            assert_eq!(role, Some(DenseVectorSegmentRole::Indexed), "{space}");
+        }
+        let dump = segment_dump(&storage, &durable_segment);
+        assert!(dump.len() > 600);
+        assert!(
+            segment_dump(&storage, &grouped_segment) == dump,
+            "the group-committed segment differs"
+        );
+        assert!(
+            grouped.1 * 10.0 < durable.1 && grouped.0 * 3.0 < durable.0,
+            "durable {durable:?} grouped {grouped:?}"
+        );
+    }
+
+    /// An index publish that dies part-way leaves a `Building` segment with no
+    /// entry point, whatever part of its graph reached the object store: a
+    /// replica keeps scanning it flat and a restarted writer's index job
+    /// rebuilds it. Only a segment whose entry point is durable is promoted as
+    /// it is, and that one has its whole graph.
+    #[test]
+    fn interrupted_indices_publish_never_leaves_a_partly_indexed_segment() {
+        use crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store;
+        use crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole;
+        use slatedb::object_store::{memory::InMemory, ObjectStore};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "indices_crash_lsm");
+        let _group = EnvVarGuard::unset("HELIX_LSM_GROUP_COMMIT");
+        let store = Arc::new(InMemory::new());
+        let _store = set_lsm_test_object_store(Arc::clone(&store) as Arc<dyn ObjectStore>);
+        let name = "indices_crash";
+        let points = 600usize;
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        let dir = TempDir::new().unwrap();
+        let (writer, config, storage, _rows) =
+            sealed_lsm_collection(dir.path(), name, &["dense"], 16, points);
+        let segment = storage
+            .named_vectors
+            .building_segment_names("dense")
+            .remove(0);
+        let mut graph = {
+            let r = storage.backend.begin_read().unwrap();
+            let mut prepared = storage
+                .named_vectors
+                .prepare_building_indices_limited_be(&r, "dense", 1)
+                .unwrap();
+            assert_eq!(prepared.len(), 1);
+            prepared.remove(0).1
+        };
+        let total = graph.point_ids.len();
+        assert_eq!(total, points);
+        // The segment's neighbor lists, keyed `id ++ level`.
+        let edges = |storage: &HelixGraphStorage| -> Vec<(Vec<u8>, Vec<u8>)> {
+            segment_dump(storage, &segment)
+                .into_iter()
+                .filter(|(db, _, _)| *db == 3)
+                .map(|(_, key, value)| (key, value))
+                .collect()
+        };
+        let role = |storage: &HelixGraphStorage| {
+            dense_layout(storage)
+                .into_iter()
+                .find(|(physical_name, _)| *physical_name == segment)
+                .map(|(_, role)| role)
+        };
+        let has_entry_point = |storage: &HelixGraphStorage| {
+            let r = storage.backend.begin_read().unwrap();
+            storage.named_vectors.cores_read().unwrap()[&segment]
+                .has_index(&r)
+                .unwrap()
+        };
+
+        // The steps of `run_chunked_indices_publish`, with a copy of the object
+        // store at each point the process could die: what a restart finds.
+        let mut publish_chunks = |start: usize, end: usize| {
+            storage
+                .with_write_backend_buffered(|w| {
+                    storage
+                        .named_vectors
+                        .flush_merge_index_chunk_be(w, &segment, &mut graph, start, end)
+                        .map_err(GraphError::from)
+                })
+                .unwrap();
+        };
+        // Half of the chunks reached the WAL on a flush tick, the rest did not.
+        publish_chunks(0, total / 2);
+        storage.backend.flush_durable().unwrap();
+        let half_edges = edges(&storage);
+        let died_between_chunks = store.fork();
+        // Every chunk is durable (the group-commit flush), no entry point yet.
+        publish_chunks(total / 2, total);
+        storage.backend.flush_durable().unwrap();
+        let all_edges = edges(&storage);
+        let died_before_entry_point = store.fork();
+        // The entry point is durable; the layout still says Building.
+        storage
+            .with_write_backend(|w| {
+                storage
+                    .named_vectors
+                    .finalize_merge_index_be(w, &segment, &graph)
+                    .map_err(GraphError::from)
+            })
+            .unwrap();
+        let died_before_promotion = store.fork();
+        assert!(!half_edges.is_empty() && half_edges.len() < all_edges.len());
+        drop(storage);
+        drop(writer);
+
+        for (crash, store, durable_edges, entry_point_durable) in [
+            ("between chunks", died_between_chunks, &half_edges, false),
+            (
+                "before the entry point",
+                died_before_entry_point,
+                &all_edges,
+                false,
+            ),
+            ("before promotion", died_before_promotion, &all_edges, true),
+        ] {
+            let _crashed = set_lsm_test_object_store(Arc::new(store));
+            // A replica sees exactly what was durable: a Building segment, with
+            // an entry point only once its whole graph is there.
+            {
+                let reader_dir = TempDir::new().unwrap();
+                let reader = CollectionManager::new(
+                    reader_dir.path().to_path_buf(),
+                    Config::new(16, 64, 128, 1).with_storage_backend(StorageBackendConfig::Lsm {
+                        storage: LsmStorage::ObjectStore,
+                        role: LsmRole::Reader,
+                    }),
+                )
+                .unwrap();
+                let replica = reader.get_collection(name).unwrap();
+                assert_eq!(
+                    role(&replica),
+                    Some(DenseVectorSegmentRole::Building),
+                    "{crash}"
+                );
+                assert_eq!(has_entry_point(&replica), entry_point_durable, "{crash}");
+                assert!(edges(&replica) == *durable_edges, "{crash}");
+            }
+
+            // A restarted writer's index job leaves it Indexed with every
+            // point's level-0 neighbor list.
+            let dir = TempDir::new().unwrap();
+            let writer =
+                Arc::new(CollectionManager::new(dir.path().to_path_buf(), config.clone()).unwrap());
+            let storage = writer.get_collection(name).unwrap();
+            wait_for_index_executor(name);
+            run_index_job(IndexJob {
+                collection: name.into(),
+                storage: Arc::downgrade(&storage),
+                spaces_to_check: vec!["dense".into()],
+                hnsw_config: hnsw.clone(),
+                flat_scan_threshold: 1_000,
+            });
+            wait_for_index_executor(name);
+            assert_eq!(
+                role(&storage),
+                Some(DenseVectorSegmentRole::Indexed),
+                "{crash}"
+            );
+            assert!(has_entry_point(&storage), "{crash}");
+            let recovered = edges(&storage);
+            let with_level_zero: HashSet<u128> = recovered
+                .iter()
+                .filter(|(key, _)| key[16..] == 0usize.to_be_bytes()[..])
+                .map(|(key, _)| u128::from_be_bytes(key[..16].try_into().unwrap()))
+                .collect();
+            assert_eq!(
+                with_level_zero,
+                (1..=points as u128).collect::<HashSet<u128>>(),
+                "{crash}"
+            );
+            // Promoted without a rebuild: the graph is the one published.
+            if entry_point_durable {
+                assert!(recovered == *durable_edges, "{crash}");
+            }
+        }
+    }
+
+    /// A regraph target is written without the gate, so a delete can
+    /// land before its row's chunk is written. If the writer dies before the
+    /// swap (or the busy drop's persist fails), the target stays `Building` in
+    /// the persisted layout; the next index job must not make it searchable.
+    #[test]
+    fn dead_regraph_target_is_not_promoted_by_the_index_job() {
+        use crate::helix_engine::storage_core::backend_any;
+        use crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole;
+        use crate::helix_engine::vector_core::vector_core::with_diverse_neighbors_for_test;
+        use rand::{Rng, SeedableRng};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "regraph_dead_target_lsm");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let mut config =
+            Config::new(16, 64, 128, 1).with_storage_backend(StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Writer,
+            });
+        config.vector_config.flat_scan_threshold = Some(0);
+        let writer_dir = TempDir::new().unwrap();
+        let writer = Arc::new(
+            CollectionManager::new(writer_dir.path().to_path_buf(), config.clone()).unwrap(),
+        );
+        let name = "regraph_dead_target";
+        let dim = 16;
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: name.into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: dim,
+                        distance:
+                            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let rows: Vec<Vec<f32>> = (0..1200)
+            .map(|_| (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect())
+            .collect();
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::UpsertPoints {
+                collection: name.into(),
+                points: rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| ReplicatedPoint {
+                        id: i as u128 + 1,
+                        vectors: HashMap::from([("dense".into(), v.clone())]),
+                        sparse_vectors: HashMap::new(),
+                        payload: HashMap::new(),
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+        let storage = writer.get_collection(name).unwrap();
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        let index_job = || {
+            run_index_job(IndexJob {
+                collection: name.into(),
+                storage: Arc::downgrade(&storage),
+                spaces_to_check: vec!["dense".into()],
+                hnsw_config: hnsw.clone(),
+                flat_scan_threshold: 1_000,
+            })
+        };
+        with_diverse_neighbors_for_test(None, || {
+            seal_lsm_dense_tail(&storage, "dense", &hnsw).unwrap();
+            index_job();
+        });
+        let layout = || {
+            storage.named_vectors.list_dense_vector_spaces()["dense"]
+                .segments
+                .iter()
+                .map(|segment| (segment.physical_name.clone(), segment.role))
+                .collect::<Vec<_>>()
+        };
+        let source: Vec<String> = layout()
+            .into_iter()
+            .filter(|(_, role)| *role == DenseVectorSegmentRole::Indexed)
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(source.len(), 1, "{:?}", layout());
+
+        // Regraph's export snapshot and build.
+        let r = storage.backend.begin_read().unwrap();
+        let exported = storage
+            .named_vectors
+            .export_for_regraph_be(&r, "dense", &source[0], 512)
+            .unwrap()
+            .unwrap()
+            .rows;
+        drop(r);
+        let prepared = {
+            let permit =
+                crate::helix_engine::vector_core::vector_core::acquire_build_permit().unwrap();
+            VectorCore::build_hnsw_in_memory_owned_with_permit(
+                exported,
+                &hnsw,
+                crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                &permit,
+            )
+            .unwrap()
+        };
+        // Deletes landing during the ungated target write, ahead of their rows' chunks.
+        let deleted: Vec<u128> = (1..=20).collect();
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::DeletePoints {
+                collection: name.into(),
+                ids: deleted.clone(),
+            },
+        )
+        .unwrap();
+        let target = write_merge_target(&storage, "dense", &hnsw, prepared).unwrap();
+        // The writer dies here: no swap, no busy drop. Its next index job runs.
+        index_job();
+        let search_top = |query: &[f32]| {
+            let r = storage.backend.begin_read().unwrap();
+            storage
+                .named_vectors
+                .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                    &r,
+                    "dense",
+                    query,
+                    3,
+                    None,
+                    false,
+                    None,
+                    Some(128),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|v| v.get_id())
+                .collect::<Vec<_>>()
+        };
+        let resurrected: Vec<u128> = deleted
+            .iter()
+            .copied()
+            .filter(|id| search_top(&rows[*id as usize - 1]).contains(id))
+            .collect();
+        println!(
+            "dead regraph target {target}: layout {:?}; resurrected {}/{}",
+            layout(),
+            resurrected.len(),
+            deleted.len()
+        );
+        assert!(
+            resurrected.is_empty(),
+            "deleted ids came back: {resurrected:?}"
+        );
+        assert!(
+            !layout().iter().any(|(n, _)| *n == target),
+            "dead regraph target still in the layout: {:?}",
+            layout()
+        );
+    }
+
+    /// A regraph writes its new segment without the point-mutation gate: an
+    /// upsert issued while the target is being written finishes before the
+    /// regraph returns, which then stands down as busy, drops its target and
+    /// loses nothing.
+    #[test]
+    fn regraph_write_phase_does_not_block_upserts() {
+        use crate::helix_engine::storage_core::backend_any;
+        use crate::helix_engine::vector_core::named_vectors::DenseVectorSegmentRole;
+        use rand::{Rng, SeedableRng};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _prefix = EnvVarGuard::set("HELIX_LSM_PREFIX", "regraph_unblocked_lsm");
+        // The smallest chunks: a long run of write-phase commits to land in.
+        let _chunks = EnvVarGuard::set("HELIX_MERGE_CHUNK_SIZE", "64");
+        let store: Arc<dyn slatedb::object_store::ObjectStore> =
+            Arc::new(slatedb::object_store::memory::InMemory::new());
+        let _store = backend_any::set_lsm_test_object_store(store);
+        let mut config =
+            Config::new(16, 64, 128, 1).with_storage_backend(StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Writer,
+            });
+        config.vector_config.flat_scan_threshold = Some(0);
+        let writer_dir = TempDir::new().unwrap();
+        let writer = Arc::new(
+            CollectionManager::new(writer_dir.path().to_path_buf(), config.clone()).unwrap(),
+        );
+        let name = "regraph_unblocked";
+        let dim = 16;
+        apply_mutation(
+            &writer,
+            &config,
+            &ReplicatedMutation::CreateCollection {
+                name: name.into(),
+                vectors: HashMap::from([(
+                    "dense".into(),
+                    NamedVectorConfig {
+                        size: dim,
+                        distance:
+                            crate::helix_engine::vector_core::named_vectors::DistanceMetric::Cosine,
+                        spindle: crate::helix_engine::vector_core::spindle::SpindleConfig::default(
+                        ),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            },
+        )
+        .unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let mut random =
+            || -> Vec<f32> { (0..dim).map(|_| rng.random_range(-1.0f32..1.0)).collect() };
+        let upsert = |points: Vec<(u128, Vec<f32>)>| {
+            apply_mutation(
+                &writer,
+                &config,
+                &ReplicatedMutation::UpsertPoints {
+                    collection: name.into(),
+                    points: points
+                        .into_iter()
+                        .map(|(id, vector)| ReplicatedPoint {
+                            id,
+                            vectors: HashMap::from([("dense".into(), vector)]),
+                            sparse_vectors: HashMap::new(),
+                            payload: HashMap::new(),
+                        })
+                        .collect(),
+                },
+            )
+            .unwrap();
+        };
+        for chunk in 0..6u128 {
+            upsert((1..=500u128).map(|i| (chunk * 500 + i, random())).collect());
+        }
+        let storage = writer.get_collection(name).unwrap();
+        let hnsw = HNSWConfig::new(Some(16), Some(64), Some(128));
+        seal_lsm_dense_tail(&storage, "dense", &hnsw).unwrap();
+        run_index_job(IndexJob {
+            collection: name.into(),
+            storage: Arc::downgrade(&storage),
+            spaces_to_check: vec!["dense".into()],
+            hnsw_config: hnsw.clone(),
+            flat_scan_threshold: 1_000,
+        });
+        let layout = || {
+            storage.named_vectors.list_dense_vector_spaces()["dense"]
+                .segments
+                .iter()
+                .map(|segment| (segment.physical_name.clone(), segment.role))
+                .collect::<Vec<_>>()
+        };
+        let indexed = |layout: &[(String, DenseVectorSegmentRole)]| {
+            layout
+                .iter()
+                .filter(|(_, role)| *role == DenseVectorSegmentRole::Indexed)
+                .map(|(segment, _)| segment.clone())
+                .collect::<Vec<_>>()
+        };
+        let before = layout();
+        assert_eq!(indexed(&before).len(), 1, "{before:?}");
+        assert!(before
+            .iter()
+            .all(|(_, role)| *role != DenseVectorSegmentRole::Building));
+
+        let regraph = {
+            let (storage, gate, hnsw) = (
+                Arc::clone(&storage),
+                writer.point_mutation_gate(name),
+                hnsw.clone(),
+            );
+            std::thread::spawn(move || {
+                let status =
+                    regraph_collection(&storage, name, &["dense".to_string()], &hnsw, &gate)
+                        .unwrap();
+                (status, std::time::Instant::now())
+            })
+        };
+        // The target appears as a Building segment once the write phase starts.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let target = loop {
+            if let Some((segment, _)) = layout().into_iter().find(|(segment, role)| {
+                *role == DenseVectorSegmentRole::Building
+                    && !before.iter().any(|(old, _)| old == segment)
+            }) {
+                break segment;
+            }
+            assert!(
+                std::time::Instant::now() < deadline && !regraph.is_finished(),
+                "the regraph target never appeared"
+            );
+            std::thread::sleep(Duration::from_micros(200));
+        };
+        let fresh = random();
+        let upsert_started = std::time::Instant::now();
+        upsert(vec![(9001, fresh.clone())]);
+        let upserted = std::time::Instant::now();
+        let (status, regraph_returned) = regraph.join().unwrap();
+        println!(
+            "regraph write phase: upsert took {:?}, regraph returned {:?} after it started; {status:?}",
+            upserted - upsert_started,
+            regraph_returned.saturating_duration_since(upsert_started)
+        );
+        assert!(
+            upserted < regraph_returned,
+            "the upsert waited for the regraph publish"
+        );
+        assert_eq!(status.state, "busy", "{status:?}");
+
+        // Nothing lost or orphaned: the source still serves, the target is gone.
+        let after = layout();
+        assert_eq!(indexed(&after), indexed(&before), "{after:?}");
+        assert!(
+            after
+                .iter()
+                .all(|(_, role)| *role != DenseVectorSegmentRole::Building),
+            "{after:?}"
+        );
+        let r = storage.backend.begin_read().unwrap();
+        assert_eq!(
+            storage.named_vectors.cores_read().unwrap()[&indexed(&before)[0]]
+                .export_level_zero(&r)
+                .unwrap()
+                .len(),
+            3000
+        );
+        let hit = storage
+            .named_vectors
+            .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                &r,
+                "dense",
+                &fresh,
+                1,
+                None,
+                false,
+                None,
+                Some(128),
+            )
+            .unwrap();
+        assert_eq!(hit[0].get_id(), 9001);
+        drop(r);
+        while storage
+            .named_vectors
+            .cores_read()
+            .unwrap()
+            .contains_key(&target)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped target was never reaped"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[test]
@@ -12009,6 +17417,7 @@ mod tests {
                 adjacency: vec![Some(vec![Vec::new()]); n],
                 entry_ord: 0,
                 level_zero_preflushed: false,
+                unreached: 0,
             },
         };
 
@@ -12116,6 +17525,7 @@ mod tests {
             ],
             entry_ord: 0,
             level_zero_preflushed: false,
+            unreached: 0,
         };
 
         let (len, stats) = budgeted_merge_index_chunk_len(&prepared, 0, 8192);
@@ -12151,6 +17561,7 @@ mod tests {
             ],
             entry_ord: 0,
             level_zero_preflushed: false,
+            unreached: 0,
         };
 
         let (len, stats) = budgeted_merge_index_chunk_len(&prepared, 0, 8192);
@@ -12347,7 +17758,7 @@ mod tests {
         assert_eq!(
             compute_content_hash(&p_v1),
             compute_content_hash(&p_v2),
-            "host_path and container_path are unindexed per CE contract; \
+            "host_path and container_path are unindexed per client contract; \
              different developer/container prefixes must not change the hash"
         );
     }
@@ -13233,7 +18644,7 @@ mod tests {
             merge_targets: targets.clone(),
             prepared_index,
         };
-        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge).unwrap();
+        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge, None).unwrap();
 
         // Production retire-clear (what the SEGMENT_REAPER finalize block calls).
         let cleared = storage
@@ -13423,7 +18834,7 @@ mod tests {
             merge_targets: targets.clone(),
             prepared_index,
         };
-        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge).unwrap();
+        run_chunked_merge_publish(&storage, TEST_DENSE_VECTOR, &hnsw_config, merge, None).unwrap();
 
         // Production retire-clear (what the SEGMENT_REAPER finalize block
         // calls) must also clear the delete-tombstones now, via the
@@ -13475,7 +18886,8 @@ mod tests {
     /// `optimizer_indexes_lsm_collection_end_to_end`), opens an `AnyRead`
     /// through `storage.backend.begin_read()`, and asserts each helper the
     /// optimizer relies on returns `Ok` rather than the LMDB-handle error:
-    ///   * `get_dense_space_stats_be`            (run_index_job read probe)
+    ///   * `get_dense_space_stats_be`            (full per-segment stats; the
+    ///     index job now probes with the bounded count behind the gate below)
     ///   * `cleanup_empty_dense_segments_locate_be`
     ///   * `gc_orphan_building_segments_deferred_be`   (NEW in the fix)
     ///   * `optimizer_has_pending_work`          (module-private optimizer gate)
@@ -13558,7 +18970,7 @@ mod tests {
         assert_eq!(
             stats.unwrap().vectors_count,
             N as u64,
-            "all flat vectors must be visible to the optimizer read probe on LSM"
+            "all flat vectors must be visible to the dense stats on LSM"
         );
 
         let empty = storage

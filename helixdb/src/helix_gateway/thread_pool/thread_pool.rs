@@ -141,7 +141,9 @@ pub(crate) fn route_class(method: &str, path: &str) -> RouteClass {
         | "/collections/{n}/points/query"
         | "/collections/{n}/points/hybrid_query" => RouteClass::Search,
         "/collections/{n}/points/scroll" => RouteClass::Scan,
-        "/collections/{n}/points/count" | "/collections/{n}/facet" => RouteClass::Read,
+        "/collections/{n}/points/count"
+        | "/collections/{n}/facet"
+        | "/collections/{n}/sparse/stats" => RouteClass::Read,
         "/collections/{n}/points" => {
             if method == "PUT" {
                 RouteClass::Write
@@ -418,7 +420,8 @@ fn route_timeout(
         "/collections/{n}/points/scroll"
         | "/v1/collections/{n}/points/scan"
         | "/collections/{n}/points/count"
-        | "/collections/{n}/facet" => Some("HELIX_READ_REQUEST_TIMEOUT_SECS"),
+        | "/collections/{n}/facet"
+        | "/collections/{n}/sparse/stats" => Some("HELIX_READ_REQUEST_TIMEOUT_SECS"),
         "/collections/{n}" if method == "GET" => Some("HELIX_COLLECTION_INFO_TIMEOUT_SECS"),
         "/collections/{n}" => Some("HELIX_WRITE_REQUEST_TIMEOUT_SECS"),
         "/collections/{n}/points" if method == "PUT" => Some("HELIX_WRITE_REQUEST_TIMEOUT_SECS"),
@@ -518,6 +521,9 @@ pub(crate) fn route_label_for(path: &str) -> &'static str {
         }
         if path.ends_with("/points") {
             return "/collections/{n}/points";
+        }
+        if path.ends_with("/sparse/stats") {
+            return "/collections/{n}/sparse/stats";
         }
         if path.contains("/snapshots") {
             return "/collections/{n}/snapshots";
@@ -626,7 +632,7 @@ fn graph_error_response(error: GraphError) -> Response {
     // Map common error shapes to more accurate HTTP status codes so clients
     // can distinguish "the collection is gone" (404 — safe to recreate or
     // skip) from actual server failures (500 — retry, alert). Without this,
-    // CE's `_is_collection_not_found_error` detector sees a 500 with
+    // the client's `_is_collection_not_found_error` detector sees a 500 with
     // "Collection 'X' not found" body only half the time (client library
     // may swallow the body), silently escalating to failure path.
     response.status = if matches!(error, GraphError::ResizeBackpressure(_))
@@ -926,7 +932,7 @@ impl Worker {
                                     ) {
                                         error!(error = ?e, "Handler error");
                                         // Route through graph_error_response so "not found"
-                                        // errors surface as 404 and let CE's UPSERT_RECOVERY
+                                        // errors surface as 404 and let the client's UPSERT_RECOVERY
                                         // detector trigger ensure+retry instead of treating
                                         // every missing-collection upsert as a server bug.
                                         resp = graph_error_response(e);
@@ -1302,6 +1308,25 @@ mod tests {
         assert!(lsm_reader_write_rejection(RouteClass::Read, reader).is_none());
         assert!(lsm_reader_write_rejection(RouteClass::Search, reader).is_none());
         assert!(lsm_reader_write_rejection(RouteClass::Write, writer).is_none());
+    }
+
+    /// The sparse statistics route is a POST that only reads: it has a label
+    /// of its own, the read class, and a reader replica takes it.
+    #[test]
+    fn sparse_stats_post_is_a_read_that_a_reader_takes() {
+        let path = "/collections/my-coll/sparse/stats";
+        assert_eq!(route_label_for(path), "/collections/{n}/sparse/stats");
+        assert_eq!(route_class("POST", path), RouteClass::Read);
+        let reader = StorageBackendConfig::Lsm {
+            storage: LsmStorage::ObjectStore,
+            role: LsmRole::Reader,
+        };
+        assert!(lsm_reader_write_rejection(route_class("POST", path), reader).is_none());
+        // Any other POST under a collection without a label stays a write.
+        assert_eq!(
+            route_class("POST", "/collections/my-coll/sparse"),
+            RouteClass::Write
+        );
     }
 
     #[test]

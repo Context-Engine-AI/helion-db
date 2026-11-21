@@ -21,18 +21,20 @@ use slatedb::{bytes::Bytes, CloseReason};
 
 use super::backend::{
     BackendError, BackendKind, KeyRange, Namespace, ReadTxn, StorageBackend, StorageBackendConfig,
-    WriteTxn,
+    TransactionRow, WriteTxn,
 };
 use super::backend_lmdb::{LmdbBackend, LmdbRead, LmdbWrite};
 use super::backend_lsm::{
     cache_root_from_env, cache_subtree_for_lsm_path, clear_s3_drop_tombstone,
-    list_s3_collection_catalog, persist_s3_drop_tombstone, read_s3_drop_tombstone,
-    read_s3_metadata_sidecar, s3_collection_prefix_exists, CollectionCatalog, LsmBackend, LsmRead,
-    LsmWrite, S3StoreConfig,
+    gc_closed_s3_collection, list_s3_collection_catalog, lsm_delete_batch_reads_enabled,
+    persist_s3_drop_tombstone, put_missing_s3_metadata_sidecar, read_s3_drop_tombstone,
+    read_s3_metadata_sidecar, s3_collection_prefix_bytes, s3_collection_prefix_exists,
+    ClosedGcOutcome, CollectionCatalog, GateWanted, LsmBackend, LsmRead, LsmWrite, S3StoreConfig,
 };
 #[cfg(test)]
 use super::backend_lsm::{
-    list_child_collection_catalog, purge_prefix_from_store, shared_lsm_handle,
+    gc_closed_collection_with_store, list_child_collection_catalog, purge_prefix_from_store,
+    put_missing_metadata_sidecar_with_store, shared_lsm_handle,
 };
 use super::backend_lsm_reader::LsmReader;
 
@@ -72,6 +74,16 @@ impl Drop for LsmTestObjectStoreGuard {
     }
 }
 
+/// Test-only: the object store every LSM open of this process takes until the
+/// guard is dropped, which puts back what it found. One slot for all test
+/// threads, and its callers do not hold one lock: the collection manager's
+/// tests hold `ENV_TEST_LOCK`, replication's `ENV_LOCK`, the gateway's and
+/// `reader_warm`'s are `#[serial]`. Tests of two of those families side by
+/// side open on each other's store, or on none once the first guard is
+/// dropped. Run such families in separate invocations (a filter naming
+/// `fenced` beside the manager's `flush_gate` failed twice and hung once),
+/// and give a new test a store of its own where it can (`open_with_store`,
+/// `with_db_builder_for_test`).
 #[cfg(test)]
 pub(crate) fn set_lsm_test_object_store(store: Arc<dyn ObjectStore>) -> LsmTestObjectStoreGuard {
     let previous = LSM_TEST_OBJECT_STORE
@@ -229,6 +241,16 @@ impl AnyBackend {
         }
     }
 
+    /// LMDB: keep the backend's catalog thread out of the env while the caller
+    /// resizes its map ([`LmdbBackend::pause_catalog`]). `None` on LSM, which
+    /// has no env to resize.
+    pub(crate) fn pause_lmdb_catalog(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        match self {
+            AnyBackend::Lmdb(backend) => Some(backend.pause_catalog()),
+            AnyBackend::Lsm(_) | AnyBackend::LsmReader(_) => None,
+        }
+    }
+
     /// The kind of the active backend.
     pub fn kind(&self) -> BackendKind {
         match self {
@@ -250,6 +272,12 @@ impl AnyBackend {
         matches!(self, AnyBackend::LsmReader(_))
     }
 
+    /// True for the LSM writer: the one backend whose close flushes a
+    /// memtable. A reader replica and LMDB have nothing to close.
+    pub fn is_lsm_writer(&self) -> bool {
+        matches!(self, AnyBackend::Lsm(_))
+    }
+
     pub(crate) fn unhealthy_lsm_writer_close_reason(&self) -> Option<CloseReason> {
         match self {
             AnyBackend::Lsm(backend) => {
@@ -259,6 +287,27 @@ impl AnyBackend {
                 unhealthy_lsm_writer_close_reason_from(reader.close_reason())
             }
             AnyBackend::Lmdb(_) => None,
+        }
+    }
+
+    /// Reader replica: whether its `DbReader` has ended with
+    /// `DatabaseMissing`, asked of the manifest now if it had not (see
+    /// [`LsmReader::ended_or_checkpoint_absent`]). `Ok(false)` on the other
+    /// backends.
+    pub(crate) fn lsm_reader_ended_or_checkpoint_absent(&self) -> Result<bool, BackendError> {
+        match self {
+            AnyBackend::LsmReader(reader) => reader.ended_or_checkpoint_absent(),
+            _ => Ok(false),
+        }
+    }
+
+    /// Reader replica: ask the manifest now whether the reader's checkpoint
+    /// is absent, without waiting for the answer (see
+    /// [`LsmReader::ask_whether_checkpoint_is_absent`]). Nothing on the other
+    /// backends.
+    pub(crate) fn ask_whether_lsm_reader_checkpoint_is_absent(&self) {
+        if let AnyBackend::LsmReader(reader) = self {
+            reader.ask_whether_checkpoint_is_absent();
         }
     }
 
@@ -275,6 +324,39 @@ impl AnyBackend {
                 reader.refresh_with_poll_interval(interval).map(|()| true)
             }
             AnyBackend::Lmdb(_) | AnyBackend::Lsm(_) => Ok(false),
+        }
+    }
+
+    /// Move a reader replica's `DbReader` to the poll tier of `interval` and
+    /// catch up with the manifest: in place when it can, by a reopen otherwise
+    /// (see [`LsmReader::retier`]). Every poll-tier change goes through here.
+    /// Returns `Ok(false)` on non-reader arms, like the reopen it replaces.
+    pub fn retier_lsm_reader(
+        &self,
+        interval: std::time::Duration,
+    ) -> Result<bool, super::backend::BackendError> {
+        match self {
+            AnyBackend::LsmReader(reader) => reader.retier(interval).map(|()| true),
+            AnyBackend::Lmdb(_) | AnyBackend::Lsm(_) => Ok(false),
+        }
+    }
+
+    /// The poll tier of a reader replica that changes tiers in place (see
+    /// [`LsmReader::in_place_tier_is_fast`]); `None` on the other arms and
+    /// for a reader replica that reopens instead.
+    pub(crate) fn lsm_reader_in_place_tier_is_fast(&self) -> Option<bool> {
+        match self {
+            AnyBackend::LsmReader(reader) => reader.in_place_tier_is_fast(),
+            AnyBackend::Lmdb(_) | AnyBackend::Lsm(_) => None,
+        }
+    }
+
+    /// A reader replica's current view (see [`LsmReader::announced_view`]);
+    /// `None` on the other arms.
+    pub(crate) fn lsm_reader_view(&self) -> Option<(u64, u64)> {
+        match self {
+            AnyBackend::LsmReader(reader) => Some(reader.announced_view()),
+            AnyBackend::Lmdb(_) | AnyBackend::Lsm(_) => None,
         }
     }
 
@@ -312,6 +394,45 @@ impl AnyBackend {
         }
     }
 
+    /// [`LsmBackend::update_key_transactional_buffered`].
+    pub(crate) fn update_lsm_key_transactional_buffered<T>(
+        &self,
+        ns: Namespace<'_>,
+        key: &[u8],
+        also: &[(&[u8], &[u8])],
+        update: impl FnMut(Option<&[u8]>) -> Result<(Vec<u8>, T), BackendError>,
+    ) -> Result<T, BackendError> {
+        match self {
+            AnyBackend::Lsm(backend) => {
+                backend.update_key_transactional_buffered(ns, key, also, update)
+            }
+            AnyBackend::Lmdb(_) => Err(BackendError::Unsupported(
+                "LMDB metadata updates use heed write transactions".to_string(),
+            )),
+            AnyBackend::LsmReader(_) => {
+                Err(BackendError::Unsupported(LSM_READER_READONLY.to_string()))
+            }
+        }
+    }
+
+    /// [`LsmBackend::update_key_transactional_with_rows`].
+    pub(crate) fn update_lsm_key_transactional_with_rows<T>(
+        &self,
+        ns: Namespace<'_>,
+        key: &[u8],
+        update: impl FnMut(Option<&[u8]>) -> Result<(Vec<u8>, Vec<TransactionRow>, T), BackendError>,
+    ) -> Result<T, BackendError> {
+        match self {
+            AnyBackend::Lsm(backend) => backend.update_key_transactional_with_rows(ns, key, update),
+            AnyBackend::Lmdb(_) => Err(BackendError::Unsupported(
+                "LMDB metadata updates use heed write transactions".to_string(),
+            )),
+            AnyBackend::LsmReader(_) => {
+                Err(BackendError::Unsupported(LSM_READER_READONLY.to_string()))
+            }
+        }
+    }
+
     /// Destroy persistent object-store state for a collection being dropped.
     ///
     /// On the LSM writer arm this quiesces SlateDB (stopping the background
@@ -334,6 +455,10 @@ impl AnyBackend {
     /// epoch, so they are no-ops here.
     pub(crate) fn close_lsm_for_cache_eviction(&self) -> Result<(), BackendError> {
         match self {
+            // Closed already: nothing is left to stop, and no blocking call is
+            // made. The shutdown close runs first and the storages are dropped
+            // inside the runtime afterwards, where a blocking call is refused.
+            AnyBackend::Lsm(b) if matches!(b.close_reason(), Some(CloseReason::Clean)) => Ok(()),
             AnyBackend::Lsm(b) => match b.close() {
                 Err(BackendError::Io(message)) if message.contains("db is closed") => Ok(()),
                 result => result,
@@ -390,8 +515,11 @@ impl AnyBackend {
 ///
 /// Returns an empty list for the in-memory backend (`HELIX_LSM_IN_MEMORY=1`):
 /// each in-memory collection gets an isolated store, so there is no shared
-/// catalog to scan. Callers MUST treat any error as non-fatal (log + fall back to
-/// the local registry); a listing failure must never block startup or a request.
+/// catalog to scan. A listing failure must never block startup: there the
+/// caller logs it and goes on with the local registry. A request that needs
+/// the catalog to tell "absent" from "there" answers the failure as an error
+/// to retry instead (the listing route, the lookup of a name with no marker
+/// directory): "absent" would tell its caller the collection is gone.
 pub fn list_collection_prefixes_from_env(
     config: StorageBackendConfig,
 ) -> Result<Vec<String>, BackendError> {
@@ -489,6 +617,44 @@ pub fn read_metadata_sidecar_from_lsm_env(
     read_s3_metadata_sidecar(&config, &prefix)
 }
 
+/// Puts `bytes`, the writer's local copy of a closed collection's metadata
+/// sidecar, where the readers look for it, unless the object store holds one:
+/// `Some(true)` when this call wrote it, `Some(false)` when one is there,
+/// `None` when `gate_wanted` stopped it first. Only an object-store writer
+/// puts; the caller holds the collection's open gate (see
+/// `gc_collection_under_gate`).
+pub(crate) fn put_missing_lsm_metadata_sidecar_from_env(
+    collection_path: &Path,
+    config: StorageBackendConfig,
+    bytes: Vec<u8>,
+    gate_wanted: GateWanted,
+) -> Result<Option<bool>, BackendError> {
+    if !config.is_writer() || config.is_lsm_in_memory() {
+        return Err(BackendError::Io(
+            "only an object-store writer puts a metadata sidecar".to_string(),
+        ));
+    }
+    let prefix = collection_lsm_path(collection_path);
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return put_missing_metadata_sidecar_with_store(store, &prefix, bytes, gate_wanted);
+    }
+    let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
+        BackendError::Io(
+            "HELIX_STORAGE_BACKEND=lsm metadata sidecar put requires HELIX_LSM_BUCKET".to_string(),
+        )
+    })?;
+    let region = std::env::var("HELIX_LSM_REGION").ok();
+    let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
+    let config = S3StoreConfig {
+        bucket: &bucket,
+        region: region.as_deref(),
+        endpoint: endpoint.as_deref(),
+        allow_http: env_flag("HELIX_LSM_ALLOW_HTTP"),
+    };
+    put_missing_s3_metadata_sidecar(&config, &prefix, bytes, gate_wanted)
+}
+
 pub(crate) fn lsm_collection_prefix_exists_from_env(
     collection_path: &Path,
     config: StorageBackendConfig,
@@ -515,6 +681,36 @@ pub(crate) fn lsm_collection_prefix_exists_from_env(
         allow_http: env_flag("HELIX_LSM_ALLOW_HTTP"),
     };
     s3_collection_prefix_exists(&config, &prefix)
+}
+
+/// Object bytes under a closed collection's prefix, so storage metering works
+/// without opening it. `None` when the backend is not an object store.
+pub(crate) fn lsm_collection_prefix_bytes_from_env(
+    collection_path: &Path,
+    config: StorageBackendConfig,
+) -> Result<Option<u64>, BackendError> {
+    if !config.is_lsm() || config.is_lsm_in_memory() {
+        return Ok(None);
+    }
+    let prefix = collection_lsm_path(collection_path);
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return super::backend_lsm::collection_prefix_bytes_with_store(store, &prefix).map(Some);
+    }
+    let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
+        BackendError::Io(
+            "HELIX_STORAGE_BACKEND=lsm prefix size requires HELIX_LSM_BUCKET".to_string(),
+        )
+    })?;
+    let region = std::env::var("HELIX_LSM_REGION").ok();
+    let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
+    let config = S3StoreConfig {
+        bucket: &bucket,
+        region: region.as_deref(),
+        endpoint: endpoint.as_deref(),
+        allow_http: env_flag("HELIX_LSM_ALLOW_HTTP"),
+    };
+    s3_collection_prefix_bytes(&config, &prefix).map(Some)
 }
 
 pub(crate) fn persist_lsm_drop_tombstone_from_env(
@@ -642,6 +838,39 @@ pub(crate) fn purge_lsm_prefix_from_env(
     )
 }
 
+/// One garbage-collection pass over a collection the writer holds no handle
+/// for (see `backend_lsm_closed_gc`). Only an object-store writer collects.
+/// The pass stops once `gate_wanted` says the caller wants the collection back.
+pub(crate) fn gc_closed_lsm_collection_from_env(
+    collection_path: &Path,
+    config: StorageBackendConfig,
+    gate_wanted: GateWanted,
+) -> Result<ClosedGcOutcome, BackendError> {
+    if !config.is_writer() || config.is_lsm_in_memory() {
+        return Ok(ClosedGcOutcome::Skipped("not_object_store_writer"));
+    }
+    let prefix = collection_lsm_path(collection_path);
+    #[cfg(test)]
+    if let Some(store) = lsm_test_object_store() {
+        return gc_closed_collection_with_store(store, &prefix, gate_wanted);
+    }
+    let bucket = std::env::var("HELIX_LSM_BUCKET").map_err(|_| {
+        BackendError::Io(
+            "HELIX_STORAGE_BACKEND=lsm closed-collection GC requires HELIX_LSM_BUCKET".to_string(),
+        )
+    })?;
+    let region = std::env::var("HELIX_LSM_REGION").ok();
+    let endpoint = std::env::var("HELIX_LSM_ENDPOINT").ok();
+    let allow_http = env_flag("HELIX_LSM_ALLOW_HTTP");
+    let config = S3StoreConfig {
+        bucket: &bucket,
+        region: region.as_deref(),
+        endpoint: endpoint.as_deref(),
+        allow_http,
+    };
+    gc_closed_s3_collection(&config, &prefix, gate_wanted)
+}
+
 impl<'s> AnyWrite<'s> {
     /// Wrap a heed write txn as the LMDB write handle (resize-safe write-view
     /// entry). The traversal holds `&mut AnyWrite`, so the whole write query
@@ -706,6 +935,17 @@ impl<'s> AnyWrite<'s> {
 }
 
 impl<'s> AnyRead<'s> {
+    /// Sequence this read is pinned at, when equal values of one collection
+    /// are guaranteed to see identical data; `None` for LMDB, latest-state
+    /// reader reads, write views with pending writes, and failed handles.
+    pub(crate) fn snapshot_seq(&self) -> Option<u64> {
+        match self {
+            AnyRead::Lsm(read) => read.snapshot_seq(),
+            AnyRead::LsmReader(Some(snapshot)) => Some(snapshot.seq()),
+            _ => None,
+        }
+    }
+
     /// The underlying heed read txn when this read handle is the LMDB arm;
     /// `None` on LSM.
     ///
@@ -728,6 +968,16 @@ impl<'s> AnyRead<'s> {
     /// handles only when a `DbSnapshot` was pinned. A latest-state reader
     /// handle (`LsmReader(None)`, including the snapshot-open failure
     /// fallback) may observe a manifest refresh between two reads.
+    /// When this handle's snapshot was opened, for handles that pin one the
+    /// process can order against its own commits (the LSM writer). `None` for
+    /// LMDB and reader replicas.
+    pub(crate) fn snapshot_opened_at(&self) -> Option<std::time::Instant> {
+        match self {
+            AnyRead::Lsm(read) => Some(read.opened_at()),
+            AnyRead::Lmdb(_) | AnyRead::LsmReader(_) | AnyRead::Failed(_) => None,
+        }
+    }
+
     pub(crate) fn is_snapshot_pinned(&self) -> bool {
         match self {
             AnyRead::Lmdb(_) | AnyRead::Lsm(_) => true,
@@ -743,17 +993,23 @@ impl<'s> AnyRead<'s> {
 /// metric) rather than failing the read txn: the legacy path serves correctly,
 /// and the gateway's reader eviction/fallback already covers persistent reader
 /// failures.
-fn lsm_reader_read_handle(reader: &LsmReader) -> AnyRead<'static> {
+///
+/// Not when the open was refused because the request is cancelled: its
+/// caller has left, there is nothing to serve, and that is no failure of the
+/// reader. The cancellation is the answer (`Err`), as it is of a writer's
+/// `begin_read`.
+fn lsm_reader_read(reader: &LsmReader) -> Result<AnyRead<'static>, BackendError> {
     use super::backend_lsm_reader::reader_snapshot_reads_enabled;
     if !reader_snapshot_reads_enabled() {
-        return AnyRead::LsmReader(None);
+        return Ok(AnyRead::LsmReader(None));
     }
     match reader.begin_snapshot() {
-        Ok(snapshot) => AnyRead::LsmReader(Some(snapshot)),
+        Ok(snapshot) => Ok(AnyRead::LsmReader(Some(snapshot))),
+        Err(error) if error.is_lsm_read_cancelled() => Err(error),
         Err(error) => {
             metrics::counter!("helix_lsm_reader_snapshot_open_failed_total").increment(1);
             tracing::warn!(%error, "reader snapshot open failed; serving latest-state reads");
-            AnyRead::LsmReader(None)
+            Ok(AnyRead::LsmReader(None))
         }
     }
 }
@@ -819,6 +1075,196 @@ impl AnyBackend {
         Ok(values)
     }
 
+    /// Whether each row is stored or staged on `w`, aligned with `rows`,
+    /// from ONE batched read on the LSM writer
+    /// ([`LsmBackend::present_for_update`]). `false` for every row where
+    /// there is no such read: the caller then writes as it did.
+    pub(crate) fn present_for_update(
+        &self,
+        w: &AnyWrite<'_>,
+        rows: &[(Namespace<'_>, &[u8], Option<&[u8]>)],
+    ) -> Result<Vec<bool>, BackendError> {
+        match (self, w) {
+            (AnyBackend::Lsm(writer), AnyWrite::Lsm(write)) => {
+                writer.present_for_update(write, rows)
+            }
+            _ => Ok(vec![false; rows.len()]),
+        }
+    }
+
+    /// Batched `get_with`, aligned with `keys`: one multi-get on the LSM
+    /// writer, per-key reads elsewhere.
+    pub(crate) fn get_many(
+        &self,
+        r: &AnyRead<'_>,
+        ns: Namespace<'_>,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let values = match (self, r) {
+            (AnyBackend::Lsm(writer), AnyRead::Lsm(read)) if lsm_delete_batch_reads_enabled() => {
+                writer.collect_values_many_with(read, ns, keys)?
+            }
+            _ => keys
+                .iter()
+                .map(|key| self.get_with(r, ns, key, |v| v.map(<[u8]>::to_vec)))
+                .collect::<Result<_, _>>()?,
+        };
+        // Callers zip values with keys; a short read would silently drop rows.
+        if values.len() != keys.len() {
+            return Err(BackendError::Io(format!(
+                "batched read returned {} values for {} keys",
+                values.len(),
+                keys.len()
+            )));
+        }
+        Ok(values)
+    }
+
+    /// Whether each `(namespace, key)` is present, aligned with `keys`, from
+    /// ONE batched read on the LSM writer. `None` where there is no such read
+    /// (other backends, or the kill switch): the caller probes key by key.
+    pub(crate) fn contains_many(
+        &self,
+        r: &AnyRead<'_>,
+        keys: &[(Namespace<'_>, Vec<u8>)],
+    ) -> Result<Option<Vec<bool>>, BackendError> {
+        let (AnyBackend::Lsm(writer), AnyRead::Lsm(read)) = (self, r) else {
+            return Ok(None);
+        };
+        if !lsm_delete_batch_reads_enabled() {
+            return Ok(None);
+        }
+        let present = writer.contains_many_with(read, keys)?;
+        if present.len() != keys.len() {
+            return Err(BackendError::Io(format!(
+                "batched probe returned {} answers for {} keys",
+                present.len(),
+                keys.len()
+            )));
+        }
+        Ok(Some(present))
+    }
+
+    /// The keys under each `(namespace, key prefix)`, aligned with `prefixes`,
+    /// from concurrent scans in ONE round trip on the LSM writer. `None` where
+    /// there is no such read: the caller scans one prefix at a time.
+    pub(crate) fn scan_prefix_keys_many(
+        &self,
+        r: &AnyRead<'_>,
+        prefixes: &[(Namespace<'_>, Vec<u8>)],
+    ) -> Result<Option<Vec<Vec<Vec<u8>>>>, BackendError> {
+        let (AnyBackend::Lsm(writer), AnyRead::Lsm(read)) = (self, r) else {
+            return Ok(None);
+        };
+        if !lsm_delete_batch_reads_enabled() {
+            return Ok(None);
+        }
+        let Some(rows) = writer.scan_prefix_keys_many_with(read, prefixes)? else {
+            return Ok(None);
+        };
+        if rows.len() != prefixes.len() {
+            return Err(BackendError::Io(format!(
+                "batched scan returned {} row sets for {} prefixes",
+                rows.len(),
+                prefixes.len()
+            )));
+        }
+        Ok(Some(rows))
+    }
+
+    /// The dup values whose logical key starts with each prefix, aligned with
+    /// `key_prefixes`, from concurrent scans in ONE round trip on the LSM
+    /// writer; at most `row_cap` values per prefix when set. `None` where
+    /// there is no such read: the caller scans one prefix at a time.
+    pub(crate) fn scan_dup_prefix_values_many(
+        &self,
+        r: &AnyRead<'_>,
+        ns: Namespace<'_>,
+        key_prefixes: &[Vec<u8>],
+        row_cap: Option<usize>,
+    ) -> Result<Option<Vec<Vec<Vec<u8>>>>, BackendError> {
+        let (AnyBackend::Lsm(writer), AnyRead::Lsm(read)) = (self, r) else {
+            return Ok(None);
+        };
+        if !lsm_delete_batch_reads_enabled() {
+            return Ok(None);
+        }
+        let Some(rows) =
+            writer.scan_dup_prefix_values_many_with(read, ns, key_prefixes, row_cap)?
+        else {
+            return Ok(None);
+        };
+        if rows.len() != key_prefixes.len() {
+            return Err(BackendError::Io(format!(
+                "batched scan returned {} row sets for {} prefixes",
+                rows.len(),
+                key_prefixes.len()
+            )));
+        }
+        Ok(Some(rows))
+    }
+
+    /// `put_dup` whose row also stores `stored` as its value (LSM writer).
+    /// LMDB dup rows hold only the 16-byte value, so it writes a plain row.
+    pub(crate) fn put_dup_stored(
+        &self,
+        w: &mut AnyWrite<'_>,
+        ns: Namespace<'_>,
+        key: &[u8],
+        value: &[u8],
+        stored: &[u8],
+    ) -> Result<(), BackendError> {
+        match (self, w) {
+            (AnyBackend::Lsm(writer), AnyWrite::Lsm(write)) => {
+                writer.put_dup_stored(write, ns, key, value, stored)
+            }
+            (_, w) => self.put_dup(w, ns, key, value),
+        }
+    }
+
+    /// Dup-namespace `scan` that also yields each row's stored value; rows
+    /// without one (every LMDB row) yield an empty slice.
+    pub(crate) fn scan_dup_stored(
+        &self,
+        txn: &AnyRead<'_>,
+        ns: Namespace<'_>,
+        range: KeyRange,
+        mut visit: impl FnMut(&[u8], &[u8], &[u8]) -> bool,
+    ) -> Result<(), BackendError> {
+        match (self, txn) {
+            (AnyBackend::Lsm(b), AnyRead::Lsm(r)) => b.scan_dup_stored(r, ns, range, visit),
+            (AnyBackend::LsmReader(b), AnyRead::LsmReader(snap)) => {
+                b.scan_dup_stored_at(snap.as_ref(), ns, range, visit)
+            }
+            _ => self.scan(txn, ns, range, |k, v| visit(k, v, &[])),
+        }
+    }
+
+    /// `for_each_dup` from the first value that is not below `from`. The LSM
+    /// writer and the reader replica start their scan there. LMDB reads the
+    /// values before it and leaves them out.
+    pub(crate) fn for_each_dup_from(
+        &self,
+        txn: &AnyRead<'_>,
+        ns: Namespace<'_>,
+        key: &[u8],
+        from: &[u8],
+        mut visit: impl FnMut(&[u8]) -> bool,
+    ) -> Result<(), BackendError> {
+        match (self, txn) {
+            (AnyBackend::Lsm(b), AnyRead::Lsm(r)) => {
+                b.for_each_dup_rows_from(r, ns, key, from, visit)
+            }
+            (AnyBackend::LsmReader(b), AnyRead::LsmReader(snap)) => {
+                b.for_each_dup_from_at(snap.as_ref(), ns, key, from, visit)
+            }
+            _ => self.for_each_dup(txn, ns, key, |value| value < from || visit(value)),
+        }
+    }
+
     /// Wrap an existing heed read txn as a borrowed read handle (LMDB only).
     ///
     /// Lets a call site that still threads a heed `&RoTxn` read through the
@@ -840,7 +1286,13 @@ impl AnyBackend {
             },
             // No borrowed heed txn to wrap on the reader replica; construct the
             // same handle `begin_read` would (snapshot-pinned when enabled).
-            AnyBackend::LsmReader(reader) => lsm_reader_read_handle(reader),
+            // This returns a handle and no `Err`: for a cancelled request it
+            // is the latest-state one, whose every read answers the
+            // cancellation when it reaches the store. (A reader's read
+            // methods take no `AnyRead::Failed`.)
+            AnyBackend::LsmReader(reader) => {
+                lsm_reader_read(reader).unwrap_or(AnyRead::LsmReader(None))
+            }
         }
     }
 
@@ -892,6 +1344,21 @@ impl AnyBackend {
                 b.scan(&r, ns, range, visit)
             }
             AnyBackend::LsmReader(b) => b.scan_with(ns, range, visit),
+        }
+    }
+
+    /// [`StorageBackend::scan`] of a range that holds a few small rows: the
+    /// LSM writer reads a block at a time for it ([`LsmBackend::scan_few`]).
+    pub(crate) fn scan_few(
+        &self,
+        txn: &AnyRead<'_>,
+        ns: Namespace<'_>,
+        range: KeyRange,
+        visit: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<(), BackendError> {
+        match (self, txn) {
+            (AnyBackend::Lsm(b), AnyRead::Lsm(r)) => b.scan_few(r, ns, range, visit),
+            _ => self.scan(txn, ns, range, visit),
         }
     }
 
@@ -1024,7 +1491,7 @@ impl StorageBackend for AnyBackend {
         match self {
             AnyBackend::Lmdb(b) => Ok(AnyRead::Lmdb(b.begin_read()?)),
             AnyBackend::Lsm(b) => Ok(AnyRead::Lsm(b.begin_read()?)),
-            AnyBackend::LsmReader(reader) => Ok(lsm_reader_read_handle(reader)),
+            AnyBackend::LsmReader(reader) => lsm_reader_read(reader),
         }
     }
 
@@ -1482,6 +1949,30 @@ mod tests {
             .expect("LMDB close helper is a no-op");
     }
 
+    /// A writer closed at shutdown is dropped inside the runtime afterwards,
+    /// where an LSM call is refused. Closing a closed writer makes no call,
+    /// so that drop has nothing to warn of; an open one is still refused.
+    #[test]
+    fn close_lsm_for_cache_eviction_of_a_closed_writer_makes_no_blocking_call() {
+        let be = AnyBackend::open_lsm_in_memory("/any-lsm-closed-close-test").unwrap();
+        round_trip(&be);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let open_inside = runtime.block_on(async { be.close_lsm_for_cache_eviction() });
+        assert!(
+            matches!(open_inside, Err(BackendError::Unsupported(_))),
+            "an open writer cannot be closed from inside a runtime: {open_inside:?}"
+        );
+
+        be.close_lsm_for_cache_eviction()
+            .expect("the close from a plain thread");
+        runtime
+            .block_on(async { be.close_lsm_for_cache_eviction() })
+            .expect("a closed writer is closed without a blocking call");
+    }
+
     /// C1: a borrowed-read handle whose snapshot failed to open (e.g. a fenced
     /// writer whose SlateDB manifest was taken by a newer client — `begin_read`
     /// returns `Err`) must surface that error cleanly through every read method
@@ -1594,6 +2085,56 @@ mod tests {
         assert!(
             matches!(reader.begin_write(), Err(BackendError::Unsupported(_))),
             "reader replica must reject begin_write"
+        );
+    }
+
+    /// A reader replica's `begin_read` for a request whose caller has left
+    /// answers the cancellation: the snapshot open is refused for it, and no
+    /// latest-state read is handed out in its place. A request that is not
+    /// cancelled gets its snapshot.
+    #[test]
+    #[serial_test::serial]
+    fn reader_begin_read_answers_a_cancelled_request_with_the_cancellation() {
+        use crate::helix_engine::storage_core::backend_lsm::{
+            allow_lsm_blocking_cancellable, LsmBackend, LsmReadCancellation,
+        };
+        use crate::helix_engine::storage_core::backend_lsm_reader::LsmReader;
+        use object_store::memory::InMemory;
+        use object_store::ObjectStore;
+        use std::sync::Arc;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "reader-cancelled-begin-read-test";
+        let writer = LsmBackend::open_with_store(path, store.clone()).expect("open writer");
+        let mut w = writer.begin_write().unwrap();
+        writer.put(&mut w, Namespace::Nodes, b"k1", b"v1").unwrap();
+        writer.commit(w).unwrap();
+        let reader = AnyBackend::LsmReader(
+            LsmReader::open_with_store(path, store.clone()).expect("open reader"),
+        );
+
+        const SWITCH: &str = "HELIX_LSM_READER_SNAPSHOT_READS";
+        let before = std::env::var(SWITCH).ok();
+        std::env::set_var(SWITCH, "1");
+        let cancellation = LsmReadCancellation::new();
+        cancellation.cancel();
+        // Whether each read is pinned to a snapshot, where one was opened.
+        let cancelled = allow_lsm_blocking_cancellable(cancellation, || {
+            reader.begin_read().map(|read| read.is_snapshot_pinned())
+        });
+        let live = reader.begin_read().map(|read| read.is_snapshot_pinned());
+        match before {
+            Some(value) => std::env::set_var(SWITCH, value),
+            None => std::env::remove_var(SWITCH),
+        }
+
+        assert!(
+            matches!(cancelled, Err(BackendError::Cancelled)),
+            "a cancelled request's read: {cancelled:?}"
+        );
+        assert!(
+            matches!(live, Ok(true)),
+            "the next request's read: {live:?}"
         );
     }
 

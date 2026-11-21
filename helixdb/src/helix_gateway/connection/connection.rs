@@ -20,6 +20,50 @@ use tokio::{
 };
 use tracing::{error, info, warn};
 
+/// In-flight requests get this long after the shutdown signal. Past it the
+/// storage is closed under them: they end with a closed connection or a
+/// "db is closed" error, as they did at the kill.
+const SHUTDOWN_REQUEST_CAP: Duration = Duration::from_secs(8);
+
+/// `HELIX_SHUTDOWN_CLOSE_MS`: time from the shutdown signal to the end of the
+/// close step, inside the pod's 30 s grace period. In it in-flight requests
+/// get [`SHUTDOWN_REQUEST_CAP`], then every open LSM writer is closed
+/// (`CollectionManager::close_lsm_writers`). Default 25000. 0 waits for every
+/// request and closes nothing, as before.
+///
+/// A process whose root is not an LSM writer (a reader replica, LMDB) has no
+/// writer to close, so it gets no budget and no cap: its requests in flight,
+/// a reader's cold opens among them, run to their end.
+fn shutdown_close_budget(lsm_writer: bool) -> Option<Duration> {
+    close_budget_from(
+        std::env::var("HELIX_SHUTDOWN_CLOSE_MS").ok().as_deref(),
+        lsm_writer,
+    )
+}
+
+fn close_budget_from(setting: Option<&str>, lsm_writer: bool) -> Option<Duration> {
+    let ms = setting
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(25_000);
+    (ms > 0 && lsm_writer).then(|| Duration::from_millis(ms))
+}
+
+/// The last storage step of a shutdown: close every open LSM writer by
+/// `deadline`, off the runtime's workers.
+async fn close_lsm_writers_for_shutdown(
+    collections: Arc<CollectionManager>,
+    graph: Arc<HelixGraphEngine>,
+    deadline: std::time::Instant,
+) {
+    if let Err(err) = tokio::task::spawn_blocking(move || {
+        allow_lsm_blocking(|| collections.close_lsm_writers(Some(&graph.storage), deadline))
+    })
+    .await
+    {
+        error!(error = %err, "LSM writer close task failed");
+    }
+}
+
 pub struct ConnectionHandler {
     pub address: String,
     pub graph: Arc<HelixGraphEngine>,
@@ -63,6 +107,7 @@ impl ConnectionHandler {
         })?;
 
         let collections = Arc::clone(&self.collections);
+        let graph = Arc::clone(&self.graph);
         let thread_pool_sender = self.thread_pool.sender.clone();
         let snapshot_interval_secs = collections.snapshot_interval_secs();
         let snapshot_on_shutdown = collections.config().snapshot_on_shutdown();
@@ -152,6 +197,7 @@ impl ConnectionHandler {
                     }
                 }
 
+                let signal_at = std::time::Instant::now();
                 info!("Draining in-flight requests (5s grace period)...");
                 drop(thread_pool_sender);
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -195,6 +241,15 @@ impl ConnectionHandler {
                     }
                 }
 
+                if let Some(budget) = shutdown_close_budget(graph.storage.backend.is_lsm_writer()) {
+                    close_lsm_writers_for_shutdown(
+                        Arc::clone(&collections),
+                        Arc::clone(&graph),
+                        signal_at + budget,
+                    )
+                    .await;
+                }
+
                 info!("Shutdown complete");
                 break;
             }
@@ -221,6 +276,7 @@ impl ConnectionHandler {
         // breaker can close without further upsert traffic.
         async_gateway::spawn_segment_breaker_reeval_task(state.clone());
         let collections = Arc::clone(&self.collections);
+        let graph = Arc::clone(&self.graph);
         let snapshot_interval_secs = collections.snapshot_interval_secs();
         let snapshot_on_shutdown = collections.config().snapshot_on_shutdown();
 
@@ -257,7 +313,11 @@ impl ConnectionHandler {
                 });
             }
 
-            let shutdown = async {
+            let close_budget = shutdown_close_budget(graph.storage.backend.is_lsm_writer());
+            let signal_at = Arc::new(std::sync::OnceLock::new());
+            let signalled = Arc::new(tokio::sync::Notify::new());
+            let (signal_at_set, signal_seen) = (Arc::clone(&signal_at), Arc::clone(&signalled));
+            let shutdown = async move {
                 #[cfg(unix)]
                 let mut sigterm =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -272,11 +332,37 @@ impl ConnectionHandler {
                     let _ = tokio::signal::ctrl_c().await;
                     info!("Received SIGINT, shutting down...");
                 }
+                let _ = signal_at_set.set(std::time::Instant::now());
+                signal_seen.notify_one();
             };
 
-            if let Err(err) = async_gateway::serve(listener, state, shutdown).await {
-                error!(error = %err, "Axum gateway failed");
+            // Without the cap the graceful shutdown waits for every request,
+            // and the pod's kill comes before any writer is closed.
+            let cap = close_budget.map(|budget| budget.min(SHUTDOWN_REQUEST_CAP));
+            let request_cap = async {
+                signalled.notified().await;
+                match cap {
+                    Some(cap) => tokio::time::sleep(cap).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                served = async_gateway::serve(listener, state, shutdown) => {
+                    if let Err(err) = served {
+                        error!(error = %err, "Axum gateway failed");
+                    }
+                }
+                _ = request_cap => {
+                    warn!(
+                        cap_ms = cap.unwrap_or_default().as_millis() as u64,
+                        "in-flight requests outlived the shutdown cap; closing storage under them"
+                    );
+                }
             }
+            let signal_at = signal_at
+                .get()
+                .copied()
+                .unwrap_or_else(std::time::Instant::now);
             snapshot_stop.store(true, Ordering::Release);
 
             while snapshot_in_progress.load(Ordering::Acquire) {
@@ -315,9 +401,32 @@ impl ConnectionHandler {
                 }
             }
 
+            if let Some(budget) = close_budget {
+                close_lsm_writers_for_shutdown(collections, graph, signal_at + budget).await;
+            }
+
             info!("Shutdown complete");
         });
 
         Ok(handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_lsm_writer_gets_the_shutdown_budget_and_any_other_process_none() {
+        let seconds = |setting, writer| close_budget_from(setting, writer).map(|d| d.as_secs());
+        // An LSM writer: 25 s unless set, and 0 is the shutdown before the close.
+        assert_eq!(seconds(None, true), Some(25));
+        assert_eq!(seconds(Some("12000"), true), Some(12));
+        assert_eq!(seconds(Some("0"), true), None);
+        assert_eq!(seconds(Some("soon"), true), Some(25));
+        // A reader replica or an LMDB process has no writer to close: no
+        // budget, so no cap on its requests in flight either.
+        assert_eq!(seconds(None, false), None);
+        assert_eq!(seconds(Some("12000"), false), None);
     }
 }

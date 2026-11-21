@@ -190,6 +190,8 @@ pub struct DbBuilder<P: Into<Path>> {
     metrics_recorder: Arc<dyn MetricsRecorder>,
     segment_extractor: Option<Arc<dyn crate::prefix_extractor::PrefixExtractor>>,
     manifest_id_floor: u64,
+    create_only: bool,
+    l0_flush_gate: Option<Arc<dyn crate::memtable_flusher::L0FlushGate>>,
 }
 
 impl<P: Into<Path>> DbBuilder<P> {
@@ -199,6 +201,8 @@ impl<P: Into<Path>> DbBuilder<P> {
             path,
             main_object_store,
             manifest_id_floor: 0,
+            create_only: false,
+            l0_flush_gate: None,
             settings: Settings::default(),
             wal_object_store: None,
             db_cache: default_db_cache(),
@@ -238,6 +242,30 @@ impl<P: Into<Path>> DbBuilder<P> {
     /// database already exists; `0` keeps the default.
     pub fn with_manifest_id_floor(mut self, floor: u64) -> Self {
         self.manifest_id_floor = floor;
+        self
+    }
+
+    /// HELION LOCAL PATCH: the open must create its database. When the path
+    /// already holds a manifest the build fails with
+    /// [`crate::ErrorCode::DatabaseExists`] and leaves that manifest as it
+    /// found it: it is not fenced, and nothing is replayed from it. A
+    /// manifest that takes the new database's first id between the look for
+    /// one and the first write is answered the same way. For a path the
+    /// caller has just emptied: whatever is there by the open is not the
+    /// caller's database.
+    pub fn with_create_only(mut self, create_only: bool) -> Self {
+        self.create_only = create_only;
+        self
+    }
+
+    /// HELION LOCAL PATCH: every L0 flush of this database asks `gate` before
+    /// it encodes its memtable (see [`crate::L0FlushGate`]). `None`, the
+    /// default, holds no flush back.
+    pub fn with_l0_flush_gate(
+        mut self,
+        gate: Option<Arc<dyn crate::memtable_flusher::L0FlushGate>>,
+    ) -> Self {
+        self.l0_flush_gate = gate;
         self
     }
 
@@ -521,6 +549,12 @@ impl<P: Into<Path>> DbBuilder<P> {
         let latest_manifest =
             StoredManifest::try_load(manifest_store.clone(), system_clock.clone()).await?;
 
+        // HELION LOCAL PATCH: see `with_create_only`.
+        let create_only = self.create_only;
+        if create_only && latest_manifest.is_some() {
+            return Err(SlateDBError::DatabaseExists.into());
+        }
+
         if let Some(latest_manifest) = &latest_manifest {
             latest_manifest
                 .db_state()
@@ -583,7 +617,14 @@ impl<P: Into<Path>> DbBuilder<P> {
                     system_clock.clone(),
                     self.manifest_id_floor,
                 )
-                .await?
+                .await
+                // HELION LOCAL PATCH: see `with_create_only`.
+                .map_err(|error| match error {
+                    SlateDBError::TransactionalObjectVersionExists if create_only => {
+                        SlateDBError::DatabaseExists
+                    }
+                    error => error,
+                })?
             }
         };
 
@@ -608,7 +649,10 @@ impl<P: Into<Path>> DbBuilder<P> {
         let (write_tx, write_rx) = SafeSender::unbounded_channel(reader);
 
         // Create the database inner state
-        let memtable_flusher = Arc::new(MemtableFlusher::new(&status_manager));
+        let memtable_flusher = Arc::new(
+            MemtableFlusher::new(&status_manager)
+                .with_gate(self.l0_flush_gate.clone(), path.to_string()),
+        );
         let inner = Arc::new(
             DbInner::new(
                 self.settings.clone(),
@@ -2145,6 +2189,45 @@ mod tests {
         let counter = helper.counter(name).level(MetricLevel::Debug).register();
         counter.increment(1);
         assert_eq!(lookup_metric(recorder, name), Some(1));
+    }
+
+    /// HELION LOCAL PATCH: `with_create_only`. The build creates a database
+    /// where there is none; one that is there it refuses and leaves as it
+    /// found it, where a build without the option opens it.
+    #[tokio::test]
+    async fn create_only_build_creates_a_database_and_refuses_one_that_is_there() {
+        let path = "create_only_build";
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let manifest_store = ManifestStore::new(&Path::from(path), object_store.clone());
+
+        let db = crate::Db::builder(path, object_store.clone())
+            .with_create_only(true)
+            .build()
+            .await
+            .expect("failed to create db");
+        db.close().await.expect("failed to close db");
+        let latest = manifest_store.read_latest_manifest().await.unwrap().id;
+
+        let refused = match crate::Db::builder(path, object_store.clone())
+            .with_create_only(true)
+            .build()
+            .await
+        {
+            Ok(_) => panic!("the build opened a database it did not create"),
+            Err(error) => error,
+        };
+        assert_eq!(refused.code(), Some(crate::ErrorCode::DatabaseExists));
+        assert_eq!(
+            manifest_store.read_latest_manifest().await.unwrap().id,
+            latest,
+            "the refused build wrote a manifest"
+        );
+
+        let db = crate::Db::builder(path, object_store)
+            .build()
+            .await
+            .expect("failed to open db");
+        db.close().await.expect("failed to close db");
     }
 
     #[tokio::test]

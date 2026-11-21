@@ -11,10 +11,19 @@ use lru::LruCache;
 use serde::{Deserialize, Serialize};
 
 use crate::helix_engine::storage_core::backend::{
-    BackendKind, Namespace, SparseDb, StorageBackend,
+    BackendError, BackendKind, Namespace, SparseDb, StorageBackend,
 };
 use crate::helix_engine::storage_core::backend_any::{AnyBackend, AnyRead, AnyWrite};
+use crate::helix_engine::storage_core::backend_lsm::lsm_read_cancelled;
 use crate::helix_engine::types::VectorError;
+
+#[path = "sparse_lazy_filter.rs"]
+mod lazy_filter;
+pub(crate) use lazy_filter::sparse_lazy_filter_enabled;
+#[cfg(test)]
+pub(crate) use lazy_filter::with_sparse_lazy_filter_for_test;
+pub use lazy_filter::DocFilter;
+use lazy_filter::LazyFilter;
 
 // ─── Types ───
 
@@ -187,6 +196,19 @@ impl PartialOrd for ScoredDoc {
     }
 }
 
+/// Offer one scored doc to a `limit`-bounded min-heap of the best docs
+/// (higher score wins, lower id breaks ties).
+fn push_top(heap: &mut BinaryHeap<ScoredDoc>, limit: usize, id: u128, score: f64) {
+    if heap.len() < limit {
+        heap.push(ScoredDoc { id, score });
+    } else if let Some(min) = heap.peek() {
+        if score > min.score || (score == min.score && id < min.id) {
+            heap.pop();
+            heap.push(ScoredDoc { id, score });
+        }
+    }
+}
+
 /// Fixed survivor margin beyond `limit` (capped at `2 * limit`) re-scored
 /// exactly after WAND accumulation.
 const WAND_RESCORE_MARGIN: usize = 32;
@@ -289,6 +311,27 @@ fn maxscore_can_stop(scores: &HashMap<u128, f64>, limit: usize, remaining_ub: f6
         .unwrap_or(false)
 }
 
+/// A search filter turns a failed read into "no match", so what a search
+/// selected is not its result when the request was cancelled meanwhile, or
+/// when a read of its filter failed for another reason
+/// ([`DocFilter::failure`]; one `helix_sparse_search_filter_read_failed_total`
+/// per search failed so).
+fn unless_filter_failed<T, F: DocFilter>(
+    result: Result<T, VectorError>,
+    filter_fn: Option<&F>,
+) -> Result<T, VectorError> {
+    if lsm_read_cancelled() {
+        return Err(VectorError::VectorCoreError(
+            BackendError::Cancelled.to_string(),
+        ));
+    }
+    if let Some(failure) = filter_fn.and_then(|f| f.failure()) {
+        metrics::counter!("helix_sparse_search_filter_read_failed_total").increment(1);
+        return Err(VectorError::VectorCoreError(failure));
+    }
+    result
+}
+
 /// Add one posting's contribution to the WAND accumulator, applying the
 /// candidate filter AT ACCUMULATION TIME (each doc's filter verdict is
 /// evaluated once and memoized in `rejected`). The maxscore stop rule then
@@ -302,7 +345,7 @@ fn accumulate_filtered<F>(
     doc_id: u128,
     contribution: f64,
 ) where
-    F: Fn(u128) -> bool,
+    F: DocFilter,
 {
     let Some(f) = filter_fn else {
         *scores.entry(doc_id).or_insert(0.0) += contribution;
@@ -311,7 +354,7 @@ fn accumulate_filtered<F>(
     if let Some(score) = scores.get_mut(&doc_id) {
         *score += contribution;
     } else if !rejected.contains(&doc_id) {
-        if f(doc_id) {
+        if f.passes(doc_id) {
             *scores.entry(doc_id).or_insert(0.0) += contribution;
         } else {
             rejected.insert(doc_id);
@@ -1233,6 +1276,27 @@ impl SparseVectorCore {
         Ok(values)
     }
 
+    /// The numbers a search over `r` weights `term_ids` with: the space's
+    /// document count, and each term's document frequency in `term_ids` order
+    /// (0 for a term without postings). Read as the WAND scorer reads them,
+    /// through its term cache: a search for the same terms on the same state
+    /// finds them cached, and this finds what such a search cached.
+    pub(crate) fn term_stats_be(
+        &self,
+        r: &AnyRead<'_>,
+        term_ids: &[u32],
+    ) -> Result<(u64, Vec<u64>), VectorError> {
+        // Epoch first, as a search reads it: cache hits must match it.
+        let epoch = self.read_cache_epoch_be(r)?;
+        let doc_count = self.get_doc_count_read_be(r)?;
+        let metadata = self.term_metadata_many_read_be(r, epoch, term_ids)?;
+        let df = term_ids
+            .iter()
+            .map(|term_id| metadata.get(term_id).map_or(0, |(df, _)| *df))
+            .collect();
+        Ok((doc_count, df))
+    }
+
     // ── Seam KV helpers for the forward + inverted indexes ──
     //
     // The forward index is keyed by the doc_id's 16-byte big-endian encoding
@@ -1943,7 +2007,7 @@ impl SparseVectorCore {
         }
 
         // ── Diff path: per-doc fallback ───────────────────────────────────
-        // Most points in steady-state CE re-ingest go through here, but
+        // Most points in steady-state client re-ingest go through here, but
         // each doc's diff only touches changed terms (already
         // optimized), so per-doc cost is small. Batching the diff path
         // is a follow-up if it becomes the new ceiling.
@@ -2095,7 +2159,7 @@ impl SparseVectorCore {
 
             // Every touched term's df and max in ONE multi-get (batch writes
             // first) instead of two sequential SlateDB reads per distinct term:
-            // ~1k terms per CE batch, each a cold block fetch on big collections.
+            // ~1k terms per client batch, each a cold block fetch on big collections.
             let step_started = Instant::now();
             let term_ids: Vec<u32> = df_deltas.keys().copied().collect();
             let meta_keys: Vec<Vec<u8>> = term_ids
@@ -2151,7 +2215,7 @@ impl SparseVectorCore {
     ///   added, removed, or whose value changed. Unchanged terms keep their
     ///   posting entries — no delete+reinsert thrash.
     ///
-    /// This is the primary entry point for the re-index workload where CE's
+    /// This is the primary entry point for the re-index workload where the client's
     /// watcher frequently re-feeds points whose sparse representation hasn't
     /// shifted meaningfully between runs; the old delete-then-reinsert path
     /// wrote every posting again for every such point.
@@ -2966,6 +3030,25 @@ impl SparseVectorCore {
     where
         F: Fn(u128) -> bool,
     {
+        self.search_be_with(r, query, limit, filter_fn, sparse_lazy_filter_enabled())
+    }
+
+    /// [`Self::search_be`] choosing how `filter_fn` is applied: `lazy_filter`
+    /// checks it best-first only for docs that can still enter the result
+    /// (worth it when a check is expensive, e.g. a node read); otherwise every
+    /// scored doc is checked as it is first touched (cheap set lookups).
+    /// Results are identical either way.
+    pub fn search_be_with<F>(
+        &self,
+        r: &AnyRead<'_>,
+        query: &SparseVector,
+        limit: usize,
+        filter_fn: Option<&F>,
+        lazy_filter: bool,
+    ) -> Result<Vec<(u128, f64)>, VectorError>
+    where
+        F: DocFilter,
+    {
         let total_start = Instant::now();
         let filtered = filter_fn.is_some();
         query.validate()?;
@@ -2995,9 +3078,9 @@ impl SparseVectorCore {
         self.record_sparse_search_items(mode, "limit", filtered, limit);
 
         let result = if use_wand {
-            self.search_wand_be(r, epoch, query, limit, filter_fn, doc_count)
+            self.search_wand_be(r, epoch, query, limit, filter_fn, lazy_filter, doc_count)
         } else {
-            self.search_full_scan_be(r, epoch, query, limit, filter_fn, doc_count)
+            self.search_full_scan_be(r, epoch, query, limit, filter_fn, lazy_filter, doc_count)
         };
         self.record_sparse_search_stage(
             mode,
@@ -3010,7 +3093,7 @@ impl SparseVectorCore {
         if let Ok(results) = &result {
             self.record_sparse_search_items(mode, "results_returned", filtered, results.len());
         }
-        result
+        unless_filter_failed(result, filter_fn)
     }
 
     pub fn search_candidate_ids_exact_be<I>(
@@ -3022,6 +3105,31 @@ impl SparseVectorCore {
     ) -> Result<Vec<(u128, f64)>, VectorError>
     where
         I: IntoIterator<Item = u128>,
+    {
+        self.search_candidate_ids_exact_filtered_be::<_, fn(u128) -> bool>(
+            r,
+            query,
+            limit,
+            candidate_ids,
+            None,
+        )
+    }
+
+    /// [`Self::search_candidate_ids_exact_be`] over the candidates that pass
+    /// `filter_fn`, checked lazily: every candidate is scored, then the
+    /// filter runs best-first until `limit` pass. Same results as filtering
+    /// the candidates first.
+    pub fn search_candidate_ids_exact_filtered_be<I, F>(
+        &self,
+        r: &AnyRead<'_>,
+        query: &SparseVector,
+        limit: usize,
+        candidate_ids: I,
+        filter_fn: Option<&F>,
+    ) -> Result<Vec<(u128, f64)>, VectorError>
+    where
+        I: IntoIterator<Item = u128>,
+        F: DocFilter,
     {
         let total_start = Instant::now();
         let mode = "exact";
@@ -3075,6 +3183,8 @@ impl SparseVectorCore {
 
         let score_start = Instant::now();
         let mut heap: BinaryHeap<ScoredDoc> = BinaryHeap::new();
+        let mut filter_scores: HashMap<u128, f64> = HashMap::new();
+        let lazy = sparse_lazy_filter_enabled();
         let mut candidates_checked = 0usize;
         let mut forward_hits = 0usize;
         let mut scored_docs = 0usize;
@@ -3103,15 +3213,21 @@ impl SparseVectorCore {
                     continue;
                 }
                 scored_docs += 1;
-                if heap.len() < limit {
-                    heap.push(ScoredDoc { id: doc_id, score });
-                } else if let Some(min) = heap.peek() {
-                    if score > min.score || (score == min.score && doc_id < min.id) {
-                        heap.pop();
-                        heap.push(ScoredDoc { id: doc_id, score });
+                match filter_fn {
+                    Some(_) if lazy => {
+                        filter_scores.insert(doc_id, score);
                     }
+                    Some(f) if !f.passes(doc_id) => {}
+                    _ => push_top(&mut heap, limit, doc_id, score),
                 }
             }
+        }
+        if let Some(f) = filter_fn.filter(|_| lazy) {
+            let mut walk = LazyFilter::new(f);
+            for (doc_id, score) in walk.top(&filter_scores, limit) {
+                push_top(&mut heap, limit, doc_id, score);
+            }
+            self.record_sparse_search_items(mode, "filter_checked", true, walk.checked());
         }
         self.record_sparse_search_stage(
             mode,
@@ -3137,7 +3253,7 @@ impl SparseVectorCore {
         if let Ok(results) = &result {
             self.record_sparse_search_items(mode, "results_returned", true, results.len());
         }
-        result
+        unless_filter_failed(result, filter_fn)
     }
 
     /// Full accumulation search — evaluates every posting for every query term.
@@ -3225,10 +3341,11 @@ impl SparseVectorCore {
         query: &SparseVector,
         limit: usize,
         filter_fn: Option<&F>,
+        lazy_filter: bool,
         doc_count: u64,
     ) -> Result<Vec<(u128, f64)>, VectorError>
     where
-        F: Fn(u128) -> bool,
+        F: DocFilter,
     {
         let total_start = Instant::now();
         let mode = "full_scan";
@@ -3272,22 +3389,27 @@ impl SparseVectorCore {
         let mut heap: BinaryHeap<ScoredDoc> = BinaryHeap::new();
         let mut filtered_out = 0usize;
         let mut scored_docs = 0usize;
+        // Lazy: only the best `limit` passing docs are offered to the heap,
+        // the very docs it would keep out of all passing ones.
+        let (scores, filter_fn) = match filter_fn.filter(|_| lazy_filter) {
+            Some(f) => {
+                let mut lazy = LazyFilter::new(f);
+                let top = lazy.top(&scores, limit);
+                filtered_out = lazy.rejected();
+                self.record_sparse_search_items(mode, "filter_checked", filtered, lazy.checked());
+                (top, None)
+            }
+            None => (scores, filter_fn),
+        };
         for (doc_id, score) in scores {
             if let Some(f) = filter_fn {
-                if !f(doc_id) {
+                if !f.passes(doc_id) {
                     filtered_out += 1;
                     continue;
                 }
             }
             scored_docs += 1;
-            if heap.len() < limit {
-                heap.push(ScoredDoc { id: doc_id, score });
-            } else if let Some(min) = heap.peek() {
-                if score > min.score || (score == min.score && doc_id < min.id) {
-                    heap.pop();
-                    heap.push(ScoredDoc { id: doc_id, score });
-                }
-            }
+            push_top(&mut heap, limit, doc_id, score);
         }
         self.record_sparse_search_stage(
             mode,
@@ -3544,10 +3666,11 @@ impl SparseVectorCore {
         query: &SparseVector,
         limit: usize,
         filter_fn: Option<&F>,
+        lazy_filter: bool,
         doc_count: u64,
     ) -> Result<Vec<(u128, f64)>, VectorError>
     where
-        F: Fn(u128) -> bool,
+        F: DocFilter,
     {
         let total_start = Instant::now();
         let mode = "wand";
@@ -3568,7 +3691,15 @@ impl SparseVectorCore {
                 // Negative contributions break both the upper bound and the
                 // partial-score lower bound the stop rule relies on.
                 metrics::counter!("helix_sparse_wand_exhaustive_fallback_total").increment(1);
-                return self.search_full_scan_be(r, epoch, query, limit, filter_fn, doc_count);
+                return self.search_full_scan_be(
+                    r,
+                    epoch,
+                    query,
+                    limit,
+                    filter_fn,
+                    lazy_filter,
+                    doc_count,
+                );
             }
             let term_df = term_metadata.get(&term_id).map(|(df, _)| *df).unwrap_or(0);
             let idf = if use_idf {
@@ -3592,7 +3723,15 @@ impl SparseVectorCore {
                 // pruning is unsound — score exhaustively.
                 if term_df > 0 {
                     metrics::counter!("helix_sparse_wand_exhaustive_fallback_total").increment(1);
-                    return self.search_full_scan_be(r, epoch, query, limit, filter_fn, doc_count);
+                    return self.search_full_scan_be(
+                        r,
+                        epoch,
+                        query,
+                        limit,
+                        filter_fn,
+                        lazy_filter,
+                        doc_count,
+                    );
                 }
                 continue;
             }
@@ -3621,6 +3760,15 @@ impl SparseVectorCore {
         let mut scores: HashMap<u128, f64> =
             HashMap::with_capacity(((doc_count as usize) / 4).clamp(1024, 65536));
         let mut rejected: HashSet<u128> = HashSet::new();
+        // Lazy: accumulate every doc; stop checks and the rescore cut see
+        // only the passing docs they could pick (`LazyFilter`), which keeps
+        // each decision equal to the eager one over the passing subset.
+        let mut lazy = filter_fn.filter(|_| lazy_filter).map(LazyFilter::new);
+        let accumulate_filter = if lazy.is_some() { None } else { filter_fn };
+        let mut stop_check = |scores: &HashMap<u128, f64>, remaining_ub: f64| match lazy.as_mut() {
+            Some(lazy) => maxscore_can_stop(&lazy.top(scores, limit + 1), limit, remaining_ub),
+            None => maxscore_can_stop(scores, limit, remaining_ub),
+        };
         let mut remaining_ub = total_ub;
         let mut terms_scanned = 0u64;
         let mut terms_pruned = 0u64;
@@ -3646,12 +3794,18 @@ impl SparseVectorCore {
         // Instant pair must not run per-term in the hot loop otherwise.
         let time_checks = self.sparse_search_metrics_enabled();
         for (index, (term_id, query_value, idf, ub, term_df)) in weighted.iter().enumerate() {
+            // The caller has gone, or the filter could not check a doc: the
+            // search fails at its end, and cached postings would be added up
+            // for nobody.
+            if lsm_read_cancelled() || filter_fn.is_some_and(|f| f.failure().is_some()) {
+                break;
+            }
             // Eager gate: before descending into a KNOWN-large posting list,
             // always run the maxscore check — the check costs one accumulator
             // pass, the scan it can avoid costs O(df).
             if terms_scanned > 0 && eager_df > 0 && *term_df >= eager_df {
                 let maxscore_start = time_checks.then(Instant::now);
-                let can_stop = maxscore_can_stop(&scores, limit, remaining_ub);
+                let can_stop = stop_check(&scores, remaining_ub);
                 if let Some(started) = maxscore_start {
                     maxscore_check_elapsed =
                         maxscore_check_elapsed.saturating_add(started.elapsed());
@@ -3679,7 +3833,13 @@ impl SparseVectorCore {
             postings_seen += postings.len();
             for &(doc_id, stored_value) in postings.iter() {
                 let contribution = *query_value as f64 * stored_value as f64 * idf;
-                accumulate_filtered(&mut scores, &mut rejected, filter_fn, doc_id, contribution);
+                accumulate_filtered(
+                    &mut scores,
+                    &mut rejected,
+                    accumulate_filter,
+                    doc_id,
+                    contribution,
+                );
             }
             remaining_ub -= *ub;
             if remaining_ub <= 0.0 {
@@ -3689,7 +3849,7 @@ impl SparseVectorCore {
             let remaining_terms = (weighted.len() as u64).saturating_sub(terms_scanned);
             if should_check_wand_maxscore(terms_scanned, remaining_terms, check_interval) {
                 let maxscore_start = time_checks.then(Instant::now);
-                let can_stop = maxscore_can_stop(&scores, limit, remaining_ub);
+                let can_stop = stop_check(&scores, remaining_ub);
                 if let Some(started) = maxscore_start {
                     maxscore_check_elapsed =
                         maxscore_check_elapsed.saturating_add(started.elapsed());
@@ -3728,11 +3888,29 @@ impl SparseVectorCore {
         );
 
         let heap_start = Instant::now();
-        // Filtered during accumulation; `rejected` holds the docs it dropped.
-        let filtered_out = rejected.len();
-        let scored_docs = scores.len();
         let slack = wand_score_slack(weighted.len(), total_ub, remaining_ub);
-        let ids = wand_rescore_candidates(&scores, limit, slack);
+        drop(stop_check);
+        let (ids, filtered_out, scored_docs) = match lazy.as_mut() {
+            Some(lazy) => {
+                let margin = (2 * limit).min(limit + WAND_RESCORE_MARGIN);
+                let cap = limit + WAND_RESCORE_NEAR_TIE_CAP;
+                let pool = lazy.rescore_pool(&scores, limit, margin, cap, slack);
+                (
+                    wand_rescore_candidates(&pool, limit, slack),
+                    lazy.rejected(),
+                    scores.len(),
+                )
+            }
+            // Filtered during accumulation; `rejected` holds the docs it dropped.
+            None => (
+                wand_rescore_candidates(&scores, limit, slack),
+                rejected.len(),
+                scores.len(),
+            ),
+        };
+        if let Some(lazy) = lazy.as_ref() {
+            self.record_sparse_search_items(mode, "filter_checked", filtered, lazy.checked());
+        }
         self.record_sparse_search_items(mode, "rescore_candidates", filtered, ids.len());
         self.record_sparse_search_stage(
             mode,
@@ -6419,6 +6597,66 @@ mod tests {
             .unwrap();
         let (postings, metadata) = sparse_cache_sizes(&reader_core);
         assert!(postings > 0 && metadata > 0);
+    }
+
+    /// The stats read and the WAND scorer read term metadata through one
+    /// cache: on one state, whichever runs first pays the storage read for a
+    /// term and the other finds it. A write gives the next view a new epoch,
+    /// so its numbers are read again.
+    #[test]
+    fn sparse_stats_share_the_wand_scorer_term_cache() {
+        let (writer_backend, writer_core, reader_backend, reader_core, doc) =
+            reader_replica_fixture("term-stats");
+        let AnyBackend::LsmReader(reader) = &*reader_backend else {
+            unreachable!()
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let storage_reads = || {
+            sparse_cache_metric_count(
+                &handle.render(),
+                "helix_sparse_term_metadata_prefetch_batches_total{kind=\"df_max\"}",
+            )
+        };
+        metrics::with_local_recorder(&recorder, || {
+            let pinned = AnyRead::LsmReader(Some(reader.begin_snapshot().unwrap()));
+            // The doc's terms, one without postings, one asked twice.
+            assert_eq!(
+                reader_core
+                    .term_stats_be(&pinned, &[10, 999, 20, 30, 10])
+                    .unwrap(),
+                (2, vec![2, 0, 2, 2, 2])
+            );
+            assert_eq!(storage_reads(), 1);
+            let hits = reader_core
+                .search_be::<fn(u128) -> bool>(&pinned, &doc, 10, None)
+                .unwrap();
+            assert_eq!(hits.len(), 2);
+            assert_eq!(storage_reads(), 1, "the search found its terms cached");
+            assert_eq!(
+                reader_core.term_stats_be(&pinned, &[]).unwrap(),
+                (2, Vec::new())
+            );
+            assert_eq!(storage_reads(), 1, "no term asked, no term read");
+
+            let mut w = writer_backend.begin_write().unwrap();
+            writer_core.delete_be(&mut w, 1).unwrap();
+            writer_backend.commit(w).unwrap();
+            assert!(reader_backend
+                .refresh_lsm_reader_with_poll_interval(Duration::from_millis(100))
+                .unwrap());
+            let pinned = AnyRead::LsmReader(Some(reader.begin_snapshot().unwrap()));
+            let hits = reader_core
+                .search_be::<fn(u128) -> bool>(&pinned, &doc, 10, None)
+                .unwrap();
+            assert_eq!(ids_of(&hits), vec![2]);
+            assert_eq!(storage_reads(), 2, "a new epoch is read from storage");
+            assert_eq!(
+                reader_core.term_stats_be(&pinned, &doc.indices).unwrap(),
+                (1, vec![1, 1, 1])
+            );
+            assert_eq!(storage_reads(), 2, "the stats found the search's terms");
+        });
     }
 
     // ─── WAND exactness regressions ───

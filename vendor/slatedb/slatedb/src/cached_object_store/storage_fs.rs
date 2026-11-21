@@ -1,7 +1,7 @@
-use crate::cached_object_store::stats::CachedObjectStoreStats;
+use crate::cached_object_store::stats::{cache_dir_size_class, trim_stats, CachedObjectStoreStats};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use lru::LruCache;
 use object_store::path::Path;
 use object_store::{Attributes, ObjectMeta};
@@ -148,6 +148,9 @@ fn read_exact_at_offset(file: &std::fs::File, buf: &mut [u8], offset: u64) -> st
     }
 }
 
+/// The start of the file name of a part of any size.
+const PART_FILE_PREFIX: &str = "_part";
+
 #[derive(Debug)]
 pub struct FsCacheStorage {
     root_folder: std::path::PathBuf,
@@ -183,6 +186,19 @@ impl FsCacheStorage {
             rand,
             file_handle_cache,
         }
+    }
+
+    /// HELION LOCAL PATCH: this cache holds parts of `part_size` only, so the
+    /// evictor's scans unlink a part file of any other size instead of
+    /// tracking it. A part's size is in its file name and a read builds the
+    /// name from the configured size, so after a change of size the old
+    /// files are never read again; they only filled the directory until
+    /// eviction reached them, and in a directory under its limit for ever.
+    /// Told before the evictor starts, the first scan already drops them;
+    /// told later, the scans from then on do. Without it every file is
+    /// tracked, as upstream does.
+    pub(crate) fn keep_only_part_size(&self, part_size: usize) {
+        self.evictor.keep_only_part_size(part_size);
     }
 
     #[cfg(test)]
@@ -299,15 +315,21 @@ impl FsCacheEntry {
     ) -> std::path::PathBuf {
         // containing the part size in the file name, allows user change the part size on
         // the fly, without the need to invalidate the cache.
+        let suffix = format!("{}{:09}", Self::part_file_prefix(part_size), part_number);
+        let mut path = root_folder.join(location.to_string());
+        path.push(suffix);
+        path
+    }
+
+    /// The start of the file name of every part of `part_size`: `_part4mb-`,
+    /// `_part256kb-`. No other part size's name starts with it.
+    pub(crate) fn part_file_prefix(part_size: usize) -> String {
         let part_size_name = if part_size.is_multiple_of(1024 * 1024) {
             format!("{}mb", part_size / (1024 * 1024))
         } else {
             format!("{}kb", part_size / 1024)
         };
-        let suffix = format!("_part{}-{:09}", part_size_name, part_number);
-        let mut path = root_folder.join(location.to_string());
-        path.push(suffix);
-        path
+        format!("{PART_FILE_PREFIX}{part_size_name}-")
     }
 
     fn make_head_path(root_folder: std::path::PathBuf, location: &Path) -> std::path::PathBuf {
@@ -565,6 +587,7 @@ struct FsCacheEvictor {
     rx: Mutex<Option<tokio::sync::mpsc::Receiver<FsCacheEvictorWork>>>,
     started: AtomicBool,
     queue_full_count: AtomicU64,
+    queue_full_reads: AtomicU64,
     last_queue_full_log_ms: AtomicI64,
     background_evict_handle: OnceCell<tokio::task::JoinHandle<()>>,
     background_scan_handle: OnceCell<tokio::task::JoinHandle<()>>,
@@ -602,6 +625,40 @@ impl FsCacheUsage {
     }
 }
 
+/// HELION LOCAL PATCH: the usage of every evictor alive in the process, for
+/// `stats::open_dirs_by_size`. A usage goes when its evictor is dropped.
+#[derive(Debug, Default)]
+pub(crate) struct OpenDirs(std::sync::Mutex<Vec<std::sync::Weak<FsCacheUsage>>>);
+
+impl OpenDirs {
+    fn add(&self, usage: &Arc<FsCacheUsage>) {
+        let mut dirs = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        dirs.retain(|dir| dir.strong_count() > 0);
+        dirs.push(Arc::downgrade(usage));
+    }
+
+    /// `(directories, bytes)` by `stats::CACHE_DIR_SIZES` class.
+    pub(crate) fn by_size(&self) -> [(u64, u64); 4] {
+        let mut by_size = [(0, 0); 4];
+        let dirs = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for usage in dirs.iter().filter_map(|dir| dir.upgrade()) {
+            let bytes = usage.used_bytes.load(Ordering::Relaxed);
+            let class = &mut by_size[cache_dir_size_class(bytes)];
+            class.0 += 1;
+            class.1 += bytes;
+        }
+        by_size
+    }
+}
+
+pub(crate) static OPEN_DIRS: OpenDirs = OpenDirs(std::sync::Mutex::new(Vec::new()));
+
 impl FsCacheEvictor {
     fn new(
         root_folder: std::path::PathBuf,
@@ -618,6 +675,7 @@ impl FsCacheEvictor {
             used_bytes: AtomicU64::new(0),
             capacity_bytes: max_cache_size_bytes.map(|bytes| bytes as u64),
         });
+        OPEN_DIRS.add(&usage);
         let inner = Arc::new(FsCacheEvictorInner::new_with_usage(
             root_folder.clone(),
             max_cache_size_bytes,
@@ -633,6 +691,7 @@ impl FsCacheEvictor {
             rx: Mutex::new(Some(rx)),
             started: AtomicBool::new(false),
             queue_full_count: AtomicU64::new(0),
+            queue_full_reads: AtomicU64::new(0),
             last_queue_full_log_ms: AtomicI64::new(i64::MIN),
             background_evict_handle: OnceCell::new(),
             background_scan_handle: OnceCell::new(),
@@ -676,6 +735,14 @@ impl FsCacheEvictor {
         self.started.load(Ordering::Acquire)
     }
 
+    /// See [`FsCacheStorage::keep_only_part_size`]. The first call decides.
+    fn keep_only_part_size(&self, part_size: usize) {
+        let _ = self
+            .inner
+            .only_part_prefix
+            .set(FsCacheEntry::part_file_prefix(part_size));
+    }
+
     // HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): abort the
     // background scan/evict tasks when the evictor is dropped. Without this,
     // `background_scan` parks forever on its own `reconcile_notify` clone
@@ -706,7 +773,7 @@ impl FsCacheEvictor {
             Ok(permit) => Some(WriteReservation::Reserved(permit)),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 self.mark_accounting_dirty();
-                self.record_queue_full();
+                self.record_queue_full(false);
                 None
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -721,8 +788,11 @@ impl FsCacheEvictor {
         self.reconcile_notify.notify_one();
     }
 
-    fn record_queue_full(&self) {
+    fn record_queue_full(&self, read: bool) {
         self.queue_full_count.fetch_add(1, Ordering::AcqRel);
+        if read {
+            self.queue_full_reads.fetch_add(1, Ordering::AcqRel);
+        }
         let now_ms = self.system_clock.now().timestamp_millis();
         let last_log_ms = self.last_queue_full_log_ms.load(Ordering::Acquire);
         if now_ms.saturating_sub(last_log_ms) < QUEUE_FULL_LOG_INTERVAL_MS {
@@ -734,9 +804,10 @@ impl FsCacheEvictor {
             .is_ok()
         {
             let queue_full_count = self.queue_full_count.swap(0, Ordering::AcqRel);
+            let queue_full_reads = self.queue_full_reads.swap(0, Ordering::AcqRel);
             warn!(
-                "evictor queue skipped cache write/access event because it was full {} times in the last 30s",
-                queue_full_count,
+                "evictor queue skipped cache write/access event because it was full {} times ({} reads) in the last 30s",
+                queue_full_count, queue_full_reads,
             );
         }
     }
@@ -801,9 +872,15 @@ impl FsCacheEvictor {
 
         match self.tx.try_send((path, access)) {
             Ok(()) => true,
+            // A dropped read only loses LRU recency: the bytes are already accounted (reads
+            // of a cached part follow its tracked write), so it must not force a full rescan.
+            Err(tokio::sync::mpsc::error::TrySendError::Full((_, EntryAccess::Read(_)))) => {
+                self.record_queue_full(true);
+                false
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 self.mark_accounting_dirty();
-                self.record_queue_full();
+                self.record_queue_full(false);
                 false
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -854,6 +931,10 @@ impl CacheState {
 struct FsCacheEvictorInner {
     root_folder: std::path::PathBuf,
     max_cache_size_bytes: Option<usize>,
+    /// HELION LOCAL PATCH: when set, the file name prefix of the one part size
+    /// this cache holds; a scan unlinks a part of another size. See
+    /// [`FsCacheStorage::keep_only_part_size`].
+    only_part_prefix: std::sync::OnceLock<String>,
     track_lock: Mutex<()>,
     cache_state: Mutex<CacheState>,
     usage: Arc<FsCacheUsage>,
@@ -896,6 +977,7 @@ impl FsCacheEvictorInner {
         Self {
             root_folder,
             max_cache_size_bytes,
+            only_part_prefix: std::sync::OnceLock::new(),
             track_lock: Mutex::new(()),
             cache_state: Mutex::new(CacheState::default()),
             usage,
@@ -923,8 +1005,36 @@ impl FsCacheEvictorInner {
         .await
         .unwrap_or_default();
 
-        let scanned_paths: HashSet<_> = paths.iter().cloned().collect();
+        let mut scanned_paths: HashSet<_> = paths.iter().cloned().collect();
+        let mut other_size_parts = 0u64;
         for path in paths {
+            // HELION LOCAL PATCH: a part of another size is never read again
+            // (see `FsCacheStorage::keep_only_part_size`): unlink it here, where
+            // every file of the directory is visited anyway, instead of
+            // counting it against the limit until eviction happens on it.
+            if self.is_part_of_another_size(&path) {
+                let gone = match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {
+                        other_size_parts += 1;
+                        true
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(err) => {
+                        warn!(
+                            "evictor failed to remove a cache part of another size [path={:?}, error={}]",
+                            path, err
+                        );
+                        false
+                    }
+                };
+                if gone {
+                    // If an earlier scan tracked it, the pass over the tracked
+                    // paths below takes its bytes off the count.
+                    scanned_paths.remove(&path);
+                    continue;
+                }
+                // Still on disk: it is counted like any other file.
+            }
             let metadata = match tokio::fs::metadata(&path).await {
                 Ok(metadata) => metadata,
                 Err(err) => {
@@ -946,6 +1056,13 @@ impl FsCacheEvictorInner {
             let bytes = metadata.len() as usize;
 
             self.track_entry_accessed(path, bytes, atime, evict).await;
+        }
+
+        if other_size_parts > 0 {
+            info!(
+                "evictor removed cache parts of another part size [root={:?}, parts={}]",
+                self.root_folder, other_size_parts
+            );
         }
 
         let tracked_paths = self.cache_state.lock().await.keys.clone();
@@ -977,6 +1094,18 @@ impl FsCacheEvictorInner {
         self.usage.initialized.store(true, Ordering::Release);
     }
 
+    /// Whether `path` is a part file (or a part's leftover temp file) of a
+    /// size other than the one this cache was told to keep. `_head` files and
+    /// everything else are not parts.
+    fn is_part_of_another_size(&self, path: &std::path::Path) -> bool {
+        let Some(keep) = self.only_part_prefix.get() else {
+            return false;
+        };
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(PART_FILE_PREFIX) && !name.starts_with(keep))
+    }
+
     /// track the cache entry access, and evict the cache files when the cache size exceeds the limit if evict is true,
     /// return the bytes of the evicted files. please note that track_entry_accessed might be called concurrently from
     /// the rescanner and evictor tasks, it's expected to be wrapped with a lock to ensure the serial execution.
@@ -994,7 +1123,11 @@ impl FsCacheEvictorInner {
 
             match cache_state.entries.get_mut(&path) {
                 Some(entry) => {
-                    entry.access_time = accessed_time;
+                    // HELION LOCAL PATCH: never set a time back. A scan passes
+                    // the file's atime, which under relatime is its first
+                    // read's: it would make every part read since look as old
+                    // as its fetch.
+                    entry.access_time = entry.access_time.max(accessed_time);
                     if entry.size_bytes != bytes {
                         if bytes > entry.size_bytes {
                             self.usage
@@ -1136,6 +1269,12 @@ impl FsCacheEvictorInner {
         self.stats
             .object_store_cache_bytes
             .set(self.usage.used_bytes.load(Ordering::Relaxed) as i64);
+        // HELION LOCAL PATCH: the process-wide totals Helion exports.
+        trim_stats().record(
+            self.usage.used_bytes.load(Ordering::Relaxed),
+            deleted_targets.len() as u64,
+            total_evicted_bytes as u64,
+        );
 
         total_evicted_bytes
     }
@@ -1404,6 +1543,131 @@ mod tests {
         assert_eq!(file_paths.len(), 2); // the folder file "." is also counted
     }
 
+    /// A rescan, which a cache write that finds the queue full sets off, must
+    /// not undo what reads recorded: under relatime a file's atime is its
+    /// first read's, so the part read last would look as old as its fetch.
+    #[tokio::test]
+    async fn a_scan_keeps_the_newer_access_time_of_a_tracked_entry() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_evictor_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let evictor = Arc::new(FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 2,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        ));
+        let read_last = gen_rand_file(temp_dir.path(), "file0", 1024);
+        let other = gen_rand_file(temp_dir.path(), "file1", 1025);
+        // On disk the part read last is the older file.
+        filetime::set_file_atime(
+            &read_last,
+            FileTime::from_system_time(SystemTime::UNIX_EPOCH),
+        )
+        .unwrap();
+        evictor.clone().scan_entries(false).await;
+        // A read of it, as the evictor's task records one.
+        evictor
+            .track_entry_accessed(
+                read_last.clone(),
+                1024,
+                DefaultSystemClock::default().now(),
+                false,
+            )
+            .await;
+
+        evictor.clone().scan_entries(false).await;
+
+        let targets = evictor.pick_evict_targets(1025).await;
+        assert_eq!(targets.len(), 1);
+        assert_eq!(
+            targets[0].0, other,
+            "the scan set the part read last back to its file's atime"
+        );
+    }
+
+    #[test]
+    fn trims_are_counted_by_what_the_directory_holds_after() {
+        const GIB: u64 = 1 << 30;
+        let stats = crate::cached_object_store::stats::TrimStats::new();
+        stats.record(GIB - 1, 3, 300);
+        stats.record(GIB, 1, 10);
+        stats.record(2 * GIB - 1, 2, 20);
+        stats.record(2 * GIB, 5, 50);
+        stats.record(4 * GIB, 7, 70);
+        let read = |of: &[AtomicU64; 4]| of.each_ref().map(|n| n.load(Ordering::Relaxed));
+        assert_eq!(read(&stats.trims), [1, 2, 1, 1]);
+        assert_eq!(read(&stats.files), [3, 3, 5, 7]);
+        assert_eq!(read(&stats.bytes), [300, 30, 50, 70]);
+    }
+
+    #[test]
+    fn open_directories_are_counted_by_size_until_their_evictor_is_dropped() {
+        const GIB: u64 = 1 << 30;
+        let usage = |bytes: u64| {
+            Arc::new(FsCacheUsage {
+                initialized: AtomicBool::new(true),
+                used_bytes: AtomicU64::new(bytes),
+                capacity_bytes: None,
+            })
+        };
+        let dirs = OpenDirs::default();
+        let (small, full, large) = (usage(5), usage(2 * GIB - 1), usage(5 * GIB));
+        for dir in [&small, &full, &large] {
+            dirs.add(dir);
+        }
+        assert_eq!(
+            dirs.by_size(),
+            [(1, 5), (1, 2 * GIB - 1), (0, 0), (1, 5 * GIB)]
+        );
+        drop(full);
+        assert_eq!(dirs.by_size(), [(1, 5), (0, 0), (0, 0), (1, 5 * GIB)]);
+    }
+
+    /// The process-wide totals move with an eviction. They are the process's
+    /// and other tests evict too, so this reads "at least"; the arithmetic is
+    /// pinned on a value of its own above.
+    #[tokio::test]
+    async fn an_eviction_is_counted_in_the_process_wide_trim_totals() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_test_evictor_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let evictor = FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 2,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        );
+        let totals = || {
+            let stats = trim_stats();
+            [&stats.trims[0], &stats.files[0], &stats.bytes[0]].map(|n| n.load(Ordering::Relaxed))
+        };
+        let before = totals();
+
+        let mut evicted = 0;
+        for name in ["file0", "file1", "file2"] {
+            let path = gen_rand_file(temp_dir.path(), name, 1024);
+            evicted += evictor
+                .track_entry_accessed(path, 1024, DefaultSystemClock::default().now(), true)
+                .await;
+        }
+
+        assert_eq!(evicted, 2048);
+        let after = totals();
+        assert!(after[0] > before[0], "no trim counted");
+        assert!(after[1] >= before[1] + 2, "files: {before:?} to {after:?}");
+        assert!(
+            after[2] >= before[2] + 2048,
+            "bytes: {before:?} to {after:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_evictor_track_entry_accessed_backpressure() {
         let temp_dir = tempfile::Builder::new()
@@ -1448,6 +1712,20 @@ mod tests {
             .track_entry_accessed(std::path::PathBuf::from("overflow"), EntryAccess::Write(1))
             .await;
         assert!(!accepted);
+
+        // A dropped read keeps the accounting valid (no forced rescan); a dropped write or
+        // delete does not.
+        evictor.usage.initialized.store(true, Ordering::Release);
+        let accepted = evictor
+            .track_entry_accessed(std::path::PathBuf::from("file0"), EntryAccess::Read(1))
+            .await;
+        assert!(!accepted);
+        assert!(evictor.usage.initialized.load(Ordering::Acquire));
+        let accepted = evictor
+            .track_entry_accessed(std::path::PathBuf::from("file1"), EntryAccess::Delete)
+            .await;
+        assert!(!accepted);
+        assert!(!evictor.usage.initialized.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1507,6 +1785,241 @@ mod tests {
         evictor.clone().scan_entries(false).await;
         let cache_size_bytes = evictor.usage.used_bytes.load(Ordering::SeqCst);
         assert_eq!(cache_size_bytes, 2049);
+    }
+
+    /// What a scan meets in an SST's cache folder after changes of part size
+    /// that ended at 1 MiB: parts of an old size and a temp file one of them
+    /// left, parts of sizes whose names begin like the configured one's (16
+    /// MiB, 128 KiB, 1 KiB), parts of the configured size and a temp file of
+    /// theirs, the `_head` file, and a file that is no part. Sizes are small
+    /// on purpose: only the names matter.
+    fn mixed_part_sizes(folder: &std::path::Path) {
+        std::fs::create_dir_all(folder).unwrap();
+        for (name, bytes) in [
+            ("_part4mb-000000000", 4096),
+            ("_part4mb-000000001", 4096),
+            ("_part4mb-000000002._tmpAbC", 100),
+            ("_part16mb-000000000", 16),
+            ("_part128kb-000000003", 128),
+            ("_part1kb-000000000", 20),
+            ("_part1mb-000000000", 1024),
+            ("_part1mb-000000007", 1000),
+            ("_part1mb-000000008._tmpXyZ", 10),
+            ("_head", 64),
+            ("note", 5),
+        ] {
+            gen_rand_file(folder, name, bytes);
+        }
+    }
+
+    /// The files of `mixed_part_sizes` and their bytes, and what a cache of
+    /// 1 MiB parts keeps of them.
+    const MIXED_FILES: usize = 11;
+    const MIXED_BYTES: u64 = 4096 + 4096 + 100 + 16 + 128 + 20 + KEPT_BYTES;
+    const KEPT_FILES: usize = 5;
+    const KEPT_BYTES: u64 = 1024 + 1000 + 10 + 64 + 5;
+
+    fn file_names_under(root: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = walkdir::WalkDir::new(root)
+            .into_iter()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_part_file_prefix_names_one_size_only() {
+        assert_eq!(FsCacheEntry::part_file_prefix(4 * 1024 * 1024), "_part4mb-");
+        assert_eq!(FsCacheEntry::part_file_prefix(1024 * 1024), "_part1mb-");
+        assert_eq!(FsCacheEntry::part_file_prefix(256 * 1024), "_part256kb-");
+        // 1 MiB's prefix must not take 16 MiB's files for its own, nor the reverse.
+        assert!(!"_part16mb-000000000".starts_with(&FsCacheEntry::part_file_prefix(1024 * 1024)));
+        assert!(
+            !"_part1mb-000000000".starts_with(&FsCacheEntry::part_file_prefix(16 * 1024 * 1024))
+        );
+        let path = FsCacheEntry::make_part_path(
+            std::path::PathBuf::from("/c"),
+            &Path::from("a/b.sst"),
+            12,
+            1024 * 1024,
+        );
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/c/a/b.sst/_part1mb-000000012")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scan_unlinks_parts_of_another_size_and_tracks_the_rest() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_other_part_size_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let evictor = Arc::new(FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 1024 * 1024,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        ));
+        evictor
+            .only_part_prefix
+            .set(FsCacheEntry::part_file_prefix(1024 * 1024))
+            .unwrap();
+        mixed_part_sizes(
+            &temp_dir
+                .path()
+                .join("db/compacted/01ARZ3NDEKTSV4RRFFQ69G5FAV.sst"),
+        );
+
+        // Twice: the second scan has nothing left to remove and counts the same.
+        for _ in 0..2 {
+            evictor.clone().scan_entries(false).await;
+            assert_eq!(
+                file_names_under(temp_dir.path()),
+                vec![
+                    "_head",
+                    "_part1mb-000000000",
+                    "_part1mb-000000007",
+                    "_part1mb-000000008._tmpXyZ",
+                    "note",
+                ]
+            );
+            assert_eq!(evictor.usage.used_bytes.load(Ordering::SeqCst), KEPT_BYTES);
+            assert_eq!(evictor.cache_state.lock().await.entries.len(), KEPT_FILES);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scan_told_no_part_size_keeps_every_file() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_any_part_size_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let evictor = Arc::new(FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 1024 * 1024,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        ));
+        mixed_part_sizes(
+            &temp_dir
+                .path()
+                .join("db/compacted/01ARZ3NDEKTSV4RRFFQ69G5FAV.sst"),
+        );
+
+        evictor.clone().scan_entries(false).await;
+        assert_eq!(file_names_under(temp_dir.path()).len(), MIXED_FILES);
+        assert_eq!(evictor.usage.used_bytes.load(Ordering::SeqCst), MIXED_BYTES);
+
+        // Told the size only now, with the other parts already counted: the
+        // next scan unlinks them and takes their bytes off the count.
+        evictor
+            .only_part_prefix
+            .set(FsCacheEntry::part_file_prefix(1024 * 1024))
+            .unwrap();
+        evictor.clone().scan_entries(false).await;
+        assert_eq!(file_names_under(temp_dir.path()).len(), KEPT_FILES);
+        assert_eq!(evictor.usage.used_bytes.load(Ordering::SeqCst), KEPT_BYTES);
+        assert_eq!(evictor.cache_state.lock().await.entries.len(), KEPT_FILES);
+    }
+
+    /// A part of another size that cannot be unlinked stays on the disk and in
+    /// the count, and goes at the first scan that can unlink it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_part_that_cannot_be_unlinked_stays_counted() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_unlink_fails_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let evictor = Arc::new(FsCacheEvictorInner::new(
+            temp_dir.path().to_path_buf(),
+            1024 * 1024 * 1024,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DbRand::default()),
+            FileHandleCache::new(1000),
+        ));
+        evictor
+            .only_part_prefix
+            .set(FsCacheEntry::part_file_prefix(1024 * 1024))
+            .unwrap();
+        let folder = temp_dir
+            .path()
+            .join("db/compacted/01ARZ3NDEKTSV4RRFFQ69G5FAV.sst");
+        mixed_part_sizes(&folder);
+        let set_mode = |mode| {
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+
+        set_mode(0o555);
+        if std::fs::File::create(folder.join("probe")).is_ok() {
+            // root, or a file system without permissions: no unlink fails here.
+            set_mode(0o755);
+            return;
+        }
+        evictor.clone().scan_entries(false).await;
+        let names = file_names_under(temp_dir.path());
+        let used = evictor.usage.used_bytes.load(Ordering::SeqCst);
+        let tracked = evictor.cache_state.lock().await.entries.len();
+        set_mode(0o755);
+        assert_eq!(names.len(), MIXED_FILES, "{names:?}");
+        assert_eq!(used, MIXED_BYTES);
+        assert_eq!(tracked, MIXED_FILES);
+
+        evictor.clone().scan_entries(false).await;
+        assert_eq!(file_names_under(temp_dir.path()).len(), KEPT_FILES);
+        assert_eq!(evictor.usage.used_bytes.load(Ordering::SeqCst), KEPT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn a_storage_told_its_part_size_drops_the_others_at_its_first_scan() {
+        let temp_dir = tempfile::Builder::new()
+            .prefix("objstore_cache_storage_part_size_")
+            .tempdir()
+            .unwrap();
+        let recorder = slatedb_common::metrics::MetricsRecorderHelper::noop();
+        let storage = FsCacheStorage::new(
+            temp_dir.path().to_path_buf(),
+            Some(1024 * 1024 * 1024),
+            None,
+            Arc::new(CachedObjectStoreStats::new(&recorder)),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            10,
+        );
+        storage.keep_only_part_size(1024 * 1024);
+        mixed_part_sizes(
+            &temp_dir
+                .path()
+                .join("db/compacted/01ARZ3NDEKTSV4RRFFQ69G5FAV.sst"),
+        );
+
+        storage.start_evictor().await;
+        let mut snapshot = storage.usage_snapshot();
+        for _ in 0..500 {
+            if matches!(snapshot, CacheUsageSnapshot::Ready { .. }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            snapshot = storage.usage_snapshot();
+        }
+        assert_eq!(
+            snapshot,
+            CacheUsageSnapshot::Ready {
+                used_bytes: KEPT_BYTES,
+                capacity_bytes: Some(1024 * 1024 * 1024),
+            }
+        );
+        assert_eq!(file_names_under(temp_dir.path()).len(), KEPT_FILES);
     }
 
     #[tokio::test]

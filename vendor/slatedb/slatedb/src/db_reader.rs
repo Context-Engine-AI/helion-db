@@ -37,9 +37,11 @@ use slatedb_common::clock::SystemClock;
 use slatedb_common::DbRand;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Sub;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use uuid::Uuid;
@@ -78,11 +80,48 @@ pub(crate) struct DbReaderInner {
     /// See: https://github.com/slatedb/slatedb/issues/1469
     #[allow(dead_code)]
     recorder: slatedb_common::metrics::MetricsRecorderHelper,
+    poll_control: PollControl,
 }
 
 #[derive(Debug)]
 enum DbReaderMessage {
+    /// Poll the manifest now.
     PollManifest,
+    /// HELION LOCAL PATCH: a tick of the poll ticker. A poll runs on every
+    /// [`PollControl::every`]-th one.
+    Tick,
+}
+
+/// HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): what lets a reader be
+/// polled at another interval, or now, without being built anew.
+///
+/// The poll ticker keeps the period it was created with,
+/// `DbReaderOptions::manifest_poll_interval`. A poll runs on every `every`-th
+/// tick, so the interval in force is a whole number of ticks, 1 at the open.
+struct PollControl {
+    every: AtomicU64,
+    /// Calls of [`DbReader::poll_manifest`] so far.
+    requested: AtomicU64,
+    /// The highest `requested` a finished poll read as it began: every call
+    /// counted up to it has had a poll that began after it. `u64::MAX` once
+    /// the poller has stopped, which releases the calls still waiting.
+    served: tokio::sync::watch::Sender<u64>,
+    /// Wakes the poller for a poll now. Set when the poller is spawned, so
+    /// empty for a reader opened at a fixed checkpoint, which has none. The
+    /// channel holds one message: a wake that waits starts a poll that serves
+    /// the calls made while it waited.
+    wake: OnceLock<async_channel::Sender<DbReaderMessage>>,
+}
+
+impl PollControl {
+    fn new() -> Self {
+        Self {
+            every: AtomicU64::new(1),
+            requested: AtomicU64::new(0),
+            served: tokio::sync::watch::channel(0).0,
+            wake: OnceLock::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -378,6 +417,7 @@ impl DbReaderInner {
             segment_extractor,
             rand,
             recorder,
+            poll_control: PollControl::new(),
         };
         Ok(inner)
     }
@@ -552,9 +592,13 @@ impl DbReaderInner {
             || latest.segments != current_state.segments
     }
 
+    /// HELION LOCAL PATCH: `held` is the checkpoint the reader has, where it
+    /// has one: the new one is written only into a manifest that holds it
+    /// (`StoredManifest::write_checkpoint_beside`).
     async fn create_checkpoint(
         &self,
         stored_manifest: &mut StoredManifest,
+        held: Option<Uuid>,
     ) -> Result<Checkpoint, SlateDBError> {
         let options = CheckpointOptions {
             lifetime: Some(self.options.checkpoint_lifetime),
@@ -562,7 +606,7 @@ impl DbReaderInner {
         };
         let new_checkpoint_id = self.rand.rng().gen_uuid();
         stored_manifest
-            .write_checkpoint(new_checkpoint_id, &options)
+            .write_checkpoint_beside(held, new_checkpoint_id, &options)
             .await
     }
 
@@ -775,7 +819,7 @@ impl DbReaderInner {
                     // manifest instead of failing the reader permanently. A user-supplied
                     // checkpoint must still fail loud: the caller's pinned view is gone.
                     warn!("reader checkpoint missing, re-establishing [checkpoint_id={id}]");
-                    let checkpoint = self.create_checkpoint(stored_manifest).await?;
+                    let checkpoint = self.create_checkpoint(stored_manifest, None).await?;
                     self.reestablish_checkpoint(checkpoint).await?;
                     return Ok(());
                 }
@@ -806,7 +850,9 @@ impl DbReaderInner {
         task_executor: &MessageHandlerExecutor,
     ) -> Result<(), SlateDBError> {
         let poller = ManifestPoller::new(Arc::clone(self));
-        let (_tx, rx) = async_channel::unbounded();
+        // HELION LOCAL PATCH: the sender is kept, for `DbReader::poll_manifest`.
+        let (tx, rx) = async_channel::bounded(1);
+        let _ = self.poll_control.wake.set(tx);
         let result = task_executor.add_handler(
             DB_READER_TASK_NAME.to_string(),
             Box::new(poller),
@@ -828,10 +874,14 @@ impl DbReaderInner {
         mut publish: Option<ReplayPublisher<'_>>,
         db_stats: Option<&DbStats>,
     ) -> Result<(u64, u64), SlateDBError> {
+        // HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): `cache_blocks`
+        // was true. A replay reads every block of a WAL SST once, and the
+        // cache keys WAL entries by this reader's own scope, so no later read
+        // finds them: they only pushed out blocks that reads do use.
         let sst_iter_options = SstIteratorOptions {
             max_fetch_tasks: 1,
             blocks_to_fetch: 256,
-            cache_blocks: true,
+            cache_blocks: false,
             cache_metadata: false,
             eager_spawn: true,
             order: IterationOrder::Ascending,
@@ -977,11 +1027,92 @@ impl DbReaderInner {
         }
         Ok(())
     }
+
+    /// HELION LOCAL PATCH: see [`DbReader::set_manifest_poll_interval`].
+    fn set_poll_interval(&self, interval: Duration) -> Result<(), SlateDBError> {
+        self.check_closed()?;
+        let invalid = || SlateDBError::InvalidManifestPollInterval(interval);
+        if self.poll_control.wake.get().is_none() {
+            return Err(invalid());
+        }
+        let tick = self.options.manifest_poll_interval;
+        let ticks = interval.as_nanos().div_ceil(tick.as_nanos().max(1)).max(1);
+        let every = u32::try_from(ticks).map_err(|_| invalid())?;
+        let double_poll_interval = tick
+            .checked_mul(every)
+            .and_then(|in_force| in_force.checked_mul(2))
+            .ok_or_else(invalid)?;
+        if self.options.checkpoint_lifetime < double_poll_interval {
+            return Err(SlateDBError::CheckpointLifetimeTooShort {
+                lifetime: self.options.checkpoint_lifetime,
+                interval: double_poll_interval,
+            });
+        }
+        self.poll_control
+            .every
+            .store(u64::from(every), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// HELION LOCAL PATCH: see [`DbReader::poll_manifest`].
+    async fn poll_now(&self) -> Result<(), SlateDBError> {
+        self.check_closed()?;
+        let Some(wake) = self.poll_control.wake.get() else {
+            return Ok(());
+        };
+        let mut served = self.poll_control.served.subscribe();
+        let want = self.poll_control.requested.fetch_add(1, Ordering::SeqCst) + 1;
+        // Full: a wake waits already, and the poll it starts counts this call.
+        // Closed: the poller has stopped, which the wait below is told.
+        let _ = wake.try_send(DbReaderMessage::PollManifest);
+        let _ = served.wait_for(|served| *served >= want).await;
+        self.check_closed()
+    }
+}
+
+impl DbReaderInner {
+    /// HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): the error that
+    /// ends a reader whose current checkpoint, `checkpoint`, is not in a
+    /// manifest loaded at its path.
+    ///
+    /// Within one database only the garbage collector takes a reader's
+    /// checkpoint out of the manifest, once its stored expiry has passed. So
+    /// either the lease was lost, and the files this reader's state names
+    /// may be gone, or the database at the path is another one: dropped and
+    /// created again, or written over by a copy, with manifest ids, WAL ids
+    /// and sequence numbers that have nothing to do with the ones this
+    /// reader holds. The manifest does not say which (the collector takes a
+    /// checkpoint up to a second before the reader's own copy of the expiry
+    /// ends, and earlier by its clock's lead), and a reader that carried on
+    /// in another database kept the dropped rows and showed none of the new.
+    /// So it closes in both cases, as when its database is gone, and its
+    /// owner opens a new reader. The line says how much of the lease was
+    /// left, or how long ago it ended.
+    fn checkpoint_absent(&self, checkpoint: &Checkpoint) -> SlateDBError {
+        let lease = match checkpoint.expire_time {
+            None => "it had no expiry".to_string(),
+            Some(expiry) => {
+                let left = (expiry - self.system_clock.now()).num_milliseconds();
+                if left >= 0 {
+                    format!("{left} ms of its lease were left")
+                } else {
+                    format!("its lease ended {} ms ago", -left)
+                }
+            }
+        };
+        warn!(
+            "reader checkpoint absent from the manifest, {lease}: closing the reader [checkpoint_id={}]",
+            checkpoint.id
+        );
+        SlateDBError::DatabaseMissing
+    }
 }
 
 struct ManifestPoller {
     inner: Arc<DbReaderInner>,
     generations: HashMap<Uuid, Weak<ReaderGeneration>>,
+    /// HELION LOCAL PATCH: ticks of the poll ticker since the last poll.
+    ticks_since_poll: u64,
 }
 
 impl ManifestPoller {
@@ -991,6 +1122,7 @@ impl ManifestPoller {
         let poller = Self {
             inner,
             generations: HashMap::from([(checkpoint_id, Arc::downgrade(&generation))]),
+            ticks_since_poll: 0,
         };
         poller.report_active_checkpoints();
         poller
@@ -1098,6 +1230,18 @@ impl ManifestPoller {
                     return Ok(());
                 }
                 Err(SlateDBError::CheckpointMissing(id)) => {
+                    // HELION LOCAL PATCH: the manifest was loaded anew just
+                    // above, so a drop and a create since this poll's first
+                    // load arrive here, and so does a lease the collector
+                    // took in between. A new checkpoint written into that
+                    // manifest used to tie this reader's state to whatever
+                    // database it had loaded.
+                    let current = self.inner.state.read().generation.checkpoint();
+                    if manifest.db_state().find_checkpoint(current.id).is_none() {
+                        return Err(self.inner.checkpoint_absent(&current));
+                    }
+                    // The lease of an older generation that a read still
+                    // holds: that read fails, the reader goes on.
                     warn!("reader checkpoint lease lost [checkpoint_id={id}]");
                     if let Some(generation) = self.generations.remove(&id).and_then(|g| g.upgrade())
                     {
@@ -1105,13 +1249,6 @@ impl ManifestPoller {
                         generation.drain().await;
                     }
                     self.report_active_checkpoints();
-
-                    let current_id = self.inner.state.read().generation.checkpoint().id;
-                    if current_id == id {
-                        let checkpoint = self.inner.create_checkpoint(manifest).await?;
-                        self.inner.reestablish_checkpoint(checkpoint).await?;
-                        self.register_current_generation();
-                    }
                     // Other live generations may be due at the same time. Retry
                     // the batch immediately after removing the missing lease so
                     // one lost checkpoint cannot make their refresh a poll late.
@@ -1135,22 +1272,61 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
     fn tickers(&mut self) -> Vec<MessageTickerDef<DbReaderMessage>> {
         vec![MessageTickerDef::new(
             self.inner.options.manifest_poll_interval,
-            Box::new(|| DbReaderMessage::PollManifest),
+            Box::new(|| DbReaderMessage::Tick),
         )]
     }
 
     async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
-        assert!(matches!(message, DbReaderMessage::PollManifest));
+        // HELION LOCAL PATCH: a tick polls only when the interval in force has
+        // passed; `PollManifest` always does.
+        if matches!(message, DbReaderMessage::Tick) {
+            self.ticks_since_poll = self.ticks_since_poll.saturating_add(1);
+            if self.ticks_since_poll < self.inner.poll_control.every.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+        }
+        self.ticks_since_poll = 0;
+        // Read before the manifest is loaded: this poll serves every call of
+        // `DbReader::poll_manifest` counted here.
+        let serves = self.inner.poll_control.requested.load(Ordering::SeqCst);
         let mut manifest = self.load_manifest().await?;
 
+        // HELION LOCAL PATCH: a manifest without this reader's own checkpoint
+        // may be of another database. Nothing below may be done with it: the
+        // replay would go on from this reader's WAL cursor among WAL ids
+        // that began again at 1, and the rows it already holds would stay.
+        // The reader closes as it does when its database is gone.
+        let current = self.inner.state.read().generation.checkpoint();
+        if manifest.db_state().find_checkpoint(current.id).is_none() {
+            return Err(self.inner.checkpoint_absent(&current));
+        }
+
         self.delete_released_checkpoints(&mut manifest).await?;
+        // HELION LOCAL PATCH: that write loads the manifest again when its
+        // put meets another's, and what it loads may be another database's.
+        // It writes nothing there (no checkpoint of this reader is in it),
+        // but what follows would go by that manifest.
+        if manifest.db_state().find_checkpoint(current.id).is_none() {
+            return Err(self.inner.checkpoint_absent(&current));
+        }
 
         let latest_manifest = manifest.manifest();
         if self
             .inner
             .should_reestablish_checkpoint(&latest_manifest.core)
         {
-            let checkpoint = self.inner.create_checkpoint(&mut manifest).await?;
+            // HELION LOCAL PATCH: and so does this one, which did write: the
+            // reader's new checkpoint, into whatever manifest it had loaded.
+            let checkpoint = match self
+                .inner
+                .create_checkpoint(&mut manifest, Some(current.id))
+                .await
+            {
+                Err(SlateDBError::CheckpointMissing(id)) if id == current.id => {
+                    return Err(self.inner.checkpoint_absent(&current));
+                }
+                written => written?,
+            };
             self.inner.reestablish_checkpoint(checkpoint).await?;
             self.register_current_generation();
         } else {
@@ -1159,6 +1335,7 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
 
         self.refresh_live_checkpoints(&mut manifest).await?;
         self.inner.db_stats.reader_manifest_polls.increment(1);
+        self.inner.poll_control.served.send_replace(serves);
         Ok(())
     }
 
@@ -1167,6 +1344,9 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
         _messages: BoxStream<'async_trait, DbReaderMessage>,
         _result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
+        // HELION LOCAL PATCH: no poll comes after this; let go of the calls
+        // of `DbReader::poll_manifest` that wait for one.
+        self.inner.poll_control.served.send_replace(u64::MAX);
         let checkpoint_ids = self.generations.keys().copied().collect::<Vec<_>>();
         if !checkpoint_ids.is_empty() {
             let live_generations = self
@@ -1794,6 +1974,60 @@ impl DbReader {
     }
 }
 
+/// HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): a reader that
+/// follows the latest state can be polled at another interval, or now,
+/// without being opened anew.
+impl DbReader {
+    /// The interval between manifest polls in force: a whole number of
+    /// `DbReaderOptions::manifest_poll_interval`, which stays the period of
+    /// the poll ticker for the reader's life.
+    pub fn manifest_poll_interval(&self) -> Duration {
+        let every = self.inner.poll_control.every.load(Ordering::Relaxed);
+        let every = u32::try_from(every).unwrap_or(u32::MAX);
+        self.inner
+            .options
+            .manifest_poll_interval
+            .saturating_mul(every)
+    }
+
+    /// Polls the manifest every `interval` from the next tick on. The reader,
+    /// its checkpoint and what it has replayed stay as they are.
+    ///
+    /// `interval` is rounded up to a whole number of
+    /// `DbReaderOptions::manifest_poll_interval`, so the reader never polls
+    /// more often than asked, and never more often than it was opened to.
+    ///
+    /// ## Errors
+    /// - `CheckpointLifetimeTooShort` when `DbReaderOptions::checkpoint_lifetime`
+    ///   is under twice the interval, the rule a reader is opened under: the
+    ///   checkpoint is refreshed by a poll and must outlive two of them.
+    /// - `InvalidManifestPollInterval` for a reader opened at a fixed
+    ///   checkpoint, which does not poll.
+    pub fn set_manifest_poll_interval(&self, interval: Duration) -> Result<(), crate::Error> {
+        self.inner
+            .set_poll_interval(interval)
+            .map_err(Into::<crate::Error>::into)
+    }
+
+    /// Runs a manifest poll now. Returns when a poll that began after this
+    /// call has finished, so a write that was durable before the call is
+    /// visible to a read after it. Calls made while a poll runs share the
+    /// next one. The interval in force is counted anew from this poll.
+    ///
+    /// A reader opened at a fixed checkpoint does not poll: this returns at
+    /// once.
+    ///
+    /// ## Errors
+    /// The reader's close reason when it is closed, or closes while this
+    /// waits: a poll that fails closes the reader.
+    pub async fn poll_manifest(&self) -> Result<(), crate::Error> {
+        self.inner
+            .poll_now()
+            .await
+            .map_err(Into::<crate::Error>::into)
+    }
+}
+
 #[async_trait::async_trait]
 impl DbReadOps for DbReader {
     async fn get_with_options<K: AsRef<[u8]> + Send>(
@@ -1878,6 +2112,72 @@ impl DbReader {
     pub fn status(&self) -> DbStatus {
         <Self as DbMetadataOps>::status(self)
     }
+
+    /// HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): the checkpoint
+    /// this reader holds now. Taken before a second reader is opened at the
+    /// same path and handed to [`Self::close_if_absent_from_reopened`].
+    pub fn current_checkpoint(&self) -> Checkpoint {
+        self.inner.state.read().generation.checkpoint()
+    }
+
+    /// HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): the poll's
+    /// check (`DbReaderInner::checkpoint_absent`) for a second reader opened
+    /// at this reader's path, as Helion does to change a reader's poll
+    /// interval. `reopened` writes its own checkpoint into whatever database
+    /// it finds, so no poll of its own ever sees anything wrong; `held`,
+    /// taken from this reader before that open, absent from the manifest
+    /// `reopened` opened (which lists every checkpoint as of its own) is what
+    /// shows that the path may hold another database.
+    ///
+    /// When it is absent this reader's status is closed with
+    /// `DatabaseMissing` and its reads are refused; the caller still calls
+    /// [`Self::close`] to end its poller, and must not let `reopened` stand
+    /// in for this reader: whatever was derived from this reader's rows, at
+    /// sequence numbers that begin again in a new database, belongs to the
+    /// old one. `held` is taken before the open because a checkpoint this
+    /// reader takes during it is in no manifest that open could have read.
+    /// A reader already closed has deleted its checkpoint itself and reads
+    /// `true` as well, under the reason it closed with.
+    pub fn close_if_absent_from_reopened(&self, held: &Checkpoint, reopened: &DbReader) -> bool {
+        let opened = Arc::clone(&reopened.inner.state.read());
+        if opened.core().find_checkpoint(held.id).is_some() {
+            return false;
+        }
+        // The first result written stands, so a reader that closed earlier
+        // keeps its own reason.
+        self.inner
+            .status_manager
+            .write_result(Err(self.inner.checkpoint_absent(held)));
+        true
+    }
+
+    /// HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): the poll's
+    /// check now, for a caller that cannot wait for the next poll: one load
+    /// of the manifest. `true` when this reader's checkpoint is not in it,
+    /// or there is no manifest: the status is then closed with
+    /// `DatabaseMissing`, and the caller calls [`Self::close`] as after
+    /// [`Self::close_if_absent_from_reopened`]. The checkpoint is taken
+    /// before the load, for the reason given there.
+    pub async fn close_if_absent_from_manifest(&self) -> Result<bool, crate::Error> {
+        let held = self.current_checkpoint();
+        let loaded = StoredManifest::load(
+            Arc::clone(&self.inner.manifest_store),
+            self.inner.system_clock.clone(),
+        )
+        .await;
+        let error = match loaded {
+            Ok(manifest) if manifest.db_state().find_checkpoint(held.id).is_some() => {
+                return Ok(false)
+            }
+            Ok(_) => self.inner.checkpoint_absent(&held),
+            Err(SlateDBError::LatestTransactionalObjectVersionMissing) => {
+                SlateDBError::DatabaseMissing
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.inner.status_manager.write_result(Err(error));
+        Ok(true)
+    }
 }
 
 #[async_trait]
@@ -1918,7 +2218,7 @@ fn has_not_found_object_store_error(err: &(dyn std::error::Error + 'static)) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckpointState, ManifestPoller, ReaderGeneration, ReplayMemtables};
+    use super::{CheckpointState, ManifestPoller, PollControl, ReaderGeneration, ReplayMemtables};
     use crate::clock::MonotonicClock;
     use crate::config::{
         CheckpointOptions, CheckpointScope, FlushOptions, FlushType, MergeOptions, PutOptions,
@@ -2356,6 +2656,778 @@ mod tests {
         assert_eq!(close_error.code(), Some(crate::ErrorCode::DatabaseMissing));
     }
 
+    /// HELION LOCAL PATCH tests: every object of the database at `path`.
+    async fn delete_database_objects(object_store: &Arc<dyn ObjectStore>, path: &Path) {
+        use futures::TryStreamExt;
+        use object_store::ObjectStoreExt;
+        let objects: Vec<Path> = object_store
+            .list(Some(path))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .unwrap();
+        assert!(!objects.is_empty(), "test needs a database to drop");
+        for location in objects {
+            object_store.delete(&location).await.unwrap();
+        }
+    }
+
+    /// HELION LOCAL PATCH tests: a database with a manifest and nothing else,
+    /// on a mock clock that reads `start_millis`.
+    async fn empty_database_on_a_mock_clock(
+        name: &str,
+        start_millis: i64,
+    ) -> (TestProvider, Arc<MockSystemClock>) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!("/tmp/{name}_{}", Uuid::new_v4()));
+        let clock = Arc::new(MockSystemClock::with_time(start_millis));
+        let mut test_provider = TestProvider::new(path, object_store);
+        test_provider.system_clock = clock.clone();
+        StoredManifest::create_new_db(
+            test_provider.manifest_store(),
+            ManifestCore::new(),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+        (test_provider, clock)
+    }
+
+    /// HELION LOCAL PATCH tests: a reader of that database with no poller
+    /// task, and the poller to call by hand. Its checkpoint lives 60 s and
+    /// is renewed from 30 s on.
+    async fn hand_polled_reader(
+        test_provider: &TestProvider,
+        clock: &Arc<MockSystemClock>,
+    ) -> (Arc<DbReaderInner>, ManifestPoller) {
+        let manifest_store = test_provider.manifest_store();
+        let stored_manifest = StoredManifest::load(Arc::clone(&manifest_store), clock.clone())
+            .await
+            .unwrap();
+        let inner = Arc::new(
+            DbReaderInner::new(
+                manifest_store,
+                test_provider.table_store(),
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_secs(10),
+                    checkpoint_lifetime: Duration::from_secs(60),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+                None,
+                clock.clone(),
+                test_provider.rand.clone(),
+                slatedb_common::metrics::MetricsRecorderHelper::noop(),
+                stored_manifest,
+            )
+            .await
+            .unwrap(),
+        );
+        let poller = ManifestPoller::new(Arc::clone(&inner));
+        (inner, poller)
+    }
+
+    /// HELION LOCAL PATCH tests: the checkpoints in the latest manifest, as
+    /// the store holds them.
+    async fn stored_checkpoints(test_provider: &TestProvider) -> Vec<crate::Checkpoint> {
+        test_provider
+            .manifest_store()
+            .read_latest_manifest()
+            .await
+            .unwrap()
+            .manifest
+            .core
+            .checkpoints
+            .clone()
+    }
+
+    // HELION LOCAL PATCH: a database dropped and created again at the path of
+    // an open reader. The reader's poll loads the new database's manifest,
+    // and used to carry on in it from its own WAL cursor, among WAL ids that
+    // began again at 1: it kept the rows of the dropped database and never
+    // showed a row of the new one. Its own checkpoint, with most of its lease
+    // left, is not in that manifest, and that closes it as a drop does.
+    #[tokio::test]
+    async fn poll_of_a_database_created_again_at_the_path_closes_the_reader() {
+        use crate::dispatcher::MessageHandler;
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!("/tmp/test_db_reader_recreated_{}", Uuid::new_v4()));
+        let clock = Arc::new(MockSystemClock::new());
+        let mut test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        test_provider.system_clock = clock.clone();
+        let has = |reader: Arc<DbReaderInner>, key: &'static [u8]| async move {
+            reader
+                .get_with_options(key, &crate::config::ReadOptions::default())
+                .await
+                .map(|row| row.is_some())
+        };
+
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"before", b"dropped").await.unwrap();
+        let (inner, mut poller) = hand_polled_reader(&test_provider, &clock).await;
+        assert!(has(Arc::clone(&inner), b"before").await.unwrap());
+
+        db.close().await.unwrap();
+        delete_database_objects(&object_store, &path).await;
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"after", b"created").await.unwrap();
+
+        clock.advance(Duration::from_secs(10)).await;
+        let polled = poller.handle(super::DbReaderMessage::PollManifest).await;
+        assert!(
+            matches!(polled, Err(SlateDBError::DatabaseMissing)),
+            "the reader went on in another database: poll {polled:?}, before={:?} after={:?}",
+            has(Arc::clone(&inner), b"before").await,
+            has(Arc::clone(&inner), b"after").await,
+        );
+        assert!(
+            stored_checkpoints(&test_provider).await.is_empty(),
+            "the reader wrote a checkpoint into a database it never opened"
+        );
+
+        // What Helion does next: the reader is evicted, and the next open
+        // reads the database that is there.
+        let (reopened, _) = hand_polled_reader(&test_provider, &clock).await;
+        assert!(!has(Arc::clone(&reopened), b"before").await.unwrap());
+        assert!(has(reopened, b"after").await.unwrap());
+        db.close().await.unwrap();
+    }
+
+    // HELION LOCAL PATCH: the drop and the create land after a poll's first
+    // load of the manifest and before its lease refresh loads it again. The
+    // refresh used to take the missing checkpoint for a lost lease, write a
+    // new one into the new database and rebuild from the old WAL cursor.
+    #[tokio::test]
+    async fn lease_refresh_of_a_database_created_again_closes_the_reader() {
+        let (test_provider, clock) =
+            empty_database_on_a_mock_clock("test_db_reader_recreated_before_refresh", 0).await;
+        let (_inner, mut poller) = hand_polled_reader(&test_provider, &clock).await;
+        let manifest_store = test_provider.manifest_store();
+
+        // Past half-life, so the refresh is due, with half the lease left.
+        clock.advance(Duration::from_secs(31)).await;
+        let mut loaded_before = StoredManifest::load(Arc::clone(&manifest_store), clock.clone())
+            .await
+            .unwrap();
+        delete_database_objects(&test_provider.object_store, &test_provider.path).await;
+        StoredManifest::create_new_db(
+            Arc::clone(&manifest_store),
+            ManifestCore::new(),
+            clock.clone(),
+        )
+        .await
+        .unwrap();
+
+        let result = poller.refresh_live_checkpoints(&mut loaded_before).await;
+        assert!(
+            matches!(result, Err(SlateDBError::DatabaseMissing)),
+            "a lease refresh in another database must close the reader, got {result:?}"
+        );
+        assert!(
+            stored_checkpoints(&test_provider).await.is_empty(),
+            "the reader wrote a checkpoint into a database it never opened"
+        );
+        assert_eq!(manifest_store.list_manifests(..).await.unwrap().len(), 1);
+    }
+
+    /// HELION LOCAL PATCH tests: a writer's and a reader's view of one path
+    /// in one store. What the reader puts passes a gate, so that a test can
+    /// change the database between a poll's manifest load and its write.
+    fn writer_and_gated_reader_sides(
+        name: &str,
+    ) -> (
+        TestProvider,
+        TestProvider,
+        Arc<crate::test_utils::GatedObjectStore>,
+        Arc<MockSystemClock>,
+    ) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let gated = Arc::new(crate::test_utils::GatedObjectStore::new(Arc::clone(
+            &object_store,
+        )));
+        let path = Path::from(format!("/tmp/{name}_{}", Uuid::new_v4()));
+        let clock = Arc::new(MockSystemClock::new());
+        let mut writer_side = TestProvider::new(path.clone(), object_store);
+        writer_side.system_clock = clock.clone();
+        let mut reader_side = TestProvider::new(path, Arc::clone(&gated) as Arc<dyn ObjectStore>);
+        reader_side.system_clock = clock.clone();
+        (writer_side, reader_side, gated, clock)
+    }
+
+    /// HELION LOCAL PATCH tests: one poll of `poller`. When its first put
+    /// arrives at the reader's store, the database is dropped and created
+    /// again with `rows` rows in its WAL and manifests up to the id that put
+    /// asks for, and the put is let through: it meets a manifest of the new
+    /// database. Returns what the poll said, and the new database.
+    async fn poll_with_a_recreate_before_its_first_put(
+        writer_side: &TestProvider,
+        gated: &Arc<crate::test_utils::GatedObjectStore>,
+        clock: &Arc<MockSystemClock>,
+        mut poller: ManifestPoller,
+        rows: usize,
+    ) -> (Result<(), SlateDBError>, Db) {
+        use crate::dispatcher::MessageHandler;
+        let latest = |clock: Arc<MockSystemClock>| async move {
+            StoredManifest::load(writer_side.manifest_store(), clock)
+                .await
+                .unwrap()
+        };
+        let asked_for = latest(clock.clone()).await.id() + 1;
+        let arrived = gated.put_opts_gate.arrivals();
+        gated.put_opts_gate.close();
+        let poll =
+            tokio::spawn(async move { poller.handle(super::DbReaderMessage::PollManifest).await });
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            gated.put_opts_gate.wait_for_arrivals(arrived + 1),
+        )
+        .await
+        .expect("the poll has a manifest write to make");
+
+        delete_database_objects(&writer_side.object_store, &writer_side.path).await;
+        let db = writer_side.new_db(Settings::default()).await.unwrap();
+        for row in 0..rows {
+            db.put(format!("after_{row}").as_bytes(), b"created")
+                .await
+                .unwrap();
+        }
+        loop {
+            let mut stored = latest(clock.clone()).await;
+            if stored.id() >= asked_for {
+                break;
+            }
+            let passing = Uuid::new_v4();
+            stored
+                .write_checkpoint(passing, &CheckpointOptions::default())
+                .await
+                .unwrap();
+            stored.delete_checkpoint(passing).await.unwrap();
+        }
+        gated.put_opts_gate.release();
+        (poll.await.unwrap(), db)
+    }
+
+    // HELION LOCAL PATCH: the drop and the create land after a poll's
+    // manifest load and before its write of the reader's new checkpoint. The
+    // put meets a manifest of the new database; the update loop loads the
+    // latest one and applies the write to that, and the reader's checkpoint
+    // went into a database it never opened. The reader rebuilt its state
+    // from there with its own WAL cursor, and every later check found its
+    // checkpoint in the manifest.
+    #[tokio::test]
+    async fn checkpoint_put_that_meets_a_database_created_again_closes_the_reader() {
+        let (writer_side, reader_side, gated, clock) =
+            writer_and_gated_reader_sides("test_db_reader_put_recreated");
+        let db = writer_side.new_db(Settings::default()).await.unwrap();
+        db.put(b"before", b"dropped").await.unwrap();
+        let (_inner, poller) = hand_polled_reader(&reader_side, &clock).await;
+        // A flushed memtable: the next poll takes a new checkpoint for it.
+        db.put(b"more", b"dropped").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+
+        let (polled, db) =
+            poll_with_a_recreate_before_its_first_put(&writer_side, &gated, &clock, poller, 1)
+                .await;
+        let written_there = stored_checkpoints(&writer_side).await;
+        assert!(
+            matches!(polled, Err(SlateDBError::DatabaseMissing)) && written_there.is_empty(),
+            "the reader went on in another database: poll {polled:?}, \
+             checkpoints written into it {written_there:?}"
+        );
+        db.close().await.unwrap();
+    }
+
+    // HELION LOCAL PATCH: the same, met by the poll's delete of a released
+    // generation's checkpoint. That write puts nothing into the new database
+    // (no checkpoint of this reader is there to delete), but it left the poll
+    // holding the new database's manifest. With no flush in it to take a
+    // checkpoint for, the poll went on to replay its WAL from the reader's
+    // own cursor.
+    #[tokio::test]
+    async fn released_checkpoint_delete_that_meets_a_database_created_again_closes_the_reader() {
+        use crate::dispatcher::MessageHandler;
+        let (writer_side, reader_side, gated, clock) =
+            writer_and_gated_reader_sides("test_db_reader_delete_recreated");
+        let db = writer_side.new_db(Settings::default()).await.unwrap();
+        db.put(b"before", b"dropped").await.unwrap();
+        let (inner, mut poller) = hand_polled_reader(&reader_side, &clock).await;
+        // A flush, and a poll that takes a new checkpoint for it: the one the
+        // reader opened with is released, for the next poll to delete.
+        db.put(b"more", b"dropped").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        poller
+            .handle(super::DbReaderMessage::PollManifest)
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+
+        let (polled, db) =
+            poll_with_a_recreate_before_its_first_put(&writer_side, &gated, &clock, poller, 8)
+                .await;
+        let read_there = inner
+            .get_with_options(b"after_7", &crate::config::ReadOptions::default())
+            .await
+            .map(|row| row.is_some());
+        let written_there = stored_checkpoints(&writer_side).await;
+        assert!(
+            matches!(polled, Err(SlateDBError::DatabaseMissing)) && written_there.is_empty(),
+            "the reader went on in another database: poll {polled:?}, a row of it read \
+             {read_there:?}, checkpoints written into it {written_there:?}"
+        );
+        db.close().await.unwrap();
+    }
+
+    // HELION LOCAL PATCH, no false alarm: a reader that polls and renews for
+    // five lifetimes keeps its checkpoint and stays open.
+    #[tokio::test]
+    async fn reader_that_renews_its_checkpoint_is_not_taken_for_another_database() {
+        use crate::dispatcher::MessageHandler;
+        let (test_provider, clock) =
+            empty_database_on_a_mock_clock("test_db_reader_renewed", 0).await;
+        let (inner, mut poller) = hand_polled_reader(&test_provider, &clock).await;
+        let opened_with = inner.state.read().generation.checkpoint();
+
+        for _ in 0..30 {
+            clock.advance(Duration::from_secs(10)).await;
+            poller
+                .handle(super::DbReaderMessage::PollManifest)
+                .await
+                .unwrap();
+        }
+        let stored = stored_checkpoints(&test_provider).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, opened_with.id);
+        assert!(stored[0].expire_time.unwrap() > clock.now());
+        assert!(stored[0].expire_time.unwrap() > opened_with.expire_time.unwrap());
+    }
+
+    // HELION LOCAL PATCH: a reader whose polls stalled past its lease, and
+    // whose checkpoint the collector took, has lost a lease in its own
+    // database. A manifest does not tell that from another database, and
+    // the reader closes for its owner to open a new one. It used to write a
+    // new checkpoint and go on.
+    #[tokio::test]
+    async fn checkpoint_taken_after_its_lease_ended_closes_the_reader() {
+        use crate::dispatcher::MessageHandler;
+        let (test_provider, clock) =
+            empty_database_on_a_mock_clock("test_db_reader_lease_ended", 0).await;
+        let (inner, mut poller) = hand_polled_reader(&test_provider, &clock).await;
+        let opened_with = inner.state.read().generation.checkpoint().id;
+
+        clock.advance(Duration::from_secs(61)).await;
+        // What a collector pass does with a checkpoint whose expiry has passed.
+        StoredManifest::load(test_provider.manifest_store(), clock.clone())
+            .await
+            .unwrap()
+            .delete_checkpoint(opened_with)
+            .await
+            .unwrap();
+
+        let polled = poller.handle(super::DbReaderMessage::PollManifest).await;
+        assert!(
+            matches!(polled, Err(SlateDBError::DatabaseMissing)),
+            "a reader without its checkpoint went on: {polled:?}"
+        );
+        assert!(stored_checkpoints(&test_provider).await.is_empty());
+        assert_eq!(inner.state.read().generation.checkpoint().id, opened_with);
+    }
+
+    // HELION LOCAL PATCH: the collector takes that checkpoint between a
+    // poll's first load of the manifest and its lease refresh, which loads
+    // the manifest again. The refresh is where a lost lease used to be
+    // answered with a new checkpoint.
+    #[tokio::test]
+    async fn checkpoint_taken_before_its_lease_refresh_closes_the_reader() {
+        let (test_provider, clock) =
+            empty_database_on_a_mock_clock("test_db_reader_taken_before_refresh", 0).await;
+        let (inner, mut poller) = hand_polled_reader(&test_provider, &clock).await;
+        let opened_with = inner.state.read().generation.checkpoint().id;
+        let manifest_store = test_provider.manifest_store();
+
+        clock.advance(Duration::from_secs(61)).await;
+        let mut loaded_before = StoredManifest::load(Arc::clone(&manifest_store), clock.clone())
+            .await
+            .unwrap();
+        StoredManifest::load(Arc::clone(&manifest_store), clock.clone())
+            .await
+            .unwrap()
+            .delete_checkpoint(opened_with)
+            .await
+            .unwrap();
+
+        let result = poller.refresh_live_checkpoints(&mut loaded_before).await;
+        assert!(
+            matches!(result, Err(SlateDBError::DatabaseMissing)),
+            "a reader without its checkpoint went on: {result:?}"
+        );
+        assert!(stored_checkpoints(&test_provider).await.is_empty());
+    }
+
+    // HELION LOCAL PATCH: the manifest stores an expiry in whole seconds,
+    // rounded down, so a collector pass can take a checkpoint in the last
+    // second of the lease the reader computed: absent with its lease still
+    // running by the reader's own copy, in the reader's own database. The
+    // reader closes here too; no length of lease left tells the databases
+    // apart.
+    #[tokio::test]
+    async fn checkpoint_taken_in_the_last_second_of_its_lease_closes_the_reader() {
+        use crate::dispatcher::MessageHandler;
+        // Opened 700 ms into a second: the lease ends at 60.7 s by the
+        // reader's own copy, and at 60 s in the manifest.
+        let (test_provider, clock) =
+            empty_database_on_a_mock_clock("test_db_reader_last_second", 700).await;
+        let (inner, mut poller) = hand_polled_reader(&test_provider, &clock).await;
+        let opened_with = inner.state.read().generation.checkpoint();
+
+        clock.set(60_200);
+        let mut manifest = StoredManifest::load(test_provider.manifest_store(), clock.clone())
+            .await
+            .unwrap();
+        let stored_expiry = manifest
+            .db_state()
+            .find_checkpoint(opened_with.id)
+            .unwrap()
+            .expire_time
+            .unwrap();
+        assert!(
+            stored_expiry <= clock.now(),
+            "the collector would not take it yet: {stored_expiry}"
+        );
+        assert!(
+            opened_with.expire_time.unwrap() > clock.now(),
+            "the reader's own copy has run out too"
+        );
+        manifest.delete_checkpoint(opened_with.id).await.unwrap();
+
+        let polled = poller.handle(super::DbReaderMessage::PollManifest).await;
+        assert!(
+            matches!(polled, Err(SlateDBError::DatabaseMissing)),
+            "a reader without its checkpoint went on: {polled:?}"
+        );
+        assert!(stored_checkpoints(&test_provider).await.is_empty());
+        assert_eq!(
+            inner.state.read().generation.checkpoint().id,
+            opened_with.id
+        );
+    }
+
+    // HELION LOCAL PATCH, no false alarm: other readers open, renew and
+    // close, and a writer writes checkpoints of its own, while this reader
+    // opens and polls. Its checkpoint stays in every manifest it loads.
+    #[tokio::test]
+    async fn checkpoints_of_other_readers_do_not_look_like_another_database() {
+        use crate::dispatcher::MessageHandler;
+        use futures::StreamExt;
+        let (test_provider, clock) =
+            empty_database_on_a_mock_clock("test_db_reader_other_readers", 0).await;
+        let manifest_store = test_provider.manifest_store();
+        let lifetime = CheckpointOptions {
+            lifetime: Some(Duration::from_secs(60)),
+            ..CheckpointOptions::default()
+        };
+        let write_one = || async {
+            StoredManifest::load(Arc::clone(&manifest_store), clock.clone())
+                .await
+                .unwrap()
+                .write_checkpoint(Uuid::new_v4(), &lifetime)
+                .await
+                .unwrap()
+        };
+
+        // Opened while two other checkpoints are being written.
+        let (_, (inner, mut poller), _) = tokio::join!(
+            write_one(),
+            hand_polled_reader(&test_provider, &clock),
+            write_one()
+        );
+        let opened_with = inner.state.read().generation.checkpoint().id;
+
+        let (_other_inner, mut other) = hand_polled_reader(&test_provider, &clock).await;
+        for round in 0..12 {
+            clock.advance(Duration::from_secs(10)).await;
+            let written = write_one().await;
+            other
+                .handle(super::DbReaderMessage::PollManifest)
+                .await
+                .unwrap();
+            poller
+                .handle(super::DbReaderMessage::PollManifest)
+                .await
+                .unwrap();
+            if round % 2 == 0 {
+                StoredManifest::load(Arc::clone(&manifest_store), clock.clone())
+                    .await
+                    .unwrap()
+                    .delete_checkpoint(written.id)
+                    .await
+                    .unwrap();
+            }
+        }
+        // The other reader closes and takes its checkpoints with it.
+        other
+            .cleanup(futures::stream::empty().boxed(), Ok(()))
+            .await
+            .unwrap();
+        clock.advance(Duration::from_secs(10)).await;
+        poller
+            .handle(super::DbReaderMessage::PollManifest)
+            .await
+            .unwrap();
+
+        assert_eq!(inner.state.read().generation.checkpoint().id, opened_with);
+        assert!(stored_checkpoints(&test_provider)
+            .await
+            .iter()
+            .any(|checkpoint| checkpoint.id == opened_with));
+    }
+
+    /// HELION LOCAL PATCH tests: a reader on the wall clock with ten minutes
+    /// of lease, as Helion opens one. A long `poll` keeps its poller out of
+    /// the test.
+    async fn open_reader(
+        path: &Path,
+        object_store: &Arc<dyn ObjectStore>,
+        poll: Duration,
+    ) -> DbReader {
+        DbReader::open(
+            path.clone(),
+            Arc::clone(object_store),
+            None,
+            DbReaderOptions {
+                manifest_poll_interval: poll,
+                checkpoint_lifetime: Duration::from_secs(600),
+                ..DbReaderOptions::default()
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    // HELION LOCAL PATCH: a second reader opened at the path of the first,
+    // as Helion does to change a reader's poll interval, after the database
+    // was dropped and created again. The second reader opens the new
+    // database and writes its own checkpoint there, so no poll of its own
+    // ever finds anything wrong; only the first reader's checkpoint, absent
+    // from the manifest the second opened, tells the two databases apart.
+    #[tokio::test]
+    async fn reader_reopened_on_a_database_created_again_closes_the_first() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_db_reader_reopen_recreated_{}",
+            Uuid::new_v4()
+        ));
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"before", b"dropped").await.unwrap();
+        let first = open_reader(&path, &object_store, Duration::from_secs(60)).await;
+        assert!(first.get(b"before").await.unwrap().is_some());
+        let held = first.current_checkpoint();
+
+        db.close().await.unwrap();
+        delete_database_objects(&object_store, &path).await;
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"after", b"created").await.unwrap();
+        let second = open_reader(&path, &object_store, Duration::from_secs(60)).await;
+
+        assert!(
+            first.close_if_absent_from_reopened(&held, &second),
+            "a reader of the new database was taken for a reopen of the dropped one"
+        );
+        assert_eq!(
+            first.status().close_reason,
+            Some(CloseReason::DatabaseMissing)
+        );
+        let refused = first
+            .get(b"before")
+            .await
+            .expect_err("the first reader went on answering from the dropped database");
+        assert_eq!(refused.code(), Some(crate::ErrorCode::DatabaseMissing));
+
+        assert_eq!(second.status().close_reason, None);
+        assert!(second.get(b"before").await.unwrap().is_none());
+        assert!(second.get(b"after").await.unwrap().is_some());
+        second.close().await.unwrap();
+        let _ = first.close().await;
+        assert!(
+            stored_checkpoints(&test_provider).await.is_empty(),
+            "a reader of the dropped database left a checkpoint in the new one"
+        );
+        db.close().await.unwrap();
+    }
+
+    // HELION LOCAL PATCH, no false alarm: a reopen on the reader's own
+    // database, and then the reason `held` is taken before the open. The
+    // first reader takes a new checkpoint at a poll after the second opened;
+    // that one is in no manifest the second could have read, and asked about
+    // it the rule would call the database another one.
+    #[tokio::test]
+    async fn reader_reopened_on_its_own_database_stays_open() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_db_reader_reopen_same_{}",
+            Uuid::new_v4()
+        ));
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"row", b"1").await.unwrap();
+        let first = open_reader(&path, &object_store, Duration::from_millis(100)).await;
+        let held = first.current_checkpoint();
+        let second = open_reader(&path, &object_store, Duration::from_secs(60)).await;
+
+        // A flushed memtable changes the manifest; the first reader's next
+        // poll takes a new checkpoint for it.
+        db.put(b"row", b"2").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let taken_later = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let current = first.current_checkpoint();
+                if current.id != held.id {
+                    return current;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first reader takes a new checkpoint after a flush");
+        assert!(
+            second
+                .inner
+                .state
+                .read()
+                .generation
+                .manifest
+                .core
+                .find_checkpoint(taken_later.id)
+                .is_none(),
+            "test needs a checkpoint the second reader's manifest cannot hold"
+        );
+
+        assert!(!first.close_if_absent_from_reopened(&held, &second));
+        assert_eq!(first.status().close_reason, None);
+        assert_eq!(first.get(b"row").await.unwrap().as_deref(), Some(&b"2"[..]));
+        first.close().await.unwrap();
+        second.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    // HELION LOCAL PATCH: two readers of their own database that the
+    // reopen's check closes all the same, pinned as they stand. One lost its
+    // lease to the collector. The other closed before the reopen and deleted
+    // its checkpoint itself; it keeps the reason it closed with, so its
+    // owner has to remember the answer.
+    #[tokio::test]
+    async fn reopen_of_a_reader_without_its_checkpoint_closes_it_in_its_own_database() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_db_reader_reopen_edges_{}",
+            Uuid::new_v4()
+        ));
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"row", b"1").await.unwrap();
+
+        let first = open_reader(&path, &object_store, Duration::from_secs(60)).await;
+        let held = first.current_checkpoint();
+        // What a collector pass does once the stored expiry has passed.
+        StoredManifest::load(
+            test_provider.manifest_store(),
+            test_provider.system_clock.clone(),
+        )
+        .await
+        .unwrap()
+        .delete_checkpoint(held.id)
+        .await
+        .unwrap();
+        let second = open_reader(&path, &object_store, Duration::from_secs(60)).await;
+        assert!(first.close_if_absent_from_reopened(&held, &second));
+        assert_eq!(
+            first.status().close_reason,
+            Some(CloseReason::DatabaseMissing)
+        );
+
+        let held = second.current_checkpoint();
+        second.close().await.unwrap();
+        let third = open_reader(&path, &object_store, Duration::from_secs(60)).await;
+        assert!(second.close_if_absent_from_reopened(&held, &third));
+        assert_eq!(second.status().close_reason, Some(CloseReason::Clean));
+        assert_eq!(third.get(b"row").await.unwrap().as_deref(), Some(&b"1"[..]));
+
+        third.close().await.unwrap();
+        let _ = first.close().await;
+        db.close().await.unwrap();
+    }
+
+    // HELION LOCAL PATCH: the same check asked between two polls, with one
+    // load of the manifest: nothing on the reader's own database, the end of
+    // the reader on a database created again at its path, and on none.
+    #[tokio::test]
+    async fn reader_asked_between_polls_closes_on_a_database_created_again() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from(format!(
+            "/tmp/test_db_reader_asked_between_polls_{}",
+            Uuid::new_v4()
+        ));
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"before", b"dropped").await.unwrap();
+        let first = open_reader(&path, &object_store, Duration::from_secs(60)).await;
+        assert!(!first.close_if_absent_from_manifest().await.unwrap());
+        assert_eq!(first.status().close_reason, None);
+        assert!(first.get(b"before").await.unwrap().is_some());
+
+        db.close().await.unwrap();
+        delete_database_objects(&object_store, &path).await;
+        let db = test_provider.new_db(Settings::default()).await.unwrap();
+        db.put(b"after", b"created").await.unwrap();
+        assert!(
+            first.close_if_absent_from_manifest().await.unwrap(),
+            "a reader of the dropped database was left open on the new one"
+        );
+        assert_eq!(
+            first.status().close_reason,
+            Some(CloseReason::DatabaseMissing)
+        );
+        let refused = first
+            .get(b"before")
+            .await
+            .expect_err("the reader went on answering from the dropped database");
+        assert_eq!(refused.code(), Some(crate::ErrorCode::DatabaseMissing));
+
+        let second = open_reader(&path, &object_store, Duration::from_secs(60)).await;
+        db.close().await.unwrap();
+        delete_database_objects(&object_store, &path).await;
+        assert!(second.close_if_absent_from_manifest().await.unwrap());
+        assert_eq!(
+            second.status().close_reason,
+            Some(CloseReason::DatabaseMissing)
+        );
+        let _ = first.close().await;
+        let _ = second.close().await;
+        assert!(
+            test_provider
+                .manifest_store()
+                .list_manifests(..)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a dropped database must stay dropped"
+        );
+    }
+
     #[tokio::test]
     async fn should_return_current_versioned_manifest() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -2758,6 +3830,341 @@ mod tests {
         reader.close().await.unwrap();
         let updated_manifest = manifest_store.read_latest_manifest().await.unwrap();
         assert_eq!(0, updated_manifest.manifest.core.checkpoints.len());
+    }
+
+    /// HELION LOCAL PATCH: a reader opened to poll every 100 ms polls at the
+    /// interval set on it afterwards, rounded up to whole ticks, and at the
+    /// first one again when that is set back. The reader is the same one
+    /// throughout.
+    #[tokio::test(start_paused = true)]
+    async fn should_poll_at_the_interval_set_on_an_open_reader() {
+        use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_set_poll_interval");
+        let _db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .build()
+            .await
+            .unwrap();
+        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let reader = DbReader::builder(path, object_store)
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_millis(100),
+                checkpoint_lifetime: Duration::from_millis(2000),
+                ..DbReaderOptions::default()
+            })
+            .with_metrics_recorder(metrics_recorder.clone())
+            .build()
+            .await
+            .unwrap();
+        let polls = || {
+            lookup_metric(&metrics_recorder, crate::db_stats::READER_MANIFEST_POLLS).unwrap_or(0)
+        };
+        let checkpoint = reader.inner.state.read().generation.checkpoint().id;
+
+        // The first tick is at once. From here the test is 50 ms off the ticks.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(polls(), 1);
+        assert_eq!(reader.manifest_poll_interval(), Duration::from_millis(100));
+
+        reader
+            .set_manifest_poll_interval(Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(reader.manifest_poll_interval(), Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(polls(), 3, "ten ticks, a poll on the fifth and the tenth");
+
+        // A poll asked for in between starts the count of ticks again.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        reader.poll_manifest().await.unwrap();
+        assert_eq!(polls(), 4);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(polls(), 4, "three ticks since the poll that was asked for");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(polls(), 5, "and the fifth");
+
+        reader
+            .set_manifest_poll_interval(Duration::from_millis(100))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(polls(), 8, "a poll a tick again");
+
+        reader
+            .set_manifest_poll_interval(Duration::from_millis(250))
+            .unwrap();
+        assert_eq!(reader.manifest_poll_interval(), Duration::from_millis(300));
+        reader.set_manifest_poll_interval(Duration::ZERO).unwrap();
+        assert_eq!(reader.manifest_poll_interval(), Duration::from_millis(100));
+
+        assert_eq!(
+            reader.inner.state.read().generation.checkpoint().id,
+            checkpoint,
+            "no new checkpoint was written for any of it"
+        );
+    }
+
+    /// HELION LOCAL PATCH: the interval set on an open reader obeys the rule a
+    /// reader is opened under, and a reader at a fixed checkpoint has none.
+    #[tokio::test]
+    async fn should_reject_a_poll_interval_the_checkpoint_cannot_outlive() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_set_poll_interval_rejected");
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .build()
+            .await
+            .unwrap();
+        let options = DbReaderOptions {
+            manifest_poll_interval: Duration::from_millis(100),
+            checkpoint_lifetime: Duration::from_millis(2000),
+            ..DbReaderOptions::default()
+        };
+        let reader = DbReader::builder(path.clone(), Arc::clone(&object_store))
+            .with_options(options.clone())
+            .build()
+            .await
+            .unwrap();
+
+        reader
+            .set_manifest_poll_interval(Duration::from_millis(1000))
+            .unwrap();
+        let err = reader
+            .set_manifest_poll_interval(Duration::from_millis(1001))
+            .unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Invalid);
+        assert!(reader.set_manifest_poll_interval(Duration::MAX).is_err());
+        assert_eq!(
+            reader.manifest_poll_interval(),
+            Duration::from_millis(1000),
+            "a rejected interval changes nothing"
+        );
+
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::All, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let fixed = DbReader::open(path, object_store, Some(checkpoint.id), options)
+            .await
+            .unwrap();
+        let err = fixed
+            .set_manifest_poll_interval(Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Invalid);
+        fixed.poll_manifest().await.unwrap();
+    }
+
+    /// HELION LOCAL PATCH: `poll_manifest` shows a reader a write its own
+    /// interval would not show it for a minute, and calls made together share
+    /// one poll.
+    #[tokio::test(start_paused = true)]
+    async fn should_poll_now_on_request() {
+        use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_poll_now");
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .build()
+            .await
+            .unwrap();
+        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let reader = DbReader::builder(path, object_store)
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(60),
+                ..DbReaderOptions::default()
+            })
+            .with_metrics_recorder(metrics_recorder.clone())
+            .build()
+            .await
+            .unwrap();
+        let polls = || {
+            lookup_metric(&metrics_recorder, crate::db_stats::READER_MANIFEST_POLLS).unwrap_or(0)
+        };
+        // The poll of the first tick, which is at once.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(polls(), 1);
+
+        db.put(b"key", b"value").await.unwrap();
+        assert_eq!(reader.get(b"key").await.unwrap(), None);
+        let asked = tokio::time::Instant::now();
+        reader.poll_manifest().await.unwrap();
+        assert_eq!(
+            reader.get(b"key").await.unwrap(),
+            Some(Bytes::from_static(b"value"))
+        );
+        assert!(asked.elapsed() < Duration::from_secs(1));
+        assert_eq!(polls(), 2);
+
+        let (first, second, third) = tokio::join!(
+            reader.poll_manifest(),
+            reader.poll_manifest(),
+            reader.poll_manifest()
+        );
+        first.unwrap();
+        second.unwrap();
+        third.unwrap();
+        assert_eq!(polls(), 3, "three calls made together, one poll");
+    }
+
+    /// HELION LOCAL PATCH: a call of `poll_manifest` that waits when the
+    /// reader is closed is let go, with the close as its error.
+    #[tokio::test(start_paused = true)]
+    async fn should_release_a_waiting_poll_request_when_the_reader_closes() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_poll_now_closed");
+        let _db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .build()
+            .await
+            .unwrap();
+        let reader = DbReader::builder(path, object_store).build().await.unwrap();
+
+        let waiting = reader.poll_manifest();
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        reader.close().await.unwrap();
+        let err = waiting.await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            crate::ErrorKind::Closed(crate::CloseReason::Clean)
+        );
+        assert!(reader.poll_manifest().await.is_err());
+    }
+
+    /// HELION LOCAL PATCH: a reader polled at a long interval set after its
+    /// open still refreshes its checkpoint in time. Opened at 100 ms with a
+    /// 3 s checkpoint, then polled every second for ten: without a refresh
+    /// the checkpoint would have expired three times over.
+    #[tokio::test(start_paused = true)]
+    async fn should_refresh_reader_checkpoint_at_an_interval_set_after_open() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_set_poll_interval_lease");
+        let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
+
+        let _db = test_provider.new_db(Settings::default()).await;
+        let reader = test_provider
+            .new_db_reader(
+                DbReaderOptions {
+                    manifest_poll_interval: Duration::from_millis(100),
+                    checkpoint_lifetime: Duration::from_millis(3000),
+                    ..DbReaderOptions::default()
+                },
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        reader
+            .set_manifest_poll_interval(Duration::from_millis(1000))
+            .unwrap();
+
+        let manifest_store = test_provider.manifest_store();
+        let initial_manifest = manifest_store.read_latest_manifest().await.unwrap();
+        assert_eq!(1, initial_manifest.manifest.core.checkpoints.len());
+        let initial = initial_manifest.manifest.core.checkpoints[0].clone();
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let latest_manifest = manifest_store.read_latest_manifest().await.unwrap();
+        assert_eq!(1, latest_manifest.manifest.core.checkpoints.len());
+        let latest = latest_manifest.manifest.core.checkpoints[0].clone();
+        assert_eq!(initial.id, latest.id);
+        assert!(
+            latest.expire_time.unwrap() > initial.expire_time.unwrap() + Duration::from_secs(5),
+            "the checkpoint was refreshed as the polls went on"
+        );
+        assert!(latest.expire_time.unwrap() > test_provider.system_clock.now());
+    }
+
+    /// HELION LOCAL PATCH (a measurement): what a read costs a reader that has
+    /// stayed open through many polls. Every poll that finds new WAL objects
+    /// adds one replay table, and they stay until the writer's next L0 flush
+    /// moves the reader's checkpoint; a reader that is polled where it used to
+    /// be reopened lives that long. Prints the time of a point read and of a
+    /// full scan at 1, 75 and 1,000 tables (run with `--show-output`). It
+    /// asserts only that the tables are there and that every row is read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reader_read_time_by_replay_table_count() {
+        use slatedb_common::metrics::{lookup_metric, DefaultMetricsRecorder};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_reader_read_time_by_replay_table_count");
+        let db = Db::builder(path.clone(), Arc::clone(&object_store))
+            .build()
+            .await
+            .unwrap();
+        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let reader = DbReader::builder(path, object_store)
+            .with_options(DbReaderOptions {
+                manifest_poll_interval: Duration::from_secs(3600),
+                checkpoint_lifetime: Duration::from_secs(3 * 3600),
+                ..DbReaderOptions::default()
+            })
+            .with_metrics_recorder(metrics_recorder.clone())
+            .build()
+            .await
+            .unwrap();
+        let tables = || {
+            lookup_metric(&metrics_recorder, crate::db_stats::READER_REPLAY_MEMTABLES).unwrap_or(0)
+        };
+        let not_durable = WriteOptions {
+            await_durable: false,
+            ..WriteOptions::default()
+        };
+        const READS: u32 = 2_000;
+
+        let mut rows = 0u32;
+        for target in [1u32, 75, 1_000] {
+            // One WAL object for each row, and one poll for each WAL object.
+            while rows < target {
+                let key = format!("key-{rows:06}");
+                db.put_with_options(
+                    key.as_bytes(),
+                    [7u8; 512],
+                    &PutOptions::default(),
+                    &not_durable,
+                )
+                .await
+                .unwrap();
+                db.flush_with_options(FlushOptions {
+                    flush_type: FlushType::Wal,
+                })
+                .await
+                .unwrap();
+                reader.poll_manifest().await.unwrap();
+                rows += 1;
+            }
+            assert_eq!(
+                tables(),
+                i64::from(target),
+                "one replay table for each poll that found a WAL object"
+            );
+
+            let started = std::time::Instant::now();
+            for i in 0..READS {
+                let key = format!("key-{:06}", i % rows);
+                assert!(reader.get(key.as_bytes()).await.unwrap().is_some());
+            }
+            let hit_us = started.elapsed().as_secs_f64() * 1e6 / f64::from(READS);
+
+            let started = std::time::Instant::now();
+            for i in 0..READS {
+                let key = format!("none-{i:06}");
+                assert!(reader.get(key.as_bytes()).await.unwrap().is_none());
+            }
+            let miss_us = started.elapsed().as_secs_f64() * 1e6 / f64::from(READS);
+
+            let started = std::time::Instant::now();
+            let mut iter = reader.scan(..).await.unwrap();
+            let mut scanned = 0u32;
+            while iter.next().await.unwrap().is_some() {
+                scanned += 1;
+            }
+            let scan_ms = started.elapsed().as_secs_f64() * 1e3;
+            assert_eq!(scanned, rows);
+
+            println!(
+                "replay tables {target}: get {hit_us:.1} us, get of a missing key {miss_us:.1} us, \
+                 scan of {rows} rows {scan_ms:.2} ms"
+            );
+        }
     }
 
     // Regression test for https://github.com/slatedb/slatedb/issues/1750.
@@ -4460,6 +5867,7 @@ mod tests {
             segment_extractor: None,
             rand: test_provider.rand.clone(),
             recorder,
+            poll_control: PollControl::new(),
         };
 
         let rebuilt_state = inner
@@ -4551,6 +5959,7 @@ mod tests {
             segment_extractor: None,
             rand: test_provider.rand.clone(),
             recorder,
+            poll_control: PollControl::new(),
         }
     }
 

@@ -4,6 +4,7 @@ pub mod graph_signal;
 pub mod heap_utils;
 pub mod hnsw;
 pub mod ivf;
+pub(crate) mod merge_windows;
 pub mod mmap_vectors;
 pub mod named_vectors;
 pub mod segment_tier;
@@ -18,5 +19,7 @@ pub mod vector_core;
 
 #[cfg(test)]
 mod concurrent_tests;
+#[cfg(test)]
+mod graph_signal_budget_tests;
 #[cfg(test)]
 mod hnsw_tests;

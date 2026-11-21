@@ -135,6 +135,21 @@ pub struct SlateDbCacheUsageSnapshot {
 /// introduced, so live wrappers start at `1` and can never alias those entries.
 static NEXT_CACHE_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): scope shared by every
+/// wrapper for compacted-SST entries once [`set_share_compacted_entries`] is on.
+/// Compacted SSTs are named by ULID and never rewritten, so an `(sst, offset)`
+/// entry is identical for every `Db`/`DbReader` that reads it; per-wrapper scopes
+/// only made a reopened reader re-load every index, filter and block it already
+/// had cached. WAL ids restart per database and stay scoped.
+const SHARED_COMPACTED_SCOPE_ID: u64 = u64::MAX;
+static SHARE_COMPACTED_ENTRIES: AtomicBool = AtomicBool::new(false);
+
+/// HELION LOCAL PATCH: share compacted-SST cache entries across wrappers built
+/// after this call (default off = upstream per-wrapper scoping).
+pub fn set_share_compacted_entries(share: bool) {
+    SHARE_COMPACTED_ENTRIES.store(share, Ordering::Relaxed);
+}
+
 fn next_cache_scope_id() -> u64 {
     NEXT_CACHE_SCOPE_ID
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -719,6 +734,8 @@ pub(crate) struct DbCacheWrapper {
     /// `DbCacheWrapper` instances that share the same cache from clobbering each other's entries.
     /// Legacy keys use scope `0`; new wrappers are assigned distinct, non-zero scopes.
     scope_id: u64,
+    /// HELION LOCAL PATCH: key compacted SSTs by [`SHARED_COMPACTED_SCOPE_ID`].
+    share_compacted: bool,
     // Records the last time that the wrapper logged an error from the wrapped cache at error
     // level. Used to ensure we only log at error level once every ERROR_LOG_INTERVAL.
     last_err_log_time: Mutex<Option<DateTime<Utc>>>,
@@ -734,6 +751,7 @@ impl DbCacheWrapper {
             stats: DbCacheStats::new(recorder),
             cache,
             scope_id: next_cache_scope_id(),
+            share_compacted: SHARE_COMPACTED_ENTRIES.load(Ordering::Relaxed),
             last_err_log_time: Mutex::new(None),
             system_clock,
         }
@@ -746,6 +764,9 @@ const ERROR_LOG_INTERVAL: TimeDelta = TimeDelta::seconds(1);
 
 impl DbCacheWrapper {
     fn scoped_key(&self, key: &CachedKey) -> CachedKey {
+        if self.share_compacted && matches!(key.sst_id, SsTableId::Compacted(_)) {
+            return key.with_scope(SHARED_COMPACTED_SCOPE_ID);
+        }
         key.with_scope(self.scope_id)
     }
 

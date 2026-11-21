@@ -61,6 +61,48 @@ pub(crate) const GC_TASK_NAME: &str = "garbage_collector";
 /// object store.
 pub(crate) const GC_DELETE_CONCURRENCY: usize = 8;
 
+/// Whether the object store would not take the call at all. A store wrapper
+/// that has ended a GC pass answers every later call this way, so nothing was
+/// attempted: the caller that ended the pass reports it, and what was left is
+/// a candidate again in the next pass.
+pub(crate) fn store_refused(error: &SlateDBError) -> bool {
+    matches!(
+        error,
+        SlateDBError::ObjectStoreError(source)
+            if matches!(source.as_ref(), object_store::Error::NotSupported { .. })
+    )
+}
+
+/// Logs a delete that did not happen: an error, unless the store refused the
+/// call ([`store_refused`]) and the delete was never started.
+pub(crate) fn log_delete_error(resource: &str, id: &dyn std::fmt::Debug, error: &SlateDBError) {
+    if store_refused(error) {
+        log::debug!(
+            "delete not started [resource={}, id={:?}, error={}]",
+            resource,
+            id,
+            error
+        );
+    } else {
+        error!("error deleting {} [id={:?}, error={}]", resource, id, error);
+    }
+}
+
+/// Logs a task step that did not happen: an error, unless the store refused
+/// the call and a pass that had been ended never started it.
+fn log_task_error(doing: &str, resource: &str, error: &SlateDBError) {
+    if store_refused(error) {
+        log::debug!(
+            "{} not started [resource={}, error={:?}]",
+            doing,
+            resource,
+            error
+        );
+    } else {
+        error!("error {} [resource={}, error={:?}]", doing, resource, error);
+    }
+}
+
 trait GcTask {
     fn resource(&self) -> &str;
     async fn collect(&self, now: DateTime<Utc>) -> Result<(), SlateDBError>;
@@ -388,17 +430,9 @@ impl GarbageCollector {
     #[instrument(level = "debug", skip_all, fields(resource = task.resource()))]
     async fn run_gc_task<T: GcTask + std::fmt::Debug>(&self, task: &T) {
         if let Err(e) = self.remove_expired_checkpoints().await {
-            error!(
-                "error removing expired checkpoints [resource={}, error={:?}]",
-                task.resource(),
-                e,
-            );
+            log_task_error("removing expired checkpoints", task.resource(), &e);
         } else if let Err(e) = task.collect(self.system_clock.now()).await {
-            error!(
-                "error collecting garbage [resource={}, error={:?}]",
-                task.resource(),
-                e,
-            );
+            log_task_error("collecting garbage", task.resource(), &e);
         }
     }
 

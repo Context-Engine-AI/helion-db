@@ -145,7 +145,7 @@ where
     }
 
     loop {
-        if touched.len() > params.max_pushed_nodes || push_count > params.max_pushes {
+        if touched.len() > params.max_pushed_nodes || push_count >= params.max_pushes {
             break;
         }
         let v = match queue.pop_front() {

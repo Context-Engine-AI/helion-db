@@ -58,6 +58,10 @@ pub(crate) enum SlateDBError {
     #[error("database does not exist")]
     DatabaseMissing,
 
+    // HELION LOCAL PATCH: see `DbBuilder::with_create_only`.
+    #[error("database already exists")]
+    DatabaseExists,
+
     #[error("generic transactional object (e.g. manifest) error {0:?}")]
     TransactionalObjectError(#[from] Arc<TransactionalObjectError>),
 
@@ -492,6 +496,10 @@ pub enum ErrorKind {
 pub enum ErrorCode {
     /// A reader cannot open because no database manifest exists.
     DatabaseMissing,
+
+    /// HELION LOCAL PATCH: an open that must create its database
+    /// (`DbBuilder::with_create_only`) found a manifest at the path.
+    DatabaseExists,
 }
 
 impl From<ErrorKind> for CloseReason {
@@ -734,6 +742,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::ManifestMissing(_) => Error::data(msg),
             SlateDBError::LatestTransactionalObjectVersionMissing => Error::data(msg),
             SlateDBError::DatabaseMissing => Error::data(msg).with_code(ErrorCode::DatabaseMissing),
+            SlateDBError::DatabaseExists => Error::data(msg).with_code(ErrorCode::DatabaseExists),
             SlateDBError::TransactionalObjectVersionExists => Error::data(msg),
             SlateDBError::InvalidTransactionalObjectState => Error::data(msg),
             SlateDBError::EmptyManifest => Error::data(msg),

@@ -47,7 +47,7 @@ use crate::protocol::items::{v6_uuid, Edge, Node, SerializedEdge, SerializedNode
 use crate::protocol::label_hash::hash_label;
 use crate::protocol::value::Value;
 
-use super::backend::{BackendError, BackendKind, Namespace, StorageBackend};
+use super::backend::{BackendError, BackendKind, Namespace, StorageBackend, TransactionRow};
 use super::backend_any::{AnyRead, AnyWrite};
 use super::metadata::StorageMetadata;
 use super::storage_core::HelixGraphStorage;
@@ -77,6 +77,23 @@ fn deserialize_metadata(bytes: &[u8]) -> Result<StorageMetadata, GraphError> {
         bincode::deserialize(bytes)
     };
     result.map_err(|e| GraphError::StorageError(format!("metadata decode: {}", e)))
+}
+
+/// The stored metadata `value` (none before a collection's first write) after
+/// `update`: the bytes to store and the metadata they hold.
+fn updated_metadata_value(
+    value: Option<&[u8]>,
+    update: &mut impl FnMut(&mut StorageMetadata) -> Result<(), GraphError>,
+) -> Result<(Vec<u8>, StorageMetadata), BackendError> {
+    let mut metadata = value
+        .map(deserialize_metadata)
+        .transpose()
+        .map_err(|e| BackendError::Corruption(e.to_string()))?
+        .unwrap_or_else(|| StorageMetadata::new(Vec::new()));
+    update(&mut metadata).map_err(|e| BackendError::Io(e.to_string()))?;
+    let bytes =
+        serialize_metadata(&metadata).map_err(|e| BackendError::Corruption(e.to_string()))?;
+    Ok((bytes, metadata))
 }
 
 impl HelixGraphStorage {
@@ -263,7 +280,19 @@ impl HelixGraphStorage {
     /// `Namespace::PayloadIndex`, so filtered delete/count do not observe stale
     /// index entries after an LSM node drop.
     pub fn drop_node_be(&self, w: &mut AnyWrite<'_>, id: &u128) -> Result<(), GraphError> {
-        // Snapshot the node row (for the multi-index dup-deletes) and the edges
+        self.drop_nodes_be(w, std::slice::from_ref(id))
+    }
+
+    /// [`Self::drop_node_be`] for many nodes in one write batch, leaving what
+    /// the per-node calls leave. The node rows and each adjacency side are
+    /// read once for the whole batch: a point delete used to pay four storage
+    /// round trips per node here, which dominated the delete.
+    pub(crate) fn drop_nodes_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        ids: &[u128],
+    ) -> Result<(), GraphError> {
+        // Snapshot the node rows (for the multi-index dup-deletes) and the edges
         // to remove, using a read snapshot — drop_node reads inside the same
         // write txn; here the writes are buffered in `w` and reads see committed
         // state, which is equivalent because a node's own edges/properties are
@@ -272,29 +301,134 @@ impl HelixGraphStorage {
             .backend
             .begin_read()
             .map_err(|e| GraphError::New(e.to_string()))?;
-
-        let existing_node: Option<Node> = self
-            .backend
-            .get_with(&r, Namespace::Nodes, &id.to_be_bytes(), |v| match v {
-                Some(data) => Some(SerializedNode::decode_node(data, *id)),
-                None => None,
-            })
-            .map_err(|e| GraphError::New(e.to_string()))?
-            .transpose()?;
-
         // Collect outgoing then incoming edges (full edge records), mirroring
         // drop_node's two prefix scans + edge-data lookups.
-        let out_edges = self.collect_incident_edges(&r, Namespace::OutEdges, id)?;
-        let in_edges = self.collect_incident_edges(&r, Namespace::InEdges, id)?;
+        let out_edges = self.collect_incident_edges_many(&r, Namespace::OutEdges, ids)?;
+        let in_edges = self.collect_incident_edges_many(&r, Namespace::InEdges, ids)?;
+        drop(r);
+        // The node rows are read last and on their own snapshot, as the
+        // one-node drop read them: a node created or dropped while the edges
+        // were being read is counted as it stands now.
+        let r = self
+            .backend
+            .begin_read()
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        let node_keys: Vec<Vec<u8>> = ids.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+        let node_rows = self
+            .backend
+            .get_many(&r, Namespace::Nodes, &node_keys)
+            .map_err(|e| GraphError::New(e.to_string()))?;
         drop(r);
 
+        let mut removed_nodes = 0i64;
+        let mut removed_edges = 0i64;
+        let per_node = ids.iter().zip(node_rows).zip(out_edges).zip(in_edges);
+        for (((id, node_row), out_edges), in_edges) in per_node {
+            let existing_node: Option<Node> = node_row
+                .as_deref()
+                .map(|data| SerializedNode::decode_node(data, *id))
+                .transpose()?;
+            removed_edges += self.drop_incident_edges_be(w, &out_edges, &in_edges)?;
+
+            // Delete node data — only adjust the node counter if the row existed.
+            self.backend
+                .delete(w, Namespace::Nodes, &id.to_be_bytes())
+                .map_err(|e| GraphError::New(e.to_string()))?;
+            if let Some(node) = &existing_node {
+                self.deindex_dropped_node_be(w, id, node)?;
+                removed_nodes += 1;
+            }
+        }
+        if removed_nodes > 0 {
+            self.adjust_metadata_counter_be(w, MetadataCounter::Nodes, -removed_nodes)?;
+        }
+        if removed_edges > 0 {
+            self.adjust_metadata_counter_be(w, MetadataCounter::Edges, -removed_edges)?;
+        }
+        Ok(())
+    }
+
+    /// Drop the ids of `ids` that are still orphans and return how many were
+    /// dropped. Unlike [`Self::drop_nodes_be`] this never removes an edge: an
+    /// id with an adjacency row on the snapshot taken here is left alone, with
+    /// its edges, and not counted, so an edge committed between the caller's
+    /// choice of `ids` and that snapshot keeps both its endpoints. An id
+    /// without a node row counts as dropped, as it does there.
+    ///
+    /// shortcut: an edge committed after that snapshot and before this batch
+    /// commits still loses the node row of its endpoint, closing that needs a
+    /// per-collection write gate.
+    pub(crate) fn drop_orphan_nodes_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        ids: &[u128],
+    ) -> Result<usize, GraphError> {
+        let r = self
+            .backend
+            .begin_read()
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        let orphans = self.nodes_without_adjacency_be(&r, ids)?;
+        drop(r);
+        self.drop_node_rows_be(w, &orphans)
+    }
+
+    /// Drop the node rows of `ids` with their index entries, and nothing of
+    /// an edge: the caller has found these ids without one. Returns
+    /// `ids.len()`, an id without a node row counting as dropped.
+    pub(crate) fn drop_node_rows_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        ids: &[u128],
+    ) -> Result<usize, GraphError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // As in `drop_nodes_be`, the node rows are read on their own snapshot.
+        let r = self
+            .backend
+            .begin_read()
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        let node_keys: Vec<Vec<u8>> = ids.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+        let node_rows = self
+            .backend
+            .get_many(&r, Namespace::Nodes, &node_keys)
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        drop(r);
+
+        let mut removed_nodes = 0i64;
+        for (id, node_row) in ids.iter().zip(node_rows) {
+            let existing_node: Option<Node> = node_row
+                .as_deref()
+                .map(|data| SerializedNode::decode_node(data, *id))
+                .transpose()?;
+            self.backend
+                .delete(w, Namespace::Nodes, &id.to_be_bytes())
+                .map_err(|e| GraphError::New(e.to_string()))?;
+            if let Some(node) = &existing_node {
+                self.deindex_dropped_node_be(w, id, node)?;
+                removed_nodes += 1;
+            }
+        }
+        if removed_nodes > 0 {
+            self.adjust_metadata_counter_be(w, MetadataCounter::Nodes, -removed_nodes)?;
+        }
+        Ok(ids.len())
+    }
+
+    /// Remove a dropped node's incident edges; returns how many were still live.
+    fn drop_incident_edges_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        out_edges: &[Edge],
+        in_edges: &[Edge],
+    ) -> Result<i64, GraphError> {
         let removed_edge_ids = out_edges
             .iter()
             .chain(in_edges.iter())
             .map(|edge| edge.id)
             .collect::<std::collections::HashSet<_>>();
-        // `r` predates this batch: skip edges an earlier op in it already
-        // deleted (e.g. the other endpoint's drop), or they count twice.
+        // The read snapshot predates this batch: skip edges an earlier op in it
+        // already deleted (e.g. the other endpoint's drop), or they count twice.
         let mut removed_edges = 0i64;
         for edge_id in &removed_edge_ids {
             let live = self
@@ -334,66 +468,64 @@ impl HelixGraphStorage {
             // does), or delete-by-path later resolves to a missing edge.
             self.delete_edge_paths_be(w, edge)?;
         }
+        Ok(removed_edges)
+    }
 
-        // Delete node data — only adjust the node counter if the row existed.
-        let deleted = self.backend_delete_returning(w, Namespace::Nodes, &id.to_be_bytes())?;
-        if deleted {
-            if let Some(node) = &existing_node {
-                // Single-value secondary indices written by create_node_be.
-                // Delete only an entry that still points at THIS node (the
-                // index is unique by value, so another node may own the key).
-                let id_bytes = id.to_be_bytes();
-                for index in self.secondary_indices.keys() {
-                    if let Some(value) = node.properties.get(index) {
-                        let key = Self::stable_index_key_for_value(value)?;
-                        let points_to_node = self
-                            .backend
-                            .get_for_update(w, Namespace::SecondaryIndex(index), &key, |v| {
-                                v.is_some_and(|bytes| bytes == id_bytes.as_slice())
-                            })
-                            .map_err(|e| GraphError::New(e.to_string()))?;
-                        if points_to_node {
-                            self.backend
-                                .delete(w, Namespace::SecondaryIndex(index), &key)
-                                .map_err(|e| GraphError::New(e.to_string()))?;
-                        }
-                    }
-                }
-                for (idx_name, _idx_db) in &self.multi_indices {
-                    if let Some(value) = Self::payload_value_for_key(&node.properties, idx_name) {
-                        let key = Self::stable_index_key_for_value(value)?;
-                        // `Namespace::MultiIndex(idx_name)` resolves to the on-disk
-                        // `midx_{idx_name}` DB (e.g. the auto-provisioned `name`
-                        // index at `midx_name`), so this dup-delete removes the real
-                        // entry, matching `drop_node`.
-                        self.backend
-                            .delete_dup(w, Namespace::MultiIndex(idx_name), &key, &id.to_be_bytes())
-                            .map_err(|e| GraphError::New(e.to_string()))?;
-                    }
-                }
-                let payload_indices = self
-                    .payload_indices
-                    .read()
-                    .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
-                for (idx_name, handle) in payload_indices.iter() {
-                    if !handle.accepts_writes() {
-                        continue;
-                    }
-                    self.deindex_node_payload_field_be(
-                        w,
-                        idx_name,
-                        &handle.schema,
-                        *id,
-                        Self::payload_value_for_key(&node.properties, idx_name),
-                    )?;
+    /// Remove a dropped node's secondary, multi and payload index entries.
+    fn deindex_dropped_node_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        id: &u128,
+        node: &Node,
+    ) -> Result<(), GraphError> {
+        // Single-value secondary indices written by create_node_be.
+        // Delete only an entry that still points at THIS node (the
+        // index is unique by value, so another node may own the key).
+        let id_bytes = id.to_be_bytes();
+        for index in self.secondary_indices.keys() {
+            if let Some(value) = node.properties.get(index) {
+                let key = Self::stable_index_key_for_value(value)?;
+                let points_to_node = self
+                    .backend
+                    .get_for_update(w, Namespace::SecondaryIndex(index), &key, |v| {
+                        v.is_some_and(|bytes| bytes == id_bytes.as_slice())
+                    })
+                    .map_err(|e| GraphError::New(e.to_string()))?;
+                if points_to_node {
+                    self.backend
+                        .delete(w, Namespace::SecondaryIndex(index), &key)
+                        .map_err(|e| GraphError::New(e.to_string()))?;
                 }
             }
-            self.adjust_metadata_counter_be(w, MetadataCounter::Nodes, -1)?;
         }
-        if removed_edges > 0 {
-            self.adjust_metadata_counter_be(w, MetadataCounter::Edges, -removed_edges)?;
+        for (idx_name, _idx_db) in &self.multi_indices {
+            if let Some(value) = Self::payload_value_for_key(&node.properties, idx_name) {
+                let key = Self::stable_index_key_for_value(value)?;
+                // `Namespace::MultiIndex(idx_name)` resolves to the on-disk
+                // `midx_{idx_name}` DB (e.g. the auto-provisioned `name`
+                // index at `midx_name`), so this dup-delete removes the real
+                // entry, matching `drop_node`.
+                self.backend
+                    .delete_dup(w, Namespace::MultiIndex(idx_name), &key, &id.to_be_bytes())
+                    .map_err(|e| GraphError::New(e.to_string()))?;
+            }
         }
-
+        let payload_indices = self
+            .payload_indices
+            .read()
+            .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
+        for (idx_name, handle) in payload_indices.iter() {
+            if !handle.accepts_writes() {
+                continue;
+            }
+            self.deindex_node_payload_field_be(
+                w,
+                idx_name,
+                handle,
+                *id,
+                Self::payload_value_for_key(&node.properties, idx_name),
+            )?;
+        }
         Ok(())
     }
 
@@ -560,15 +692,7 @@ impl HelixGraphStorage {
             return self
                 .backend
                 .update_lsm_key_transactional(Namespace::Metadata, METADATA_CURRENT_KEY, |value| {
-                    let mut metadata = value
-                        .map(deserialize_metadata)
-                        .transpose()
-                        .map_err(|e| BackendError::Corruption(e.to_string()))?
-                        .unwrap_or_else(|| StorageMetadata::new(Vec::new()));
-                    update(&mut metadata).map_err(|e| BackendError::Io(e.to_string()))?;
-                    let bytes = serialize_metadata(&metadata)
-                        .map_err(|e| BackendError::Corruption(e.to_string()))?;
-                    Ok((bytes, metadata))
+                    updated_metadata_value(value, &mut update)
                 })
                 .map_err(|e| GraphError::New(e.to_string()));
         }
@@ -583,6 +707,72 @@ impl HelixGraphStorage {
             .unwrap_or_else(|| StorageMetadata::new(Vec::new()));
         update(&mut metadata)?;
         self.put_metadata_be(w, &metadata)?;
+        Ok(metadata)
+    }
+
+    /// [`Self::update_metadata_be`] on the LSM backend with the Metadata rows
+    /// `also` in the same transaction, committed buffered: durable only once
+    /// the caller's `flush_durable` has returned.
+    pub(crate) fn update_metadata_be_buffered<F>(
+        &self,
+        also: &[(&[u8], &[u8])],
+        mut update: F,
+    ) -> Result<StorageMetadata, GraphError>
+    where
+        F: FnMut(&mut StorageMetadata) -> Result<(), GraphError>,
+    {
+        const METADATA_CURRENT_KEY: &[u8] = b"current";
+        self.backend
+            .update_lsm_key_transactional_buffered(
+                Namespace::Metadata,
+                METADATA_CURRENT_KEY,
+                also,
+                |value| updated_metadata_value(value, &mut update),
+            )
+            .map_err(|e| GraphError::New(e.to_string()))
+    }
+
+    /// [`Self::update_metadata_be`] whose `update` also names rows of the
+    /// metadata table to put or delete with the metadata. On LSM they are in
+    /// the transaction that replaces the metadata, decided from the metadata
+    /// that transaction read; on LMDB in the write `w`.
+    pub(crate) fn update_metadata_be_with_rows<F>(
+        &self,
+        w: &mut AnyWrite<'_>,
+        mut update: F,
+    ) -> Result<StorageMetadata, GraphError>
+    where
+        F: FnMut(&mut StorageMetadata) -> Result<Vec<TransactionRow>, GraphError>,
+    {
+        const METADATA_CURRENT_KEY: &[u8] = b"current";
+        let mut rows = Vec::new();
+        if self.backend.kind() == BackendKind::Lsm {
+            return self
+                .backend
+                .update_lsm_key_transactional_with_rows(
+                    Namespace::Metadata,
+                    METADATA_CURRENT_KEY,
+                    |value| {
+                        let (bytes, metadata) = updated_metadata_value(value, &mut |metadata| {
+                            rows = update(metadata)?;
+                            Ok(())
+                        })?;
+                        Ok((bytes, std::mem::take(&mut rows), metadata))
+                    },
+                )
+                .map_err(|e| GraphError::New(e.to_string()));
+        }
+        let metadata = self.update_metadata_be(w, |metadata| {
+            rows = update(metadata)?;
+            Ok(())
+        })?;
+        for (key, value) in rows {
+            match value {
+                Some(value) => self.backend.put(w, Namespace::Metadata, &key, &value),
+                None => self.backend.delete(w, Namespace::Metadata, &key),
+            }
+            .map_err(|e| GraphError::New(e.to_string()))?;
+        }
         Ok(metadata)
     }
 
@@ -601,7 +791,11 @@ impl HelixGraphStorage {
         })
     }
 
-    /// Backend-routed twin of `set_dense_vector_spaces_metadata`.
+    /// Backend-routed twin of `set_dense_vector_spaces_metadata`, for tests:
+    /// it stores a layout with no change of the layout held and records no
+    /// name that the layout drops. Every store outside tests goes through
+    /// `store_dense_layout` (replication.rs).
+    #[cfg(test)]
     pub fn set_dense_vector_spaces_metadata_be(
         &self,
         w: &mut AnyWrite<'_>,
@@ -706,29 +900,57 @@ impl HelixGraphStorage {
         Ok(edges)
     }
 
-    /// Backend `delete` that reports whether a row existed, mirroring heed's
-    /// `Database::delete` return value (used by `drop_node` to gate the counter).
-    /// The backend `delete` returns `()`, so we probe existence first via a read
-    /// snapshot, then delete.
-    fn backend_delete_returning(
+    /// [`Self::collect_incident_edges`] for many nodes, aligned with `nodes`:
+    /// one round trip for the adjacency scans and one for the edge rows where
+    /// the backend batches, the per-node path elsewhere.
+    fn collect_incident_edges_many(
         &self,
-        w: &mut AnyWrite<'_>,
+        r: &AnyRead<'_>,
         ns: Namespace<'_>,
-        key: &[u8],
-    ) -> Result<bool, GraphError> {
-        let r = self
+        nodes: &[u128],
+    ) -> Result<Vec<Vec<Edge>>, GraphError> {
+        let prefixes: Vec<Vec<u8>> = nodes.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+        let Some(adjacency) = self
             .backend
-            .begin_read()
-            .map_err(|e| GraphError::New(e.to_string()))?;
-        let existed = self
+            .scan_dup_prefix_values_many(r, ns, &prefixes, None)
+            .map_err(|e| GraphError::New(e.to_string()))?
+        else {
+            return nodes
+                .iter()
+                .map(|node| self.collect_incident_edges(r, ns, node))
+                .collect();
+        };
+
+        let mut edge_ids: Vec<Vec<u128>> = Vec::with_capacity(adjacency.len());
+        for values in &adjacency {
+            let ids = values
+                .iter()
+                .map(|value| Self::unpack_adj_edge_data(value).map(|(_peer, edge_id)| edge_id))
+                .collect::<Result<Vec<_>, _>>()?;
+            edge_ids.push(ids);
+        }
+        let edge_keys: Vec<Vec<u8>> = edge_ids
+            .iter()
+            .flatten()
+            .map(|edge_id| edge_id.to_be_bytes().to_vec())
+            .collect();
+        let mut edge_rows = self
             .backend
-            .get_with(&r, ns, key, |v| v.is_some())
-            .map_err(|e| GraphError::New(e.to_string()))?;
-        drop(r);
-        self.backend
-            .delete(w, ns, key)
-            .map_err(|e| GraphError::New(e.to_string()))?;
-        Ok(existed)
+            .get_many(r, Namespace::Edges, &edge_keys)
+            .map_err(|e| GraphError::New(e.to_string()))?
+            .into_iter();
+        let mut edges = Vec::with_capacity(edge_ids.len());
+        for ids in edge_ids {
+            let mut node_edges = Vec::with_capacity(ids.len());
+            for edge_id in ids {
+                // `get_many` returns one row per key, in key order.
+                if let Some(data) = edge_rows.next().flatten() {
+                    node_edges.push(SerializedEdge::decode_edge(&data, edge_id)?);
+                }
+            }
+            edges.push(node_edges);
+        }
+        Ok(edges)
     }
 }
 
@@ -1272,5 +1494,156 @@ mod tests {
         storage.drop_node_be(&mut w, &2).unwrap();
         storage.backend.commit(w).unwrap();
         assert_eq!(edge_count(), 1, "only n3->n4 remains");
+    }
+
+    /// One batched drop leaves what dropping each node in turn leaves — a
+    /// shared edge counted once, a missing id not at all — in fewer storage
+    /// round trips.
+    #[test]
+    #[serial_test::serial]
+    fn lsm_drop_nodes_be_matches_per_node_drops_in_fewer_round_trips() {
+        use super::super::backend_lsm::lsm_round_trips_for_test as round_trips;
+        use super::super::upsert::EdgeUpsert;
+
+        // (node_count, edge_count, round trips) after dropping n1, n2 and a
+        // missing id from n1->n2->n3->n4.
+        let drop_nodes = |batched: bool| {
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = HelixGraphStorage::new(
+                dir.path().to_str().unwrap(),
+                test_config().with_lsm_in_memory(),
+            )
+            .unwrap();
+            let mut w = storage.backend.begin_write().unwrap();
+            for n in 1..=4u128 {
+                storage
+                    .create_node_be(&mut w, "Sym", [], None, Some(n))
+                    .unwrap();
+            }
+            for (id, from_node, to_node) in [(0xE1, 1, 2), (0xE2, 2, 3), (0xE3, 3, 4)] {
+                let edge = EdgeUpsert {
+                    id,
+                    label: "CALLS".to_string(),
+                    from_node,
+                    to_node,
+                    properties: Default::default(),
+                };
+                storage.upsert_edge_be(&mut w, &edge).unwrap();
+            }
+            storage.backend.commit(w).unwrap();
+
+            let ids = [1u128, 2, 0xDEAD];
+            let before = round_trips();
+            let mut w = storage.backend.begin_write().unwrap();
+            if batched {
+                storage.drop_nodes_be(&mut w, &ids).unwrap();
+            } else {
+                for id in &ids {
+                    storage.drop_node_be(&mut w, id).unwrap();
+                }
+            }
+            storage.backend.commit(w).unwrap();
+            let spent = round_trips() - before;
+            let stats = storage
+                .with_read_backend(|r| storage.get_metadata_be(r))
+                .unwrap()
+                .stats;
+            (stats.node_count, stats.edge_count, spent)
+        };
+        let (nodes, edges, batched_trips) = drop_nodes(true);
+        let (serial_nodes, serial_edges, serial_trips) = drop_nodes(false);
+
+        assert_eq!((nodes, edges), (2, 1), "n3, n4 and n3->n4 remain");
+        assert_eq!((nodes, edges), (serial_nodes, serial_edges));
+        assert!(
+            batched_trips < serial_trips,
+            "batched drop took {batched_trips} round trips, per-node drops {serial_trips}"
+        );
+    }
+
+    /// The orphan drop removes only what is still an orphan when it reads. A
+    /// node that had no edge when the caller chose it, and got one committed
+    /// before the drop, keeps its row, that edge and both adjacency rows, and
+    /// is not counted; `drop_nodes_be` would have removed all of them.
+    #[test]
+    #[serial_test::serial]
+    fn lsm_drop_orphan_nodes_be_keeps_a_node_that_got_an_edge_after_the_check() {
+        use super::super::upsert::EdgeUpsert;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
+        assert_eq!(storage.backend.kind(), BackendKind::Lsm);
+        let counts = || {
+            let stats = storage
+                .with_read_backend(|r| storage.get_metadata_be(r))
+                .unwrap()
+                .stats;
+            (stats.node_count, stats.edge_count)
+        };
+
+        // n1..n4 have a row and no edge; 0xDEAD has neither.
+        let mut w = storage.backend.begin_write().unwrap();
+        for n in 1..=4u128 {
+            storage
+                .create_node_be(&mut w, "Sym", [], None, Some(n))
+                .unwrap();
+        }
+        storage.backend.commit(w).unwrap();
+
+        // The check: every chosen id is an orphan.
+        let chosen = [1u128, 2, 3, 0xDEAD];
+        let r = storage.backend.begin_read().unwrap();
+        assert_eq!(
+            storage.nodes_without_adjacency_be(&r, &chosen).unwrap(),
+            chosen
+        );
+        drop(r);
+
+        // Another writer commits n4 -> n2 before the drop.
+        let edge = EdgeUpsert {
+            id: 0xE1,
+            label: "CALLS".to_string(),
+            from_node: 4,
+            to_node: 2,
+            properties: Default::default(),
+        };
+        let mut w = storage.backend.begin_write().unwrap();
+        storage.upsert_edge_be(&mut w, &edge).unwrap();
+        storage.backend.commit(w).unwrap();
+        assert_eq!(counts(), (4, 1));
+
+        let mut w = storage.backend.begin_write().unwrap();
+        let dropped = storage.drop_orphan_nodes_be(&mut w, &chosen).unwrap();
+        storage.backend.commit(w).unwrap();
+        assert_eq!(
+            dropped, 3,
+            "n1, n3 and the id without a row; n2 is kept and not counted"
+        );
+
+        let r = storage.backend.begin_read().unwrap();
+        let has_row = |id: u128| {
+            storage
+                .backend
+                .get_with(&r, Namespace::Nodes, &id.to_be_bytes(), |v| v.is_some())
+                .unwrap()
+        };
+        assert_eq!([1u128, 2, 3, 4].map(has_row), [false, true, false, true]);
+        assert!(
+            storage.get_edge_be(&r, &0xE1).is_ok(),
+            "the edge committed after the check survives"
+        );
+        assert_eq!(
+            storage.out_adj_be(&r, &4, "CALLS").unwrap(),
+            vec![(2u128, 0xE1u128)]
+        );
+        assert_eq!(
+            storage.in_adj_be(&r, &2, "CALLS").unwrap(),
+            vec![(4u128, 0xE1u128)]
+        );
+        assert_eq!(counts(), (2, 1));
     }
 }

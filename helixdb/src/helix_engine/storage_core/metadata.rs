@@ -113,6 +113,14 @@ pub struct StorageMetadataSidecar {
     pub data_mdb_bytes: u64,
     #[serde(default)]
     pub map_size_bytes: Option<u64>,
+    /// Whether the collection's adjacency backfill from points had run to
+    /// its end when this file was written. `None` in a file written before
+    /// the field, or where its writer did not know: a reader of the file
+    /// then has to ask the writer. A writer puts `false` on the object store
+    /// before it starts a pass over, and `true` only after the pass's last
+    /// write is stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjacency_backfill_complete: Option<bool>,
     pub metadata: StorageMetadata,
 }
 
@@ -129,6 +137,7 @@ impl StorageMetadataSidecar {
             written_at_millis: chrono::Utc::now().timestamp_millis(),
             data_mdb_bytes,
             map_size_bytes,
+            adjacency_backfill_complete: None,
             metadata,
         }
     }

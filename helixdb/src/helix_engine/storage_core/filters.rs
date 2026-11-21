@@ -372,6 +372,11 @@ impl HasIdCondition {
             .iter()
             .any(|raw| point_id_json_to_u128(raw) == Some(id))
     }
+
+    /// Every id this condition can match, parsed exactly as `matches_id` does.
+    pub(crate) fn point_ids(&self) -> impl Iterator<Item = u128> + '_ {
+        self.has_id.iter().filter_map(point_id_json_to_u128)
+    }
 }
 
 impl FieldCondition {
@@ -743,7 +748,7 @@ mod tests {
             "should": [{"key": "metadata.kind", "match": {"value": "function"}}],
             "must_not": [{"key": "metadata.path", "match": {"text": "vendor/"}}]
         }))
-        .expect("CE filter shapes must parse");
+        .expect("client filter shapes must parse");
         assert_eq!(filter.must.len(), 14);
         let mut props = test_props();
         let Some(Value::Object(metadata)) = props.get_mut("metadata") else {

@@ -8,7 +8,7 @@ use super::metrics;
 use super::qdrant;
 use super::raft;
 
-/// Register all CE REST API routes on the router.
+/// Register all client REST API routes on the router.
 pub fn register_api_routes(router: &mut HelixRouter) {
     // Health — also register GET / so Qdrant-compat wait scripts work.
     // `/readyz` and `/livez` mirror Kubernetes probe conventions so
@@ -198,6 +198,26 @@ pub fn register_api_routes(router: &mut HelixRouter) {
         "/collections/{name}/snapshots/recover",
         qdrant::handle_recover_snapshot,
     );
+    router.add_pattern_route(
+        "POST",
+        "/collections/{name}/regraph",
+        collections::handle_regraph,
+    );
+    router.add_pattern_route(
+        "GET",
+        "/collections/{name}/regraph",
+        collections::handle_regraph_status,
+    );
+    router.add_pattern_route(
+        "GET",
+        "/collections/{name}/unreached",
+        collections::handle_unreached,
+    );
+    router.add_pattern_route(
+        "POST",
+        "/collections/{name}/unreached/link",
+        collections::handle_link_unreached,
+    );
 
     // Point operations: payload, count, retrieve, exists
     router.add_pattern_route(
@@ -220,6 +240,11 @@ pub fn register_api_routes(router: &mut HelixRouter) {
         "POST",
         "/collections/{name}/facet/count",
         qdrant::handle_facet,
+    );
+    router.add_pattern_route(
+        "POST",
+        "/collections/{name}/sparse/stats",
+        qdrant::sparse_stats::handle_sparse_stats,
     );
     router.add_pattern_route(
         "POST",

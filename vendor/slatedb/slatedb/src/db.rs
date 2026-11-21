@@ -378,14 +378,20 @@ impl DbInner {
                 format_bytes_si(self.settings.max_unflushed_bytes as u64),
             );
 
-            if total_mem_size_bytes >= self.settings.max_unflushed_bytes {
+            // HELION LOCAL PATCH (see `L0FlushGate`): a flush of this database
+            // waits at the gate. What it was kept from taking must not go into
+            // the next memtable instead, so no write goes in while it waits,
+            // by the same wait as below and one arm more.
+            let flush_waits_at_gate = self.memtable_flusher.flush_waits_at_gate();
+            if total_mem_size_bytes >= self.settings.max_unflushed_bytes || flush_waits_at_gate {
                 self.db_stats.backpressure_count.increment(1);
                 warn!(
-                    "unflushed memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}]",
+                    "unflushed memtable size exceeds max_unflushed_bytes, or a flush waits at the l0 flush gate. applying backpressure. [total_mem_size_bytes={}, wal_size_bytes={}, imm_memtable_size_bytes={}, max_unflushed_bytes={}, flush_waits_at_gate={}]",
                     format_bytes_si(total_mem_size_bytes as u64),
                     format_bytes_si(wal_size_bytes as u64),
                     format_bytes_si(imm_memtable_size_bytes as u64),
                     format_bytes_si(self.settings.max_unflushed_bytes as u64),
+                    flush_waits_at_gate,
                 );
 
                 let maybe_oldest_unflushed_memtable = {
@@ -431,10 +437,17 @@ impl DbInner {
                     }
                 };
 
+                // HELION LOCAL PATCH: a write held back for a flush that waited
+                // at the gate looks again when that flush is let in. Armed only
+                // in a turn that found one waiting: a write held for memory
+                // alone would spin on an arm that is ready at once.
+                let await_flush_let_in = self.memtable_flusher.no_flush_waits_at_gate();
+
                 tokio::select! {
                     result = await_memtable_uploaded => result?,
                     result = await_flush_wal => result?,
                     result = await_closed => result?,
+                    _ = await_flush_let_in, if flush_waits_at_gate => {}
                     _ = timeout_fut => {
                         warn!("backpressure timeout: waited 30s, no memtable/WAL flushed yet");
                     }

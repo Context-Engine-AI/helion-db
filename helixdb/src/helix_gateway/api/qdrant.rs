@@ -1,5 +1,19 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+#[path = "qdrant_candidate_exactness.rs"]
+mod candidate_exactness;
+#[path = "qdrant_dense_candidate_plan.rs"]
+mod dense_candidate_plan;
+#[path = "qdrant_sparse_filter.rs"]
+mod sparse_filter;
+#[path = "qdrant_sparse_stats.rs"]
+pub mod sparse_stats;
+use candidate_exactness::{
+    indexed_condition_candidates_are_exact, indexed_filter_candidates_are_exact,
+    indexed_filter_candidates_may_be_exact,
+};
+use dense_candidate_plan::{dense_filter_candidates_be, must_has_id_candidates};
 use serde::{Deserialize, Serialize};
+use sparse_filter::{sparse_search_limit, SparseDocFilter};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::Hasher;
 use std::ops::Bound;
@@ -9,14 +23,17 @@ use std::time::{Duration, Instant};
 use crate::helix_engine::storage_core::backend::{
     BackendError, BackendKind, KeyRange, Namespace, StorageBackend,
 };
-use crate::helix_engine::storage_core::backend_any::{AnyBackend, AnyRead};
+use crate::helix_engine::storage_core::backend_any::{AnyBackend, AnyRead, AnyWrite};
+use crate::helix_engine::storage_core::backend_lsm::LsmThreadContext;
 use crate::helix_engine::storage_core::collection_manager::reader_refresh_ttl_ms;
 use crate::helix_engine::storage_core::filters::{
     Condition, FieldCondition, Filter, MatchCondition, RangeCondition,
 };
 use crate::helix_engine::storage_core::metadata::PayloadIndexSchema;
-use crate::helix_engine::storage_core::replication::{ReplicatedMutation, ReplicatedPoint};
-use crate::helix_engine::storage_core::storage_core::HelixGraphStorage;
+use crate::helix_engine::storage_core::replication::{
+    lock_point_mutation_gate, ReplicatedMutation, ReplicatedPoint,
+};
+use crate::helix_engine::storage_core::storage_core::{HelixGraphStorage, PayloadValueRows};
 use crate::helix_engine::storage_core::storage_methods::StorageMethods;
 use crate::helix_engine::types::{graph_error_from_backend_error, GraphError};
 use crate::helix_engine::vector_core::fusion::{
@@ -29,10 +46,13 @@ use crate::helix_engine::vector_core::hnsw::HNSW;
 use crate::helix_engine::vector_core::named_vectors::{
     DenseVectorSegmentRole, DistanceMetric, NamedVectorConfig,
 };
-use crate::helix_engine::vector_core::sparse::{SparseModifier, SparseVector, SparseVectorConfig};
+use crate::helix_engine::vector_core::sparse::{
+    sparse_lazy_filter_enabled, SparseModifier, SparseVector, SparseVectorConfig,
+};
 use crate::helix_engine::vector_core::spindle::{SpindleConfig, SpindleMode};
 use crate::helix_engine::vector_core::vector::HVector;
 use crate::helix_engine::vector_core::vector_core::HnswOverrides;
+use crate::helix_gateway::async_gateway::{answer_handler_error, graph_error_status};
 use crate::helix_gateway::router::router::HandlerInput;
 use crate::protocol::items::{Node, SerializedNode};
 use crate::protocol::label_hash::hash_label;
@@ -53,6 +73,67 @@ mod qdrant_payload_cache_handler_tests;
 mod qdrant_payload_cache_tests;
 
 // ─── Helpers ───
+
+#[cfg(test)]
+#[path = "qdrant_backfill_mark_tests.rs"]
+mod backfill_mark_tests;
+#[cfg(test)]
+#[path = "qdrant_exact_text_review_tests.rs"]
+mod exact_text_review_tests;
+#[cfg(test)]
+#[path = "qdrant_exact_text_tests.rs"]
+mod exact_text_tests;
+#[cfg(test)]
+#[path = "qdrant_filter_fixture.rs"]
+mod filter_fixture;
+#[cfg(test)]
+#[path = "qdrant_filter_planning_tests.rs"]
+mod filter_planning_tests;
+#[cfg(test)]
+#[path = "qdrant_filter_semantics_tests.rs"]
+mod filter_semantics_tests;
+#[cfg(test)]
+#[path = "qdrant_filtered_recall_tests.rs"]
+mod filtered_recall_tests;
+#[cfg(test)]
+#[path = "qdrant_hybrid_parallel_tests.rs"]
+mod hybrid_parallel_tests;
+#[cfg(test)]
+#[path = "qdrant_lazy_filter_tests.rs"]
+mod lazy_filter_tests;
+#[cfg(test)]
+#[path = "qdrant_open_error_tests.rs"]
+mod open_error_tests;
+#[cfg(test)]
+#[path = "qdrant_reader_recreate_tests.rs"]
+mod reader_recreate_tests;
+#[cfg(test)]
+#[path = "qdrant_reupsert_copy_tests.rs"]
+mod reupsert_copy_tests;
+#[cfg(test)]
+#[path = "qdrant_reupsert_moved_chunk_tests.rs"]
+mod reupsert_moved_chunk_tests;
+#[cfg(test)]
+#[path = "qdrant_scan_batch_tests.rs"]
+mod scan_batch_tests;
+#[cfg(test)]
+#[path = "qdrant_scan_page_window_tests.rs"]
+mod scan_page_window_tests;
+#[cfg(test)]
+#[path = "qdrant_scroll_page_time_tests.rs"]
+mod scroll_page_time_tests;
+#[cfg(test)]
+#[path = "qdrant_selective_must_tests.rs"]
+mod selective_must_tests;
+#[cfg(test)]
+#[path = "qdrant_sparse_filter_tests.rs"]
+mod sparse_filter_tests;
+#[cfg(test)]
+#[path = "qdrant_text_prefilter_tests.rs"]
+mod text_prefilter_tests;
+#[cfg(test)]
+#[path = "qdrant_text_walk_gave_up_tests.rs"]
+mod text_walk_gave_up_tests;
 
 fn json_ok<T: Serialize>(response: &mut Response, body: &T) -> Result<(), GraphError> {
     response.status = 200;
@@ -87,6 +168,53 @@ fn json_err(response: &mut Response, status: u16, msg: &str) -> Result<(), Graph
     response
         .headers
         .insert("Content-Type".to_string(), "application/json".to_string());
+    Ok(())
+}
+
+/// Answers a failed `get_collection`. An absent collection keeps the JSON 404
+/// these routes always gave. Any other failure answers what the router
+/// answers for the same error, but from here: the router would quarantine the
+/// name as well. A failed open is in the open-failure backoff already, that
+/// quarantine has no end on a reader, and an open that races a drop's purge
+/// fails with the very text that earns it.
+fn collection_open_err(
+    input: &HandlerInput,
+    response: &mut Response,
+    error: GraphError,
+) -> Result<(), GraphError> {
+    collection_open_err_as(input, response, error, json_err)
+}
+
+/// [`collection_open_err`] for routes whose JSON has another shape:
+/// `not_found` writes the absent collection's 404.
+pub(super) fn collection_open_err_as(
+    input: &HandlerInput,
+    response: &mut Response,
+    error: GraphError,
+    not_found: fn(&mut Response, u16, &str) -> Result<(), GraphError>,
+) -> Result<(), GraphError> {
+    // Absent in the manager's own words, at the open or replayed from it.
+    let absent = matches!(
+        error,
+        GraphError::New(_) | GraphError::OpenReplay(_) | GraphError::StorageError(_)
+    ) && graph_error_status(&error) == 404;
+    if absent {
+        return not_found(response, 404, &error.to_string());
+    }
+    // A node, an edge, a label or a vector that is not found is a 404 for the
+    // router. From an open it would read here as "the collection is gone", so
+    // it is answered as the failure it is.
+    let error = if graph_error_status(&error) == 404 {
+        GraphError::StorageError(error.to_string())
+    } else {
+        error
+    };
+    // Rewritten, it is a 404 again where its text names a database that is
+    // missing. That is the route's own answer too: the router's has no JSON.
+    if graph_error_status(&error) == 404 {
+        return not_found(response, 404, &error.to_string());
+    }
+    answer_handler_error(&input.request.method, &input.request.path, &error, response);
     Ok(())
 }
 
@@ -244,13 +372,13 @@ fn indexed_condition_ids(
     let ids = match schema {
         PayloadIndexSchema::Keyword => match &condition.match_cond {
             Some(MatchCondition::Value(value)) => {
-                let value = json_to_value(&value.value);
+                let value = match_lookup_value(&value.value);
                 storage.get_nodes_by_payload_value(txn, &condition.key, &value)?
             }
             Some(MatchCondition::Any(values)) => {
                 let mut ids = HashSet::new();
                 for value in &values.any {
-                    let value = json_to_value(value);
+                    let value = match_lookup_value(value);
                     ids.extend(storage.get_nodes_by_payload_value(txn, &condition.key, &value)?);
                 }
                 return Ok(Some(ids));
@@ -285,31 +413,35 @@ fn indexed_condition_ids(
     Ok(Some(ids.into_iter().collect()))
 }
 
+/// Index-resolved candidate ids plus whether they are exactly the matches in
+/// the snapshot the planner read (`false`: a superset to recheck per point).
+type IndexedIds = (HashSet<u128>, bool);
+
 fn indexed_condition_ids_be(
     storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
     r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
     condition: &FieldCondition,
-) -> Result<Option<HashSet<u128>>, GraphError> {
-    let Some(schema) = storage.has_payload_index(&condition.key) else {
+) -> Result<Option<IndexedIds>, GraphError> {
+    let Some(schema) = storage.has_payload_index_at(&condition.key, r) else {
         return Ok(None);
     };
 
     let ids = match schema {
         PayloadIndexSchema::Keyword => match &condition.match_cond {
             Some(MatchCondition::Value(value)) => {
-                let value = json_to_value(&value.value);
+                let value = match_lookup_value(&value.value);
                 storage.get_nodes_by_payload_value_be(r, &condition.key, &value)?
             }
             Some(MatchCondition::Any(values)) => {
                 let mut ids = HashSet::new();
                 for value in &values.any {
-                    let value = json_to_value(value);
+                    let value = match_lookup_value(value);
                     ids.extend(storage.get_nodes_by_payload_value_be(r, &condition.key, &value)?);
                 }
-                return Ok(Some(ids));
+                return Ok(Some((ids, true)));
             }
             Some(MatchCondition::Text(value)) => {
-                let Some(ids) = storage.get_nodes_by_payload_text_be(
+                let Some((ids, exact)) = storage.get_nodes_by_payload_text_exact_be(
                     r,
                     &condition.key,
                     &value.text,
@@ -318,7 +450,10 @@ fn indexed_condition_ids_be(
                 else {
                     return Ok(None);
                 };
-                ids
+                return Ok(Some((
+                    ids.into_iter().collect(),
+                    exact && text_walk_exact_enabled(),
+                )));
             }
             _ => return Ok(None),
         },
@@ -335,7 +470,7 @@ fn indexed_condition_ids_be(
         }
     };
 
-    Ok(Some(ids.into_iter().collect()))
+    Ok(Some((ids.into_iter().collect(), true)))
 }
 
 fn indexed_filter_candidates(
@@ -361,7 +496,7 @@ fn indexed_filter_candidates(
         candidates = intersect_candidate_sets(candidates, ids);
     }
     for condition in text_conditions {
-        if text_walk_skippable(candidates.as_ref()) {
+        if text_walk_skippable(candidates.as_ref(), text_candidate_skip_max()) {
             continue;
         }
         let Some(ids) = indexed_condition_candidates(storage, txn, condition)? else {
@@ -398,7 +533,7 @@ fn indexed_filter_candidates(
     // Before this change, any filter with a `must_not` clause on an
     // indexed field still ran through the indexed-candidate path but
     // the must_not predicate was only checked during post-scan filter
-    // application (scan loop `filter.matches_point`). For a common CE
+    // application (scan loop `filter.matches_point`). For a common client
     // pattern like `must=[repo=X] must_not=[branch=feature/abc]` that
     // meant scanning every point in the positive set just to reject
     // a small excluded subset.
@@ -453,7 +588,34 @@ fn indexed_filter_candidates_be(
     r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
     filter: &Filter,
 ) -> Result<Option<HashSet<u128>>, GraphError> {
+    indexed_filter_candidates_be_bounded(storage, r, filter, text_candidate_skip_max())
+}
+
+/// `indexed_filter_candidates_be` with an explicit text-walk skip threshold:
+/// a `must` text condition is walked unless the other conditions already
+/// narrowed the candidates to at most `text_skip_max` ids.
+fn indexed_filter_candidates_be_bounded(
+    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+    r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+    filter: &Filter,
+    text_skip_max: usize,
+) -> Result<Option<HashSet<u128>>, GraphError> {
+    Ok(indexed_filter_ids_be(storage, r, filter, text_skip_max)?.map(|(ids, _)| ids))
+}
+
+/// [`indexed_filter_candidates_be_bounded`] plus whether the set is exactly
+/// the filter's matches in `r`. Exact only when every clause was applied from
+/// an index complete in `r` with an exact lookup: a skipped, unindexed or
+/// superset clause leaves a superset that callers recheck per point.
+fn indexed_filter_ids_be(
+    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+    r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+    filter: &Filter,
+    text_skip_max: usize,
+) -> Result<Option<IndexedIds>, GraphError> {
     let mut candidates: Option<HashSet<u128>> = None;
+    // Candidate derivation ignores `min_should`.
+    let mut exact = filter.min_should.is_none();
 
     // Text conditions are resolved by walking index terms, so materialize
     // the cheap keyword/range/nested conditions first and skip the walk when
@@ -465,42 +627,60 @@ fn indexed_filter_candidates_be(
             text_conditions.push(condition);
             continue;
         }
-        let Some(ids) = indexed_condition_candidates_be(storage, r, condition)? else {
+        let Some((ids, ids_exact)) =
+            indexed_condition_candidates_be(storage, r, condition, text_skip_max)?
+        else {
+            exact = false;
             continue;
         };
+        exact &= ids_exact;
         candidates = intersect_candidate_sets(candidates, ids);
     }
     for condition in text_conditions {
-        if text_walk_skippable(candidates.as_ref()) {
+        if text_walk_skippable(candidates.as_ref(), text_skip_max) {
+            exact = false;
             continue;
         }
-        let Some(ids) = indexed_condition_candidates_be(storage, r, condition)? else {
+        let Some((ids, ids_exact)) =
+            indexed_condition_candidates_be(storage, r, condition, text_skip_max)?
+        else {
+            exact = false;
             continue;
         };
+        exact &= ids_exact;
         candidates = intersect_candidate_sets(candidates, ids);
     }
 
     // A single unindexable branch discards the whole should set, so check
     // every branch before walking any (text walks are not free).
-    if !filter.should.is_empty()
-        && filter
+    if !filter.should.is_empty() {
+        let mut should_applied = false;
+        if filter
             .should
             .iter()
             .all(|condition| condition_may_yield_candidates(storage, condition))
-    {
-        let mut should_candidates: Option<HashSet<u128>> = None;
+        {
+            let mut should_candidates: Option<HashSet<u128>> = None;
+            let mut should_exact = true;
 
-        for condition in &filter.should {
-            let Some(ids) = indexed_condition_candidates_be(storage, r, condition)? else {
-                should_candidates = None;
-                break;
-            };
-            should_candidates = union_candidate_sets(should_candidates, ids);
-        }
+            for condition in &filter.should {
+                let Some((ids, ids_exact)) =
+                    indexed_condition_candidates_be(storage, r, condition, text_skip_max)?
+                else {
+                    should_candidates = None;
+                    break;
+                };
+                should_exact &= ids_exact;
+                should_candidates = union_candidate_sets(should_candidates, ids);
+            }
 
-        if let Some(ids) = should_candidates {
-            candidates = intersect_candidate_sets(candidates, ids);
+            if let Some(ids) = should_candidates {
+                candidates = intersect_candidate_sets(candidates, ids);
+                should_applied = true;
+                exact &= should_exact;
+            }
         }
+        exact &= should_applied;
     }
 
     if !filter.must_not.is_empty() && candidates.is_some() {
@@ -509,37 +689,95 @@ fn indexed_filter_candidates_be(
         for condition in &filter.must_not {
             // A nested filter's candidate set may be a superset (unindexed
             // inner clauses are skipped); subtracting a superset would drop
-            // points that do not actually match the exclusion.
-            if !indexed_condition_candidates_are_exact(storage, condition) {
+            // points that do not actually match the exclusion. A text walk
+            // proves itself exact below (the client's test exclusion); like a `must`
+            // walk it is skipped when the set left to recheck is small.
+            let text = is_text_field_condition(condition);
+            if (text && text_walk_skippable(candidates.as_ref(), text_skip_max))
+                || (!text && !indexed_condition_candidates_are_exact(storage, condition))
+            {
                 any_unindexed = true;
                 break;
             }
-            match indexed_condition_candidates_be(storage, r, condition)? {
-                Some(ids) => {
+            match indexed_condition_candidates_be(storage, r, condition, text_skip_max)? {
+                // Only an exact exclusion set may be subtracted (an index not
+                // yet complete in `r` leaves a superset here).
+                Some((ids, true)) => {
                     must_not_candidates = union_candidate_sets(must_not_candidates, ids);
                 }
-                None => {
+                Some((_, false)) | None => {
                     any_unindexed = true;
                     break;
                 }
             }
         }
-        if !any_unindexed {
-            if let (Some(cands), Some(excludes)) = (candidates.as_mut(), must_not_candidates) {
-                cands.retain(|id| !excludes.contains(id));
-            }
+        if any_unindexed {
+            exact = false;
+        } else if let (Some(cands), Some(excludes)) = (candidates.as_mut(), must_not_candidates) {
+            cands.retain(|id| !excludes.contains(id));
         }
     }
 
-    Ok(candidates)
+    Ok(candidates.map(|ids| (ids, exact)))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEXT_WALK_MAX_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `text_candidate_walk_max` forced on this thread.
+#[cfg(test)]
+fn with_text_walk_max_for_test<R>(max: usize, f: impl FnOnce() -> R) -> R {
+    let previous = TEXT_WALK_MAX_OVERRIDE.with(|cell| cell.replace(Some(max)));
+    let out = f();
+    TEXT_WALK_MAX_OVERRIDE.with(|cell| cell.set(previous));
+    out
 }
 
 /// Entries a single `match.text` index-term walk may visit before the planner
 /// gives up on it (the condition is then treated as unindexed and the scan
 /// recheck applies it). `0` disables the cap.
 fn text_candidate_walk_max() -> usize {
+    #[cfg(test)]
+    if let Some(max) = TEXT_WALK_MAX_OVERRIDE.with(std::cell::Cell::get) {
+        return max;
+    }
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| env_usize_or("HELIX_TEXT_CANDIDATE_WALK_MAX", 200_000))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEXT_WALK_EXACT_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `text_walk_exact_enabled` forced on this thread.
+#[cfg(test)]
+fn with_text_walk_exact_for_test<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let previous = TEXT_WALK_EXACT_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+    let out = f();
+    TEXT_WALK_EXACT_OVERRIDE.with(|cell| cell.set(previous));
+    out
+}
+
+/// Trust a `match.text` walk whose hits are all plain string rows as the
+/// exact match set (no per-point recheck). `HELIX_TEXT_WALK_EXACT=0` treats
+/// every walk as a superset again.
+fn text_walk_exact_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEXT_WALK_EXACT_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HELIX_TEXT_WALK_EXACT")
+            .ok()
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no"))
+            .unwrap_or(true)
+    })
 }
 
 /// When the non-text `must` conditions already narrowed candidates to at most
@@ -556,8 +794,8 @@ fn is_text_field_condition(condition: &Condition) -> bool {
     )
 }
 
-fn text_walk_skippable(candidates: Option<&HashSet<u128>>) -> bool {
-    let skip = candidates.is_some_and(|ids| ids.len() <= text_candidate_skip_max());
+fn text_walk_skippable(candidates: Option<&HashSet<u128>>, skip_max: usize) -> bool {
+    let skip = candidates.is_some_and(|ids| ids.len() <= skip_max);
     if skip {
         metrics::counter!("helix_payload_text_walk_total", "outcome" => "skipped_selective")
             .increment(1);
@@ -608,44 +846,6 @@ fn indexed_field_condition_supported(
     }
 }
 
-fn indexed_condition_candidates_are_exact(
-    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
-    condition: &Condition,
-) -> bool {
-    match condition {
-        // Text candidates are resolved by a substring walk over index terms
-        // (historically they were only the exact keyword hits — a subset).
-        // Keep them out of must_not subtraction; the scan recheck applies the
-        // exclusion, which is always correct.
-        Condition::Field(field) => {
-            indexed_field_condition_supported(storage, field)
-                && !matches!(field.match_cond, Some(MatchCondition::Text(_)))
-        }
-        Condition::Nested(filter) => indexed_filter_candidates_are_exact(storage, filter),
-        Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => false,
-    }
-}
-
-fn indexed_filter_candidates_are_exact(
-    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
-    filter: &Filter,
-) -> bool {
-    filter
-        .must
-        .iter()
-        .all(|condition| indexed_condition_candidates_are_exact(storage, condition))
-        && filter
-            .must_not
-            .iter()
-            .all(|condition| indexed_condition_candidates_are_exact(storage, condition))
-        && filter
-            .should
-            .iter()
-            .all(|condition| indexed_condition_candidates_are_exact(storage, condition))
-        // Candidate derivation ignores `min_should`, so the set is a superset.
-        && filter.min_should.is_none()
-}
-
 fn indexed_condition_candidates(
     storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
     txn: &heed3::RoTxn,
@@ -662,10 +862,11 @@ fn indexed_condition_candidates_be(
     storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
     r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
     condition: &Condition,
-) -> Result<Option<HashSet<u128>>, GraphError> {
+    text_skip_max: usize,
+) -> Result<Option<IndexedIds>, GraphError> {
     match condition {
         Condition::Field(field) => indexed_condition_ids_be(storage, r, field),
-        Condition::Nested(filter) => indexed_filter_candidates_be(storage, r, filter),
+        Condition::Nested(filter) => indexed_filter_ids_be(storage, r, filter, text_skip_max),
         Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => Ok(None),
     }
 }
@@ -721,6 +922,38 @@ fn vector_query_candidates_too_broad(candidate_count: usize, total: usize) -> bo
     total > 0 && candidate_count > vector_query_broad_candidate_cap(total)
 }
 
+/// When the dense-search planner drops a broad candidate set but keeps it as
+/// a prefilter, this enables a flat mmap-sidecar scan of the prefilter
+/// members instead of forcing the filtered HNSW path at high ef.
+/// Disable with `HELIX_BROAD_FILTER_SCAN=0`.
+fn broad_filter_scan_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = BROAD_SCAN_OVERRIDE.with(std::cell::Cell::get) {
+        return v;
+    }
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HELIX_BROAD_FILTER_SCAN")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static BROAD_SCAN_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `broad_filter_scan_enabled` forced on this thread.
+#[cfg(test)]
+fn with_broad_scan_for_test<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let previous = BROAD_SCAN_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+    let out = f();
+    BROAD_SCAN_OVERRIDE.with(|cell| cell.set(previous));
+    out
+}
+
 /// Count-only mirror of `indexed_condition_ids_be` for the cardinality probe.
 /// Returns `None` when the condition cannot be probed cheaply (no ready
 /// payload index, or an unsupported match kind) — the planner treats that as
@@ -731,14 +964,14 @@ fn indexed_condition_count_be(
     condition: &FieldCondition,
     cap: usize,
 ) -> Result<Option<usize>, GraphError> {
-    let Some(schema) = storage.has_payload_index(&condition.key) else {
+    let Some(schema) = storage.has_payload_index_at(&condition.key, r) else {
         return Ok(None);
     };
 
     let count = match schema {
         PayloadIndexSchema::Keyword => match &condition.match_cond {
             Some(MatchCondition::Value(value)) => {
-                let value = json_to_value(&value.value);
+                let value = match_lookup_value(&value.value);
                 storage.count_nodes_by_payload_value_be(r, &condition.key, &value, cap)?
             }
             Some(MatchCondition::Any(values)) => {
@@ -747,7 +980,7 @@ fn indexed_condition_count_be(
                     if count > cap {
                         break;
                     }
-                    let value = json_to_value(value);
+                    let value = match_lookup_value(value);
                     count = count.saturating_add(storage.count_nodes_by_payload_value_be(
                         r,
                         &condition.key,
@@ -795,15 +1028,16 @@ fn indexed_condition_count_be(
 
 /// Upper-bound cardinality estimate for the indexed candidate set a filter
 /// would materialize: the minimum count across probeable `must` conditions
-/// (each counted with early abort, saturating at `cap + 1`). `None` when no
-/// must condition is probeable.
+/// (each counted with early abort, saturating at `cap + 1`, and after the
+/// first a row past the smallest count before it). `None` when no must
+/// condition is probeable.
 ///
 /// Deliberate trade-off: min-over-must-counts is an upper bound of the
 /// intersection. When every must condition is individually broad but the
 /// intersection is tiny, the probe skips materialization and the search runs
 /// as in-traversal filtered HNSW with the `matches_point` recheck instead of
 /// finding the tiny intersection — results stay correct via the recheck, only
-/// the perf path differs. The common CE case (one selective scoping key such
+/// the perf path differs. The common client case (one selective scoping key such
 /// as a repo filter) keeps the fast candidate path.
 fn indexed_filter_must_count_estimate_be(
     storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
@@ -811,20 +1045,56 @@ fn indexed_filter_must_count_estimate_be(
     filter: &Filter,
     cap: usize,
 ) -> Result<Option<usize>, GraphError> {
-    let mut estimate: Option<usize> = None;
-    for condition in &filter.must {
+    Ok(must_count_probe_be(storage, r, filter, cap)?.estimate)
+}
+
+/// `indexed_filter_must_count_estimate_be` plus the `must` conditions the
+/// planner can still materialize but could not count.
+struct MustCountProbe {
+    estimate: Option<usize>,
+    /// Indices into `filter.must`: a `match.text` term walk with no
+    /// exact-keyword hit, or an indexable nested filter. Such a clause may be
+    /// the selective one (a path or symbol substring next to a repo/language
+    /// scope), so a broad estimate from its siblings proves nothing about the
+    /// intersection.
+    unprobed_indexable: Vec<usize>,
+}
+
+fn must_count_probe_be(
+    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+    r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+    filter: &Filter,
+    cap: usize,
+) -> Result<MustCountProbe, GraphError> {
+    let mut probe = MustCountProbe {
+        estimate: None,
+        unprobed_indexable: Vec::new(),
+    };
+    for (index, condition) in filter.must.iter().enumerate() {
+        // The estimate is the smallest count, and a count a row past the
+        // smallest so far cannot lower it: no condition is counted further.
+        let cap = probe.estimate.map_or(cap, |smallest| smallest.min(cap));
+        let mut unprobed = false;
         let count = match condition {
             Condition::Field(field) => indexed_condition_count_be(storage, r, field, cap)?,
             Condition::Nested(nested) => {
-                indexed_filter_must_count_estimate_be(storage, r, nested, cap)?
+                let inner = must_count_probe_be(storage, r, nested, cap)?;
+                unprobed = !inner.unprobed_indexable.is_empty();
+                inner.estimate
             }
             Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => None,
         };
-        if let Some(count) = count {
-            estimate = Some(estimate.map_or(count, |existing| existing.min(count)));
+        match count {
+            Some(count) => {
+                probe.estimate = Some(probe.estimate.map_or(count, |existing| existing.min(count)))
+            }
+            None => unprobed |= condition_may_yield_candidates(storage, condition),
+        }
+        if unprobed {
+            probe.unprobed_indexable.push(index);
         }
     }
-    Ok(estimate)
+    Ok(probe)
 }
 
 /// Result of a probed candidate resolution.
@@ -836,6 +1106,15 @@ struct ProbedCandidates {
     /// True when the probe concluded the candidate set would be dropped as
     /// too broad after materialization, so materialization was skipped.
     probe_skipped: bool,
+    /// A superset of the filter's matches that planning dropped as too broad
+    /// (`candidates` is then `None`). Filter closures reject non-members with
+    /// a set lookup instead of a node read; planning ignores it, so results
+    /// are unchanged.
+    prefilter: Option<HashSet<u128>>,
+    /// The set the filter closures consult (`candidates`, else `prefilter`)
+    /// is exactly the filter's matches in the planner's snapshot, so members
+    /// need no per-point recheck.
+    exact: bool,
 }
 
 fn vector_query_indexed_filter_candidates(
@@ -880,6 +1159,8 @@ fn vector_query_indexed_filter_candidates_probed(
                     candidates: None,
                     probe_estimate,
                     probe_skipped: true,
+                    prefilter: None,
+                    exact: false,
                 });
             }
         }
@@ -890,6 +1171,8 @@ fn vector_query_indexed_filter_candidates_probed(
             candidates: None,
             probe_estimate,
             probe_skipped: false,
+            prefilter: None,
+            exact: false,
         });
     };
     if vector_query_candidates_too_broad(candidates.len(), total) {
@@ -897,12 +1180,16 @@ fn vector_query_indexed_filter_candidates_probed(
             candidates: None,
             probe_estimate,
             probe_skipped: false,
+            prefilter: None,
+            exact: false,
         });
     }
     Ok(ProbedCandidates {
+        exact: indexed_filter_candidates_are_exact(storage, filter),
         candidates: Some(candidates),
         probe_estimate,
         probe_skipped: false,
+        prefilter: None,
     })
 }
 
@@ -912,45 +1199,46 @@ fn vector_query_indexed_filter_candidates_be_probed(
     filter: &Filter,
     probe_enabled: bool,
 ) -> Result<ProbedCandidates, GraphError> {
-    let total = collection_vector_count_be(storage) as usize;
+    dense_filter_candidates_be(
+        storage,
+        r,
+        filter,
+        probe_enabled,
+        dense_broad_exact_candidate_max(),
+        true,
+    )
+}
 
-    let mut probe_estimate = None;
-    if probe_enabled && total > 0 && !filter.must.is_empty() {
-        let cap = vector_query_broad_candidate_cap(total);
-        probe_estimate = indexed_filter_must_count_estimate_be(storage, r, filter, cap)?;
-        if let Some(estimate) = probe_estimate {
-            if vector_query_candidates_too_broad(estimate, total) {
-                return Ok(ProbedCandidates {
-                    candidates: None,
-                    probe_estimate,
-                    probe_skipped: true,
-                });
-            }
-        }
-    }
+/// Largest broad candidate set a dense search still materializes when the
+/// filter is index-exact. Without a set, filtered HNSW evaluates the filter
+/// per visited node with an LSM node read (~0.3-0.7 ms each on a serving
+/// reader, thousands per segment at ef=800); one posting-list scan plus a
+/// HashSet probe per visit is far cheaper. `0` restores the broad cap.
+fn dense_broad_exact_candidate_max() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| env_usize_or("HELIX_DENSE_BROAD_EXACT_CANDIDATE_MAX", 100_000))
+}
 
-    let Some(candidates) = indexed_filter_candidates_be(storage, r, filter)? else {
-        return Ok(ProbedCandidates {
-            candidates: None,
-            probe_estimate,
-            probe_skipped: false,
-        });
-    };
-    if vector_query_candidates_too_broad(candidates.len(), total) {
-        return Ok(ProbedCandidates {
-            candidates: None,
-            probe_estimate,
-            probe_skipped: false,
-        });
-    }
-    Ok(ProbedCandidates {
-        candidates: Some(candidates),
-        probe_estimate,
-        probe_skipped: false,
-    })
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_CANDIDATE_MAX_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `max_scan_index_candidates` forced on this thread.
+#[cfg(test)]
+fn with_scan_index_candidate_max_for_test<R>(max: usize, f: impl FnOnce() -> R) -> R {
+    let previous = SCAN_INDEX_CANDIDATE_MAX_OVERRIDE.with(|cell| cell.replace(Some(max)));
+    let out = f();
+    SCAN_INDEX_CANDIDATE_MAX_OVERRIDE.with(|cell| cell.set(previous));
+    out
 }
 
 fn max_scan_index_candidates() -> usize {
+    #[cfg(test)]
+    if let Some(max) = SCAN_INDEX_CANDIDATE_MAX_OVERRIDE.with(std::cell::Cell::get) {
+        return max;
+    }
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("HELIX_SCAN_INDEX_CANDIDATE_MAX")
@@ -971,6 +1259,276 @@ fn scan_broad_candidate_cap(total: usize) -> usize {
 
 fn scan_candidates_too_broad(candidate_count: usize, total: usize) -> bool {
     total > 0 && candidate_count > scan_broad_candidate_cap(total)
+}
+
+/// Most rows a `must` condition may match and still be the selective one in
+/// [`without_broad_musts`]: its rows are what the caller rechecks. A scan
+/// page with a budget over these goes on to [`page_selective_rows`].
+const SELECTIVE_MUST_MAX_ROWS: usize = 512;
+/// A sibling is left to the recheck when it matches more than this many times
+/// the selective condition's rows, and more than `SELECTIVE_MUST_MIN_BROAD`.
+/// Below that, reading the extra rows costs more than walking its postings.
+const SELECTIVE_MUST_BROAD_RATIO: usize = 8;
+const SELECTIVE_MUST_MIN_BROAD: usize = 256;
+
+/// Most rows the selective condition may match on a scan page, where none is
+/// under `SELECTIVE_MUST_MAX_ROWS`: a scroll's largest budget less one. A
+/// `/points/scan` page may ask for a budget of a million rows, and the counts
+/// that look for the selective condition walk every condition as far as the
+/// bound.
+const DEFAULT_SELECTIVE_MUST_PAGE_MAX_ROWS: usize = DEFAULT_QDRANT_SCROLL_SCAN_BUDGET_MAX - 1;
+/// Rows a page reads and does not return before the conditions its bound left
+/// out come back, counted as each batch of rows ends: a page can read a batch
+/// less one row more. The eightfold ratio that leaves a sibling out cannot
+/// tell one nearly every row passes from one that rejects nearly every row,
+/// and a page of the second kind read up to 4,095 rows to return a few.
+const DEFAULT_SELECTIVE_MUST_PAGE_REJECT_ROWS: usize = 32;
+
+#[cfg(test)]
+thread_local! {
+    static SELECTIVE_MUST_PAGE_OVERRIDE: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `selective_must_page_settings` forced on this
+/// thread.
+#[cfg(test)]
+fn with_selective_must_page_for_test<R>(
+    max_rows: usize,
+    reject_rows: usize,
+    f: impl FnOnce() -> R,
+) -> R {
+    let previous =
+        SELECTIVE_MUST_PAGE_OVERRIDE.with(|cell| cell.replace(Some((max_rows, reject_rows))));
+    let out = f();
+    SELECTIVE_MUST_PAGE_OVERRIDE.with(|cell| cell.set(previous));
+    out
+}
+
+/// The page bound's two settings, read once. The most rows the selective
+/// condition may match on a scan page: `HELIX_SELECTIVE_MUST_PAGE_MAX_ROWS`,
+/// where `0` is no page bound and the 512 rows stand. And the rows a page may
+/// read and not return before the conditions left out come back:
+/// `HELIX_SELECTIVE_MUST_PAGE_REJECT_ROWS`.
+fn selective_must_page_settings() -> (usize, usize) {
+    #[cfg(test)]
+    if let Some(settings) = SELECTIVE_MUST_PAGE_OVERRIDE.with(std::cell::Cell::get) {
+        return settings;
+    }
+    static CACHED: OnceLock<(usize, usize)> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        (
+            env_usize_or(
+                "HELIX_SELECTIVE_MUST_PAGE_MAX_ROWS",
+                DEFAULT_SELECTIVE_MUST_PAGE_MAX_ROWS,
+            ),
+            env_usize_or(
+                "HELIX_SELECTIVE_MUST_PAGE_REJECT_ROWS",
+                DEFAULT_SELECTIVE_MUST_PAGE_REJECT_ROWS,
+            ),
+        )
+    })
+}
+
+/// The bound a scan page's budget gives the selective condition, where it is
+/// over `SELECTIVE_MUST_MAX_ROWS`. `max_rows` is the page's budget less one,
+/// so that the rows scanned cannot reach the budget; `usize::MAX` is no page
+/// (a count, a filtered delete, a scan with no budget).
+fn page_selective_rows(max_rows: usize) -> Option<usize> {
+    Some(max_rows.min(selective_must_page_settings().0))
+        .filter(|rows| max_rows != usize::MAX && *rows > SELECTIVE_MUST_MAX_ROWS)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SELECTIVE_MUST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `selective_must_scan_enabled` forced on this thread.
+#[cfg(test)]
+fn with_selective_must_for_test<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let previous = SELECTIVE_MUST_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+    let out = f();
+    SELECTIVE_MUST_OVERRIDE.with(|cell| cell.set(previous));
+    out
+}
+
+/// Kill switch for [`without_broad_musts`] and [`must_has_id_ids`]:
+/// `HELIX_SELECTIVE_MUST_SCAN=0` counts and materializes every `must`
+/// condition again and takes no candidates from a `has_id` list.
+fn selective_must_scan_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = SELECTIVE_MUST_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HELIX_SELECTIVE_MUST_SCAN")
+            .ok()
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    })
+}
+
+/// A `must` condition [`without_broad_musts`] may count and leave out: a
+/// field condition on a keyword or number index. A text condition has its own
+/// skip, and a nested filter is planned as before.
+fn plain_field_condition(condition: &Condition) -> Option<&FieldCondition> {
+    match condition {
+        Condition::Field(field) if !is_text_field_condition(condition) => Some(field),
+        _ => None,
+    }
+}
+
+/// `filter` without the top-level `must` conditions that are broad next to a
+/// selective sibling; `None` when there is nothing to leave out.
+///
+/// Only for callers that recheck every candidate row against the whole
+/// filter: a scan, a filtered delete, a count told the set is not exact. A
+/// `must` on one file's path next to a `must` on its repository walked the
+/// repository's whole posting list twice, to count it and to build its id set,
+/// for rows the path alone had already found. Leaving a condition out only
+/// widens the candidate set, so the counts here decide cost and never results.
+///
+/// `max_rows` bounds the rows the selective condition may match, for a page
+/// whose scan budget the candidate set must stay under; a caller with no page
+/// passes `usize::MAX`. Off a page the bound is `SELECTIVE_MUST_MAX_ROWS`. On
+/// one, where no condition is under those, the conditions are counted again
+/// as far as the page's own bound ([`page_selective_rows`]): the client reads the
+/// calls linked to a unit's files with the files next to `edge_type`, and
+/// files of more than 512 calls had the whole list of calls counted and
+/// materialized for every page, 0.28 s on our graph and more on a larger one.
+fn without_broad_musts(
+    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+    r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+    filter: &Filter,
+    max_rows: usize,
+) -> Result<Option<Filter>, GraphError> {
+    Ok(without_broad_musts_on_page(storage, r, filter, max_rows)?.map(|(narrowed, _)| narrowed))
+}
+
+/// [`without_broad_musts`], and with the filter the conditions it left out
+/// where the selective one was found under a page's bound and not under the
+/// 512 rows (none otherwise). Up to 4,095 rows may then be read to be
+/// rejected, so the page takes these back once it has read
+/// `HELIX_SELECTIVE_MUST_PAGE_REJECT_ROWS` rows it did not return.
+fn without_broad_musts_on_page(
+    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+    r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+    filter: &Filter,
+    max_rows: usize,
+) -> Result<Option<(Filter, Vec<Condition>)>, GraphError> {
+    if filter.must.len() < 2 || !selective_must_scan_enabled() {
+        return Ok(None);
+    }
+    // Each count stops one row past the bound it is given.
+    let count_to = |max_rows: usize| -> Result<Vec<Option<usize>>, GraphError> {
+        filter
+            .must
+            .iter()
+            .map(|condition| {
+                Ok(match (condition, plain_field_condition(condition)) {
+                    // A `has_id` list matches at most its length, with nothing read.
+                    (Condition::HasId(listed), _) => Some(listed.has_id.len()),
+                    (_, Some(field)) => indexed_condition_count_be(storage, r, field, max_rows)?,
+                    _ => None,
+                })
+            })
+            .collect()
+    };
+    let smallest = |counts: &[Option<usize>]| counts.iter().flatten().copied().min();
+    let page_rows = page_selective_rows(max_rows);
+    let mut max_rows = max_rows.min(SELECTIVE_MUST_MAX_ROWS);
+    let mut counts = count_to(max_rows)?;
+    let mut on_page = false;
+    if let Some(page_rows) =
+        page_rows.filter(|_| smallest(&counts).is_some_and(|rows| rows > max_rows))
+    {
+        max_rows = page_rows;
+        counts = count_to(max_rows)?;
+        on_page = true;
+    }
+    let Some(selective) = smallest(&counts).filter(|rows| *rows <= max_rows) else {
+        return Ok(None);
+    };
+    let broad_over = selective
+        .saturating_mul(SELECTIVE_MUST_BROAD_RATIO)
+        .max(SELECTIVE_MUST_MIN_BROAD);
+    let mut must = Vec::with_capacity(filter.must.len());
+    let mut left_out = Vec::new();
+    for (condition, count) in filter.must.iter().zip(counts) {
+        let broad = match (plain_field_condition(condition), count) {
+            // The first count stopped short of the bound: count on to it.
+            (Some(field), Some(rows)) if rows > max_rows && broad_over > max_rows => {
+                indexed_condition_count_be(storage, r, field, broad_over)?
+                    .is_some_and(|rows| rows > broad_over)
+            }
+            (Some(_), Some(rows)) => rows > broad_over,
+            _ => false,
+        };
+        if !broad {
+            must.push(condition.clone());
+        } else if on_page {
+            left_out.push(condition.clone());
+        }
+    }
+    if must.len() == filter.must.len() {
+        return Ok(None);
+    }
+    metrics::counter!("helix_filter_broad_must_skipped_total")
+        .increment((filter.must.len() - must.len()) as u64);
+    let narrowed = Filter {
+        must,
+        must_not: filter.must_not.clone(),
+        should: filter.should.clone(),
+        min_should: filter.min_should.clone(),
+    };
+    Ok(Some((narrowed, left_out)))
+}
+
+/// The ids a top-level `must` `has_id` lists (several lists intersect), for
+/// a scan, a count or a filtered delete to take as candidates.
+///
+/// The client deletes replaced chunks a page of ids at a time, with the page's file
+/// paths next to them. The payload indexes gave every row of those files as
+/// candidates and `has_id` none, so a page of 256 ids read 4,515 rows on a
+/// 26,577-point collection and 24,228 on a 137,342-point one.
+fn must_has_id_ids(filter: &Filter) -> Option<HashSet<u128>> {
+    if !selective_must_scan_enabled() {
+        return None;
+    }
+    must_has_id_candidates(filter)
+}
+
+/// `indexed` cut down to the `listed` ids; with no indexed set, the listed
+/// ids are the set. Only for callers that recheck every candidate row against
+/// the whole filter: a listed id may not exist, and its row may fail the
+/// other conditions, so the result is never exact.
+fn keep_listed(indexed: Option<IndexedIds>, listed: Option<HashSet<u128>>) -> Option<IndexedIds> {
+    let Some(listed) = listed else {
+        return indexed;
+    };
+    metrics::counter!("helix_filter_has_id_candidates_total").increment(1);
+    Some(match indexed {
+        Some((mut ids, _)) => {
+            ids.retain(|id| listed.contains(id));
+            (ids, false)
+        }
+        None => (listed, false),
+    })
+}
+
+/// The rows a filtered delete reads and rechecks against `filter`; `None`
+/// when it has to read every row.
+fn filter_delete_candidates_be(
+    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+    r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+    filter: &Filter,
+) -> Result<Option<HashSet<u128>>, GraphError> {
+    let narrowed = without_broad_musts(storage, r, filter, usize::MAX)?;
+    let indexed = indexed_filter_candidates_be(storage, r, narrowed.as_ref().unwrap_or(filter))?;
+    Ok(keep_listed(indexed.map(|ids| (ids, false)), must_has_id_ids(filter)).map(|(ids, _)| ids))
 }
 
 fn scan_indexed_filter_candidates(
@@ -1000,30 +1558,60 @@ fn scan_indexed_filter_candidates(
     Ok(Some(candidates))
 }
 
+/// Test-only: the candidate set for a scan page that visits at most
+/// `max_scan` rows, as the page plans it.
+#[cfg(test)]
 fn scan_indexed_filter_candidates_be(
     storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
     r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
     filter: &Filter,
+    max_scan: Option<usize>,
 ) -> Result<Option<HashSet<u128>>, GraphError> {
-    Ok(
-        scan_indexed_filter_candidates_be_probed(storage, r, filter, filter_count_probe_enabled())?
-            .candidates,
-    )
+    Ok(scan_indexed_filter_candidates_be_probed(
+        storage,
+        r,
+        filter,
+        filter_count_probe_enabled(),
+        max_scan,
+        &mut Vec::new(),
+    )?
+    .candidates)
 }
 
+/// The candidate set for a scan page that visits at most `max_scan` rows.
+/// `page_left_out` is given the conditions the page's bound left out of the
+/// set ([`without_broad_musts_on_page`]), for the page to take back.
 fn scan_indexed_filter_candidates_be_probed(
     storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
     r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
     filter: &Filter,
     probe_enabled: bool,
+    max_scan: Option<usize>,
+    page_left_out: &mut Vec<Condition>,
 ) -> Result<ProbedCandidates, GraphError> {
     if filter.is_empty() {
         return Ok(ProbedCandidates {
             candidates: None,
             probe_estimate: None,
             probe_skipped: false,
+            prefilter: None,
+            exact: false,
         });
     }
+
+    // The scan rechecks every row it visits. A set kept under the page's scan
+    // budget ends the page where the full intersection would. So does a
+    // `has_id` list under it, or later: its page ends at the limit or the last
+    // match, where the plan without the list could stop at the budget first.
+    let selective_rows = max_scan.map_or(usize::MAX, |budget| budget.saturating_sub(1));
+    let (narrowed, left_out) = without_broad_musts_on_page(storage, r, filter, selective_rows)?
+        .map_or((None, Vec::new()), |(narrowed, left_out)| {
+            (Some(narrowed), left_out)
+        });
+    let unnarrowed = narrowed.is_none();
+    let listed =
+        must_has_id_ids(filter).filter(|ids| max_scan.is_none_or(|budget| ids.len() < budget));
+    let filter = narrowed.as_ref().unwrap_or(filter);
 
     let total = storage
         .get_metadata_be(r)
@@ -1032,9 +1620,11 @@ fn scan_indexed_filter_candidates_be_probed(
 
     // Pre-materialization count probe; same rationale and trade-off as
     // `vector_query_indexed_filter_candidates_probed`, with the scan-path
-    // broadness threshold.
+    // broadness threshold. A narrowed filter keeps a condition already
+    // counted under that threshold.
     let mut probe_estimate = None;
-    if probe_enabled && total > 0 && !filter.must.is_empty() {
+    let mut probe_skipped = false;
+    if unnarrowed && probe_enabled && total > 0 && !filter.must.is_empty() {
         let cap = scan_broad_candidate_cap(total);
         probe_estimate = indexed_filter_must_count_estimate_be(storage, r, filter, cap)?;
         if let Some(estimate) = probe_estimate {
@@ -1044,20 +1634,24 @@ fn scan_indexed_filter_candidates_be_probed(
                     total_nodes = total,
                     "scan filter count probe skipped candidate materialization"
                 );
-                return Ok(ProbedCandidates {
-                    candidates: None,
-                    probe_estimate,
-                    probe_skipped: true,
-                });
+                probe_skipped = true;
             }
         }
     }
 
-    let Some(candidates) = indexed_filter_candidates_be(storage, r, filter)? else {
+    // Conditions too broad to materialize still leave a `has_id` list.
+    let indexed = if probe_skipped {
+        None
+    } else {
+        indexed_filter_ids_be(storage, r, filter, text_candidate_skip_max())?
+    };
+    let Some((candidates, exact)) = keep_listed(indexed, listed) else {
         return Ok(ProbedCandidates {
             candidates: None,
             probe_estimate,
-            probe_skipped: false,
+            probe_skipped,
+            prefilter: None,
+            exact: false,
         });
     };
     let candidate_count = candidates.len();
@@ -1065,15 +1659,131 @@ fn scan_indexed_filter_candidates_be_probed(
         return Ok(ProbedCandidates {
             candidates: None,
             probe_estimate,
-            probe_skipped: false,
+            probe_skipped,
+            prefilter: None,
+            exact: false,
         });
     }
 
+    *page_left_out = left_out;
     Ok(ProbedCandidates {
         candidates: Some(candidates),
         probe_estimate,
-        probe_skipped: false,
+        probe_skipped,
+        prefilter: None,
+        exact: exact && unnarrowed,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_PAGE_WINDOW_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `scan_page_window_enabled` forced on this thread.
+#[cfg(test)]
+fn with_scan_page_window_for_test<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let previous = SCAN_PAGE_WINDOW_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+    let out = f();
+    SCAN_PAGE_WINDOW_OVERRIDE.with(|cell| cell.set(previous));
+    out
+}
+
+/// Kill switch for [`scan_page_window`]: `HELIX_SCAN_PAGE_WINDOW=0` plans
+/// every scan page from the whole list of each condition again.
+fn scan_page_window_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = SCAN_PAGE_WINDOW_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HELIX_SCAN_PAGE_WINDOW")
+            .ok()
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    })
+}
+
+/// Most index rows one read of a page's window takes: a scroll's largest
+/// budget. A page with no budget reads on in windows of these.
+const SCAN_PAGE_WINDOW_MAX_ROWS: usize = DEFAULT_QDRANT_SCROLL_SCAN_BUDGET_MAX;
+
+/// The rows of the one keyword condition that are all the candidates a scan
+/// page of `filter` has, where the planner would take candidates from
+/// nothing else in the filter. `None` where it would.
+///
+/// A page reads its candidates in id order from its offset and ends at its
+/// limit or its budget, and one keyword value's index rows are stored in id
+/// order. So the page reads those rows from its offset as it goes
+/// (`execute_point_scan_be`), where every page counted the whole list, read
+/// it into a set and sorted it: 240,522 rows twice and 0.56 s for each page
+/// of 50 `calls` edges of our graph collection.
+///
+/// Every other condition must be one the planner takes nothing from, so that
+/// the rows scanned are the list's rows it would have scanned: a field with
+/// no index in `r`, an `is_empty`, an `is_null`, a `min_should`, and a text
+/// condition on a field whose walk is known to give up in `r`. Each row is
+/// checked against the whole filter as before. A list too broad for the
+/// planner (over half the collection and over its cap) it did not take at
+/// all: it walked every row from the offset, where the page now reads the
+/// list's rows alone.
+///
+/// And `r` must read one committed state, since the page reads the list more
+/// than once: a reader replica's latest-state read could see a refresh
+/// between two of them, and plans as before.
+fn scan_page_window(
+    storage: &crate::helix_engine::storage_core::storage_core::HelixGraphStorage,
+    r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+    filter: &Filter,
+) -> Option<PayloadValueRows> {
+    if !scan_page_window_enabled()
+        || !r.is_snapshot_pinned()
+        || !filter.should.is_empty()
+        || !filter.must_not.is_empty()
+    {
+        return None;
+    }
+    let mut keyword = None;
+    let mut walked = Vec::new();
+    for condition in &filter.must {
+        let field = match condition {
+            Condition::Field(field) => field,
+            Condition::IsEmpty(_) | Condition::IsNull(_) => continue,
+            // A `has_id` list and a nested filter give candidates of their own.
+            Condition::HasId(_) | Condition::Nested(_) => return None,
+        };
+        match (
+            storage.has_payload_index_at(&field.key, r),
+            &field.match_cond,
+        ) {
+            (None, _) => {}
+            (Some(PayloadIndexSchema::Keyword), Some(MatchCondition::Value(value)))
+                if keyword.is_none() =>
+            {
+                keyword = Some((field.key.as_str(), &value.value));
+            }
+            (Some(PayloadIndexSchema::Keyword), Some(MatchCondition::Text(_))) => {
+                walked.push(field.key.as_str());
+            }
+            _ => return None,
+        }
+    }
+    let (field, value) = keyword?;
+    // Asked last: a mark's read is counted, and a page turned down above
+    // would count it again in the planner.
+    let walk_max = text_candidate_walk_max();
+    if !walked
+        .iter()
+        .all(|field| storage.payload_text_walk_gave_up_be(r, field, walk_max))
+    {
+        return None;
+    }
+    // An index that has gone since it was asked for: planned as before.
+    storage
+        .payload_value_rows(field, &match_lookup_value(value))
+        .ok()
 }
 
 /// When both inclusive and exclusive bounds are present, the index scan must
@@ -1399,6 +2109,50 @@ fn default_spindle_config_for_env(
     }
 }
 
+/// The tests that change `HELIX_SPINDLE_*` change it for the whole process,
+/// and a collection another test creates meanwhile would be quantized. They
+/// hold this while the variables are changed, and every other thread's read
+/// of the default waits for them.
+#[cfg(test)]
+pub(crate) mod quantizer_env_for_test {
+    use std::cell::Cell;
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    static WINDOW: RwLock<()> = RwLock::new(());
+    thread_local! {
+        static HELD: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Held by a test for as long as it has the variables changed.
+    pub(crate) struct Held {
+        _window: RwLockWriteGuard<'static, ()>,
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            HELD.with(|held| held.set(false));
+        }
+    }
+
+    pub(crate) fn hold() -> Held {
+        let window = WINDOW
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        HELD.with(|held| held.set(true));
+        Held { _window: window }
+    }
+
+    /// `None` on the thread that holds it: its own creates read the
+    /// variables it changed.
+    pub(crate) fn wait() -> Option<RwLockReadGuard<'static, ()>> {
+        (!HELD.with(Cell::get)).then(|| {
+            WINDOW
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        })
+    }
+}
+
 /// Build the default `SpindleConfig` used when a create-collection request
 /// carries no explicit `quantization` block. Returns a fully-disabled
 /// config when `HELIX_SPINDLE_MODE` is unset/none (byte-identical to the
@@ -1409,6 +2163,8 @@ fn default_spindle_config_for_env(
 /// * `HELIX_SPINDLE_KEEP_ORIGINAL=true` retains f32 originals for rescore,
 ///   improving recall but preserving much of the LMDB storage pressure.
 fn env_default_spindle_config() -> SpindleConfig {
+    #[cfg(test)]
+    let _window = quantizer_env_for_test::wait();
     let mode = spindle_mode_from_env();
     let keep_original = spindle_bool_from_env("HELIX_SPINDLE_KEEP_ORIGINAL", false);
     let requested_rescore = spindle_bool_from_env("HELIX_SPINDLE_RESCORE", keep_original);
@@ -1454,7 +2210,7 @@ fn parse_spindle_config(input: &Option<VectorQuantizationInput>) -> SpindleConfi
         // Context Engine watcher path. Fall back to the deployment-wide
         // env default (HELIX_SPINDLE_MODE) instead of unconditionally
         // disabling — that env defaults to none, so behavior is unchanged
-        // until an operator opts in, and no CE change is required to start
+        // until an operator opts in, and no client change is required to start
         // quantizing newly created / re-ingested collections.
         return env_default_spindle_config();
     };
@@ -1651,7 +2407,7 @@ pub fn handle_create_collection(
 
     // Idempotent fast-path for existing collections.
     //
-    // CE's watcher / index-worker call PUT /collections/<name> on every
+    // Indexing clients call PUT /collections/<name> on every
     // startup + periodic backfill tick to "ensure" companion graph
     // stores. Under a deep write queue these calls were piling up behind
     // real upserts — the client's 30 s read timeout was firing because
@@ -1729,7 +2485,10 @@ pub fn handle_get_collection(
     // no live dense-segment scans, and no HNSW/file existence diagnostics.
     // Deep checks belong on admin diagnostics endpoints, not this hot path.
     let loaded_storage = input.collections.get_loaded_collection(&name)?;
-    let (metadata, cold_metadata) = match &loaded_storage {
+    // With the metadata, whether the adjacency backfill from points has run
+    // to its end: from memory for a loaded collection, from the sidecar for
+    // any other, and `null` where neither knows. No read of the store.
+    let (metadata, cold_metadata, adjacency_backfill_complete) = match &loaded_storage {
         Some(storage) => {
             // A reader replica's metadata snapshot is pinned at open time — it
             // never commits locally, so points_count would otherwise stay frozen
@@ -1747,11 +2506,27 @@ pub fn handle_get_collection(
                 // `get_collection`'s post-lock path, used by the actual
                 // search/scroll/query read handlers this poll tier exists for.
             }
-            (storage.metadata_snapshot()?, false)
+            (
+                storage.metadata_snapshot()?,
+                false,
+                storage.adjacency_backfill_complete(),
+            )
         }
         None => match input.collections.collection_metadata_sidecar(&name)? {
-            Some(sidecar) => (sidecar.metadata, true),
+            Some(sidecar) => (sidecar.metadata, true, sidecar.adjacency_backfill_complete),
             None if input.collections.collection_exists(&name)? => {
+                // Nothing was ever opened here to leave one. Where that is
+                // because the open fails, a writer answers the open's error,
+                // as every route that opens does: "not available" sent the client
+                // away to come back later, for ever. This route opens
+                // nothing, so it knows of the failure only once another
+                // request has tried the open. A reader has no sidecar for a
+                // collection it has not loaded, and says so as before.
+                if !input.collections.config().storage_backend.is_reader() {
+                    if let Some(error) = input.collections.last_failed_open(&name) {
+                        return collection_open_err(input, response, error);
+                    }
+                }
                 return json_err(
                     response,
                     503,
@@ -2015,6 +2790,9 @@ pub fn handle_get_collection(
                 },
                 "metadata": {
                     "helix_quantization": helix_quantization_info,
+                    "helix_graph": {
+                        "adjacency_backfill_complete": adjacency_backfill_complete,
+                    },
                 },
             },
             "payload_schema": payload_schema,
@@ -2058,13 +2836,15 @@ pub fn handle_delete_collection(
         None => return json_err(response, 400, "Missing collection name"),
     };
 
-    match input
+    // A failed drop is not "collection absent" (a 404 made clients forget a
+    // collection whose storage was still there): the router maps the error,
+    // 503 with Retry-After when the object store refused the drop before
+    // teardown, 500 otherwise. Dropping a collection that does not exist
+    // still succeeds.
+    input
         .replication
-        .apply(ReplicatedMutation::DeleteCollection { name: name.clone() })
-    {
-        Ok(_) => json_ok(response, &true),
-        Err(e) => json_err(response, 404, &e.to_string()),
-    }
+        .apply(ReplicatedMutation::DeleteCollection { name })?;
+    json_ok(response, &true)
 }
 
 /// PATCH /collections/{name}
@@ -2088,6 +2868,29 @@ struct OptimizerConfigUpdate {
     /// Omit `optimizer_config` entirely to leave the current value unchanged.
     #[serde(default)]
     indexing_threshold: Option<usize>,
+}
+
+/// Stores a collection's indexing threshold override with its metadata;
+/// `None` takes it away. `with_write_txn` is LMDB's alone: on LSM the route
+/// answered 500 with it, after it had set the threshold in memory, and the
+/// next open did not know of it.
+fn store_indexing_threshold_override(
+    storage: &HelixGraphStorage,
+    threshold: Option<usize>,
+) -> Result<(), GraphError> {
+    if storage.backend.kind() == BackendKind::Lsm {
+        return storage.with_write_backend(|w| {
+            storage.update_metadata_be(w, |metadata| {
+                metadata.set_indexing_threshold_override(threshold);
+                Ok(())
+            })?;
+            Ok(())
+        });
+    }
+    storage.with_write_txn(|txn| {
+        storage.set_indexing_threshold_override_metadata(txn, threshold)?;
+        Ok(())
+    })
 }
 
 pub fn handle_update_collection(
@@ -2163,28 +2966,19 @@ pub fn handle_update_collection(
         })?;
 
     // Apply per-collection indexing threshold override (bulk mode support).
-    // CE can PATCH with `{"optimizer_config": {"indexing_threshold": 0}}` before
+    // The client can PATCH with `{"optimizer_config": {"indexing_threshold": 0}}` before
     // bulk upload, then restore with a positive threshold later, or omit
     // `optimizer_config` entirely to leave the current mode unchanged.
     if let Some(opt_config) = &req.optimizer_config {
         if let Ok(storage) = input.collections.get_collection(&name) {
-            match opt_config.indexing_threshold {
-                Some(threshold) => {
-                    let effective = if threshold == 0 { 0 } else { threshold };
-                    storage.named_vectors.set_indexing_threshold(effective);
-                    storage.with_write_txn(|txn| {
-                        storage.set_indexing_threshold_override_metadata(txn, Some(effective))?;
-                        Ok(())
-                    })?;
-                }
-                None => {
-                    storage.named_vectors.set_indexing_threshold(usize::MAX);
-                    storage.with_write_txn(|txn| {
-                        storage.set_indexing_threshold_override_metadata(txn, None)?;
-                        Ok(())
-                    })?;
-                }
-            }
+            // Stored first, then taken: the next open reads the stored one
+            // back, so a threshold the store did not take is not in force
+            // until then either.
+            let threshold = opt_config.indexing_threshold;
+            store_indexing_threshold_override(&storage, threshold)?;
+            storage
+                .named_vectors
+                .set_indexing_threshold(threshold.unwrap_or(usize::MAX));
         }
     }
 
@@ -2977,7 +3771,7 @@ pub fn handle_list_snapshots(
             let result: Vec<serde_json::Value> = snapshots.iter().map(snapshot_result).collect();
             json_ok(response, &result)
         }
-        Err(e) => json_err(response, 404, &e.to_string()),
+        Err(e) => collection_open_err(input, response, e),
     }
 }
 
@@ -3141,6 +3935,16 @@ fn validate_score_threshold(threshold: Option<f32>) -> Result<(), &'static str> 
         Err("score_threshold must be finite")
     } else {
         Ok(())
+    }
+}
+
+/// JSON numbers past f32 range (e.g. `1e39`) parse to infinities; inserts
+/// reject them, and a query must too: they score NaN hits.
+fn validate_query_vector(values: &[f32]) -> Result<(), &'static str> {
+    if values.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err("query vector values must be finite")
     }
 }
 
@@ -3404,40 +4208,25 @@ fn observe_dense_search_plan(
 
 /// Candidate resolution for the LSM `/points/search` branch with the
 /// pre-materialization cardinality probe. This site historically materialized
-/// the candidate set unconditionally (no post-materialization drop), so the
-/// probe applies the same broadness threshold as
-/// `vector_query_indexed_filter_candidates` before paying for
-/// materialization; when it skips, downstream falls to the in-traversal
-/// filtered arm with the `matches_point` recheck (see
-/// `indexed_filter_must_count_estimate_be` for the upper-bound trade-off).
+/// the candidate set unconditionally (no post-materialization drop); the
+/// probe uses the same keep cap as `/points/query` (see
+/// `dense_filter_candidates_be`) before paying for materialization; when it
+/// skips, downstream falls to the in-traversal filtered arm with the
+/// `matches_point` recheck.
 fn search_indexed_filter_candidates_be(
     storage: &HelixGraphStorage,
     r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
     filter: &Filter,
     probe_enabled: bool,
 ) -> Result<ProbedCandidates, GraphError> {
-    let mut probe_estimate = None;
-    if probe_enabled && !filter.must.is_empty() {
-        let total = collection_vector_count_be(storage) as usize;
-        if total > 0 {
-            let cap = vector_query_broad_candidate_cap(total);
-            probe_estimate = indexed_filter_must_count_estimate_be(storage, r, filter, cap)?;
-            if let Some(estimate) = probe_estimate {
-                if vector_query_candidates_too_broad(estimate, total) {
-                    return Ok(ProbedCandidates {
-                        candidates: None,
-                        probe_estimate,
-                        probe_skipped: true,
-                    });
-                }
-            }
-        }
-    }
-    Ok(ProbedCandidates {
-        candidates: indexed_filter_candidates_be(storage, r, filter)?,
-        probe_estimate,
-        probe_skipped: false,
-    })
+    dense_filter_candidates_be(
+        storage,
+        r,
+        filter,
+        probe_enabled,
+        dense_broad_exact_candidate_max(),
+        false,
+    )
 }
 
 /// POST /collections/{name}/points/search
@@ -3457,13 +4246,20 @@ pub fn handle_search_points(
     if let Err(message) = validate_score_threshold(req.score_threshold) {
         return json_err(response, 400, message);
     }
+    let query_values = match &req.vector {
+        SearchVector::NamedSparse { vector, .. } => &vector.values,
+        SearchVector::Named { vector, .. } | SearchVector::Raw(vector) => vector,
+    };
+    if let Err(message) = validate_query_vector(query_values) {
+        return json_err(response, 400, message);
+    }
     req.limit = clamp_limit(req.limit);
     req.offset = clamp_offset(req.offset);
     let result_window = result_window(req.limit, req.offset);
 
     let storage = match input.collections.get_collection(&name) {
         Ok(s) => s,
-        Err(e) => return json_err(response, 404, &e.to_string()),
+        Err(e) => return collection_open_err(input, response, e),
     };
 
     if storage.backend.kind() == BackendKind::Lsm {
@@ -3477,6 +4273,8 @@ pub fn handle_search_points(
             candidates: indexed_candidates,
             probe_estimate,
             probe_skipped,
+            prefilter,
+            exact: candidates_exact,
         } = search_indexed_filter_candidates_be(
             &storage,
             &r,
@@ -3484,14 +4282,14 @@ pub fn handle_search_points(
             filter_count_probe_enabled(),
         )?;
         let filter_index_exact =
-            indexed_candidates.is_some() && indexed_filter_candidates_are_exact(&storage, &filter);
+            (indexed_candidates.is_some() || prefilter.is_some()) && candidates_exact;
         let filter_recheck_required = has_filter && !filter_index_exact;
         let total_vectors = indexed_candidates
             .as_ref()
             .map(|_| collection_vector_count_be(&storage))
             .unwrap_or(0);
         let filter_fn = |id: u128| -> bool {
-            if let Some(candidates) = &indexed_candidates {
+            if let Some(candidates) = indexed_candidates.as_ref().or(prefilter.as_ref()) {
                 if !candidates.contains(&id) {
                     return false;
                 }
@@ -3514,31 +4312,45 @@ pub fn handle_search_points(
                 indices: vector.indices.clone(),
                 values: vector.values.clone(),
             };
-            let search_limit = if has_filter || indexed_candidates.is_some() {
-                result_window.saturating_mul(4)
-            } else {
-                result_window
+            let search_limit =
+                sparse_search_limit(result_window, has_filter || indexed_candidates.is_some());
+            let doc_filter = SparseDocFilter {
+                storage: &storage,
+                r: &r,
+                filter: &filter,
+                candidates: indexed_candidates.as_ref().or(prefilter.as_ref()),
+                recheck: filter_recheck_required,
+                failure: OnceLock::new(),
             };
+            // Exact-scored candidates are rechecked lazily, best-first.
+            let lazy_recheck = filter_recheck_required && sparse_lazy_filter_enabled();
             let exact_candidate_ids = bounded_filter_candidate_ids_be(
                 &storage,
                 &r,
                 indexed_candidates.as_ref(),
                 &filter,
-                filter_recheck_required,
+                filter_recheck_required && !lazy_recheck,
                 total_vectors,
             );
             let mut sparse_results = storage
                 .named_vectors
                 .with_sparse_core(using, |core| {
                     let mut results = if let Some(candidate_ids) = exact_candidate_ids.as_ref() {
-                        core.search_candidate_ids_exact_be(
+                        core.search_candidate_ids_exact_filtered_be(
                             &r,
                             &query,
                             search_limit,
                             candidate_ids.iter().copied(),
+                            lazy_recheck.then_some(&doc_filter),
                         )?
                     } else {
-                        core.search_be(&r, &query, search_limit, Some(&filter_fn))?
+                        core.search_be_with(
+                            &r,
+                            &query,
+                            search_limit,
+                            Some(&doc_filter),
+                            filter_recheck_required && sparse_lazy_filter_enabled(),
+                        )?
                     };
                     results.truncate(result_window);
                     Ok(results)
@@ -3634,29 +4446,85 @@ pub fn handle_search_points(
                 selectivity_hint,
             )
         } else if let Some(candidate_ids) = exact_index_filter_candidates {
-            storage
-                .named_vectors
-                .dense_search_candidate_set_filter_ef_be(
+            // Try sidecar scan first (exact candidates -- no recheck needed).
+            let scan_ok = if broad_filter_scan_enabled() {
+                let scan_total = collection_vector_count_be(&storage);
+                let scan_sel =
+                    (scan_total > 0).then_some(candidate_ids.len() as f32 / scan_total as f32);
+                storage
+                    .named_vectors
+                    .dense_search_broad_prefilter_scan_be::<fn(u128) -> bool>(
+                        &r,
+                        &vec_name,
+                        &query_vec,
+                        search_limit,
+                        candidate_ids,
+                        None,
+                        scan_sel,
+                    )
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            match scan_ok {
+                Some(results) => Ok(results),
+                None => storage
+                    .named_vectors
+                    .dense_search_candidate_set_filter_ef_be(
+                        &r,
+                        &vec_name,
+                        &query_vec,
+                        search_limit,
+                        candidate_ids,
+                        true,
+                        selectivity_hint,
+                        ef_override,
+                    ),
+            }
+        } else {
+            // Broad-filter scan: when we have a prefilter (probe-skipped
+            // broad set), try a sequential mmap sidecar scan before falling
+            // back to HNSW.
+            let scan_ok =
+                if let Some(pf) = prefilter.as_ref().filter(|_| broad_filter_scan_enabled()) {
+                    let recheck_fn = |id: u128| -> bool {
+                        match storage.get_node_be(&r, &id) {
+                            Ok(node) => filter.matches_point(Some(id), &node.properties),
+                            Err(_) => false,
+                        }
+                    };
+                    let scan_total = collection_vector_count_be(&storage);
+                    let scan_sel = (scan_total > 0).then_some(pf.len() as f32 / scan_total as f32);
+                    storage
+                        .named_vectors
+                        .dense_search_broad_prefilter_scan_be(
+                            &r,
+                            &vec_name,
+                            &query_vec,
+                            search_limit,
+                            pf,
+                            filter_recheck_required.then_some(&[recheck_fn][..]),
+                            scan_sel,
+                        )
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+            match scan_ok {
+                Some(results) => Ok(results),
+                None => storage.named_vectors.dense_search_with_id_filter_ef_be(
                     &r,
                     &vec_name,
                     &query_vec,
                     search_limit,
-                    candidate_ids,
+                    dense_filter_active.then_some(&[filter_fn][..]),
                     true,
                     selectivity_hint,
                     ef_override,
-                )
-        } else {
-            storage.named_vectors.dense_search_with_id_filter_ef_be(
-                &r,
-                &vec_name,
-                &query_vec,
-                search_limit,
-                dense_filter_active.then_some(&[filter_fn][..]),
-                true,
-                selectivity_hint,
-                ef_override,
-            )
+                ),
+            }
         }
         .map_err(GraphError::from)?;
         search_results.truncate(result_window);
@@ -3711,6 +4579,8 @@ pub fn handle_search_points(
         candidates: indexed_candidates,
         probe_estimate,
         probe_skipped,
+        prefilter: _,
+        exact: _,
     } = vector_query_indexed_filter_candidates_probed(
         &storage,
         &txn,
@@ -3986,6 +4856,9 @@ impl PointScanEndpoint {
 enum PointScanPlan {
     Primary,
     IndexedCandidates,
+    /// One keyword's rows, read from the page's offset as the page goes
+    /// ([`scan_page_window`]).
+    IndexedWindow,
 }
 
 impl PointScanPlan {
@@ -3993,6 +4866,7 @@ impl PointScanPlan {
         match self {
             PointScanPlan::Primary => "primary",
             PointScanPlan::IndexedCandidates => "indexed_candidates",
+            PointScanPlan::IndexedWindow => "indexed_window",
         }
     }
 }
@@ -4007,8 +4881,11 @@ struct PointScanOptions<'a> {
     partition: Option<ScanPartition>,
     max_scan: Option<usize>,
     deadline: Option<Instant>,
-    /// Wall-clock bound for the indexed-candidates plan (`deadline` bounds the
-    /// primary walk only).
+    /// The wall of the indexed-candidates plan, set where the page starts
+    /// (`deadline` bounds the primary walk only). The scan itself ends a
+    /// budget after its planning, or here, and the primary walk's deadline
+    /// is put off by its planning no further than here:
+    /// `scan_opts_after_planning`.
     indexed_deadline: Option<Instant>,
     filter_hash: u64,
     cursor_generation: Option<usize>,
@@ -4100,8 +4977,16 @@ const DEFAULT_QDRANT_SCROLL_SCAN_BUDGET_MS: usize = 250;
 /// Indexed pages are already capped at `max_scan` candidates, but on a cold
 /// cache each candidate is an object-store read (~7-8ms): 2s returns a ~100-hit
 /// set whole (scroll agrees with count) and pages a ~1000-hit one before the
-/// upstream proxy and client deadlines expire.
+/// upstream proxy and client deadlines expire. The 2 s are the scan's: they
+/// are counted from the end of the page's planning.
 const DEFAULT_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS: usize = 2_000;
+/// The latest an indexed page ends, counted from where its 2 s were counted
+/// before (the request parsed, its collection open), whatever its planning
+/// took. It stays under the time the writer's proxy gives a reader,
+/// `HELIX_GATEWAY_READER_TIMEOUT_MS` (3,000 in the deployment this was
+/// measured on): past that the caller has a
+/// transport error and a second pod where it would have had a short page.
+const DEFAULT_QDRANT_INDEXED_SCROLL_PAGE_WALL_MS: usize = 2_700;
 
 fn env_usize_or(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -4167,21 +5052,136 @@ fn qdrant_scroll_scan_deadline(filter: &Filter) -> Option<Instant> {
     )
 }
 
-/// Indexed-candidates plan deadline; see `DEFAULT_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS`.
-fn qdrant_indexed_scroll_scan_deadline(filter: &Filter) -> Option<Instant> {
-    scan_deadline_from_budget_ms(
-        filter,
-        env_usize_or(
-            "HELIX_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS",
-            DEFAULT_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS,
-        ),
-    )
+#[cfg(test)]
+thread_local! {
+    static INDEXED_SCROLL_TIMES_OVERRIDE: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+    /// Slept by a scan once its candidates are resolved, as a slow plan
+    /// would have taken.
+    static SCAN_PLANNING_DELAY_FOR_TEST: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+/// Test-only: run `f` with `qdrant_indexed_scroll_times_ms` forced on this
+/// thread and every scan's planning taking `planning` longer.
+#[cfg(test)]
+fn with_indexed_scroll_times_for_test<R>(
+    budget_ms: usize,
+    wall_ms: usize,
+    planning: Duration,
+    f: impl FnOnce() -> R,
+) -> R {
+    let times = INDEXED_SCROLL_TIMES_OVERRIDE.with(|cell| cell.replace(Some((budget_ms, wall_ms))));
+    let delay = SCAN_PLANNING_DELAY_FOR_TEST.with(|cell| cell.replace(planning));
+    let out = f();
+    INDEXED_SCROLL_TIMES_OVERRIDE.with(|cell| cell.set(times));
+    SCAN_PLANNING_DELAY_FOR_TEST.with(|cell| cell.set(delay));
+    out
+}
+
+/// The scan budget of a scroll page served from indexed candidates and the
+/// page's wall, in milliseconds: `HELIX_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS`
+/// and `HELIX_QDRANT_INDEXED_SCROLL_PAGE_WALL_MS`. The wall is never under
+/// the budget: set to the budget's value or less, the page's time is counted
+/// from its start, as it was before the scan had a budget of its own.
+fn qdrant_indexed_scroll_times_ms() -> (usize, usize) {
+    #[cfg(test)]
+    if let Some((budget, wall)) = INDEXED_SCROLL_TIMES_OVERRIDE.with(std::cell::Cell::get) {
+        return (budget, wall.max(budget));
+    }
+    let budget = env_usize_or(
+        "HELIX_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS",
+        DEFAULT_QDRANT_INDEXED_SCROLL_SCAN_BUDGET_MS,
+    );
+    let wall = env_usize_or(
+        "HELIX_QDRANT_INDEXED_SCROLL_PAGE_WALL_MS",
+        DEFAULT_QDRANT_INDEXED_SCROLL_PAGE_WALL_MS,
+    );
+    (budget, wall.max(budget))
+}
+
+/// The wall of an indexed scroll page that starts now; `None` when
+/// unfiltered or the scan budget is disabled (`0`).
+fn qdrant_indexed_scroll_page_wall(filter: &Filter) -> Option<Instant> {
+    let (budget_ms, wall_ms) = qdrant_indexed_scroll_times_ms();
+    scan_deadline_from_budget_ms(filter, if budget_ms == 0 { 0 } else { wall_ms })
+}
+
+/// When the scan of a page's indexed candidates ends: `budget` after the
+/// page's planning ended at `planned`, and no later than the page's `wall`.
+/// A plan that took the scan's time with it left the page one row and an
+/// offset, and each page after it paid the plan again. A page whose planning
+/// passes the wall still returns that one row.
+fn indexed_scan_deadline(wall: Instant, planned: Instant, budget: Duration) -> Instant {
+    planned
+        .checked_add(budget)
+        .map_or(wall, |scan| scan.min(wall))
+}
+
+/// When the walk of a page with no indexed candidates ends: at its deadline
+/// `end`, put off by the `planning` the page did first, and not put off past
+/// the page's `wall`. A plan that took the walk's time with it (a text walk
+/// that gives up takes longer than the walk's 250 ms) left the page one row
+/// and an offset. A deadline already past the wall stays where it is.
+fn primary_scan_deadline(end: Instant, planning: Duration, wall: Option<Instant>) -> Instant {
+    let put_off = end.checked_add(planning).unwrap_or(end);
+    wall.map_or(put_off, |wall| end.max(put_off.min(wall)))
+}
+
+/// `opts` for the scan of a page whose planning began at `began` and whose
+/// candidates are resolved now: the indexed plan's budget starts here, under
+/// the wall `opts` came with, and the primary walk is given back the time
+/// the planning took, under the same wall.
+fn scan_opts_after_planning<'a>(
+    opts: &PointScanOptions<'a>,
+    began: Instant,
+) -> PointScanOptions<'a> {
+    #[cfg(test)]
+    std::thread::sleep(SCAN_PLANNING_DELAY_FOR_TEST.with(std::cell::Cell::get));
+    PointScanOptions {
+        deadline: opts
+            .deadline
+            .map(|end| primary_scan_deadline(end, began.elapsed(), opts.indexed_deadline)),
+        indexed_deadline: opts.indexed_deadline.map(|wall| {
+            let budget = Duration::from_millis(qdrant_indexed_scroll_times_ms().0 as u64);
+            indexed_scan_deadline(wall, Instant::now(), budget)
+        }),
+        ..*opts
+    }
 }
 
 fn normalize_scan_budget(max_scan: Option<usize>) -> Option<usize> {
     max_scan
         .filter(|&n| n > 0)
         .map(|n| n.min(max_scan_budget()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCAN_READ_BATCH_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `scan_read_batch` forced on this thread.
+#[cfg(test)]
+fn with_scan_read_batch_for_test<R>(batch: usize, f: impl FnOnce() -> R) -> R {
+    let previous = SCAN_READ_BATCH_OVERRIDE.with(|cell| cell.replace(Some(batch)));
+    let out = f();
+    SCAN_READ_BATCH_OVERRIDE.with(|cell| cell.set(previous));
+    out
+}
+
+/// Most candidate rows a scan page reads in one batch. A read a row is a
+/// round trip to the store a row; a batch is one for all its rows, and on a
+/// cold reader their waits overlap. `HELIX_SCAN_READ_BATCH=1` reads one row
+/// at a time again.
+fn scan_read_batch() -> usize {
+    #[cfg(test)]
+    if let Some(batch) = SCAN_READ_BATCH_OVERRIDE.with(std::cell::Cell::get) {
+        return batch;
+    }
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| env_usize_or("HELIX_SCAN_READ_BATCH", 96).max(1))
 }
 
 fn validate_scan_partition(
@@ -4384,7 +5384,7 @@ fn point_scan_budget_exhausted(
 ) -> bool {
     let deadline = match plan {
         PointScanPlan::Primary => opts.deadline,
-        PointScanPlan::IndexedCandidates => opts.indexed_deadline,
+        PointScanPlan::IndexedCandidates | PointScanPlan::IndexedWindow => opts.indexed_deadline,
     };
     opts.max_scan.map(|max| scanned >= max).unwrap_or(false)
         || deadline
@@ -4458,7 +5458,9 @@ fn execute_point_scan(
         .unwrap_or(false);
     let start_id = opts.offset_id.max(scan_partition_start(opts.partition));
     let end_exclusive = scan_partition_end_exclusive(opts.partition);
+    let planning = Instant::now();
     let indexed_candidates = scan_indexed_filter_candidates(storage, txn, opts.filter)?;
+    let opts = &scan_opts_after_planning(opts, planning);
     let plan = if indexed_candidates.is_some() {
         PointScanPlan::IndexedCandidates
     } else {
@@ -4641,8 +5643,26 @@ fn execute_point_scan_be(
         .unwrap_or(false);
     let start_id = opts.offset_id.max(scan_partition_start(opts.partition));
     let end_exclusive = scan_partition_end_exclusive(opts.partition);
-    let indexed_candidates = scan_indexed_filter_candidates_be(storage, r, opts.filter)?;
-    let plan = if indexed_candidates.is_some() {
+    let mut left_out = Vec::new();
+    let planning = Instant::now();
+    let window = scan_page_window(storage, r, opts.filter);
+    let indexed_candidates = if window.is_some() {
+        None
+    } else {
+        scan_indexed_filter_candidates_be_probed(
+            storage,
+            r,
+            opts.filter,
+            filter_count_probe_enabled(),
+            opts.max_scan,
+            &mut left_out,
+        )?
+        .candidates
+    };
+    let opts = &scan_opts_after_planning(opts, planning);
+    let plan = if window.is_some() {
+        PointScanPlan::IndexedWindow
+    } else if indexed_candidates.is_some() {
         PointScanPlan::IndexedCandidates
     } else {
         PointScanPlan::Primary
@@ -4660,65 +5680,155 @@ fn execute_point_scan_be(
     let mut next_offset: Option<String> = None;
     let mut scanned = 0usize;
     let mut budget_exhausted = false;
-    if let Some(candidates) = indexed_candidates {
-        let mut ids: Vec<u128> = candidates.into_iter().collect();
+    if window.is_some() || indexed_candidates.is_some() {
+        let mut ids: Vec<u128> = indexed_candidates
+            .into_iter()
+            .flatten()
+            .filter(|id| *id >= start_id && end_exclusive.is_none_or(|end| *id < end))
+            .collect();
         ids.sort_unstable();
+        let batch = scan_read_batch();
+        let reject_rows = selective_must_page_settings().1;
+        // Where the window's next rows start: `None` with no window, and
+        // once its list or the partition has ended.
+        let mut window_from = window.as_ref().map(|_| start_id);
+        let mut window_rows = opts.limit.max(batch);
 
-        for id in ids {
-            if id < start_id {
-                continue;
-            }
-            if let Some(end) = end_exclusive {
-                if id >= end {
+        let mut at = 0;
+        'page: loop {
+            if at == ids.len() {
+                let (Some(list), Some(from)) = (&window, window_from) else {
+                    break;
+                };
+                // No more index rows than the page may still scan: all it
+                // has read are scanned by now. Each read is twice the last,
+                // so a page that rejects its rows does not seek for each few.
+                // A page whose clock has run out reads the one row it ends at.
+                let rows = if point_scan_budget_exhausted(scanned, opts, plan) {
+                    1
+                } else {
+                    window_rows.min(SCAN_PAGE_WINDOW_MAX_ROWS).min(
+                        opts.max_scan
+                            .map_or(usize::MAX, |max| max.saturating_sub(scanned).max(1)),
+                    )
+                };
+                window_rows = window_rows.saturating_mul(2);
+                let mut read = storage.payload_value_ids_from_be(r, list, from, rows)?;
+                window_from = read
+                    .last()
+                    .filter(|_| read.len() == rows)
+                    .and_then(|last| last.checked_add(1));
+                if let Some(end) = end_exclusive {
+                    let inside = read.partition_point(|id| *id < end);
+                    if inside < read.len() {
+                        read.truncate(inside);
+                        window_from = None;
+                    }
+                }
+                ids.append(&mut read);
+                if at == ids.len() {
                     break;
                 }
             }
-
-            scanned = scanned.saturating_add(1);
-            let node = match storage.get_node_be(r, &id) {
-                Ok(node) => node,
-                Err(GraphError::NodeNotFound) => {
-                    // A ghost payload-index entry (or merely a sparse filter)
-                    // lands here. Without a budget check, a long run of
-                    // missing candidates never terminates the page — this is
-                    // the generic runaway-scan protection every other branch
-                    // below already gets.
+            // A page whose clock has run out ends at its next row, whatever
+            // the row is: it reads that row alone, as before the batches,
+            // and takes no condition back for it.
+            let late = point_scan_budget_exhausted(scanned, opts, plan);
+            let batch = if late { 1 } else { batch };
+            // The conditions the page's bound left out come back once the
+            // page has read `reject_rows` rows it did not return: each one's
+            // rows are read from its index once, and of the rows not yet
+            // scanned only those in all of them stay. The page counts as a
+            // batch ends, so it may have read the rest of that batch.
+            let rejected = scanned - points.len();
+            if !late && !left_out.is_empty() && rejected >= reject_rows {
+                let mut rest = ids.split_off(at);
+                for condition in left_out.drain(..) {
+                    let rows = indexed_condition_candidates_be(
+                        storage,
+                        r,
+                        &condition,
+                        text_candidate_skip_max(),
+                    )?;
+                    if let Some((rows, _)) = rows {
+                        rest.retain(|id| rows.contains(id));
+                    }
+                }
+                ids.append(&mut rest);
+                metrics::counter!("helix_filter_page_bound_fallback_total").increment(1);
+                continue;
+            }
+            // No more rows than the page may still return or scan: a batch
+            // reads the rows the page read one at a time, and none past its
+            // end.
+            let returns = opts.limit.saturating_sub(points.len()).max(1);
+            let scans = opts
+                .max_scan
+                .map_or(usize::MAX, |max| max.saturating_sub(scanned).max(1));
+            let rows = &ids[at..at + batch.min(returns).min(scans).min(ids.len() - at)];
+            at += rows.len();
+            // `None`: one row, or a backend with no batched read.
+            let mut nodes = if rows.len() > 1 {
+                storage
+                    .get_nodes_many_checked_be(r, rows)
+                    .map_err(|e| GraphError::New(e.to_string()))?
+            } else {
+                None
+            };
+            for (row, &id) in rows.iter().enumerate() {
+                scanned = scanned.saturating_add(1);
+                // A batch says of each row what the single read said: its
+                // node, that there is none, or why it does not decode.
+                let read = match nodes.as_mut() {
+                    Some(nodes) => nodes[row].take().unwrap_or(Err(GraphError::NodeNotFound)),
+                    None => storage.get_node_be(r, &id),
+                };
+                let node = match read {
+                    Ok(node) => node,
+                    Err(GraphError::NodeNotFound) => {
+                        // A ghost payload-index entry (or merely a sparse
+                        // filter) lands here. Without a budget check, a long
+                        // run of missing candidates never terminates the page
+                        // — this is the generic runaway-scan protection every
+                        // other branch below already gets.
+                        if point_scan_budget_exhausted(scanned, opts, plan) {
+                            budget_exhausted = true;
+                            next_offset = next_scan_offset(id);
+                            break 'page;
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if !opts.filter.is_empty() && !opts.filter.matches_point(Some(id), &node.properties)
+                {
                     if point_scan_budget_exhausted(scanned, opts, plan) {
                         budget_exhausted = true;
                         next_offset = next_scan_offset(id);
-                        break;
+                        break 'page;
                     }
                     continue;
                 }
-                Err(e) => return Err(e),
-            };
-            if !opts.filter.is_empty() && !opts.filter.matches_point(Some(id), &node.properties) {
+
+                points.push(build_scan_point_be(
+                    storage,
+                    r,
+                    id,
+                    &node,
+                    opts.with_payload,
+                    hydrate_vectors,
+                    &vec_names,
+                ));
+
+                if points.len() >= opts.limit {
+                    next_offset = next_scan_offset(id);
+                    break 'page;
+                }
                 if point_scan_budget_exhausted(scanned, opts, plan) {
                     budget_exhausted = true;
                     next_offset = next_scan_offset(id);
-                    break;
+                    break 'page;
                 }
-                continue;
-            }
-
-            points.push(build_scan_point_be(
-                storage,
-                r,
-                id,
-                &node,
-                opts.with_payload,
-                hydrate_vectors,
-                &vec_names,
-            ));
-
-            if points.len() >= opts.limit {
-                next_offset = next_scan_offset(id);
-                break;
-            }
-            if point_scan_budget_exhausted(scanned, opts, plan) {
-                budget_exhausted = true;
-                next_offset = next_scan_offset(id);
-                break;
             }
         }
     } else {
@@ -4964,7 +6074,7 @@ pub fn handle_scroll_points(
 
     let storage = match input.collections.get_collection(&name) {
         Ok(s) => s,
-        Err(e) => return json_err(response, 404, &e.to_string()),
+        Err(e) => return collection_open_err(input, response, e),
     };
 
     let filter = req.filter.unwrap_or_default();
@@ -4978,7 +6088,7 @@ pub fn handle_scroll_points(
         partition: None,
         max_scan: qdrant_scroll_scan_budget(req.limit, &filter),
         deadline: qdrant_scroll_scan_deadline(&filter),
-        indexed_deadline: qdrant_indexed_scroll_scan_deadline(&filter),
+        indexed_deadline: qdrant_indexed_scroll_page_wall(&filter),
         filter_hash: scan_filter_hash(&filter),
         cursor_generation: None,
         fuse_pending: true,
@@ -5108,7 +6218,7 @@ pub fn handle_scan_points(input: &HandlerInput, response: &mut Response) -> Resu
 
     let storage = match input.collections.get_collection(&name) {
         Ok(s) => s,
-        Err(e) => return json_err(response, 404, &e.to_string()),
+        Err(e) => return collection_open_err(input, response, e),
     };
 
     let opts = PointScanOptions {
@@ -5723,7 +6833,7 @@ pub fn handle_facet(input: &HandlerInput, response: &mut Response) -> Result<(),
     let phase_start = Instant::now();
     let storage = match input.collections.get_collection(&name) {
         Ok(s) => s,
-        Err(e) => return json_err(response, 404, &e.to_string()),
+        Err(e) => return collection_open_err(input, response, e),
     };
     record_facet_phase(&name, "unknown", "get_collection", phase_start);
 
@@ -5843,6 +6953,9 @@ struct DeletePointsRequest {
 }
 
 /// POST /collections/{name}/points/delete
+/// Candidate rows a filter delete rechecks per batched read.
+const FILTER_DELETE_RECHECK_CHUNK: usize = 512;
+
 pub fn handle_delete_points(
     input: &HandlerInput,
     response: &mut Response,
@@ -5885,7 +6998,7 @@ pub fn handle_delete_points(
         let phase_start = Instant::now();
         let storage = match input.collections.get_collection(&name) {
             Ok(s) => s,
-            Err(e) => return json_err(response, 404, &e.to_string()),
+            Err(e) => return collection_open_err(input, response, e),
         };
         if storage.backend.kind() == BackendKind::Lsm {
             let r = storage
@@ -5894,15 +7007,29 @@ pub fn handle_delete_points(
                 .map_err(|e| GraphError::New(e.to_string()))?;
             let mut to_delete = Vec::new();
             let mut resolve_plan = "scan";
-            if let Some(candidates) = indexed_filter_candidates_be(&storage, &r, filter)? {
+            let mut rows_read = 0usize;
+            if let Some(candidates) = filter_delete_candidates_be(&storage, &r, filter)? {
                 resolve_plan = "indexed";
-                for id in candidates {
-                    let node = match storage.get_node_be(&r, &id) {
-                        Ok(node) => node,
-                        Err(_) => continue,
-                    };
-                    if filter.matches_point(Some(id), &node.properties) {
-                        to_delete.push(id);
+                // Recheck the candidates a chunk of rows per round trip, not a
+                // read each; the chunk bounds the rows held at once.
+                let candidates: Vec<u128> = candidates.into_iter().collect();
+                rows_read = candidates.len();
+                for chunk in candidates.chunks(FILTER_DELETE_RECHECK_CHUNK) {
+                    let keys: Vec<Vec<u8>> =
+                        chunk.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+                    let rows = storage
+                        .backend
+                        .get_many(&r, Namespace::Nodes, &keys)
+                        .map_err(|e| GraphError::New(e.to_string()))?;
+                    for (&id, row) in chunk.iter().zip(rows) {
+                        let Some(Ok(node)) =
+                            row.map(|bytes| SerializedNode::decode_node(&bytes, id))
+                        else {
+                            continue;
+                        };
+                        if filter.matches_point(Some(id), &node.properties) {
+                            to_delete.push(id);
+                        }
                     }
                 }
             } else {
@@ -5916,6 +7043,7 @@ pub fn handle_delete_points(
                             ));
                             return false;
                         };
+                        rows_read += 1;
                         let id = u128::from_be_bytes(bytes);
                         match SerializedNode::decode_node(data, id) {
                             Ok(node) => {
@@ -5944,20 +7072,30 @@ pub fn handle_delete_points(
                     .record(phase_start.elapsed().as_secs_f64() * 1000.0);
                 metrics::histogram!("helix_qdrant_delete_matched_ids", "source" => resolve_plan)
                     .record(to_delete.len() as f64);
+                metrics::histogram!("helix_qdrant_delete_candidate_rows", "source" => resolve_plan)
+                    .record(rows_read as f64);
             }
             drop(r);
 
             total_plan = resolve_plan;
-            let phase_start = Instant::now();
-            input.replication.apply(ReplicatedMutation::DeletePoints {
-                collection: name.clone(),
-                ids: to_delete.clone(),
-            })?;
-            if observe_hot_metrics {
-                metrics::histogram!("helix_qdrant_delete_phase_ms", "phase" => "replication_apply", "plan" => resolve_plan)
-                    .record(phase_start.elapsed().as_secs_f64() * 1000.0);
+            // Nothing matched (most deletes the client sends): applying an empty delete
+            // changes nothing but still counts as a mutation for regraph and
+            // the caches. The apply refused a degraded collection, so that is
+            // kept.
+            if to_delete.is_empty() {
+                storage.ensure_not_degraded()?;
+            } else {
+                let phase_start = Instant::now();
+                input.replication.apply(ReplicatedMutation::DeletePoints {
+                    collection: name.clone(),
+                    ids: to_delete.clone(),
+                })?;
+                if observe_hot_metrics {
+                    metrics::histogram!("helix_qdrant_delete_phase_ms", "phase" => "replication_apply", "plan" => resolve_plan)
+                        .record(phase_start.elapsed().as_secs_f64() * 1000.0);
+                }
+                clear_pending_ids(&name, &to_delete);
             }
-            clear_pending_ids(&name, &to_delete);
             if observe_hot_metrics {
                 metrics::histogram!(
                     "helix_qdrant_delete_phase_ms",
@@ -6093,11 +7231,19 @@ pub fn handle_set_payload(input: &HandlerInput, response: &mut Response) -> Resu
         points.iter().map(|v| point_id_to_u128(v)).collect()
     } else if let Some(_filter) = &req.filter {
         // Filter-based: scroll all points and apply filter
-        // For now, return error — CE primarily uses point-ID-based set_payload
+        // For now, return error — the client primarily uses point-ID-based set_payload
         return json_err(response, 400, "Filter-based set_payload not yet supported");
     } else {
         return json_err(response, 400, "Must provide 'points' or 'filter'");
     };
+
+    // A read-modify-write of whole nodes and their index rows: order it with
+    // upserts, deletes and payload-index creation, which hold this gate on
+    // the resolved name. The gateway's gate is keyed by the URL name, so a
+    // write under an alias would otherwise race one under the real name.
+    let resolved = input.collections.resolve_alias(&name);
+    let gate = input.collections.point_mutation_gate(&resolved);
+    let _gate = lock_point_mutation_gate(&gate, &resolved, "set_payload");
 
     if storage.backend.kind() == BackendKind::Lsm {
         let r = storage
@@ -6131,12 +7277,23 @@ pub fn handle_set_payload(input: &HandlerInput, response: &mut Response) -> Resu
             });
         }
 
-        storage.with_write_backend(|w| {
+        let write = |w: &mut AnyWrite<'_>| -> Result<(), GraphError> {
             for upsert in &upserts {
                 storage.upsert_node_be(w, upsert)?;
             }
             Ok(())
-        })?;
+        };
+        // Flushed at once, as an upsert is, instead of waiting for the next
+        // WAL flush tick; durable before the reply either way.
+        if crate::helix_engine::storage_core::replication::lsm_point_write_flush_enabled() {
+            storage.with_write_backend_buffered(write)?;
+            storage
+                .backend
+                .flush_durable()
+                .map_err(|e| storage.backend_error(e, "set_payload_flush_durable"))?;
+        } else {
+            storage.with_write_backend(write)?;
+        }
 
         return json_ok(response, &sonic_rs::json!({"status": "completed"}));
     }
@@ -6146,7 +7303,7 @@ pub fn handle_set_payload(input: &HandlerInput, response: &mut Response) -> Resu
             // Read existing payload
             let mut props = storage.get_node(txn, id)?.properties;
             // Merge new payload fields. Qdrant's `key` parameter scopes the
-            // patch under a payload object (CE uses key="metadata" for
+            // patch under a payload object (the client uses key="metadata" for
             // backfill markers). Preserve nested object fields instead of
             // writing marker fields at the top level.
             if let Some(payload_key) = req.key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
@@ -6382,7 +7539,12 @@ pub fn handle_count_points(
             .begin_read()
             .map_err(|e| GraphError::New(e.to_string()))?;
         if filter.is_empty() && !exact {
-            let stats = storage.metadata_snapshot()?;
+            // The stored counter on this read, and the handle's snapshot only
+            // if that fails: a reader replica's snapshot is one reconcile
+            // behind this request at best.
+            let stats = storage
+                .get_metadata_be(&r)
+                .or_else(|_| storage.metadata_snapshot())?;
             let pending_new = pending_points
                 .iter()
                 .filter(|(id, _)| storage.get_node_be(&r, id).is_err())
@@ -6393,10 +7555,21 @@ pub fn handle_count_points(
             );
         }
 
-        let indexed_candidates = indexed_filter_candidates_be(&storage, &r, &filter)?;
+        let narrowed = without_broad_musts(&storage, &r, &filter, usize::MAX)?;
+        // A condition left out of the set is applied by the recheck below.
+        let indexed_candidates = keep_listed(
+            indexed_filter_ids_be(
+                &storage,
+                &r,
+                narrowed.as_ref().unwrap_or(&filter),
+                text_candidate_skip_max(),
+            )?,
+            must_has_id_ids(&filter),
+        )
+        .map(|(ids, exact)| (ids, exact && narrowed.is_none()));
         let mut count: u64 = 0;
-        if let Some(candidates) = indexed_candidates {
-            if indexed_filter_candidates_are_exact(&storage, &filter) {
+        if let Some((candidates, candidates_exact)) = indexed_candidates {
+            if candidates_exact {
                 return json_ok(
                     response,
                     &sonic_rs::json!({
@@ -6946,7 +8119,7 @@ enum HybridGraphRequest {
 struct HybridGraphConfig {
     #[serde(default = "default_true")]
     enabled: bool,
-    /// Edge labels to walk. Absent means the CE code-graph defaults
+    /// Edge labels to walk. Absent means the client's code-graph defaults
     /// (CALLS + IMPORTS, mirroring /graph/pagerank); an explicit empty list
     /// walks nothing, so the channel degrades to two-channel fusion.
     #[serde(default)]
@@ -7103,6 +8276,7 @@ fn classify_query(val: &serde_json::Value) -> Result<QueryKind, String> {
             .iter()
             .map(|x| x.as_f64().unwrap_or(0.0) as f32)
             .collect();
+        validate_query_vector(&v)?;
         return Ok(QueryKind::DenseVector(v));
     }
     // Object — check for indices/values (sparse) or fusion
@@ -7119,6 +8293,7 @@ fn classify_query(val: &serde_json::Value) -> Result<QueryKind, String> {
                 .as_array()
                 .map(|a| a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
                 .unwrap_or_default();
+            validate_query_vector(&values)?;
             return Ok(QueryKind::SparseVector(SparseVector { indices, values }));
         }
         if let Some(fusion_val) = obj.get("fusion") {
@@ -7175,6 +8350,14 @@ pub fn handle_query_points(
     if let Err(message) = validate_score_threshold(req.score_threshold) {
         return json_err(response, 400, message);
     }
+    // The top-level `query` is checked by `classify_query`.
+    if let Err(message) = req
+        .prefetch
+        .iter()
+        .try_for_each(|prefetch| validate_query_vector(&prefetch.query))
+    {
+        return json_err(response, 400, message);
+    }
     req.limit = clamp_limit(req.limit);
     req.offset = clamp_offset(req.offset);
     let result_window = result_window(req.limit, req.offset);
@@ -7207,15 +8390,20 @@ pub fn handle_query_points(
                 "collection_get",
                 collection_start,
             );
+            let answered = collection_open_err(input, response, e);
             record_qdrant_query_outcome(
                 &name,
                 ENDPOINT,
                 "unknown",
                 "unknown",
-                "collection_not_found",
+                if response.status == 404 {
+                    "collection_not_found"
+                } else {
+                    "collection_open_failed"
+                },
                 request_start,
             );
-            return json_err(response, 404, &e.to_string());
+            return answered;
         }
     };
     let backend = backend_label(storage.backend.kind());
@@ -7240,6 +8428,8 @@ pub fn handle_query_points(
             candidates: indexed_candidates,
             probe_estimate,
             probe_skipped,
+            prefilter,
+            exact: candidates_exact,
         } = vector_query_indexed_filter_candidates_be_probed(
             &storage,
             &r,
@@ -7256,7 +8446,7 @@ pub fn handle_query_points(
         );
         let has_filter = !filter.is_empty();
         let filter_index_exact =
-            indexed_candidates.is_some() && indexed_filter_candidates_are_exact(&storage, &filter);
+            (indexed_candidates.is_some() || prefilter.is_some()) && candidates_exact;
         let filter_recheck_required = has_filter && !filter_index_exact;
         let classify_start = Instant::now();
         let query_kind = match &req.query {
@@ -7327,6 +8517,16 @@ pub fn handle_query_points(
                 candidates.len(),
             );
         }
+        if let Some(prefilter) = &prefilter {
+            record_qdrant_query_count(
+                &name,
+                ENDPOINT,
+                backend,
+                query_kind_label,
+                "filter_prefilter",
+                prefilter.len(),
+            );
+        }
         if let Some(estimate) = probe_estimate {
             record_qdrant_query_count(
                 &name,
@@ -7389,7 +8589,7 @@ pub fn handle_query_points(
             };
             let ef_override = req.params.as_ref().and_then(|p| p.hnsw_ef);
             let filter_fn = |id: u128| -> bool {
-                if let Some(candidates) = &indexed_candidates {
+                if let Some(candidates) = indexed_candidates.as_ref().or(prefilter.as_ref()) {
                     if !candidates.contains(&id) {
                         return false;
                     }
@@ -7456,29 +8656,104 @@ pub fn handle_query_points(
                     selectivity_hint,
                 )
             } else if let Some(candidate_ids) = exact_index_filter_candidates {
-                storage
-                    .named_vectors
-                    .dense_search_candidate_set_filter_ef_be(
-                        &r,
-                        using,
-                        dense_vec,
-                        search_limit,
-                        candidate_ids,
-                        true,
-                        selectivity_hint,
-                        ef_override,
-                    )
+                // Try sidecar scan first (exact candidates -- no recheck needed).
+                let scan_ok = if broad_filter_scan_enabled() {
+                    let scan_total = collection_vector_count_be(&storage);
+                    let scan_sel =
+                        (scan_total > 0).then_some(candidate_ids.len() as f32 / scan_total as f32);
+                    storage
+                        .named_vectors
+                        .dense_search_broad_prefilter_scan_be::<fn(u128) -> bool>(
+                            &r,
+                            using,
+                            dense_vec,
+                            search_limit,
+                            candidate_ids,
+                            None,
+                            scan_sel,
+                        )
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                match scan_ok {
+                    Some(results) => Ok(results),
+                    None => storage
+                        .named_vectors
+                        .dense_search_candidate_set_filter_ef_be(
+                            &r,
+                            using,
+                            dense_vec,
+                            search_limit,
+                            candidate_ids,
+                            true,
+                            selectivity_hint,
+                            ef_override,
+                        ),
+                }
             } else {
-                storage.named_vectors.dense_search_with_id_filter_ef_be(
-                    &r,
-                    using,
-                    dense_vec,
-                    search_limit,
-                    dense_filter_active.then_some(&[filter_fn][..]),
-                    true,
-                    selectivity_hint,
-                    ef_override,
-                )
+                let scan_ok = if let Some(pf) =
+                    prefilter.as_ref().filter(|_| broad_filter_scan_enabled())
+                {
+                    let recheck_fn = |id: u128| -> bool {
+                        match storage.get_node_be(&r, &id) {
+                            Ok(node) => filter.matches_point(Some(id), &node.properties),
+                            Err(_) => false,
+                        }
+                    };
+                    let scan_total = collection_vector_count_be(&storage);
+                    let scan_sel = (scan_total > 0).then_some(pf.len() as f32 / scan_total as f32);
+                    storage
+                        .named_vectors
+                        .dense_search_broad_prefilter_scan_be(
+                            &r,
+                            using,
+                            dense_vec,
+                            search_limit,
+                            pf,
+                            filter_recheck_required.then_some(&[recheck_fn][..]),
+                            scan_sel,
+                        )
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                match scan_ok {
+                    Some(results) => Ok(results),
+                    None if dense_filter_active => {
+                        storage.named_vectors.dense_search_with_id_filter_ef_be(
+                            &r,
+                            using,
+                            dense_vec,
+                            search_limit,
+                            Some(&[filter_fn][..]),
+                            true,
+                            selectivity_hint,
+                            ef_override,
+                        )
+                    }
+                    None => dense_search_live_be(
+                        search_limit,
+                        &storage.named_vectors.rows_without_point_met,
+                        |k| {
+                            storage
+                                .named_vectors
+                                .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                                    &r,
+                                    using,
+                                    dense_vec,
+                                    k,
+                                    None,
+                                    true,
+                                    selectivity_hint,
+                                    ef_override,
+                                )
+                        },
+                        |ids| nodes_present_be(&storage, &r, ids),
+                    ),
+                }
             }
             .map_err(GraphError::from)?;
             record_qdrant_query_stage(
@@ -7578,32 +8853,25 @@ pub fn handle_query_points(
                     "'using' is required for sparse vector queries",
                 );
             };
-            let filter_fn = |doc_id: u128| -> bool {
-                if let Some(candidates) = &indexed_candidates {
-                    if !candidates.contains(&doc_id) {
-                        return false;
-                    }
-                }
-                if !filter_recheck_required {
-                    return true;
-                }
-                match storage.get_node_be(&r, &doc_id) {
-                    Ok(node) => filter.matches_point(Some(doc_id), &node.properties),
-                    Err(_) => false,
-                }
+            let doc_filter = SparseDocFilter {
+                storage: &storage,
+                r: &r,
+                filter: &filter,
+                candidates: indexed_candidates.as_ref().or(prefilter.as_ref()),
+                recheck: filter_recheck_required,
+                failure: OnceLock::new(),
             };
-            let search_limit = if has_filter || indexed_candidates.is_some() {
-                result_window.saturating_mul(4)
-            } else {
-                result_window
-            };
+            let search_limit =
+                sparse_search_limit(result_window, has_filter || indexed_candidates.is_some());
             let candidate_start = Instant::now();
+            // Exact-scored candidates are rechecked lazily, best-first.
+            let lazy_recheck = filter_recheck_required && sparse_lazy_filter_enabled();
             let exact_candidate_ids = bounded_filter_candidate_ids_be(
                 &storage,
                 &r,
                 indexed_candidates.as_ref(),
                 &filter,
-                filter_recheck_required,
+                filter_recheck_required && !lazy_recheck,
                 total_vectors,
             );
             record_qdrant_query_stage(
@@ -7629,14 +8897,21 @@ pub fn handle_query_points(
                 .named_vectors
                 .with_sparse_core(using, |core| {
                     let mut results = if let Some(candidate_ids) = exact_candidate_ids.as_ref() {
-                        core.search_candidate_ids_exact_be(
+                        core.search_candidate_ids_exact_filtered_be(
                             &r,
                             sparse_vec,
                             search_limit,
                             candidate_ids.iter().copied(),
+                            lazy_recheck.then_some(&doc_filter),
                         )?
                     } else {
-                        core.search_be(&r, sparse_vec, search_limit, Some(&filter_fn))?
+                        core.search_be_with(
+                            &r,
+                            sparse_vec,
+                            search_limit,
+                            Some(&doc_filter),
+                            filter_recheck_required && sparse_lazy_filter_enabled(),
+                        )?
                     };
                     results.truncate(result_window);
                     Ok(results)
@@ -7727,7 +9002,7 @@ pub fn handle_query_points(
             };
             let pf_ef = pf.params.as_ref().and_then(|p| p.hnsw_ef);
             let filter_fn = |id: u128| -> bool {
-                if let Some(candidates) = &indexed_candidates {
+                if let Some(candidates) = indexed_candidates.as_ref().or(prefilter.as_ref()) {
                     if !candidates.contains(&id) {
                         return false;
                     }
@@ -7784,29 +9059,105 @@ pub fn handle_query_points(
                     selectivity_hint,
                 )
             } else if let Some(candidate_ids) = exact_index_filter_candidates {
-                storage
-                    .named_vectors
-                    .dense_search_candidate_set_filter_ef_be(
-                        &r,
-                        &pf.using,
-                        &pf.query,
-                        search_limit,
-                        candidate_ids,
-                        true,
-                        selectivity_hint,
-                        pf_ef,
-                    )
+                // Try sidecar scan first (exact candidates -- no recheck needed).
+                let scan_ok = if broad_filter_scan_enabled() {
+                    let scan_total = collection_vector_count_be(&storage);
+                    let scan_sel =
+                        (scan_total > 0).then_some(candidate_ids.len() as f32 / scan_total as f32);
+                    storage
+                        .named_vectors
+                        .dense_search_broad_prefilter_scan_be::<fn(u128) -> bool>(
+                            &r,
+                            &pf.using,
+                            &pf.query,
+                            search_limit,
+                            candidate_ids,
+                            None,
+                            scan_sel,
+                        )
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                match scan_ok {
+                    Some(results) => Ok(results),
+                    None => storage
+                        .named_vectors
+                        .dense_search_candidate_set_filter_ef_be(
+                            &r,
+                            &pf.using,
+                            &pf.query,
+                            search_limit,
+                            candidate_ids,
+                            true,
+                            selectivity_hint,
+                            pf_ef,
+                        ),
+                }
             } else {
-                storage.named_vectors.dense_search_with_id_filter_ef_be(
-                    &r,
-                    &pf.using,
-                    &pf.query,
-                    search_limit,
-                    dense_filter_active.then_some(&[filter_fn][..]),
-                    true,
-                    selectivity_hint,
-                    pf_ef,
-                )
+                let scan_ok = if let Some(pfset) =
+                    prefilter.as_ref().filter(|_| broad_filter_scan_enabled())
+                {
+                    let recheck_fn = |id: u128| -> bool {
+                        match storage.get_node_be(&r, &id) {
+                            Ok(node) => filter.matches_point(Some(id), &node.properties),
+                            Err(_) => false,
+                        }
+                    };
+                    let scan_total = collection_vector_count_be(&storage);
+                    let scan_sel =
+                        (scan_total > 0).then_some(pfset.len() as f32 / scan_total as f32);
+                    storage
+                        .named_vectors
+                        .dense_search_broad_prefilter_scan_be(
+                            &r,
+                            &pf.using,
+                            &pf.query,
+                            search_limit,
+                            pfset,
+                            filter_recheck_required.then_some(&[recheck_fn][..]),
+                            scan_sel,
+                        )
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                match scan_ok {
+                    Some(results) => Ok(results),
+                    None if dense_filter_active => {
+                        storage.named_vectors.dense_search_with_id_filter_ef_be(
+                            &r,
+                            &pf.using,
+                            &pf.query,
+                            search_limit,
+                            Some(&[filter_fn][..]),
+                            true,
+                            selectivity_hint,
+                            pf_ef,
+                        )
+                    }
+                    None => dense_search_live_be(
+                        search_limit,
+                        &storage.named_vectors.rows_without_point_met,
+                        |k| {
+                            storage
+                                .named_vectors
+                                .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                                    &r,
+                                    &pf.using,
+                                    &pf.query,
+                                    k,
+                                    None,
+                                    true,
+                                    selectivity_hint,
+                                    pf_ef,
+                                )
+                        },
+                        |ids| nodes_present_be(&storage, &r, ids),
+                    ),
+                }
             }
             .map_err(GraphError::from)?;
             record_qdrant_query_stage(
@@ -8317,9 +9668,94 @@ pub fn handle_query_points(
     json_ok(response, &serde_json::json!({ "points": results }))
 }
 
+#[cfg(test)]
+thread_local! {
+    static HYBRID_PARALLEL_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with `hybrid_parallel_channels_enabled` forced on this
+/// thread. Tests that count this thread's reads or set other thread-local
+/// overrides around a hybrid request force it off: neither reaches the helper
+/// thread.
+#[cfg(test)]
+pub(crate) fn with_hybrid_parallel_channels_for_test<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    let previous = HYBRID_PARALLEL_OVERRIDE.with(|cell| cell.replace(Some(enabled)));
+    let out = f();
+    HYBRID_PARALLEL_OVERRIDE.with(|cell| cell.set(previous));
+    out
+}
+
+/// Run the dense and the sparse channels of a hybrid request at the same time
+/// (see [`run_dense_beside_sparse`]), so a cold request waits for the slower
+/// kind instead of both. `HELIX_HYBRID_PARALLEL_CHANNELS=0` runs sparse after
+/// dense again.
+fn hybrid_parallel_channels_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = HYBRID_PARALLEL_OVERRIDE.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HELIX_HYBRID_PARALLEL_CHANNELS")
+            .ok()
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    })
+}
+
+/// Why a hybrid channel loop stopped early: a 400 for the client, or an error.
+enum HybridChannelError {
+    BadRequest(&'static str),
+    Failed(GraphError),
+}
+
+impl From<GraphError> for HybridChannelError {
+    fn from(error: GraphError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+/// Runs `dense` on the calling thread while `sparse` runs on a scoped helper
+/// thread, in the calling thread's LSM context (its blocking mark and the
+/// request's cancellation are thread-local). A plain thread, not rayon or the
+/// blocking pool: the dense search fans its segments out on rayon and both
+/// sides block on storage reads, so a shared pool could leave one side
+/// waiting for a worker the other holds. A dense error wins over a sparse
+/// one, as when sparse only ran after dense had succeeded; a panic on the
+/// helper is raised again here once dense has returned, and fails the request
+/// like any other handler panic.
+fn run_dense_beside_sparse<D, S: Send, E: Send>(
+    dense: impl FnOnce() -> Result<D, E>,
+    sparse: impl Fn() -> Result<S, E> + Sync,
+) -> Result<(D, S), E> {
+    let lsm_context = LsmThreadContext::current();
+    let sparse = || lsm_context.enter(&sparse);
+    std::thread::scope(|scope| {
+        let spawned = std::thread::Builder::new()
+            .name("helix-hybrid-sparse".to_string())
+            .spawn_scoped(scope, sparse);
+        let dense = dense();
+        let sparse = match spawned {
+            Ok(helper) => helper
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "no thread for the hybrid sparse channels; running them after dense"
+                );
+                let dense = dense?;
+                return Ok((dense, sparse()?));
+            }
+        };
+        Ok((dense?, sparse?))
+    })
+}
+
 /// POST /collections/{name}/points/hybrid_query
 ///
-/// Server-side multi-channel retrieval for CE fast paths. The request carries
+/// Server-side multi-channel retrieval for the client's fast paths. The request carries
 /// client-computed dense and sparse query vectors; Helix executes each channel
 /// under one read transaction and fuses the ranked lists with RRF.
 pub fn handle_hybrid_query_points(
@@ -8350,6 +9786,15 @@ pub fn handle_hybrid_query_points(
             400,
             "At least one dense or sparse query is required",
         );
+    }
+    if let Err(message) = req
+        .dense
+        .iter()
+        .map(|dense| &dense.query[..])
+        .chain(req.sparse.iter().map(|sparse| &sparse.query.values[..]))
+        .try_for_each(validate_query_vector)
+    {
+        return json_err(response, 400, message);
     }
     if let Some(rrf_k) = req.rrf_k {
         if !rrf_k.is_finite() || rrf_k <= 0.0 {
@@ -8392,7 +9837,7 @@ pub fn handle_hybrid_query_points(
             }
             s
         }
-        Err(e) => return json_err(response, 404, &e.to_string()),
+        Err(e) => return collection_open_err(input, response, e),
     };
 
     if storage.backend.kind() == BackendKind::Lsm {
@@ -8441,6 +9886,8 @@ pub fn handle_hybrid_query_points(
             candidates: indexed_candidates,
             probe_estimate,
             probe_skipped: _,
+            prefilter,
+            exact: candidates_exact,
         } = vector_query_indexed_filter_candidates_be_probed(
             &storage,
             &r,
@@ -8463,6 +9910,16 @@ pub fn handle_hybrid_query_points(
                 query_kind_label,
                 "filter_candidates",
                 candidates.len(),
+            );
+        }
+        if let Some(prefilter) = &prefilter {
+            record_qdrant_query_count(
+                &name,
+                ENDPOINT,
+                backend,
+                query_kind_label,
+                "filter_prefilter",
+                prefilter.len(),
             );
         }
         if let Some(estimate) = probe_estimate {
@@ -8502,490 +9959,645 @@ pub fn handle_hybrid_query_points(
         let collect_mmr_vectors = mmr_config.is_some();
         let mut ranked_lists: Vec<Vec<RankedItem>> = Vec::new();
         let mut dense_channels: Vec<serde_json::Value> = Vec::new();
-        let mut sparse_channels: Vec<serde_json::Value> = Vec::new();
         let mut dense_vectors: HashMap<u128, Vec<f32>> = HashMap::new();
-        let mut request_payload_cache = RequestPayloadCache::default();
+        // Behind a lock: both channel loops below use it.
+        let request_payload_cache = parking_lot::Mutex::new(RequestPayloadCache::default());
 
-        for dense in &req.dense {
-            if dense.query.is_empty() {
-                record_qdrant_query_outcome(
-                    &name,
-                    ENDPOINT,
-                    backend,
-                    query_kind_label,
-                    "bad_request",
-                    request_start,
-                );
-                return json_err(response, 400, "Dense query vector must not be empty");
-            }
-            let eff_filter: &Filter = dense.filter.as_ref().unwrap_or(&filter);
-            let eff_has_filter = !eff_filter.is_empty();
-            let channel_filter_start = Instant::now();
-            let eff_indexed_candidates = if dense.filter.is_some() {
-                vector_query_indexed_filter_candidates_be_probed(
-                    &storage,
-                    &r,
-                    eff_filter,
-                    filter_count_probe_enabled(),
-                )?
-                .candidates
-            } else {
-                indexed_candidates.clone()
-            };
-            record_qdrant_query_stage(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_dense_filter_candidates",
-                channel_filter_start,
-            );
-            if let Some(candidates) = &eff_indexed_candidates {
-                record_qdrant_query_count(
+        let mut run_dense = || -> Result<(), HybridChannelError> {
+            for dense in &req.dense {
+                if dense.query.is_empty() {
+                    return Err(HybridChannelError::BadRequest(
+                        "Dense query vector must not be empty",
+                    ));
+                }
+                let eff_filter: &Filter = dense.filter.as_ref().unwrap_or(&filter);
+                let eff_has_filter = !eff_filter.is_empty();
+                let channel_filter_start = Instant::now();
+                // Borrow the request-level set; only a channel filter owns one.
+                let channel_probe = if dense.filter.is_some() {
+                    Some(vector_query_indexed_filter_candidates_be_probed(
+                        &storage,
+                        &r,
+                        eff_filter,
+                        filter_count_probe_enabled(),
+                    )?)
+                } else {
+                    None
+                };
+                let (eff_indexed_candidates, eff_prefilter, eff_exact) = match &channel_probe {
+                    Some(probe) => (
+                        probe.candidates.as_ref(),
+                        probe.prefilter.as_ref(),
+                        probe.exact,
+                    ),
+                    None => (
+                        indexed_candidates.as_ref(),
+                        prefilter.as_ref(),
+                        candidates_exact,
+                    ),
+                };
+                record_qdrant_query_stage(
                     &name,
                     ENDPOINT,
                     backend,
                     query_kind_label,
                     "hybrid_dense_filter_candidates",
-                    candidates.len(),
+                    channel_filter_start,
                 );
-            }
-            let eff_filter_index_exact = eff_indexed_candidates.is_some()
-                && indexed_filter_candidates_are_exact(&storage, eff_filter);
-            let eff_filter_recheck_required = eff_has_filter && !eff_filter_index_exact;
-            let eff_total_vectors = eff_indexed_candidates
-                .as_ref()
-                .map(|_| collection_vector_count_be(&storage))
-                .unwrap_or(0);
-            let eff_selectivity_hint = if dense.filter.is_some() && eff_has_filter {
-                eff_indexed_candidates.as_ref().and_then(|candidates| {
-                    (eff_total_vectors > 0)
-                        .then_some(candidates.len() as f32 / eff_total_vectors as f32)
-                })
-            } else {
-                selectivity_hint
-            };
-            let filter_fn = |id: u128| -> bool {
                 if let Some(candidates) = &eff_indexed_candidates {
-                    if !candidates.contains(&id) {
-                        return false;
-                    }
-                }
-                if !eff_filter_recheck_required {
-                    return true;
-                }
-                match storage.get_node_be(&r, &id) {
-                    Ok(node) => eff_filter.matches_point(Some(id), &node.properties),
-                    Err(_) => false,
-                }
-            };
-            let search_limit = if eff_has_filter || eff_indexed_candidates.is_some() {
-                dense.limit.saturating_mul(4)
-            } else {
-                dense.limit
-            };
-            let ef_override = dense.params.as_ref().and_then(|p| p.hnsw_ef);
-            let dense_filter_active = eff_has_filter || eff_indexed_candidates.is_some();
-            let exact_index_filter_candidates = exact_index_filter_candidates(
-                eff_has_filter,
-                eff_filter_recheck_required,
-                eff_indexed_candidates.as_ref(),
-            );
-            let candidate_start = Instant::now();
-            let exact_candidate_ids = exact_dense_candidate_ids_be(
-                &storage,
-                &r,
-                eff_indexed_candidates.as_ref(),
-                &eff_filter,
-                eff_filter_recheck_required,
-                eff_total_vectors,
-            );
-            record_qdrant_query_stage(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_dense_candidate_plan",
-                candidate_start,
-            );
-            if let Some(candidate_ids) = &exact_candidate_ids {
-                record_qdrant_query_count(
-                    &name,
-                    ENDPOINT,
-                    backend,
-                    query_kind_label,
-                    "exact_candidate_ids",
-                    candidate_ids.len(),
-                );
-            }
-            let search_start = Instant::now();
-            let mut results = if let Some(candidate_ids) = exact_candidate_ids {
-                storage.named_vectors.dense_search_candidate_ids_exact_be(
-                    &r,
-                    &dense.using,
-                    &dense.query,
-                    search_limit,
-                    candidate_ids.iter().copied(),
-                    eff_selectivity_hint,
-                )
-            } else if let Some(candidate_ids) = exact_index_filter_candidates {
-                storage
-                    .named_vectors
-                    .dense_search_candidate_set_filter_ef_be(
-                        &r,
-                        &dense.using,
-                        &dense.query,
-                        search_limit,
-                        candidate_ids,
-                        true,
-                        eff_selectivity_hint,
-                        ef_override,
-                    )
-            } else {
-                storage.named_vectors.dense_search_with_id_filter_ef_be(
-                    &r,
-                    &dense.using,
-                    &dense.query,
-                    search_limit,
-                    dense_filter_active.then_some(&[filter_fn][..]),
-                    true,
-                    eff_selectivity_hint,
-                    ef_override,
-                )
-            }
-            .map_err(GraphError::from)?;
-            record_qdrant_query_stage(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_dense_search",
-                search_start,
-            );
-            record_qdrant_query_count(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "search_results_raw",
-                results.len(),
-            );
-            results.truncate(dense.limit);
-            let score_start = Instant::now();
-            for result in &mut results {
-                if let Some(distance) = result.distance {
-                    result.distance = Some(
-                        storage
-                            .named_vectors
-                            .public_score(&dense.using, distance)
-                            .map_err(GraphError::from)?,
+                    record_qdrant_query_count(
+                        &name,
+                        ENDPOINT,
+                        backend,
+                        query_kind_label,
+                        "hybrid_dense_filter_candidates",
+                        candidates.len(),
                     );
                 }
-            }
-            record_qdrant_query_stage(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_dense_score_normalize",
-                score_start,
-            );
-            let fuse_start = Instant::now();
-            fuse_pending_dense_results(
-                &name,
-                eff_filter,
-                &dense.using,
-                &dense.query,
-                dense.limit,
-                &mut results,
-            );
-            record_qdrant_query_stage(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_dense_pending_fuse",
-                fuse_start,
-            );
-            record_qdrant_query_count(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_dense_results",
-                results.len(),
-            );
-            if collect_mmr_vectors {
-                for vector in &results {
-                    dense_vectors
-                        .entry(vector.id)
-                        .or_insert_with(|| vector.get_data().to_vec());
-                }
-            }
-            if req.with_channel_points {
-                let response_start = Instant::now();
-                let payload_cache = if req.with_payload {
-                    request_payload_cache
-                        .get_or_load(&name, &storage, &r, results.iter().map(|v| v.id))
-                        .map_err(graph_error_from_backend_error)?
-                } else {
-                    None
-                };
-                let points: Vec<serde_json::Value> = results
-                    .iter()
-                    .map(|v| {
-                        query_point_json_be(
-                            &name,
-                            &storage,
-                            &r,
-                            v.id,
-                            v.distance.unwrap_or(0.0) as f64,
-                            req.with_payload,
-                            payload_cache,
-                        )
+                let eff_filter_index_exact =
+                    (eff_indexed_candidates.is_some() || eff_prefilter.is_some()) && eff_exact;
+                let eff_filter_recheck_required = eff_has_filter && !eff_filter_index_exact;
+                let eff_total_vectors = eff_indexed_candidates
+                    .as_ref()
+                    .map(|_| collection_vector_count_be(&storage))
+                    .unwrap_or(0);
+                let eff_selectivity_hint = if dense.filter.is_some() && eff_has_filter {
+                    eff_indexed_candidates.as_ref().and_then(|candidates| {
+                        (eff_total_vectors > 0)
+                            .then_some(candidates.len() as f32 / eff_total_vectors as f32)
                     })
-                    .collect();
+                } else {
+                    selectivity_hint
+                };
+                let filter_fn = |id: u128| -> bool {
+                    if let Some(candidates) = eff_indexed_candidates.or(eff_prefilter) {
+                        if !candidates.contains(&id) {
+                            return false;
+                        }
+                    }
+                    if !eff_filter_recheck_required {
+                        return true;
+                    }
+                    match storage.get_node_be(&r, &id) {
+                        Ok(node) => eff_filter.matches_point(Some(id), &node.properties),
+                        Err(_) => false,
+                    }
+                };
+                let search_limit = if eff_has_filter || eff_indexed_candidates.is_some() {
+                    dense.limit.saturating_mul(4)
+                } else {
+                    dense.limit
+                };
+                let ef_override = dense.params.as_ref().and_then(|p| p.hnsw_ef);
+                let dense_filter_active = eff_has_filter || eff_indexed_candidates.is_some();
+                let exact_index_filter_candidates = exact_index_filter_candidates(
+                    eff_has_filter,
+                    eff_filter_recheck_required,
+                    eff_indexed_candidates,
+                );
+                let candidate_start = Instant::now();
+                let exact_candidate_ids = exact_dense_candidate_ids_be(
+                    &storage,
+                    &r,
+                    eff_indexed_candidates,
+                    &eff_filter,
+                    eff_filter_recheck_required,
+                    eff_total_vectors,
+                );
                 record_qdrant_query_stage(
                     &name,
                     ENDPOINT,
                     backend,
                     query_kind_label,
-                    "hybrid_dense_channel_response",
-                    response_start,
+                    "hybrid_dense_candidate_plan",
+                    candidate_start,
                 );
-                dense_channels.push(serde_json::json!({
-                    "using": dense.using,
-                    "points": points,
-                }));
-            }
-            ranked_lists.push(
-                results
-                    .into_iter()
-                    .map(|v| RankedItem {
-                        id: v.id,
-                        score: v.distance.unwrap_or(0.0) as f64,
-                    })
-                    .collect(),
-            );
-        }
-
-        for sparse in &req.sparse {
-            if sparse.query.indices.is_empty() || sparse.query.values.is_empty() {
-                record_qdrant_query_outcome(
+                if let Some(candidate_ids) = &exact_candidate_ids {
+                    record_qdrant_query_count(
+                        &name,
+                        ENDPOINT,
+                        backend,
+                        query_kind_label,
+                        "exact_candidate_ids",
+                        candidate_ids.len(),
+                    );
+                }
+                let search_start = Instant::now();
+                let mut results = if let Some(candidate_ids) = exact_candidate_ids {
+                    storage.named_vectors.dense_search_candidate_ids_exact_be(
+                        &r,
+                        &dense.using,
+                        &dense.query,
+                        search_limit,
+                        candidate_ids.iter().copied(),
+                        eff_selectivity_hint,
+                    )
+                } else if let Some(candidate_ids) = exact_index_filter_candidates {
+                    // Try sidecar scan first (exact candidates -- no recheck needed).
+                    let scan_ok = if broad_filter_scan_enabled() {
+                        let scan_total = collection_vector_count_be(&storage);
+                        let scan_sel = (scan_total > 0)
+                            .then_some(candidate_ids.len() as f32 / scan_total as f32);
+                        storage
+                            .named_vectors
+                            .dense_search_broad_prefilter_scan_be::<fn(u128) -> bool>(
+                                &r,
+                                &dense.using,
+                                &dense.query,
+                                search_limit,
+                                candidate_ids,
+                                None,
+                                scan_sel,
+                            )
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    match scan_ok {
+                        Some(results) => Ok(results),
+                        None => storage
+                            .named_vectors
+                            .dense_search_candidate_set_filter_ef_be(
+                                &r,
+                                &dense.using,
+                                &dense.query,
+                                search_limit,
+                                candidate_ids,
+                                true,
+                                eff_selectivity_hint,
+                                ef_override,
+                            ),
+                    }
+                } else {
+                    let scan_ok = if let Some(pf) =
+                        eff_prefilter.filter(|_| broad_filter_scan_enabled())
+                    {
+                        let recheck_fn = |id: u128| -> bool {
+                            match storage.get_node_be(&r, &id) {
+                                Ok(node) => eff_filter.matches_point(Some(id), &node.properties),
+                                Err(_) => false,
+                            }
+                        };
+                        let scan_total = collection_vector_count_be(&storage);
+                        let scan_sel =
+                            (scan_total > 0).then_some(pf.len() as f32 / scan_total as f32);
+                        storage
+                            .named_vectors
+                            .dense_search_broad_prefilter_scan_be(
+                                &r,
+                                &dense.using,
+                                &dense.query,
+                                search_limit,
+                                pf,
+                                eff_filter_recheck_required.then_some(&[recheck_fn][..]),
+                                scan_sel,
+                            )
+                            .ok()
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    match scan_ok {
+                        Some(results) => Ok(results),
+                        None if dense_filter_active => {
+                            storage.named_vectors.dense_search_with_id_filter_ef_be(
+                                &r,
+                                &dense.using,
+                                &dense.query,
+                                search_limit,
+                                Some(&[filter_fn][..]),
+                                true,
+                                eff_selectivity_hint,
+                                ef_override,
+                            )
+                        }
+                        None => dense_search_live_be(
+                            search_limit,
+                            &storage.named_vectors.rows_without_point_met,
+                            |k| {
+                                storage
+                                    .named_vectors
+                                    .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                                        &r,
+                                        &dense.using,
+                                        &dense.query,
+                                        k,
+                                        None,
+                                        true,
+                                        eff_selectivity_hint,
+                                        ef_override,
+                                    )
+                            },
+                            |ids| {
+                                if !(req.with_payload && req.with_channel_points) {
+                                    return nodes_present_be(&storage, &r, ids);
+                                }
+                                // The channel's reply reads these payloads
+                                // anyway: that one read answers this too.
+                                let mut payloads = request_payload_cache.lock();
+                                let loaded = payloads
+                                    .get_or_load(&name, &storage, &r, ids.iter().copied())
+                                    .ok()??;
+                                Some(
+                                    ids.iter()
+                                        .map(|id| {
+                                            loaded.contains_key(id)
+                                                || pending_point(&name, *id).is_some()
+                                        })
+                                        .collect(),
+                                )
+                            },
+                        ),
+                    }
+                }
+                .map_err(GraphError::from)?;
+                record_qdrant_query_stage(
                     &name,
                     ENDPOINT,
                     backend,
                     query_kind_label,
-                    "bad_request",
-                    request_start,
+                    "hybrid_dense_search",
+                    search_start,
                 );
-                return json_err(response, 400, "Sparse query vector must not be empty");
-            }
-            if sparse.query.indices.len() != sparse.query.values.len() {
-                record_qdrant_query_outcome(
-                    &name,
-                    ENDPOINT,
-                    backend,
-                    query_kind_label,
-                    "bad_request",
-                    request_start,
-                );
-                return json_err(
-                    response,
-                    400,
-                    "Sparse query vector indices and values must have the same length",
-                );
-            }
-            let eff_filter: &Filter = sparse.filter.as_ref().unwrap_or(&filter);
-            let eff_has_filter = !eff_filter.is_empty();
-            let channel_filter_start = Instant::now();
-            let eff_indexed_candidates = if sparse.filter.is_some() {
-                vector_query_indexed_filter_candidates_be_probed(
-                    &storage,
-                    &r,
-                    eff_filter,
-                    filter_count_probe_enabled(),
-                )?
-                .candidates
-            } else {
-                indexed_candidates.clone()
-            };
-            record_qdrant_query_stage(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_sparse_filter_candidates",
-                channel_filter_start,
-            );
-            if let Some(candidates) = &eff_indexed_candidates {
                 record_qdrant_query_count(
+                    &name,
+                    ENDPOINT,
+                    backend,
+                    query_kind_label,
+                    "search_results_raw",
+                    results.len(),
+                );
+                results.truncate(dense.limit);
+                let score_start = Instant::now();
+                for result in &mut results {
+                    if let Some(distance) = result.distance {
+                        result.distance = Some(
+                            storage
+                                .named_vectors
+                                .public_score(&dense.using, distance)
+                                .map_err(GraphError::from)?,
+                        );
+                    }
+                }
+                record_qdrant_query_stage(
+                    &name,
+                    ENDPOINT,
+                    backend,
+                    query_kind_label,
+                    "hybrid_dense_score_normalize",
+                    score_start,
+                );
+                let fuse_start = Instant::now();
+                fuse_pending_dense_results(
+                    &name,
+                    eff_filter,
+                    &dense.using,
+                    &dense.query,
+                    dense.limit,
+                    &mut results,
+                );
+                record_qdrant_query_stage(
+                    &name,
+                    ENDPOINT,
+                    backend,
+                    query_kind_label,
+                    "hybrid_dense_pending_fuse",
+                    fuse_start,
+                );
+                record_qdrant_query_count(
+                    &name,
+                    ENDPOINT,
+                    backend,
+                    query_kind_label,
+                    "hybrid_dense_results",
+                    results.len(),
+                );
+                if collect_mmr_vectors {
+                    for vector in &results {
+                        dense_vectors
+                            .entry(vector.id)
+                            .or_insert_with(|| vector.get_data().to_vec());
+                    }
+                }
+                if req.with_channel_points {
+                    let response_start = Instant::now();
+                    let mut request_payload_cache = request_payload_cache.lock();
+                    let payload_cache = if req.with_payload {
+                        request_payload_cache
+                            .get_or_load(&name, &storage, &r, results.iter().map(|v| v.id))
+                            .map_err(graph_error_from_backend_error)?
+                    } else {
+                        None
+                    };
+                    let points: Vec<serde_json::Value> = results
+                        .iter()
+                        .map(|v| {
+                            query_point_json_be(
+                                &name,
+                                &storage,
+                                &r,
+                                v.id,
+                                v.distance.unwrap_or(0.0) as f64,
+                                req.with_payload,
+                                payload_cache,
+                            )
+                        })
+                        .collect();
+                    record_qdrant_query_stage(
+                        &name,
+                        ENDPOINT,
+                        backend,
+                        query_kind_label,
+                        "hybrid_dense_channel_response",
+                        response_start,
+                    );
+                    dense_channels.push(serde_json::json!({
+                        "using": dense.using,
+                        "points": points,
+                    }));
+                }
+                ranked_lists.push(
+                    results
+                        .into_iter()
+                        .map(|v| RankedItem {
+                            id: v.id,
+                            score: v.distance.unwrap_or(0.0) as f64,
+                        })
+                        .collect(),
+                );
+            }
+            Ok(())
+        };
+
+        let run_sparse = |r: &AnyRead<'_>| -> Result<
+            (Vec<Vec<RankedItem>>, Vec<serde_json::Value>),
+            HybridChannelError,
+        > {
+            let mut ranked_lists: Vec<Vec<RankedItem>> = Vec::new();
+            let mut sparse_channels: Vec<serde_json::Value> = Vec::new();
+            for sparse in &req.sparse {
+                if sparse.query.indices.is_empty() || sparse.query.values.is_empty() {
+                    return Err(HybridChannelError::BadRequest(
+                        "Sparse query vector must not be empty",
+                    ));
+                }
+                if sparse.query.indices.len() != sparse.query.values.len() {
+                    return Err(HybridChannelError::BadRequest(
+                        "Sparse query vector indices and values must have the same length",
+                    ));
+                }
+                let eff_filter: &Filter = sparse.filter.as_ref().unwrap_or(&filter);
+                let eff_has_filter = !eff_filter.is_empty();
+                let channel_filter_start = Instant::now();
+                // Borrow the request-level set; only a channel filter owns one.
+                let channel_probe = if sparse.filter.is_some() {
+                    Some(vector_query_indexed_filter_candidates_be_probed(
+                        &storage,
+                        r,
+                        eff_filter,
+                        filter_count_probe_enabled(),
+                    )?)
+                } else {
+                    None
+                };
+                let (eff_indexed_candidates, eff_prefilter, eff_exact) = match &channel_probe {
+                    Some(probe) => (
+                        probe.candidates.as_ref(),
+                        probe.prefilter.as_ref(),
+                        probe.exact,
+                    ),
+                    None => (
+                        indexed_candidates.as_ref(),
+                        prefilter.as_ref(),
+                        candidates_exact,
+                    ),
+                };
+                record_qdrant_query_stage(
                     &name,
                     ENDPOINT,
                     backend,
                     query_kind_label,
                     "hybrid_sparse_filter_candidates",
-                    candidates.len(),
+                    channel_filter_start,
                 );
-            }
-            let eff_filter_index_exact = eff_indexed_candidates.is_some()
-                && indexed_filter_candidates_are_exact(&storage, eff_filter);
-            let eff_filter_recheck_required = eff_has_filter && !eff_filter_index_exact;
-            let filter_fn = |doc_id: u128| -> bool {
                 if let Some(candidates) = &eff_indexed_candidates {
-                    if !candidates.contains(&doc_id) {
-                        return false;
-                    }
+                    record_qdrant_query_count(
+                        &name,
+                        ENDPOINT,
+                        backend,
+                        query_kind_label,
+                        "hybrid_sparse_filter_candidates",
+                        candidates.len(),
+                    );
                 }
-                if !eff_filter_recheck_required {
-                    return true;
-                }
-                match storage.get_node_be(&r, &doc_id) {
-                    Ok(node) => eff_filter.matches_point(Some(doc_id), &node.properties),
-                    Err(_) => false,
-                }
-            };
-            let search_limit = if eff_has_filter || eff_indexed_candidates.is_some() {
-                sparse.limit.saturating_mul(4)
-            } else {
-                sparse.limit
-            };
-            let query = SparseVector {
-                indices: sparse.query.indices.clone(),
-                values: sparse.query.values.clone(),
-            };
-            let eff_total_vectors = eff_indexed_candidates
-                .as_ref()
-                .map(|_| collection_vector_count_be(&storage))
-                .unwrap_or(0);
-            let candidate_start = Instant::now();
-            let exact_candidate_ids = bounded_filter_candidate_ids_be(
-                &storage,
-                &r,
-                eff_indexed_candidates.as_ref(),
-                eff_filter,
-                eff_filter_recheck_required,
-                eff_total_vectors,
-            );
-            record_qdrant_query_stage(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_sparse_candidate_plan",
-                candidate_start,
-            );
-            if let Some(candidate_ids) = &exact_candidate_ids {
-                record_qdrant_query_count(
-                    &name,
-                    ENDPOINT,
-                    backend,
-                    query_kind_label,
-                    "exact_candidate_ids",
-                    candidate_ids.len(),
-                );
-            }
-            let search_start = Instant::now();
-            let mut results = storage
-                .named_vectors
-                .with_sparse_core(&sparse.using, |core| {
-                    if let Some(candidate_ids) = exact_candidate_ids.as_ref() {
-                        core.search_candidate_ids_exact_be(
-                            &r,
-                            &query,
-                            search_limit,
-                            candidate_ids.iter().copied(),
-                        )
-                    } else {
-                        core.search_be(&r, &query, search_limit, Some(&filter_fn))
-                    }
-                })
-                .map_err(GraphError::from)?;
-            record_qdrant_query_stage(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_sparse_search",
-                search_start,
-            );
-            record_qdrant_query_count(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "search_results_raw",
-                results.len(),
-            );
-            results.truncate(sparse.limit);
-            let fuse_start = Instant::now();
-            fuse_pending_sparse_results(
-                &name,
-                eff_filter,
-                &sparse.using,
-                &query,
-                sparse.limit,
-                &mut results,
-            );
-            record_qdrant_query_stage(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_sparse_pending_fuse",
-                fuse_start,
-            );
-            record_qdrant_query_count(
-                &name,
-                ENDPOINT,
-                backend,
-                query_kind_label,
-                "hybrid_sparse_results",
-                results.len(),
-            );
-            if req.with_channel_points {
-                let response_start = Instant::now();
-                let payload_cache = if req.with_payload {
-                    request_payload_cache
-                        .get_or_load(&name, &storage, &r, results.iter().map(|(id, _)| *id))
-                        .map_err(graph_error_from_backend_error)?
-                } else {
-                    None
+                let eff_filter_index_exact =
+                    (eff_indexed_candidates.is_some() || eff_prefilter.is_some()) && eff_exact;
+                let eff_filter_recheck_required = eff_has_filter && !eff_filter_index_exact;
+                let doc_filter = SparseDocFilter {
+                    storage: &storage,
+                    r,
+                    filter: eff_filter,
+                    candidates: eff_indexed_candidates.or(eff_prefilter),
+                    recheck: eff_filter_recheck_required,
+                    failure: OnceLock::new(),
                 };
-                let points: Vec<serde_json::Value> = results
-                    .iter()
-                    .map(|(id, score)| {
-                        query_point_json_be(
-                            &name,
-                            &storage,
-                            &r,
-                            *id,
-                            *score,
-                            req.with_payload,
-                            payload_cache,
-                        )
-                    })
-                    .collect();
+                let search_limit = sparse_search_limit(
+                    sparse.limit,
+                    eff_has_filter || eff_indexed_candidates.is_some(),
+                );
+                let query = SparseVector {
+                    indices: sparse.query.indices.clone(),
+                    values: sparse.query.values.clone(),
+                };
+                let eff_total_vectors = eff_indexed_candidates
+                    .as_ref()
+                    .map(|_| collection_vector_count_be(&storage))
+                    .unwrap_or(0);
+                let candidate_start = Instant::now();
+                // Exact-scored candidates are rechecked lazily, best-first.
+                let lazy_recheck = eff_filter_recheck_required && sparse_lazy_filter_enabled();
+                let exact_candidate_ids = bounded_filter_candidate_ids_be(
+                    &storage,
+                    r,
+                    eff_indexed_candidates,
+                    eff_filter,
+                    eff_filter_recheck_required && !lazy_recheck,
+                    eff_total_vectors,
+                );
                 record_qdrant_query_stage(
                     &name,
                     ENDPOINT,
                     backend,
                     query_kind_label,
-                    "hybrid_sparse_channel_response",
-                    response_start,
+                    "hybrid_sparse_candidate_plan",
+                    candidate_start,
                 );
-                sparse_channels.push(serde_json::json!({
-                    "using": sparse.using,
-                    "points": points,
-                }));
+                if let Some(candidate_ids) = &exact_candidate_ids {
+                    record_qdrant_query_count(
+                        &name,
+                        ENDPOINT,
+                        backend,
+                        query_kind_label,
+                        "exact_candidate_ids",
+                        candidate_ids.len(),
+                    );
+                }
+                let search_start = Instant::now();
+                let mut results = storage
+                    .named_vectors
+                    .with_sparse_core(&sparse.using, |core| {
+                        if let Some(candidate_ids) = exact_candidate_ids.as_ref() {
+                            core.search_candidate_ids_exact_filtered_be(
+                                r,
+                                &query,
+                                search_limit,
+                                candidate_ids.iter().copied(),
+                                lazy_recheck.then_some(&doc_filter),
+                            )
+                        } else {
+                            core.search_be_with(
+                                r,
+                                &query,
+                                search_limit,
+                                Some(&doc_filter),
+                                eff_filter_recheck_required && sparse_lazy_filter_enabled(),
+                            )
+                        }
+                    })
+                    .map_err(GraphError::from)?;
+                record_qdrant_query_stage(
+                    &name,
+                    ENDPOINT,
+                    backend,
+                    query_kind_label,
+                    "hybrid_sparse_search",
+                    search_start,
+                );
+                record_qdrant_query_count(
+                    &name,
+                    ENDPOINT,
+                    backend,
+                    query_kind_label,
+                    "search_results_raw",
+                    results.len(),
+                );
+                results.truncate(sparse.limit);
+                let fuse_start = Instant::now();
+                fuse_pending_sparse_results(
+                    &name,
+                    eff_filter,
+                    &sparse.using,
+                    &query,
+                    sparse.limit,
+                    &mut results,
+                );
+                record_qdrant_query_stage(
+                    &name,
+                    ENDPOINT,
+                    backend,
+                    query_kind_label,
+                    "hybrid_sparse_pending_fuse",
+                    fuse_start,
+                );
+                record_qdrant_query_count(
+                    &name,
+                    ENDPOINT,
+                    backend,
+                    query_kind_label,
+                    "hybrid_sparse_results",
+                    results.len(),
+                );
+                if req.with_channel_points {
+                    let response_start = Instant::now();
+                    let mut request_payload_cache = request_payload_cache.lock();
+                    let payload_cache = if req.with_payload {
+                        request_payload_cache
+                            .get_or_load(&name, &storage, r, results.iter().map(|(id, _)| *id))
+                            .map_err(graph_error_from_backend_error)?
+                    } else {
+                        None
+                    };
+                    let points: Vec<serde_json::Value> = results
+                        .iter()
+                        .map(|(id, score)| {
+                            query_point_json_be(
+                                &name,
+                                &storage,
+                                r,
+                                *id,
+                                *score,
+                                req.with_payload,
+                                payload_cache,
+                            )
+                        })
+                        .collect();
+                    record_qdrant_query_stage(
+                        &name,
+                        ENDPOINT,
+                        backend,
+                        query_kind_label,
+                        "hybrid_sparse_channel_response",
+                        response_start,
+                    );
+                    sparse_channels.push(serde_json::json!({
+                        "using": sparse.using,
+                        "points": points,
+                    }));
+                }
+                ranked_lists.push(
+                    results
+                        .into_iter()
+                        .map(|(id, score)| RankedItem { id, score })
+                        .collect(),
+                );
             }
-            ranked_lists.push(
-                results
-                    .into_iter()
-                    .map(|(id, score)| RankedItem { id, score })
-                    .collect(),
-            );
-        }
+            Ok((ranked_lists, sparse_channels))
+        };
+
+        // With both kinds of channel in the request, the sparse loop gets a
+        // helper thread and its own handle on the same snapshot (a read handle
+        // cannot be shared across threads) and runs beside the dense loop.
+        let sparse_thread_read = if hybrid_parallel_channels_enabled()
+            && !req.dense.is_empty()
+            && !req.sparse.is_empty()
+        {
+            match &r {
+                AnyRead::Lsm(read) => Some((Some(read.clone()), None)),
+                AnyRead::LsmReader(snapshot) => Some((None, snapshot.clone())),
+                AnyRead::Lmdb(_) | AnyRead::Failed(_) => None,
+            }
+        } else {
+            None
+        };
+        let channels = match sparse_thread_read {
+            Some((lsm_read, reader_snapshot)) => run_dense_beside_sparse(run_dense, || {
+                let local_read = match &lsm_read {
+                    Some(read) => AnyRead::Lsm(read.clone()),
+                    None => AnyRead::LsmReader(reader_snapshot.clone()),
+                };
+                run_sparse(&local_read)
+            })
+            .map(|((), sparse)| sparse),
+            None => run_dense().and_then(|()| run_sparse(&r)),
+        };
+        let (sparse_ranked_lists, sparse_channels) = match channels {
+            Ok(sparse) => sparse,
+            Err(HybridChannelError::BadRequest(message)) => {
+                record_qdrant_query_outcome(
+                    &name,
+                    ENDPOINT,
+                    backend,
+                    query_kind_label,
+                    "bad_request",
+                    request_start,
+                );
+                return json_err(response, 400, message);
+            }
+            Err(HybridChannelError::Failed(error)) => return Err(error),
+        };
+        ranked_lists.extend(sparse_ranked_lists);
+        let mut request_payload_cache = request_payload_cache.into_inner();
 
         let mut graph_summary: Option<serde_json::Value> = None;
         let mut graph_channels: Vec<serde_json::Value> = Vec::new();
@@ -9710,6 +11322,97 @@ fn query_point_json_be(
     point
 }
 
+/// Whether each id has a node, from one batched read. `None` where there is
+/// no such read (LMDB) or it failed: the caller then goes on unchecked.
+fn nodes_present_be(
+    storage: &HelixGraphStorage,
+    r: &AnyRead<'_>,
+    ids: &[u128],
+) -> Option<Vec<bool>> {
+    if ids.is_empty() {
+        return Some(Vec::new());
+    }
+    let keys: Vec<Vec<u8>> = ids.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+    let values = match (&*storage.backend, r) {
+        (AnyBackend::Lsm(writer), AnyRead::Lsm(read)) => {
+            writer.collect_values_many_with(read, Namespace::Nodes, &keys)
+        }
+        (AnyBackend::LsmReader(reader), AnyRead::LsmReader(snap)) => {
+            reader.collect_values_many_with_at(snap.as_ref(), Namespace::Nodes, &keys)
+        }
+        _ => return None,
+    }
+    .ok()?;
+    (values.len() == ids.len()).then(|| values.iter().map(Option::is_some).collect())
+}
+
+/// `HELIX_DENSE_SEARCH_POINT_CHECK=0` puts unfiltered dense searches back to
+/// returning every row they find, with or without a point.
+fn dense_search_point_check_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("HELIX_DENSE_SEARCH_POINT_CHECK")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    })
+}
+
+/// A dense search without a filter can meet rows of points that are gone: a
+/// merge used to republish a point deleted while it was building (see
+/// `merge_windows`), and such a row stays until its segment merges again. It
+/// is no hit, so this leaves it out and has `search` return more until there
+/// are `k` hits with a point or nothing more to return. A filtered search
+/// never returns one: every filter reads the point or takes its ids from a
+/// payload index.
+///
+/// `has_point` says which ids have a node (`None`: it cannot tell, and the
+/// hits go out unchecked). `met_lately` is the collection's count of such
+/// rows in its last searches: a second search costs as much as the first, so
+/// the first asks for that many more than `k`, and none where there are none.
+fn dense_search_live_be(
+    k: usize,
+    met_lately: &std::sync::atomic::AtomicUsize,
+    search: impl Fn(usize) -> Result<Vec<HVector>, crate::helix_engine::types::VectorError>,
+    mut has_point: impl FnMut(&[u128]) -> Option<Vec<bool>>,
+) -> Result<Vec<HVector>, crate::helix_engine::types::VectorError> {
+    use std::sync::atomic::Ordering;
+    if !dense_search_point_check_enabled() {
+        return search(k);
+    }
+    let expected = met_lately.load(Ordering::Relaxed).min(k);
+    let mut checked: HashMap<u128, bool> = HashMap::new();
+    let mut ask = k + 2 * expected;
+    loop {
+        let mut found = search(ask)?;
+        let no_more = found.len() < ask;
+        let unchecked: Vec<u128> = found
+            .iter()
+            .map(|hit| hit.id)
+            .filter(|id| !checked.contains_key(id))
+            .collect();
+        let Some(present) = has_point(&unchecked) else {
+            found.truncate(k);
+            return Ok(found);
+        };
+        checked.extend(unchecked.into_iter().zip(present));
+        found.retain(|hit| checked.get(&hit.id).copied().unwrap_or(true));
+        let gone = checked.values().filter(|present| !**present).count();
+        if found.len() >= k || no_more {
+            found.truncate(k);
+            if gone > 0 {
+                metrics::counter!("helix_dense_search_nodeless_hits_total").increment(gone as u64);
+            }
+            // A maximum that fades by an eighth a search.
+            met_lately.store(gone.max(expected - expected.div_ceil(8)), Ordering::Relaxed);
+            return Ok(found);
+        }
+        // Short of `k` only by rows now known to be gone, more than twice as
+        // many as the search allowed for: allow for twice what it met.
+        ask = k + 2 * gone;
+    }
+}
+
 #[derive(Default)]
 struct RequestPayloadCache {
     payloads: HashMap<u128, serde_json::Value>,
@@ -10339,12 +12042,8 @@ fn fetch_named_vectors_be(
         return serde_json::Value::Object(out);
     }
     let spaces = storage.named_vectors.list_dense_vector_spaces();
-    let cores = match storage.named_vectors.cores_read() {
-        Ok(c) => c,
-        Err(_) => return serde_json::Value::Object(out),
-    };
     for name in names {
-        let Some(space) = spaces.get(name) else {
+        if !spaces.contains_key(name) {
             if let Ok(Some(sv)) = storage
                 .named_vectors
                 .with_sparse_core(name, |core| core.get_doc_vector_be(r, id))
@@ -10355,24 +12054,11 @@ fn fetch_named_vectors_be(
                 );
             }
             continue;
-        };
-        let mut found: Option<Vec<f32>> = None;
-        for seg in &space.segments {
-            let Some(core) = cores.get(&seg.physical_name) else {
-                continue;
-            };
-            match core.get_vector(r, id, 0, true) {
-                Ok(hv) => {
-                    let data = hv.get_data();
-                    if !data.is_empty() {
-                        found = Some(data.to_vec());
-                        break;
-                    }
-                }
-                Err(_) => continue,
-            }
         }
-        if let Some(vec) = found {
+        // The copy search serves, not the first in creation order: a point
+        // rewritten before old rows were removed at write time has an older
+        // copy in an earlier segment.
+        if let Some(vec) = storage.named_vectors.stored_dense_vector_be(r, name, id) {
             out.insert(name.clone(), serde_json::json!(vec));
         }
     }
@@ -10386,6 +12072,29 @@ fn json_payload_to_value_map(
         .iter()
         .map(|(k, v)| (k.clone(), json_to_value(v)))
         .collect()
+}
+
+/// Keyword-index lookup value for a `match.value` / `match.any` operand.
+/// Payloads store JSON `null` as the string `"null"` (`json_to_value`), which
+/// `matches_point` never equals to a `null` operand (`Value::Empty`); looking
+/// up `"null"` made the planner treat those points as matches, so a
+/// `must_not` on `null` dropped them and a `must` on `null` returned them.
+/// Everything else converts as payloads do, so numbers keep the keys they
+/// are stored under (an integer above i64::MAX is stored as its f64).
+fn match_lookup_value(v: &serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Empty,
+        serde_json::Value::Array(values) => {
+            Value::Array(values.iter().map(match_lookup_value).collect())
+        }
+        serde_json::Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), match_lookup_value(value)))
+                .collect(),
+        ),
+        _ => json_to_value(v),
+    }
 }
 
 fn json_to_value(v: &serde_json::Value) -> Value {
@@ -10557,7 +12266,9 @@ mod tests {
     };
     use crate::helix_engine::vector_core::named_vectors::{DistanceMetric, NamedVectorConfig};
     use crate::helix_engine::vector_core::spindle::SpindleConfig;
-    use crate::helix_engine::vector_core::vector_core::HNSWConfig;
+    use crate::helix_engine::vector_core::vector_core::{
+        broad_scan_completions_for_test, HNSWConfig,
+    };
     use crate::helix_gateway::api::graph::handle_rebuild_adjacency_for_paths;
     use crate::helix_gateway::router::router::HandlerInput;
     use crate::protocol::request::Request;
@@ -10647,6 +12358,56 @@ mod tests {
             replication: std::sync::Arc::clone(&ctx.replication),
             path_params,
         }
+    }
+
+    /// A drop that failed before teardown left the collection in place. The
+    /// handler hands the error to the router (503, retryable) instead of
+    /// answering 404, which clients read as "already absent".
+    #[test]
+    #[serial]
+    fn failed_collection_drop_is_not_answered_as_absent() {
+        use crate::helix_engine::storage_core::backend::{
+            LsmRole, LsmStorage, StorageBackendConfig,
+        };
+        use crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store;
+
+        struct ClearOnDrop(&'static str);
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+
+        let _store =
+            set_lsm_test_object_store(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let ctx = setup_with_config(Config::default().with_storage_backend(
+            StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Writer,
+            },
+        ));
+        // A local collection directory makes the drop write its tombstone first.
+        let local = ctx._tmp.path().join("data/collections/kept");
+        std::fs::create_dir_all(&local).unwrap();
+        let input = make_input(
+            &ctx,
+            "DELETE",
+            "/collections/kept",
+            Vec::new(),
+            HashMap::from([("name".into(), "kept".into())]),
+        );
+        let mut response = Response::new();
+
+        std::env::set_var("HELIX_LSM_TEST_FAIL_TOMBSTONE_WRITE", "1");
+        let _clear = ClearOnDrop("HELIX_LSM_TEST_FAIL_TOMBSTONE_WRITE");
+        let dropped = handle_delete_collection(&input, &mut response);
+
+        assert!(
+            matches!(dropped, Err(GraphError::PurgePending(_))),
+            "a failed drop must reach the router as its error: {dropped:?}"
+        );
+        assert_ne!(response.status, 404);
+        assert!(local.exists(), "the failed drop tore the collection down");
     }
 
     fn wait_for_payload_index_ready(ctx: &TestContext, collection: &str, field: &str) {
@@ -10989,6 +12750,97 @@ mod tests {
         assert_eq!(payload["metadata"]["_graph_backfilled"], true);
         assert!(
             payload.get("_graph_backfilled").is_none() || payload["_graph_backfilled"].is_null()
+        );
+    }
+
+    /// A set_payload commit is flushed at once instead of waiting for the next
+    /// WAL flush tick, and is on the object store when the request returns:
+    /// one WAL object per request either way.
+    /// `HELIX_LSM_FLUSH_POINT_WRITES=0` waits for the tick again.
+    #[test]
+    #[serial]
+    fn point_write_flush_makes_set_payload_durable_without_a_wal_tick() {
+        use crate::helix_engine::storage_core::backend::{
+            LsmRole, LsmStorage, StorageBackendConfig,
+        };
+        use crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store;
+        use futures::TryStreamExt;
+
+        const SWITCH: &str = "HELIX_LSM_FLUSH_POINT_WRITES";
+        const INTERVAL: &str = "HELIX_LSM_FLUSH_INTERVAL_MS";
+        let previous = [SWITCH, INTERVAL].map(|key| (key, std::env::var_os(key)));
+        std::env::set_var(INTERVAL, "200");
+        let store: std::sync::Arc<dyn object_store::ObjectStore> =
+            std::sync::Arc::new(object_store::memory::InMemory::new());
+        let _store = set_lsm_test_object_store(std::sync::Arc::clone(&store));
+        let ctx = setup_with_config(Config::default().with_storage_backend(
+            StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Writer,
+            },
+        ));
+        ctx.collections.create_collection("payload_flush").unwrap();
+        upsert_points(
+            &ctx,
+            "payload_flush",
+            serde_json::json!([{"id": 1, "payload": {"path": "a"}}]),
+        );
+        let wal_objects = || {
+            futures::executor::block_on(store.list(None).try_collect::<Vec<_>>())
+                .unwrap()
+                .iter()
+                .filter(|object| object.location.as_ref().contains("/wal/"))
+                .count()
+        };
+        // (elapsed, WAL objects written) for five requests in a row.
+        let five_patches = |switch_off: bool, first_round: i64| {
+            if switch_off {
+                std::env::set_var(SWITCH, "0");
+            } else {
+                std::env::remove_var(SWITCH);
+            }
+            let before = wal_objects();
+            let started = Instant::now();
+            for round in first_round..first_round + 5 {
+                let input = make_input(
+                    &ctx,
+                    "POST",
+                    "/collections/payload_flush/points/payload",
+                    sonic_rs::to_vec(
+                        &sonic_rs::json!({"payload": {"round": round}, "points": [1]}),
+                    )
+                    .unwrap(),
+                    HashMap::from([("name".into(), "payload_flush".into())]),
+                );
+                let mut response = Response::new();
+                handle_set_payload(&input, &mut response).unwrap();
+                assert_eq!(response.status, 200);
+            }
+            (started.elapsed(), wal_objects() - before)
+        };
+        let waited = five_patches(true, 0);
+        // The request above returned on a WAL tick, so the next tick is a whole
+        // interval away: the WAL objects written here are these requests' own.
+        let flushed = five_patches(false, 5);
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        let scroll = run_scroll(&ctx, "payload_flush", serde_json::json!(true));
+        let payload = &scroll["result"]["points"][0]["payload"];
+        assert_eq!(payload["round"], 9);
+        assert_eq!(payload["path"], "a");
+        assert!(waited.0 >= Duration::from_millis(600), "{waited:?}");
+        assert!(
+            flushed.0 * 3 < waited.0,
+            "waited {waited:?}, flushed {flushed:?}"
+        );
+        assert!(
+            flushed.1 >= 5 && flushed.1 <= waited.1,
+            "a WAL object per request: waited {waited:?}, flushed {flushed:?}"
         );
     }
 
@@ -11525,7 +13377,11 @@ mod tests {
             let txn = storage.begin_resize_safe_read_txn().unwrap();
             execute_point_scan(&storage, &txn, &opts).unwrap()
         };
-        assert!(matches!(scan.plan, PointScanPlan::IndexedCandidates));
+        // The keyword's rows: a page's window of them on the LSM writer.
+        assert!(matches!(
+            scan.plan,
+            PointScanPlan::IndexedCandidates | PointScanPlan::IndexedWindow
+        ));
         assert_eq!(
             scan.points.len(),
             8,
@@ -11620,17 +13476,23 @@ mod tests {
             fuse_pending: true,
         };
         let r = storage.backend.begin_read().unwrap();
-        let scan = execute_point_scan_be(&storage, &r, &opts).unwrap();
-        assert!(matches!(scan.plan, PointScanPlan::IndexedCandidates));
-        assert!(
-            scan.budget_exhausted,
-            "an indexed page must stop at its own deadline"
-        );
-        assert!(scan.points.len() < 8);
-        assert!(
-            scan.next_offset.is_some(),
-            "a cut page must hand back a resume offset"
-        );
+        // The keyword's rows as a page's window, and as the whole list.
+        for (window, plan) in [(true, "indexed_window"), (false, "indexed_candidates")] {
+            let scan = with_scan_page_window_for_test(window, || {
+                execute_point_scan_be(&storage, &r, &opts)
+            })
+            .unwrap();
+            assert_eq!(scan.plan.as_str(), plan);
+            assert!(
+                scan.budget_exhausted,
+                "an indexed page must stop at its own deadline ({plan})"
+            );
+            assert!(scan.points.len() < 8, "{plan}");
+            assert!(
+                scan.next_offset.is_some(),
+                "a cut page must hand back a resume offset ({plan})"
+            );
+        }
     }
 
     #[test]
@@ -12673,6 +14535,143 @@ mod tests {
         assert_text_walk_cap(&text_walk_ctx(&ctx));
     }
 
+    fn text_walk(storage: &HelixGraphStorage, text: &str) -> Option<(Vec<u128>, bool)> {
+        let r = storage.backend.begin_read().unwrap();
+        storage
+            .get_nodes_by_payload_text_exact_be(&r, "sym", text, 0)
+            .unwrap()
+    }
+
+    /// One value longer than a raw index key used to end the walk with no
+    /// answer, so every text lookup on that field became a paged scan.
+    #[test]
+    fn text_walk_keeps_values_too_long_for_a_raw_key_as_candidates_lsm() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = text_walk_ctx(&ctx);
+        let long = |tail: &str| format!("{}{tail}", "x::".repeat(200));
+        upsert_points(
+            &ctx,
+            "tw",
+            serde_json::json!([
+                {"id": 6, "payload": {"sym": long("VectorError"), "repo": "a"}},
+                {"id": 7, "payload": {"sym": long("Other"), "repo": "a"}},
+            ]),
+        );
+        // The index holds only a hash of 6 and 7, so both stay candidates.
+        assert_eq!(
+            text_walk(&storage, "vectorerror"),
+            Some((vec![1, 2, 3, 6, 7], false))
+        );
+        let filter = Filter {
+            must: vec![text_cond("sym", "vectorerror")],
+            ..Default::default()
+        };
+        let r = storage.backend.begin_read().unwrap();
+        let scan = execute_point_scan_be(&storage, &r, &scan_opts(&filter, 10, 0)).unwrap();
+        assert!(matches!(scan.plan, PointScanPlan::IndexedCandidates));
+        assert_eq!(scan.index_candidates, Some(5));
+        // The recheck reads the stored value: 6 contains the text, 7 does not.
+        assert_eq!(scan_ids(&scan), vec![1, 2, 3, 6]);
+        assert!(scan.next_offset.is_none());
+        // As an exclusion the walk is not exact, so nothing is subtracted
+        // from repo=a (1, 4, 6, 7) and the recheck drops 1 and 6.
+        let filter = Filter {
+            must: vec![keyword_cond("repo", "a")],
+            must_not: vec![text_cond("sym", "vectorerror")],
+            ..Default::default()
+        };
+        let (ids, exact) = indexed_filter_ids_be(&storage, &r, &filter, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!((ids.len(), exact), (4, false));
+        let scan = execute_point_scan_be(&storage, &r, &scan_opts(&filter, 10, 0)).unwrap();
+        assert_eq!(scan_ids(&scan), vec![4, 7]);
+    }
+
+    #[test]
+    fn text_walk_cache_reuses_a_snapshot_walk_and_sees_later_writes_lsm() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = text_walk_ctx(&ctx);
+        let first = text_walk(&storage, "vectorerror");
+        assert_eq!(
+            first.as_ref().map(|(ids, _)| ids.clone()),
+            Some(vec![1, 2, 3])
+        );
+        let (entries, hits) = storage.text_walk_cache_stats();
+        assert_eq!(text_walk(&storage, "vectorerror"), first);
+        assert_eq!(
+            storage.text_walk_cache_stats(),
+            (entries, hits + 1),
+            "an unchanged snapshot sequence reuses the walk"
+        );
+        assert_eq!(
+            text_walk(&storage, "VectorError").map(|(ids, _)| ids),
+            Some(vec![1, 2, 3]),
+            "needles are keyed verbatim"
+        );
+
+        upsert_points(
+            &ctx,
+            "tw",
+            serde_json::json!([
+                {"id": 6, "payload": {"sym": "VectorErrorKind", "repo": "a"}},
+                {"id": 2, "payload": {"sym": "Renamed", "repo": "b"}},
+            ]),
+        );
+        let (_, hits) = storage.text_walk_cache_stats();
+        assert_eq!(
+            text_walk(&storage, "vectorerror").map(|(ids, _)| ids),
+            Some(vec![1, 3, 6]),
+            "a write moves the snapshot sequence, so the walk reflects it"
+        );
+        assert_eq!(storage.text_walk_cache_stats().1, hits, "no stale hit");
+    }
+
+    #[test]
+    fn text_walk_cache_is_dropped_with_a_rebuilt_index_lsm() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = text_walk_ctx(&ctx);
+        assert_eq!(
+            text_walk(&storage, "vectorerror").map(|(ids, _)| ids),
+            Some(vec![1, 2, 3])
+        );
+        storage.delete_payload_index("sym").unwrap();
+        storage
+            .create_payload_index("sym", PayloadIndexSchema::Keyword)
+            .unwrap();
+        wait_for_payload_index_ready(&ctx, "tw", "sym");
+        let (_, hits) = storage.text_walk_cache_stats();
+        assert_eq!(
+            text_walk(&storage, "vectorerror").map(|(ids, _)| ids),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(
+            storage.text_walk_cache_stats().1,
+            hits,
+            "a rebuilt index is a new handle: walk it again"
+        );
+    }
+
+    #[test]
+    fn cached_text_walk_still_honours_a_smaller_walk_cap_lsm() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = text_walk_ctx(&ctx);
+        assert!(text_walk(&storage, "vectorerror").is_some());
+        let r = storage.backend.begin_read().unwrap();
+        let (_, hits) = storage.text_walk_cache_stats();
+        assert_eq!(
+            storage
+                .get_nodes_by_payload_text_exact_be(&r, "sym", "vectorerror", 2)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            storage.text_walk_cache_stats().1,
+            hits + 1,
+            "answered from the cache"
+        );
+    }
+
     #[test]
     fn text_walk_cap_returns_none_lmdb() {
         let ctx = setup();
@@ -12744,11 +14743,12 @@ mod tests {
     }
 
     /// A value whose encoding exceeds the raw-key limit is stored under a
-    /// hashed `\xffhxk1` key that cannot be decoded for substring matching:
-    /// the walk must abstain (None) and the query must still be answered
-    /// correctly by the recheck scan.
+    /// hashed `\xffhxk1` key that cannot be decoded for substring matching.
+    /// The backend walk keeps its ids as candidates and the recheck answers
+    /// the query; the LMDB heed walk, which cannot flag its result as inexact,
+    /// still abstains.
     #[test]
-    fn text_walk_abstains_on_hashed_keys_and_recheck_stays_correct() {
+    fn text_walk_keeps_hashed_keys_as_candidates_and_recheck_stays_correct() {
         for lsm in [false, true] {
             let ctx = if lsm {
                 setup_with_config(Config::default().with_lsm_in_memory())
@@ -12775,17 +14775,17 @@ mod tests {
             let r = storage.backend.begin_read().unwrap();
             assert_eq!(
                 storage
-                    .get_nodes_by_payload_text_be(&r, "sym", "vectorerror", 0)
+                    .get_nodes_by_payload_text_exact_be(&r, "sym", "vectorerror", 0)
                     .unwrap(),
-                None,
-                "hashed key must make the walk abstain (lsm={lsm})"
+                Some((vec![1, 2, 3, 9], false)),
+                "a hashed key is an inexact candidate (lsm={lsm})"
             );
             let filter = Filter {
                 must: vec![text_cond("sym", "VectorError")],
                 ..Default::default()
             };
             let scan = execute_point_scan_be(&storage, &r, &scan_opts(&filter, 10, 0)).unwrap();
-            assert!(matches!(scan.plan, PointScanPlan::Primary));
+            assert!(matches!(scan.plan, PointScanPlan::IndexedCandidates));
             assert_eq!(scan_ids(&scan), vec![1, 2, 3, 9], "recheck (lsm={lsm})");
             assert!(scan.next_offset.is_none());
         }
@@ -13572,12 +15572,22 @@ mod tests {
             fuse_pending: false,
         };
         let r = storage.backend.begin_read().unwrap();
-        let scan = execute_point_scan_be(&storage, &r, &opts).unwrap();
-
-        assert!(matches!(scan.plan, PointScanPlan::IndexedCandidates));
-        assert_eq!(scan.scanned, 1);
-        assert_eq!(scan.returned, 1);
-        assert_eq!(scan.index_candidates, Some(1));
+        // The symbol's one row is the only row scanned, taken as the page's
+        // window of the keyword's rows or from the whole list. A window does
+        // not count its list.
+        for (window, plan, candidates) in [
+            (true, "indexed_window", None),
+            (false, "indexed_candidates", Some(1)),
+        ] {
+            let scan = with_scan_page_window_for_test(window, || {
+                execute_point_scan_be(&storage, &r, &opts)
+            })
+            .unwrap();
+            assert_eq!(scan.plan.as_str(), plan);
+            assert_eq!(scan.scanned, 1, "{plan}");
+            assert_eq!(scan.returned, 1, "{plan}");
+            assert_eq!(scan.index_candidates, candidates, "{plan}");
+        }
     }
 
     /// Scan-budget blind spot: `execute_point_scan_be`'s `IndexedCandidates`
@@ -13616,7 +15626,7 @@ mod tests {
             let mut w = storage.backend.begin_write().unwrap();
             for ghost_id in 1_u128..=100_u128 {
                 storage
-                    .index_node_payload_field_be(
+                    .index_node_payload_field_be_unrecorded(
                         &mut w,
                         "metadata.symbol",
                         &PayloadIndexSchema::Keyword,
@@ -13655,30 +15665,40 @@ mod tests {
             fuse_pending: false,
         };
         let r = storage.backend.begin_read().unwrap();
-        let scan = execute_point_scan_be(&storage, &r, &opts).unwrap();
+        // The symbol's rows as the page's window of them, and as the whole
+        // list. A window does not count its list.
+        for (window, plan, candidates) in [
+            (true, "indexed_window", None),
+            (false, "indexed_candidates", Some(101)),
+        ] {
+            let scan = with_scan_page_window_for_test(window, || {
+                execute_point_scan_be(&storage, &r, &opts)
+            })
+            .unwrap();
 
-        assert_eq!(
-            scan.index_candidates,
-            Some(101),
-            "101 candidates: 100 ghosts + 1 real"
-        );
-        assert!(
-            scan.budget_exhausted,
-            "must stop once the scan budget is hit rather than walk the whole ghost run"
-        );
-        assert!(
-            scan.next_cursor.is_some(),
-            "a budget-exhausted page must carry a resumable next_page_offset"
-        );
-        assert!(
-            scan.scanned <= 11,
-            "must not scan far past the budget (max_scan=10, checked after incrementing): scanned={}",
-            scan.scanned
-        );
-        assert!(
-            scan.returned == 0,
-            "the real match (id 1000) sorts after all 100 ghosts, so a budget of 10 must not reach it"
-        );
+            assert_eq!(scan.plan.as_str(), plan);
+            assert_eq!(
+                scan.index_candidates, candidates,
+                "101 candidates: 100 ghosts + 1 real ({plan})"
+            );
+            assert!(
+                scan.budget_exhausted,
+                "must stop once the scan budget is hit rather than walk the whole ghost run ({plan})"
+            );
+            assert!(
+                scan.next_cursor.is_some(),
+                "a budget-exhausted page must carry a resumable next_page_offset ({plan})"
+            );
+            assert!(
+                scan.scanned <= 11,
+                "must not scan far past the budget (max_scan=10, checked after incrementing): scanned={} ({plan})",
+                scan.scanned
+            );
+            assert!(
+                scan.returned == 0,
+                "the real match (id 1000) sorts after all 100 ghosts, so a budget of 10 must not reach it ({plan})"
+            );
+        }
     }
 
     #[test]
@@ -13801,15 +15821,20 @@ mod tests {
         let filter = broad_keyword_filter("broad", "yes");
         let r = storage.backend.begin_read().unwrap();
 
-        // Probe enabled: every point matches broad=yes, so counting aborts at
-        // the broadness cap (12/4 = 3) and materialization is skipped.
-        let probed = search_indexed_filter_candidates_be(&storage, &r, &filter, true).unwrap();
+        // With the broad-exact keep cap disabled (`0`), every point matching
+        // broad=yes makes counting abort at the broadness cap (12/4 = 3) and
+        // materialization is skipped.
+        let probed = dense_filter_candidates_be(&storage, &r, &filter, true, 0, false).unwrap();
         assert!(probed.probe_skipped);
         assert!(probed.candidates.is_none());
         assert_eq!(
             probed.probe_estimate,
             Some(vector_query_broad_candidate_cap(12) + 1)
         );
+        // Default: the filter is index-exact, so the broad set is kept.
+        let kept = search_indexed_filter_candidates_be(&storage, &r, &filter, true).unwrap();
+        assert!(!kept.probe_skipped);
+        assert_eq!(kept.candidates.map(|ids| ids.len()), Some(12));
 
         // Kill switch: materialize-always restores today's behavior.
         let unprobed = search_indexed_filter_candidates_be(&storage, &r, &filter, false).unwrap();
@@ -14035,14 +16060,19 @@ mod tests {
 
         let filter = broad_keyword_filter("scope", "all");
         let r = storage.backend.begin_read().unwrap();
-        let probed =
-            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &filter, true).unwrap();
+        let probed = dense_filter_candidates_be(&storage, &r, &filter, true, 0, true).unwrap();
         assert!(probed.probe_skipped);
         assert!(probed.candidates.is_none());
         assert_eq!(
             probed.probe_estimate,
             Some(vector_query_broad_candidate_cap(12) + 1)
         );
+        // Default keep cap: broad but index-exact, so the set is materialized
+        // and the HTTP query below runs the candidate-set plan.
+        let kept =
+            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &filter, true).unwrap();
+        assert!(!kept.probe_skipped);
+        assert_eq!(kept.candidates.map(|ids| ids.len()), Some(12));
 
         let (status, body) = query_points_raw(
             &ctx,
@@ -14095,10 +16125,13 @@ mod tests {
         let channel_filter = broad_keyword_filter("scope", "channel");
         let r = storage.backend.begin_read().unwrap();
         let probed =
-            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &channel_filter, true)
-                .unwrap();
+            dense_filter_candidates_be(&storage, &r, &channel_filter, true, 0, true).unwrap();
         assert!(probed.probe_skipped);
         assert!(probed.candidates.is_none());
+        let kept =
+            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &channel_filter, true)
+                .unwrap();
+        assert_eq!(kept.candidates.map(|ids| ids.len()), Some(10));
 
         let top_filter = broad_keyword_filter("scope", "top");
         let narrow =
@@ -14151,6 +16184,422 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 400 points on [0, pi) so cosine to [1,0,0] strictly orders them by n;
+    /// `scope` is the same everywhere (a repo-style scope), `path` puts ten
+    /// points in each of 40 files.
+    fn selective_filter_fixture(
+        ctx: &TestContext,
+        name: &str,
+    ) -> std::sync::Arc<HelixGraphStorage> {
+        create_dense_collection_lsm(ctx, name);
+        let points: Vec<serde_json::Value> = (0..400_i64)
+            .map(|n| {
+                let angle = (n as f32 * 0.37) % std::f32::consts::PI;
+                serde_json::json!({
+                    "id": n + 1,
+                    "vector": {"dense": [angle.cos(), angle.sin(), 0.0]},
+                    "payload": {
+                        "n": n,
+                        "scope": "all",
+                        "path": format!("/work/repo/src/mod_{:03}/file.rs", n % 40)
+                    }
+                })
+            })
+            .collect();
+        upsert_points(ctx, name, serde_json::Value::Array(points));
+        let storage = ctx.collections.get_collection(name).unwrap();
+        for field in ["scope", "path"] {
+            storage
+                .create_payload_index(field, PayloadIndexSchema::Keyword)
+                .unwrap();
+            wait_for_payload_index_ready(ctx, name, field);
+        }
+        // A quiesced tail may be sealed in the background; Building segments
+        // are not searched, so wait until every segment is searchable.
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while storage
+            .named_vectors
+            .list_dense_vector_spaces()
+            .values()
+            .any(|space| {
+                space
+                    .segments
+                    .iter()
+                    .any(|segment| segment.role == DenseVectorSegmentRole::Building)
+            })
+        {
+            assert!(
+                Instant::now() < deadline,
+                "dense segment build did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        storage
+    }
+
+    fn fixture_score(n: i64) -> f32 {
+        ((n as f32 * 0.37) % std::f32::consts::PI).cos()
+    }
+
+    /// Brute-force top-`k` `n`s among `matching` for the query [1,0,0].
+    fn brute_force_top_k(matching: impl Iterator<Item = i64>, k: usize) -> Vec<i64> {
+        let mut ns: Vec<i64> = matching.collect();
+        ns.sort_by(|a, b| fixture_score(*b).total_cmp(&fixture_score(*a)));
+        ns.truncate(k);
+        ns
+    }
+
+    fn result_ns(points: &serde_json::Value) -> Vec<i64> {
+        points
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| point["payload"]["n"].as_i64().unwrap())
+            .collect()
+    }
+
+    /// The pre-fix plan for a filter the planner could not resolve: filtered
+    /// HNSW with a node read + `matches_point` per visited point. Returns the
+    /// hit `n`s and how many node reads the recheck paid.
+    fn old_filtered_hnsw_plan(
+        storage: &HelixGraphStorage,
+        r: &crate::helix_engine::storage_core::backend_any::AnyRead<'_>,
+        filter: &Filter,
+        k: usize,
+    ) -> (Vec<i64>, usize) {
+        let node_reads = std::cell::Cell::new(0usize);
+        let filter_fn = |id: u128| -> bool {
+            node_reads.set(node_reads.get() + 1);
+            match storage.get_node_be(r, &id) {
+                Ok(node) => filter.matches_point(Some(id), &node.properties),
+                Err(_) => false,
+            }
+        };
+        let hits = storage
+            .named_vectors
+            .dense_search_with_id_filter_ef_be(
+                r,
+                "dense",
+                &[1.0, 0.0, 0.0],
+                k,
+                Some(&[filter_fn][..]),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let ns = hits
+            .iter()
+            .map(|hit| (hit.id - 1) as i64)
+            .collect::<Vec<_>>();
+        (ns, node_reads.get())
+    }
+
+    #[test]
+    fn lsm_selective_text_filter_next_to_broad_scope_scores_only_candidates() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = selective_filter_fixture(&ctx, "selective_text_lsm");
+        // A client-style single-file scope: broad keyword scope + path substring.
+        let filter: Filter = serde_json::from_value(serde_json::json!({
+            "must": [
+                {"key": "scope", "match": {"value": "all"}},
+                {"key": "path", "match": {"text": "mod_007/file.rs"}}
+            ]
+        }))
+        .unwrap();
+        let matching = || (0..400_i64).filter(|n| n % 40 == 7);
+        let r = storage.backend.begin_read().unwrap();
+
+        // Root cause 1: the scope count saturates the probe and the path text
+        // (no exact-keyword hit) abstains, so the old min-over-must estimate
+        // alone declared the filter too broad.
+        let cap = vector_query_broad_candidate_cap(400);
+        let probe = must_count_probe_be(&storage, &r, &filter, cap).unwrap();
+        assert_eq!(probe.estimate, Some(cap + 1));
+        assert_eq!(probe.unprobed_indexable, vec![1]);
+        // Root cause 2: with the default 50k text-walk skip, the walk is
+        // skipped behind the broad scope set, which is then too broad to keep.
+        let unbounded = indexed_filter_candidates_be(&storage, &r, &filter)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unbounded.len(), 400);
+
+        // Only the uncounted path clause is walked; the broad scope set is
+        // never built.
+        let probed =
+            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &filter, true).unwrap();
+        assert!(!probed.probe_skipped);
+        let candidates = probed.candidates.expect("selective text must materialize");
+        assert_eq!(candidates.len(), 10);
+        // Text is not index-exact: the exact plan rechecks each candidate
+        // once (one node read each) and scores only those vectors.
+        assert!(!indexed_filter_candidates_are_exact(&storage, &filter));
+        let new_node_reads = candidates.len();
+        let exact_ids = exact_dense_candidate_ids_be(
+            &storage,
+            &r,
+            Some(&candidates),
+            &filter,
+            true,
+            collection_vector_count_be(&storage),
+        )
+        .expect("10 candidates must use exact scoring");
+        assert_eq!(exact_ids.len(), 10);
+
+        let (old_ns, old_node_reads) = old_filtered_hnsw_plan(&storage, &r, &filter, 12);
+        assert!(
+            new_node_reads * 10 <= old_node_reads,
+            "exact plan reads {new_node_reads} nodes, old plan {old_node_reads}"
+        );
+
+        // Exact top-k over the filtered set: every match, in score order. The
+        // old plan returns a subset (it missed matches on this fixture).
+        let expected = brute_force_top_k(matching(), 10);
+        let (status, body) = query_points_raw(
+            &ctx,
+            "selective_text_lsm",
+            serde_json::json!({
+                "query": [1.0, 0.0, 0.0],
+                "using": "dense",
+                "limit": 10,
+                "with_payload": true,
+                "filter": serde_json::to_value(&filter).unwrap()
+            }),
+        );
+        assert_eq!(status, 200, "query failed: {body}");
+        assert_eq!(result_ns(&body["result"]["points"]), expected);
+        assert!(old_ns.iter().all(|n| expected.contains(n)));
+        assert!(old_ns.len() <= expected.len());
+    }
+
+    #[test]
+    fn lsm_has_id_filter_resolves_to_exact_candidates() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = selective_filter_fixture(&ctx, "has_id_lsm");
+        // ReFRAG-style gate: a few hundred ids in production; 6 live + 1 absent.
+        let gate: Vec<i64> = vec![3, 50, 101, 202, 303, 399];
+        let mut has_id: Vec<serde_json::Value> =
+            gate.iter().map(|n| serde_json::json!(n + 1)).collect();
+        has_id.push(serde_json::json!(999_999));
+        let r = storage.backend.begin_read().unwrap();
+
+        for (label, filter_json, expected_matches) in [
+            (
+                "has_id only",
+                serde_json::json!({"must": [{"has_id": has_id}]}),
+                gate.clone(),
+            ),
+            (
+                "has_id + broad scope",
+                serde_json::json!({"must": [
+                    {"key": "scope", "match": {"value": "all"}},
+                    {"has_id": has_id}
+                ]}),
+                gate.clone(),
+            ),
+            (
+                "has_id + non-matching scope",
+                serde_json::json!({"must": [
+                    {"key": "scope", "match": {"value": "none"}},
+                    {"has_id": has_id}
+                ]}),
+                Vec::new(),
+            ),
+        ] {
+            let filter: Filter = serde_json::from_value(filter_json.clone()).unwrap();
+            let probed =
+                vector_query_indexed_filter_candidates_be_probed(&storage, &r, &filter, true)
+                    .unwrap();
+            assert!(!probed.probe_skipped, "{label}");
+            let candidates = probed
+                .candidates
+                .expect("has_id must resolve to candidates");
+            assert_eq!(candidates.len(), 7, "{label}: gate ids are the candidates");
+            assert!(!indexed_filter_candidates_are_exact(&storage, &filter));
+            let exact_ids = exact_dense_candidate_ids_be(
+                &storage,
+                &r,
+                Some(&candidates),
+                &filter,
+                true,
+                collection_vector_count_be(&storage),
+            )
+            .expect("gate-sized candidates must use exact scoring");
+            assert_eq!(exact_ids.len(), expected_matches.len(), "{label}");
+
+            let expected = brute_force_top_k(expected_matches.iter().copied(), 4);
+            let (old_ns, old_node_reads) = old_filtered_hnsw_plan(&storage, &r, &filter, 16);
+            assert!(
+                candidates.len() * 10 <= old_node_reads,
+                "{label}: {} candidate reads vs old {old_node_reads}",
+                candidates.len()
+            );
+            assert!(
+                old_ns.iter().all(|n| expected_matches.contains(n)),
+                "{label}"
+            );
+
+            let (status, body) = query_points_raw(
+                &ctx,
+                "has_id_lsm",
+                serde_json::json!({
+                    "query": [1.0, 0.0, 0.0],
+                    "using": "dense",
+                    "limit": 4,
+                    "with_payload": true,
+                    "filter": filter_json
+                }),
+            );
+            assert_eq!(status, 200, "{label}: {body}");
+            assert_eq!(result_ns(&body["result"]["points"]), expected, "{label}");
+
+            let input = make_input(
+                &ctx,
+                "POST",
+                "/collections/has_id_lsm/points/search",
+                sonic_rs::to_vec(&serde_json::json!({
+                    "vector": {"name": "dense", "vector": [1.0, 0.0, 0.0]},
+                    "limit": 4,
+                    "with_payload": true,
+                    "filter": filter_json
+                }))
+                .unwrap(),
+                HashMap::from([("name".into(), "has_id_lsm".into())]),
+            );
+            let mut resp = Response::new();
+            handle_search_points(&input, &mut resp).unwrap();
+            assert_eq!(resp.status, 200, "{label}");
+            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(
+                result_ns(&body["result"]),
+                expected,
+                "{label} /points/search"
+            );
+
+            // Same filter as a hybrid dense-channel filter (the client's gated hybrid body).
+            let (status, body) = hybrid_query_points_raw(
+                &ctx,
+                "has_id_lsm",
+                serde_json::json!({
+                    "dense": [{
+                        "using": "dense",
+                        "query": [1.0, 0.0, 0.0],
+                        "limit": 4,
+                        "filter": filter_json
+                    }],
+                    "sparse": [],
+                    "limit": 4,
+                    "with_payload": true,
+                    "with_channel_points": true
+                }),
+            );
+            assert_eq!(status, 200, "{label}: {body}");
+            let channel = &body["result"]["channels"]["dense"][0]["points"];
+            assert_eq!(result_ns(channel), expected, "{label} hybrid channel");
+        }
+
+        // Several has_id clauses intersect; an empty list matches nothing.
+        let two: Filter = serde_json::from_value(serde_json::json!({"must": [
+            {"has_id": [4, 51, 102]},
+            {"has_id": [51, 102, 203]}
+        ]}))
+        .unwrap();
+        let ids = must_has_id_candidates(&two).unwrap();
+        assert_eq!(ids, HashSet::from([51_u128, 102]));
+        let empty: Filter =
+            serde_json::from_value(serde_json::json!({"must": [{"has_id": []}]})).unwrap();
+        assert_eq!(must_has_id_candidates(&empty), Some(HashSet::new()));
+        let (status, body) = query_points_raw(
+            &ctx,
+            "has_id_lsm",
+            serde_json::json!({
+                "query": [1.0, 0.0, 0.0],
+                "using": "dense",
+                "limit": 4,
+                "filter": {"must": [{"has_id": []}]}
+            }),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(body["result"]["points"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lsm_broad_exact_filter_keeps_candidates_without_node_reads() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = selective_filter_fixture(&ctx, "broad_exact_lsm");
+        let filter = broad_keyword_filter("scope", "all");
+        let r = storage.backend.begin_read().unwrap();
+        assert!(indexed_filter_candidates_are_exact(&storage, &filter));
+
+        let old = dense_filter_candidates_be(&storage, &r, &filter, true, 0, true).unwrap();
+        assert!(old.probe_skipped, "kill switch keeps the old skip");
+        let kept =
+            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &filter, true).unwrap();
+        assert!(!kept.probe_skipped);
+        let candidates = kept.candidates.expect("broad exact filter is kept");
+        assert_eq!(candidates.len(), 400);
+        // Index-exact: no recheck, so the in-traversal check is a set probe
+        // with no node reads.
+        let recheck = !indexed_filter_candidates_are_exact(&storage, &filter);
+        assert!(exact_index_filter_candidates(true, recheck, Some(&candidates)).is_some());
+
+        let (old_ns, old_node_reads) = old_filtered_hnsw_plan(&storage, &r, &filter, 5);
+        assert!(old_node_reads >= 5);
+        let candidate_filter = |id: u128| candidates.contains(&id);
+        let new_hits = storage
+            .named_vectors
+            .dense_search_with_id_filter_ef_be(
+                &r,
+                "dense",
+                &[1.0, 0.0, 0.0],
+                5,
+                Some(&[candidate_filter][..]),
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        let new_ns: Vec<i64> = new_hits.iter().map(|hit| (hit.id - 1) as i64).collect();
+        assert_eq!(new_ns, old_ns, "same predicate, same traversal, same hits");
+
+        let expected = brute_force_top_k(0..400, 5);
+        let query = |filter: serde_json::Value| {
+            let (status, body) = query_points_raw(
+                &ctx,
+                "broad_exact_lsm",
+                serde_json::json!({
+                    "query": [1.0, 0.0, 0.0],
+                    "using": "dense",
+                    "limit": 5,
+                    "with_payload": true,
+                    "filter": filter
+                }),
+            );
+            assert_eq!(status, 200, "{body}");
+            result_ns(&body["result"]["points"])
+        };
+        assert_eq!(
+            query(serde_json::json!({"must": [{"key": "scope", "match": {"value": "all"}}]})),
+            expected
+        );
+        // An unindexed clause makes the filter non-exact: the broad probe still
+        // skips materialization and the in-traversal recheck serves it.
+        let non_exact: Filter = serde_json::from_value(serde_json::json!({"must": [
+            {"key": "scope", "match": {"value": "all"}},
+            {"key": "n", "range": {"gte": 0}}
+        ]}))
+        .unwrap();
+        let skipped =
+            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &non_exact, true)
+                .unwrap();
+        assert!(skipped.probe_skipped);
+        assert_eq!(
+            query(serde_json::to_value(&non_exact).unwrap()),
+            expected,
+            "probe-skip path"
+        );
     }
 
     #[test]
@@ -14708,7 +17157,7 @@ mod tests {
 
     // ── Helpers for sparse vector tests ──
 
-    fn create_collection_with_sparse(ctx: &TestContext, name: &str) {
+    pub(super) fn create_collection_with_sparse(ctx: &TestContext, name: &str) {
         let body = sonic_rs::to_vec(&sonic_rs::json!({
             "vectors": {
                 "dense": {"size": 3, "distance": "Cosine"}
@@ -16346,6 +18795,116 @@ mod tests {
         );
     }
 
+    /// A PATCH of the indexing threshold on `ctx`'s collection `name`: what
+    /// the route returned.
+    fn patch_indexing_threshold(
+        ctx: &TestContext,
+        name: &str,
+        threshold: serde_json::Value,
+    ) -> Result<u16, GraphError> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "optimizer_config": {"indexing_threshold": threshold}
+        }))
+        .unwrap();
+        let input = make_input(
+            ctx,
+            "PATCH",
+            &format!("/collections/{name}"),
+            body,
+            HashMap::from([("name".into(), name.to_string())]),
+        );
+        let mut resp = Response::new();
+        handle_update_collection(&input, &mut resp).map(|()| resp.status)
+    }
+
+    /// The override as the collection's stored metadata has it, read through
+    /// the backend, and the threshold in force in memory.
+    fn indexing_threshold(ctx: &TestContext, name: &str) -> (Option<usize>, usize) {
+        let storage = ctx.collections.get_collection(name).unwrap();
+        let stored = storage
+            .with_read_backend(|r| storage.get_metadata_be(r))
+            .unwrap()
+            .indexing_threshold_override;
+        let global = ctx.collections.config().vector_flat_scan_threshold();
+        (
+            stored,
+            storage.named_vectors.effective_indexing_threshold(global),
+        )
+    }
+
+    /// On LSM the override is stored through the backend, and the next open
+    /// has it. The route answered 500 there (`with_write_txn is LMDB-only`)
+    /// after it had set the threshold in memory: it held until the next
+    /// open, which did not know of it.
+    #[test]
+    #[serial]
+    fn update_collection_optimizer_threshold_is_stored_on_lsm() {
+        use crate::helix_engine::storage_core::backend::{
+            LsmRole, LsmStorage, StorageBackendConfig,
+        };
+        use crate::helix_engine::storage_core::backend_any::set_lsm_test_object_store;
+
+        // One store under every open, so that a second open of the
+        // collection finds what the first one wrote.
+        let _store =
+            set_lsm_test_object_store(std::sync::Arc::new(object_store::memory::InMemory::new()));
+        let ctx = setup_with_config(Config::default().with_storage_backend(
+            StorageBackendConfig::Lsm {
+                storage: LsmStorage::ObjectStore,
+                role: LsmRole::Writer,
+            },
+        ));
+        create_dense_collection_lsm(&ctx, "bulk_lsm");
+        let global = ctx.collections.config().vector_flat_scan_threshold();
+        assert_eq!(indexing_threshold(&ctx, "bulk_lsm"), (None, global));
+
+        for (asked, stored, in_force) in [
+            (serde_json::json!(0), Some(0), 0),
+            (serde_json::Value::Null, None, global),
+        ] {
+            assert_eq!(
+                patch_indexing_threshold(&ctx, "bulk_lsm", asked).unwrap(),
+                200
+            );
+            assert_eq!(indexing_threshold(&ctx, "bulk_lsm"), (stored, in_force));
+            ctx.collections.evict_collection("bulk_lsm");
+            assert_eq!(
+                indexing_threshold(&ctx, "bulk_lsm"),
+                (stored, in_force),
+                "after the collection was opened again"
+            );
+        }
+    }
+
+    /// A threshold the store does not take is not taken in memory either: the
+    /// route stores first.
+    #[test]
+    fn update_collection_optimizer_threshold_changes_nothing_it_could_not_store() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        create_dense_collection_lsm(&ctx, "bulk_refused");
+        let before = indexing_threshold(&ctx, "bulk_refused");
+        // A degraded collection takes no write.
+        let storage = ctx.collections.get_collection("bulk_refused").unwrap();
+        storage.mark_collection_degraded(
+            &GraphError::FatalCollectionStorage {
+                code: "degraded_for_the_test",
+                message: "degraded for the test".into(),
+            },
+            "test",
+        );
+        let refused = patch_indexing_threshold(&ctx, "bulk_refused", serde_json::json!(0));
+        assert!(
+            matches!(refused, Err(GraphError::FatalCollectionStorage { .. })),
+            "the degraded collection answered {refused:?}"
+        );
+        let global = ctx.collections.config().vector_flat_scan_threshold();
+        assert_eq!(
+            storage.named_vectors.effective_indexing_threshold(global),
+            before.1,
+            "the threshold changed in memory though it was not stored"
+        );
+    }
+
     #[test]
     #[serial]
     fn estimate_upsert_headroom_respects_env_floor() {
@@ -16461,6 +19020,103 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("score_threshold must be finite"));
+    }
+
+    /// JSON `1e39` parses to an f32 infinity: every dense and sparse query
+    /// vector entry point answers 400 instead of scoring NaN hits, and the
+    /// finite twin of each request still answers.
+    #[test]
+    fn query_routes_reject_non_finite_query_vectors() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        create_collection_with_sparse(&ctx, "finite_query");
+        upsert_mixed_points(
+            &ctx,
+            "finite_query",
+            serde_json::json!([{"id": 1, "payload": {}, "vector": {
+                "dense": [1.0, 0.0, 0.0],
+                "lex_sparse": {"indices": [1], "values": [1.0]}}}]),
+        );
+        let requests = |x: f64| {
+            let dense = serde_json::json!([x, 0.0, 0.0]);
+            let sparse = serde_json::json!({"indices": [1], "values": [x]});
+            [
+                ("search", serde_json::json!({"vector": dense})),
+                (
+                    "search",
+                    serde_json::json!({"vector": {"name": "dense", "vector": dense}}),
+                ),
+                (
+                    "search",
+                    serde_json::json!({"vector": {"name": "lex_sparse", "vector": sparse}}),
+                ),
+                (
+                    "query",
+                    serde_json::json!({"query": dense, "using": "dense"}),
+                ),
+                (
+                    "query",
+                    serde_json::json!({"query": {"nearest": dense}, "using": "dense"}),
+                ),
+                (
+                    "query",
+                    serde_json::json!({"query": sparse, "using": "lex_sparse"}),
+                ),
+                (
+                    "query",
+                    serde_json::json!({"prefetch": [{"query": dense, "using": "dense"}],
+                                       "query": {"fusion": "rrf"}}),
+                ),
+                (
+                    "hybrid_query",
+                    serde_json::json!({"dense": [{"query": dense, "using": "dense"}]}),
+                ),
+                (
+                    "hybrid_query",
+                    serde_json::json!({"sparse": [{"query": sparse, "using": "lex_sparse"}]}),
+                ),
+            ]
+        };
+        let post = |route: &str, body: &serde_json::Value| {
+            let input = make_input(
+                &ctx,
+                "POST",
+                &format!("/collections/finite_query/points/{route}"),
+                sonic_rs::to_vec(body).unwrap(),
+                HashMap::from([("name".into(), "finite_query".into())]),
+            );
+            let mut response = Response::new();
+            match route {
+                "search" => handle_search_points(&input, &mut response),
+                "query" => handle_query_points(&input, &mut response),
+                _ => handle_hybrid_query_points(&input, &mut response),
+            }
+            .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
+            (response.status, body)
+        };
+        for bad in [1e39, -1e39] {
+            for (route, request) in requests(bad) {
+                let (status, body) = post(route, &request);
+                assert_eq!(status, 400, "{route} {request}: {body}");
+                assert!(
+                    body["status"]["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("query vector values must be finite")),
+                    "{route} {request}: {body}"
+                );
+            }
+        }
+        assert!(validate_query_vector(&[0.5, f32::NAN]).is_err());
+        for (route, request) in requests(1.0) {
+            let (status, body) = post(route, &request);
+            assert_eq!(status, 200, "{route} {request}: {body}");
+            let points = body["result"]["points"]
+                .as_array()
+                .or(body["result"].as_array())
+                .unwrap();
+            assert_eq!(points.len(), 1, "{route} {request}: {body}");
+        }
     }
 
     #[test]
@@ -16737,6 +19393,7 @@ mod tests {
         // F1: when no quantization is requested, the stored SpindleConfig
         // must be internally consistent — no inherited oversampling:16 or
         // rescore:true from SpindleConfig::default().
+        let _held = quantizer_env_for_test::hold();
         let previous = std::env::var_os("HELIX_SPINDLE_MODE");
         unsafe {
             std::env::remove_var("HELIX_SPINDLE_MODE");
@@ -16786,6 +19443,7 @@ mod tests {
     #[test]
     #[serial]
     fn get_collection_reports_env_default_quantization() {
+        let _held = quantizer_env_for_test::hold();
         let previous_mode = std::env::var_os("HELIX_SPINDLE_MODE");
         let previous_keep = std::env::var_os("HELIX_SPINDLE_KEEP_ORIGINAL");
         let previous_rescore = std::env::var_os("HELIX_SPINDLE_RESCORE");
@@ -16845,6 +19503,48 @@ mod tests {
         }
     }
 
+    /// A collection another thread creates while a test has the quantizer
+    /// variables changed is made once they are put back, with the default
+    /// that stood before.
+    #[test]
+    #[serial]
+    fn a_create_on_another_thread_waits_out_a_changed_quantizer_default() {
+        let held = quantizer_env_for_test::hold();
+        let before = env_default_spindle_config().mode;
+        let changed = match before {
+            SpindleMode::ScalarInt8 => "binary",
+            _ => "scalar_int8",
+        };
+        let previous = std::env::var_os("HELIX_SPINDLE_MODE");
+        unsafe {
+            std::env::set_var("HELIX_SPINDLE_MODE", changed);
+        }
+        let (at_the_create, reached) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let ctx = setup();
+            at_the_create.send(()).unwrap();
+            create_and_get_spindle(
+                &ctx,
+                "made_beside",
+                sonic_rs::json!({
+                    "vectors": {"dense": {"size": 3, "distance": "Cosine"}}
+                }),
+            )
+            .mode
+        });
+        reached.recv().unwrap();
+        // Time for that create to read the default, were nothing in its way.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HELIX_SPINDLE_MODE", value),
+                None => std::env::remove_var("HELIX_SPINDLE_MODE"),
+            }
+        }
+        drop(held);
+        assert_eq!(other.join().unwrap(), before);
+    }
+
     #[test]
     fn quantization_collection_level_qdrant_scalar_applies() {
         // F2 (existing): top-level quantization_config with {"scalar": {...}}
@@ -16864,6 +19564,71 @@ mod tests {
         assert!(!spindle.keep_original);
         assert!(!spindle.rescore);
         assert_eq!(spindle.oversampling, 1);
+    }
+
+    /// A scalar-quantized LSM collection of three points and one question of
+    /// it: the nearest two to the first point among the rows of repository
+    /// `a`, a field no payload index answers.
+    fn scalar_lsm_search(name: &str) -> (TestContext, HandlerInput) {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let spindle = create_and_get_spindle(
+            &ctx,
+            name,
+            sonic_rs::json!({
+                "vectors": {"dense": {"size": 3, "distance": "Cosine"}},
+                "quantization_config": {"scalar": {"type": "int8"}}
+            }),
+        );
+        assert_eq!(spindle.mode, SpindleMode::ScalarInt8);
+        assert!(!spindle.keep_original);
+        let storage = ctx.collections.get_collection(name).unwrap();
+        assert_eq!(storage.backend.kind(), BackendKind::Lsm);
+        upsert_points(
+            &ctx,
+            name,
+            serde_json::json!([
+                {"id": 1, "vector": {"dense": [1.0, 0.0, 0.0]}, "payload": {"repo": "a"}},
+                {"id": 2, "vector": {"dense": [0.0, 1.0, 0.0]}, "payload": {"repo": "a"}},
+                {"id": 3, "vector": {"dense": [0.9, 0.1, 0.0]}, "payload": {"repo": "b"}}
+            ]),
+        );
+        let body = sonic_rs::to_vec(&sonic_rs::json!({
+            "vector": {"name": "dense", "vector": [1.0, 0.0, 0.0]},
+            "limit": 2,
+            "filter": {"must": [{"key": "repo", "match": {"value": "a"}}]}
+        }))
+        .unwrap();
+        let input = make_input(
+            &ctx,
+            "POST",
+            &format!("/collections/{name}/points/search"),
+            body,
+            HashMap::from([("name".into(), name.into())]),
+        );
+        (ctx, input)
+    }
+
+    /// A scalar-quantized collection on LSM keeps no ordinal and no sidecar
+    /// slot for a row, so its flat search is the scan of its rows, which asks
+    /// the filter inside the store's scan. A filter that has to read each
+    /// point still finds its rows there, on a thread that carries the mark a
+    /// request's thread carries.
+    #[test]
+    fn a_filtered_search_of_a_scalar_quantized_lsm_collection_returns_its_rows() {
+        use crate::helix_engine::storage_core::backend_lsm::allow_lsm_blocking;
+        let (_ctx, input) = scalar_lsm_search("lsm_scalar_filtered");
+        let mut response = Response::new();
+        allow_lsm_blocking(|| handle_search_points(&input, &mut response)).unwrap();
+        let body = String::from_utf8_lossy(&response.body).to_string();
+        assert_eq!(response.status, 200, "{body}");
+        let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let ids: Vec<&str> = reply["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| point["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, [format_point_id(1), format_point_id(2)], "{body}");
     }
 
     #[test]
@@ -17595,6 +20360,803 @@ mod tests {
         assert!(
             stale_ids.is_empty(),
             "drop_node_be must de-index payload index entries on delete, got stale ids: {stale_ids:?}"
+        );
+    }
+
+    // ── Broad prefilter scan tests ──────────────────────────────────────
+
+    /// Build a 400-point LSM fixture where scope=all on every point. Returns
+    /// the storage handle. Vectors follow the selective_filter_fixture pattern
+    /// (angle = n*0.37 mod pi) so brute_force_top_k works.
+    ///
+    /// Ensures the mmap sidecar is materialized on every dense segment so
+    /// `search_broad_prefilter_scan` exercises the scan path (not Ok(None)).
+    fn broad_scan_fixture(ctx: &TestContext, name: &str) -> std::sync::Arc<HelixGraphStorage> {
+        let storage = selective_filter_fixture(ctx, name);
+        // Force sidecar materialization on every non-empty segment.
+        {
+            let r = storage.backend.begin_read().unwrap();
+            let spaces = storage.named_vectors.list_dense_vector_spaces();
+            let space = spaces
+                .get("dense")
+                .expect("fixture must have a 'dense' space");
+            let mut materialized = 0usize;
+            for segment in &space.segments {
+                storage
+                    .named_vectors
+                    .with_core(&segment.physical_name, |core| {
+                        if core.is_empty(&r)? {
+                            return Ok(()); // empty segment → scan returns empty, no sidecar needed
+                        }
+                        core.ensure_lsm_mmap_sidecar()?;
+                        assert!(
+                            core.has_mmap_sidecar(),
+                            "segment '{}' must have a materialized mmap sidecar",
+                            segment.physical_name,
+                        );
+                        materialized += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert!(
+                materialized > 0,
+                "fixture must have at least one non-empty segment with a sidecar"
+            );
+        }
+        storage
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_matches_brute_force() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = broad_scan_fixture(&ctx, "broad_scan_recall");
+
+        let r = storage.backend.begin_read().unwrap();
+
+        let prefilter: HashSet<u128> = (1..=400_u128).collect();
+        let total = collection_vector_count_be(&storage);
+        let sel_hint = Some(prefilter.len() as f32 / total as f32);
+        let query = [1.0_f32, 0.0, 0.0];
+        let k = 10;
+
+        let brute_results = storage
+            .named_vectors
+            .dense_search_candidate_ids_exact_be(
+                &r,
+                "dense",
+                &query,
+                k,
+                prefilter.iter().copied(),
+                sel_hint,
+            )
+            .unwrap();
+
+        let before = broad_scan_completions_for_test();
+        let scan_results = storage
+            .named_vectors
+            .dense_search_broad_prefilter_scan_be(
+                &r,
+                "dense",
+                &query,
+                k,
+                &prefilter,
+                None::<&[fn(u128) -> bool]>,
+                sel_hint,
+            )
+            .unwrap()
+            .expect("scan must execute on a fixture with materialized sidecars");
+        assert!(
+            broad_scan_completions_for_test() > before,
+            "scan completion counter must increment"
+        );
+
+        let brute_ids: Vec<u128> = brute_results.iter().map(|h| h.id).collect();
+        let scan_ids: Vec<u128> = scan_results.iter().map(|h| h.id).collect();
+        assert_eq!(
+            brute_ids, scan_ids,
+            "broad scan must return same top-k ids as brute force"
+        );
+        for (brute, scan) in brute_results.iter().zip(scan_results.iter()) {
+            let a = brute.distance.unwrap_or(0.0);
+            let b = scan.distance.unwrap_or(0.0);
+            assert!(
+                (a - b).abs() < 1e-4,
+                "score mismatch for {}: brute={a} scan={b}",
+                brute.id
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_with_recheck() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = broad_scan_fixture(&ctx, "broad_scan_recheck");
+
+        let r = storage.backend.begin_read().unwrap();
+        // Filter: scope=all (broad, matches all) + path contains "mod_007"
+        // (selective, matches only n%40==7 → 10 points).
+        let filter: Filter = serde_json::from_value(serde_json::json!({
+            "must": [
+                {"key": "scope", "match": {"value": "all"}},
+                {"key": "path", "match": {"text": "mod_007/file.rs"}}
+            ]
+        }))
+        .unwrap();
+
+        let prefilter: HashSet<u128> = (1..=400_u128).collect();
+        let sel_hint = Some(prefilter.len() as f32 / 400.0);
+        let k = 10;
+
+        let recheck_fn = |id: u128| -> bool {
+            match storage.get_node_be(&r, &id) {
+                Ok(node) => filter.matches_point(Some(id), &node.properties),
+                Err(_) => false,
+            }
+        };
+
+        let before = broad_scan_completions_for_test();
+        let scan_results = storage
+            .named_vectors
+            .dense_search_broad_prefilter_scan_be(
+                &r,
+                "dense",
+                &[1.0_f32, 0.0, 0.0],
+                k,
+                &prefilter,
+                Some(&[recheck_fn][..]),
+                sel_hint,
+            )
+            .unwrap()
+            .expect("scan must execute on a fixture with materialized sidecars");
+        assert!(
+            broad_scan_completions_for_test() > before,
+            "scan completion counter must increment"
+        );
+
+        // Only 10 of the 400 prefilter members (2.5%) pass, far fewer than
+        // the 4x window of nearest members holds: the scan keeps rechecking
+        // best-first and returns all of them in brute-force order.
+        let actual_ns: Vec<i64> = scan_results.iter().map(|h| (h.id - 1) as i64).collect();
+        let expected_ns = brute_force_top_k((0..400).filter(|n| n % 40 == 7), k);
+        assert_eq!(
+            actual_ns, expected_ns,
+            "recheck results must be the brute-force top-k of the passing members"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_edge_empty_prefilter() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = broad_scan_fixture(&ctx, "broad_scan_empty");
+        let r = storage.backend.begin_read().unwrap();
+
+        let empty: HashSet<u128> = HashSet::new();
+        // Empty prefilter short-circuits before the scan loop, so no counter
+        // increment is expected — but it must still return Some(empty).
+        let results = storage
+            .named_vectors
+            .dense_search_broad_prefilter_scan_be(
+                &r,
+                "dense",
+                &[1.0, 0.0, 0.0],
+                10,
+                &empty,
+                None::<&[fn(u128) -> bool]>,
+                None,
+            )
+            .unwrap()
+            .expect("empty prefilter must return Some(empty), not None");
+        assert!(results.is_empty(), "empty prefilter → empty results");
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_edge_single_point() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = broad_scan_fixture(&ctx, "broad_scan_single");
+        let r = storage.backend.begin_read().unwrap();
+
+        let single: HashSet<u128> = [1_u128].into_iter().collect();
+        let before = broad_scan_completions_for_test();
+        let results = storage
+            .named_vectors
+            .dense_search_broad_prefilter_scan_be(
+                &r,
+                "dense",
+                &[1.0, 0.0, 0.0],
+                10,
+                &single,
+                None::<&[fn(u128) -> bool]>,
+                None,
+            )
+            .unwrap()
+            .expect("scan must execute on a fixture with materialized sidecars");
+        assert!(
+            broad_scan_completions_for_test() > before,
+            "scan completion counter must increment"
+        );
+        assert_eq!(results.len(), 1, "single prefilter → one result");
+        assert_eq!(results[0].id, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_deleted_points_excluded() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        create_dense_collection_lsm(&ctx, "broad_scan_del");
+        let points: Vec<serde_json::Value> = (0..20_i64)
+            .map(|n| {
+                let angle = (n as f32 * 0.37) % std::f32::consts::PI;
+                serde_json::json!({
+                    "id": n + 1,
+                    "vector": {"dense": [angle.cos(), angle.sin(), 0.0]},
+                    "payload": {"scope": "all"}
+                })
+            })
+            .collect();
+        upsert_points(&ctx, "broad_scan_del", serde_json::Value::Array(points));
+        let storage = ctx.collections.get_collection("broad_scan_del").unwrap();
+        storage
+            .create_payload_index("scope", PayloadIndexSchema::Keyword)
+            .unwrap();
+        wait_for_payload_index_ready(&ctx, "broad_scan_del", "scope");
+
+        // Force sidecar materialization on every non-empty segment.
+        {
+            let r = storage.backend.begin_read().unwrap();
+            let spaces = storage.named_vectors.list_dense_vector_spaces();
+            let space = spaces.get("dense").expect("must have 'dense' space");
+            for segment in &space.segments {
+                storage
+                    .named_vectors
+                    .with_core(&segment.physical_name, |core| {
+                        if core.is_empty(&r)? {
+                            return Ok(());
+                        }
+                        core.ensure_lsm_mmap_sidecar()?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+
+        // Delete points 5..=10 through the handler.
+        let delete_body = sonic_rs::to_vec(&sonic_rs::json!({
+            "points": [5, 6, 7, 8, 9, 10]
+        }))
+        .unwrap();
+        let delete_input = make_input(
+            &ctx,
+            "POST",
+            "/collections/broad_scan_del/points/delete",
+            delete_body,
+            HashMap::from([("name".into(), "broad_scan_del".into())]),
+        );
+        let mut delete_resp = Response::new();
+        handle_delete_points(&delete_input, &mut delete_resp).unwrap();
+        assert_eq!(delete_resp.status, 200);
+
+        let r = storage.backend.begin_read().unwrap();
+        let prefilter: HashSet<u128> = (1..=20_u128).collect();
+        let before = broad_scan_completions_for_test();
+        let hits = storage
+            .named_vectors
+            .dense_search_broad_prefilter_scan_be(
+                &r,
+                "dense",
+                &[1.0, 0.0, 0.0],
+                20,
+                &prefilter,
+                None::<&[fn(u128) -> bool]>,
+                None,
+            )
+            .unwrap()
+            .expect("scan must execute on a fixture with materialized sidecars");
+        assert!(
+            broad_scan_completions_for_test() > before,
+            "scan completion counter must increment"
+        );
+
+        let deleted: HashSet<u128> = (5..=10_u128).collect();
+        for hit in &hits {
+            assert!(
+                !deleted.contains(&hit.id),
+                "deleted point {} must not appear in scan results",
+                hit.id
+            );
+        }
+        assert_eq!(hits.len(), 14, "14 alive points must be returned");
+
+        // Cross-check: brute force over alive points must produce the same ids.
+        let alive: HashSet<u128> = (1..=20_u128).filter(|id| !deleted.contains(id)).collect();
+        let brute = storage
+            .named_vectors
+            .dense_search_candidate_ids_exact_be(
+                &r,
+                "dense",
+                &[1.0_f32, 0.0, 0.0],
+                20,
+                alive.iter().copied(),
+                None,
+            )
+            .unwrap();
+        let brute_ids: Vec<u128> = brute.iter().map(|h| h.id).collect();
+        let scan_ids: Vec<u128> = hits.iter().map(|h| h.id).collect();
+        assert_eq!(
+            brute_ids, scan_ids,
+            "scan ids must match brute force over alive points"
+        );
+    }
+
+    /// After sidecar build, update a vector in place (same id) so its true
+    /// score changes rank. The scan must return brute-force-correct results
+    /// on the live (updated) vectors, not the stale sidecar data.
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_updated_vector_correct() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        create_dense_collection_lsm(&ctx, "broad_scan_update");
+        // Insert 20 points with no exact match to query [1,0,0].
+        // Offset avoids angle=0 → [1,0,0] which would tie the update.
+        let points: Vec<serde_json::Value> = (0..20_i64)
+            .map(|n| {
+                let angle = ((n as f32 + 1.0) * 0.37) % std::f32::consts::PI;
+                serde_json::json!({
+                    "id": n + 1,
+                    "vector": {"dense": [angle.cos(), angle.sin(), 0.0]},
+                    "payload": {"scope": "all"}
+                })
+            })
+            .collect();
+        upsert_points(&ctx, "broad_scan_update", serde_json::Value::Array(points));
+        let storage = ctx.collections.get_collection("broad_scan_update").unwrap();
+        storage
+            .create_payload_index("scope", PayloadIndexSchema::Keyword)
+            .unwrap();
+        wait_for_payload_index_ready(&ctx, "broad_scan_update", "scope");
+
+        // Force sidecar materialization.
+        {
+            let r = storage.backend.begin_read().unwrap();
+            let spaces = storage.named_vectors.list_dense_vector_spaces();
+            let space = spaces.get("dense").expect("must have 'dense' space");
+            for segment in &space.segments {
+                storage
+                    .named_vectors
+                    .with_core(&segment.physical_name, |core| {
+                        if core.is_empty(&r)? {
+                            return Ok(());
+                        }
+                        core.ensure_lsm_mmap_sidecar()?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+
+        // Update point 20 (originally score ~0.0 for query [1,0,0]) to [1,0,0]
+        // (perfect match, score 1.0). This must be the new #1 result.
+        upsert_points(
+            &ctx,
+            "broad_scan_update",
+            serde_json::json!([{
+                "id": 20,
+                "vector": {"dense": [1.0, 0.0, 0.0]},
+                "payload": {"scope": "all"}
+            }]),
+        );
+
+        let r = storage.backend.begin_read().unwrap();
+        let prefilter: HashSet<u128> = (1..=20_u128).collect();
+        let total = collection_vector_count_be(&storage);
+        let sel_hint = Some(prefilter.len() as f32 / total as f32);
+        let query = [1.0_f32, 0.0, 0.0];
+        let k = 5;
+
+        let before = broad_scan_completions_for_test();
+        let scan_results = with_broad_scan_for_test(true, || {
+            storage
+                .named_vectors
+                .dense_search_broad_prefilter_scan_be::<fn(u128) -> bool>(
+                    &r, "dense", &query, k, &prefilter, None, sel_hint,
+                )
+                .unwrap()
+                .expect("scan must execute on fixture with materialized sidecars")
+        });
+        assert!(
+            broad_scan_completions_for_test() > before,
+            "scan completion counter must increment"
+        );
+
+        // Brute-force reference on live data.
+        let brute_results = storage
+            .named_vectors
+            .dense_search_candidate_ids_exact_be(
+                &r,
+                "dense",
+                &query,
+                k,
+                prefilter.iter().copied(),
+                sel_hint,
+            )
+            .unwrap();
+
+        // Point 20 (now [1,0,0]) must be the top result in both.
+        assert_eq!(
+            scan_results[0].id, 20,
+            "updated point 20 must be the #1 scan result"
+        );
+        let brute_ids: Vec<u128> = brute_results.iter().map(|h| h.id).collect();
+        let scan_ids: Vec<u128> = scan_results.iter().map(|h| h.id).collect();
+        assert_eq!(
+            brute_ids, scan_ids,
+            "scan must return same top-k as brute force after in-place update"
+        );
+    }
+
+    /// Delete a point, then re-insert it with a different vector. The scan
+    /// must score the NEW vector, not the old one from the pre-delete sidecar.
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_delete_reinsert_correct() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        create_dense_collection_lsm(&ctx, "broad_scan_reins");
+        let points: Vec<serde_json::Value> = (0..20_i64)
+            .map(|n| {
+                let angle = ((n as f32 + 1.0) * 0.37) % std::f32::consts::PI;
+                serde_json::json!({
+                    "id": n + 1,
+                    "vector": {"dense": [angle.cos(), angle.sin(), 0.0]},
+                    "payload": {"scope": "all"}
+                })
+            })
+            .collect();
+        upsert_points(&ctx, "broad_scan_reins", serde_json::Value::Array(points));
+        let storage = ctx.collections.get_collection("broad_scan_reins").unwrap();
+        storage
+            .create_payload_index("scope", PayloadIndexSchema::Keyword)
+            .unwrap();
+        wait_for_payload_index_ready(&ctx, "broad_scan_reins", "scope");
+
+        // Materialize sidecar.
+        {
+            let r = storage.backend.begin_read().unwrap();
+            let spaces = storage.named_vectors.list_dense_vector_spaces();
+            let space = spaces.get("dense").expect("must have 'dense' space");
+            for segment in &space.segments {
+                storage
+                    .named_vectors
+                    .with_core(&segment.physical_name, |core| {
+                        if core.is_empty(&r)? {
+                            return Ok(());
+                        }
+                        core.ensure_lsm_mmap_sidecar()?;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+
+        // Delete point 15, then re-insert it with a perfect-match vector.
+        let delete_body = sonic_rs::to_vec(&sonic_rs::json!({"points": [15]})).unwrap();
+        let delete_input = make_input(
+            &ctx,
+            "POST",
+            "/collections/broad_scan_reins/points/delete",
+            delete_body,
+            HashMap::from([("name".into(), "broad_scan_reins".into())]),
+        );
+        let mut delete_resp = Response::new();
+        handle_delete_points(&delete_input, &mut delete_resp).unwrap();
+        assert_eq!(delete_resp.status, 200);
+
+        upsert_points(
+            &ctx,
+            "broad_scan_reins",
+            serde_json::json!([{
+                "id": 15,
+                "vector": {"dense": [1.0, 0.0, 0.0]},
+                "payload": {"scope": "all"}
+            }]),
+        );
+
+        let r = storage.backend.begin_read().unwrap();
+        let prefilter: HashSet<u128> = (1..=20_u128).collect();
+        let total = collection_vector_count_be(&storage);
+        let sel_hint = Some(prefilter.len() as f32 / total as f32);
+        let query = [1.0_f32, 0.0, 0.0];
+        let k = 5;
+
+        let before = broad_scan_completions_for_test();
+        let scan_results = with_broad_scan_for_test(true, || {
+            storage
+                .named_vectors
+                .dense_search_broad_prefilter_scan_be::<fn(u128) -> bool>(
+                    &r, "dense", &query, k, &prefilter, None, sel_hint,
+                )
+                .unwrap()
+                .expect("scan must execute on fixture with materialized sidecars")
+        });
+        assert!(
+            broad_scan_completions_for_test() > before,
+            "scan completion counter must increment"
+        );
+
+        // Brute-force reference.
+        let brute_results = storage
+            .named_vectors
+            .dense_search_candidate_ids_exact_be(
+                &r,
+                "dense",
+                &query,
+                k,
+                prefilter.iter().copied(),
+                sel_hint,
+            )
+            .unwrap();
+
+        // Point 15 (now [1,0,0]) must be in the top results.
+        assert_eq!(
+            scan_results[0].id, 15,
+            "re-inserted point 15 must be the #1 scan result"
+        );
+        let brute_ids: Vec<u128> = brute_results.iter().map(|h| h.id).collect();
+        let scan_ids: Vec<u128> = scan_results.iter().map(|h| h.id).collect();
+        assert_eq!(
+            brute_ids, scan_ids,
+            "scan must return same top-k as brute force after delete+reinsert"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_has_id_combo() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = broad_scan_fixture(&ctx, "broad_scan_has_id");
+        let r = storage.backend.begin_read().unwrap();
+
+        // has_id gate narrows to a few points → should resolve to exact
+        // candidates, not use the broad scan. Verify the planner still works.
+        let filter: Filter = serde_json::from_value(serde_json::json!({
+            "must": [
+                {"key": "scope", "match": {"value": "all"}},
+                {"has_id": [1, 50, 100, 200, 300]}
+            ]
+        }))
+        .unwrap();
+
+        let probed =
+            vector_query_indexed_filter_candidates_be_probed(&storage, &r, &filter, true).unwrap();
+        // has_id resolves to exact candidates (small set); prefilter not needed.
+        assert!(
+            probed.candidates.is_some(),
+            "has_id must resolve candidates"
+        );
+        assert!(
+            probed.candidates.as_ref().unwrap().len() <= 5,
+            "has_id gate should produce at most 5 candidates"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_must_not_combo() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = broad_scan_fixture(&ctx, "broad_scan_must_not");
+        let r = storage.backend.begin_read().unwrap();
+
+        // must: scope=all (broad, all match) + must_not: path contains "mod_000"
+        // The scan should return results, and none should have n%40==0.
+        let filter: Filter = serde_json::from_value(serde_json::json!({
+            "must": [{"key": "scope", "match": {"value": "all"}}],
+            "must_not": [{"key": "path", "match": {"text": "mod_000/file.rs"}}]
+        }))
+        .unwrap();
+        let prefilter: HashSet<u128> = (1..=400_u128).collect();
+        let recheck_fn = |id: u128| -> bool {
+            match storage.get_node_be(&r, &id) {
+                Ok(node) => filter.matches_point(Some(id), &node.properties),
+                Err(_) => false,
+            }
+        };
+
+        let before = broad_scan_completions_for_test();
+        let hits = storage
+            .named_vectors
+            .dense_search_broad_prefilter_scan_be(
+                &r,
+                "dense",
+                &[1.0, 0.0, 0.0],
+                10,
+                &prefilter,
+                Some(&[recheck_fn][..]),
+                Some(1.0),
+            )
+            .unwrap()
+            .expect("scan must execute on a fixture with materialized sidecars");
+        assert!(
+            broad_scan_completions_for_test() > before,
+            "scan completion counter must increment"
+        );
+
+        for hit in &hits {
+            let n = (hit.id - 1) as i64;
+            assert!(
+                n % 40 != 0,
+                "must_not mod_000 should exclude n={n} (id={})",
+                hit.id
+            );
+        }
+
+        // Cross-check: brute force over the recheck-passing points.
+        let passing_ns: Vec<i64> = (0..400_i64).filter(|n| n % 40 != 0).collect();
+        let expected_ns = brute_force_top_k(passing_ns.iter().copied(), 10);
+        let actual_ns: Vec<i64> = hits.iter().map(|h| (h.id - 1) as i64).collect();
+        assert_eq!(
+            actual_ns, expected_ns,
+            "must_not scan ids must match brute force"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_sparse_untouched() {
+        // Sparse search must not be affected by the broad scan path.
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        create_collection_with_sparse(&ctx, "broad_scan_sparse");
+        let points: Vec<serde_json::Value> = (0..20_i64)
+            .map(|i| {
+                serde_json::json!({
+                    "id": i + 1,
+                    "vector": {
+                        "dense": [1.0, 0.0, 0.0],
+                        "lex_sparse": {"indices": [7], "values": [1.0]}
+                    },
+                    "payload": {"scope": "all"}
+                })
+            })
+            .collect();
+        upsert_mixed_points(&ctx, "broad_scan_sparse", serde_json::Value::Array(points));
+        let storage = ctx.collections.get_collection("broad_scan_sparse").unwrap();
+        storage.refresh_metadata_snapshot().unwrap();
+        storage
+            .create_payload_index("scope", PayloadIndexSchema::Keyword)
+            .unwrap();
+        wait_for_payload_index_ready(&ctx, "broad_scan_sparse", "scope");
+
+        let (status, body) = query_points_raw(
+            &ctx,
+            "broad_scan_sparse",
+            serde_json::json!({
+                "query": {"indices": [7], "values": [1.0]},
+                "using": "lex_sparse",
+                "limit": 5,
+                "with_payload": true,
+                "filter": {"must": [{"key": "scope", "match": {"value": "all"}}]}
+            }),
+        );
+        assert_eq!(status, 200, "sparse query failed: {body}");
+        let points = body["result"]["points"].as_array().unwrap();
+        assert_eq!(
+            points.len(),
+            5,
+            "sparse query with broad filter must still return results"
+        );
+    }
+
+    /// Mid-size exact candidate set: the scan path should engage when
+    /// the candidate set comes from `exact_index_filter_candidates`
+    /// (no recheck needed). This mirrors the routers/services live
+    /// scenario where candidates are under the broad cap but still
+    /// benefit from sidecar scan over filtered HNSW.
+    #[test]
+    #[serial]
+    fn lsm_broad_prefilter_scan_midsize_exact_candidates() {
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let storage = broad_scan_fixture(&ctx, "broad_scan_midsize");
+
+        let r = storage.backend.begin_read().unwrap();
+
+        // Mid-size candidate set: 50 out of 400 points (12.5% selectivity).
+        // In production this would come from an indexed keyword filter that
+        // resolves to exact candidates (no payload recheck).
+        let candidates: HashSet<u128> = (1..=200_u128).filter(|n| n % 4 == 0).collect(); // 50 points
+        assert_eq!(candidates.len(), 50);
+
+        let total = collection_vector_count_be(&storage);
+        let sel_hint = Some(candidates.len() as f32 / total as f32);
+        let query = [1.0_f32, 0.0, 0.0];
+        let k = 10;
+
+        // Brute-force reference.
+        let brute_results = storage
+            .named_vectors
+            .dense_search_candidate_ids_exact_be(
+                &r,
+                "dense",
+                &query,
+                k,
+                candidates.iter().copied(),
+                sel_hint,
+            )
+            .unwrap();
+
+        // Scan path (no recheck -- exact candidates).
+        let before = broad_scan_completions_for_test();
+        let scan_results = with_broad_scan_for_test(true, || {
+            storage
+                .named_vectors
+                .dense_search_broad_prefilter_scan_be::<fn(u128) -> bool>(
+                    &r,
+                    "dense",
+                    &query,
+                    k,
+                    &candidates,
+                    None,
+                    sel_hint,
+                )
+                .unwrap()
+                .expect("scan must execute on a fixture with materialized sidecars")
+        });
+        assert!(
+            broad_scan_completions_for_test() > before,
+            "scan completion counter must increment for mid-size exact candidates"
+        );
+
+        let brute_ids: Vec<u128> = brute_results.iter().map(|h| h.id).collect();
+        let scan_ids: Vec<u128> = scan_results.iter().map(|h| h.id).collect();
+        assert_eq!(
+            brute_ids, scan_ids,
+            "mid-size exact candidate scan must return same top-k ids as brute force"
+        );
+        for (brute, scan) in brute_results.iter().zip(scan_results.iter()) {
+            let a = brute.distance.unwrap_or(0.0);
+            let b = scan.distance.unwrap_or(0.0);
+            assert!(
+                (a - b).abs() < 1e-4,
+                "score mismatch for {}: brute={a} scan={b}",
+                brute.id
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn lsm_broad_scan_e2e_query_endpoint() {
+        // End-to-end through the query handler: a broad keyword filter that
+        // matches all points must produce brute-force-correct results.
+        // The handler may or may not route through the flat-scan path
+        // depending on the planner; the unit tests above prove the scan
+        // path itself works.
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        let _storage = broad_scan_fixture(&ctx, "broad_scan_e2e");
+
+        let (status, body) = with_broad_scan_for_test(true, || {
+            query_points_raw(
+                &ctx,
+                "broad_scan_e2e",
+                serde_json::json!({
+                    "query": [1.0, 0.0, 0.0],
+                    "using": "dense",
+                    "limit": 10,
+                    "with_payload": true,
+                    "filter": {"must": [{"key": "scope", "match": {"value": "all"}}]}
+                }),
+            )
+        });
+        assert_eq!(status, 200, "e2e query failed: {body}");
+
+        let points = body["result"]["points"].as_array().unwrap();
+        assert_eq!(points.len(), 10);
+        let expected_ns = brute_force_top_k(0..400_i64, 10);
+        let actual_ns = result_ns(&body["result"]["points"]);
+        assert_eq!(
+            actual_ns, expected_ns,
+            "e2e query must produce brute-force-correct ordering"
         );
     }
 }

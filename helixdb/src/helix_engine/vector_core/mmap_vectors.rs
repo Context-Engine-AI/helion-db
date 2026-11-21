@@ -443,6 +443,13 @@ impl MmapVectorStore {
         Ok(())
     }
 
+    /// False from an append until the next remap, the only time
+    /// `refresh_read_mmap` has anything to do. With the mapping present, a row
+    /// `get` does not find is past the file's end.
+    pub fn read_mmap_is_current(&self) -> bool {
+        self.mmap.is_some()
+    }
+
     /// Remap the read-only mmap to reflect current file contents.
     fn remap(&mut self) -> Result<(), VectorError> {
         let mmap = unsafe {
@@ -2244,6 +2251,15 @@ impl MmapBackend {
         match self {
             Self::Hvec(s) => s.refresh_read_mmap(),
             Self::Hvs8(_) | Self::Hvtq(_) | Self::Hspn(_) => Ok(()),
+        }
+    }
+
+    /// Whether [`Self::refresh_read_mmap`] would have nothing to do.
+    #[inline]
+    pub fn read_mmap_is_current(&self) -> bool {
+        match self {
+            Self::Hvec(s) => s.read_mmap_is_current(),
+            Self::Hvs8(_) | Self::Hvtq(_) | Self::Hspn(_) => true,
         }
     }
 

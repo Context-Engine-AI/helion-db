@@ -2,9 +2,9 @@ use crate::helix_engine::{
     graph_core::graph_core::HelixGraphEngine,
     storage_core::{
         backend_lsm::{allow_lsm_blocking, allow_lsm_blocking_cancellable, LsmReadCancellation},
-        collection_manager::CollectionManager,
+        collection_manager::{CollectionManager, PATH_NAME_REFUSAL, ROOT_ENGINE_NAME_REFUSAL},
         reader_warm,
-        replication::{self, ReplicationManager},
+        replication::{self, ReplicationManager, VECTOR_NAME_REFUSAL},
     },
     types::GraphError,
 };
@@ -56,12 +56,14 @@ type BlockingSemaphore = (Arc<Semaphore>, usize);
 /// read fallbacks; a normally completed request disarms the guard.
 struct CancelLsmReadOnDrop {
     cancellation: Option<LsmReadCancellation>,
+    route: &'static str,
 }
 
 impl CancelLsmReadOnDrop {
-    fn new(cancellation: LsmReadCancellation) -> Self {
+    fn new(cancellation: LsmReadCancellation, route: &'static str) -> Self {
         Self {
             cancellation: Some(cancellation),
+            route,
         }
     }
 
@@ -74,6 +76,13 @@ impl Drop for CancelLsmReadOnDrop {
     fn drop(&mut self) {
         if let Some(cancellation) = self.cancellation.take() {
             cancellation.cancel();
+            // One per request its caller left, where
+            // `helix_lsm_reader_request_cancelled_total` counts the reads
+            // such a request still tried. Only a request that carries this
+            // guard is counted: one admitted on a route with a cancellable
+            // read. A write or maintenance request whose caller left is not.
+            metrics::counter!("helix_http_requests_abandoned_total", "route" => self.route)
+                .increment(1);
         }
     }
 }
@@ -649,29 +658,85 @@ pub fn spawn_segment_breaker_reeval_task(state: AsyncGatewayState) {
 /// hammering a create that cannot succeed until the purge completes.
 const PURGE_PENDING_RETRY_AFTER_SECS: u64 = 10;
 
-fn graph_error_status(error: &GraphError) -> u16 {
+pub(crate) fn graph_error_status(error: &GraphError) -> u16 {
     match error {
         GraphError::EdgeNotFound | GraphError::NodeNotFound | GraphError::LabelNotFound => 404,
         GraphError::FatalCollectionStorage { .. } => 500,
         GraphError::MapFull | GraphError::ResizeBackpressure(_) => 503,
         // Transient: the dropped incarnation's object-store purge is retrying.
         GraphError::PurgePending(_) => 503,
+        // Transient: no room to open the collection now.
+        GraphError::OpenDeferred { .. } => 503,
+        // The root graph engine's name asked for as a collection, a name
+        // that is not one path segment, or a vector space's name that cannot
+        // be a file's stem: the caller's mistake, whatever the route.
+        GraphError::New(msg)
+            if msg.ends_with(ROOT_ENGINE_NAME_REFUSAL)
+                || msg.ends_with(PATH_NAME_REFUSAL)
+                || msg.ends_with(VECTOR_NAME_REFUSAL) =>
+        {
+            400
+        }
         // `VectorError(_)` can wrap a "Vector not found" message that has no
         // dedicated variant; fall back to the string for that not-found case.
         GraphError::VectorError(_) if error.to_string().contains("not found") => 404,
         // `collection_manager::get_loaded_collection`/`get_collection` raise a
         // missing collection as `GraphError::New(format!("Collection '{}' not
         // found", name))` — no dedicated variant either. Same string fallback.
-        GraphError::New(msg) if msg.contains("Collection") && msg.contains("not found") => 404,
+        GraphError::New(msg) | GraphError::OpenReplay(msg)
+            if msg.contains("Collection") && msg.contains("not found") =>
+        {
+            404
+        }
         // A reader whose collection was dropped and purged under it fails reads
         // with SlateDB `DatabaseMissing`, stringified by handlers without the
         // "Collection ... not found" wording (the legacy gateway already 404s it).
-        GraphError::New(msg) | GraphError::StorageError(msg)
+        GraphError::New(msg) | GraphError::OpenReplay(msg) | GraphError::StorageError(msg)
             if msg.contains("database does not exist") =>
         {
             404
         }
         _ => 500,
+    }
+}
+
+/// Seconds after which a request that got `error` is worth repeating, for the
+/// errors that pass on their own.
+fn graph_error_retry_after_secs(error: &GraphError) -> Option<u64> {
+    match error {
+        GraphError::PurgePending(_) => Some(PURGE_PENDING_RETRY_AFTER_SECS),
+        GraphError::OpenDeferred {
+            retry_after_secs, ..
+        } => Some(*retry_after_secs),
+        _ => None,
+    }
+}
+
+/// Writes the answer for a handler's error into `response` and logs it: the
+/// status, `Retry-After` for an error that passes on its own, and the body.
+/// The router quarantines the collection besides; a handler that answers a
+/// failed open itself calls this alone.
+pub(crate) fn answer_handler_error(
+    method: &str,
+    path: &str,
+    error: &GraphError,
+    response: &mut HelixResponse,
+) {
+    let status = graph_error_status(error);
+    log_handler_error(method, path, status, error);
+    response.status = status;
+    if let Some(secs) = graph_error_retry_after_secs(error) {
+        response
+            .headers
+            .insert("Retry-After".to_string(), secs.to_string());
+    }
+    if let Some(body) = error.fatal_collection_response_body() {
+        response.body = body;
+        response
+            .headers
+            .insert("Content-Type".to_string(), "application/json".to_string());
+    } else {
+        response.body = error.to_string().into_bytes();
     }
 }
 
@@ -683,6 +748,11 @@ fn graph_error_status(error: &GraphError) -> u16 {
 enum HandlerErrorLogClass {
     CooperativeCancellation,
     ClientOutcome,
+    /// Not served now and the wait is named: the cause passes by itself.
+    RetryLater,
+    /// The last open's error again, with no new attempt. The collection
+    /// manager writes one line a cooldown for all of them.
+    OpenReplay,
     ServerFailure,
 }
 
@@ -691,6 +761,10 @@ fn handler_error_log_class(error: &GraphError, status: u16) -> HandlerErrorLogCl
         HandlerErrorLogClass::CooperativeCancellation
     } else if (400..500).contains(&status) {
         HandlerErrorLogClass::ClientOutcome
+    } else if graph_error_retry_after_secs(error).is_some() {
+        HandlerErrorLogClass::RetryLater
+    } else if matches!(error, GraphError::OpenReplay(_)) {
+        HandlerErrorLogClass::OpenReplay
     } else {
         HandlerErrorLogClass::ServerFailure
     }
@@ -717,6 +791,26 @@ fn log_handler_error(method: &str, path: &str, status: u16, error: &GraphError) 
                 status,
                 error = ?error,
                 "Handler returned client outcome"
+            );
+        }
+        HandlerErrorLogClass::RetryLater => {
+            // One line a request, like a failure, but not at ERROR: these
+            // come in bursts when a pod is full or a purge is pending.
+            warn!(
+                method,
+                path,
+                status,
+                error = ?error,
+                "Handler deferred the request"
+            );
+        }
+        HandlerErrorLogClass::OpenReplay => {
+            debug!(
+                method,
+                path,
+                status,
+                error = ?error,
+                "Handler answered with the last open's error"
             );
         }
         HandlerErrorLogClass::ServerFailure => {
@@ -1435,17 +1529,14 @@ async fn handle(
             .unwrap_or(0);
         let snapshot =
             crate::helix_engine::storage_core::change_feed::change_feed().changes_since(since);
-        let body_json = serde_json::json!({
-            "epoch": snapshot.epoch,
-            "cursor": snapshot.cursor,
-            "changes": snapshot.changes,
-        });
+        // Written from the type the reader's poller parses it into.
+        let body_json = serde_json::to_vec(&snapshot).unwrap_or_default();
         observe_http_request(&method, &path, 200, request_started);
         return HttpResponse::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("X-Helix-Route-Class", RouteClass::Probe.as_label())
-            .body(Body::from(body_json.to_string().into_bytes()))
+            .body(Body::from(body_json))
             .unwrap();
     }
 
@@ -1684,7 +1775,8 @@ async fn run_router(
     let cancellation =
         route_has_cancellable_lsm_read(&method, &path, class).then(LsmReadCancellation::new);
     let worker_cancellation = cancellation.clone();
-    let mut cancel_on_drop = cancellation.map(CancelLsmReadOnDrop::new);
+    let mut cancel_on_drop = cancellation
+        .map(|cancellation| CancelLsmReadOnDrop::new(cancellation, route_label_for(&path)));
     let panic_method = method.clone();
     let panic_path = path.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -1706,24 +1798,8 @@ async fn run_router(
                 request,
                 &mut response,
             ) {
-                let status = graph_error_status(&e);
-                log_handler_error(&method, &path, status, &e);
                 quarantine_collection_from_handler_error(&state.collections, &path, &e);
-                response.status = status;
-                if matches!(e, GraphError::PurgePending(_)) {
-                    response.headers.insert(
-                        "Retry-After".to_string(),
-                        PURGE_PENDING_RETRY_AFTER_SECS.to_string(),
-                    );
-                }
-                if let Some(body) = e.fatal_collection_response_body() {
-                    response.body = body;
-                    response
-                        .headers
-                        .insert("Content-Type".to_string(), "application/json".to_string());
-                } else {
-                    response.body = e.to_string().into_bytes();
-                }
+                answer_handler_error(&method, &path, &e, &mut response);
             }
             response
         };
@@ -1815,13 +1891,13 @@ mod reader_request_cancellation_tests {
     fn drop_guard_cancels_only_while_armed() {
         let cancelled = LsmReadCancellation::new();
         {
-            let _guard = CancelLsmReadOnDrop::new(cancelled.clone());
+            let _guard = CancelLsmReadOnDrop::new(cancelled.clone(), "/test");
         }
         assert!(cancelled.is_cancelled());
 
         let completed = LsmReadCancellation::new();
         {
-            let mut guard = CancelLsmReadOnDrop::new(completed.clone());
+            let mut guard = CancelLsmReadOnDrop::new(completed.clone(), "/test");
             guard.disarm();
         }
         assert!(!completed.is_cancelled());
@@ -1927,13 +2003,41 @@ mod reader_request_cancellation_tests {
 #[cfg(test)]
 mod segment_circuit_breaker_tests {
     use super::{
-        graph_error_status, handler_error_log_class, segment_breaker_reeval_decision,
-        segment_breaker_submit_allowed, segment_circuit_breaker_collection,
-        segment_circuit_breaker_should_reject, HandlerErrorLogClass, SegmentBreakerReevalDecision,
-        SegmentBreakerState, SEGMENT_BREAKER_OPTIMIZER_SUBMIT_TIMES,
+        answer_handler_error, graph_error_retry_after_secs, graph_error_status,
+        handler_error_log_class, segment_breaker_reeval_decision, segment_breaker_submit_allowed,
+        segment_circuit_breaker_collection, segment_circuit_breaker_should_reject,
+        HandlerErrorLogClass, HelixResponse, SegmentBreakerReevalDecision, SegmentBreakerState,
+        PURGE_PENDING_RETRY_AFTER_SECS, REPLICA_SHED_HEADER, ROOT_ENGINE_NAME_REFUSAL,
+        SEGMENT_BREAKER_OPTIMIZER_SUBMIT_TIMES,
     };
     use crate::helix_engine::types::GraphError;
     use std::time::{Duration, Instant};
+
+    /// A deferred open is this replica's own "later", not a shed: the header
+    /// that makes the gateway eject a reader stays off.
+    #[test]
+    fn deferred_open_answers_503_with_retry_after_and_no_shed_header() {
+        let mut response = HelixResponse::new();
+        answer_handler_error(
+            "POST",
+            "/collections/x/points/query",
+            &GraphError::OpenDeferred {
+                retry_after_secs: 3,
+                message: "collection open capacity saturated: loaded=1 opening=0 max=1".into(),
+            },
+            &mut response,
+        );
+        assert_eq!(response.status, 503);
+        assert_eq!(
+            response.headers.get("Retry-After").map(String::as_str),
+            Some("3")
+        );
+        assert!(!response.headers.contains_key(REPLICA_SHED_HEADER));
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            "Collection open deferred: collection open capacity saturated: loaded=1 opening=0 max=1"
+        );
+    }
 
     #[test]
     fn at_or_below_limit_does_not_reject() {
@@ -2137,6 +2241,34 @@ mod segment_circuit_breaker_tests {
             graph_error_status(&GraphError::PurgePending("purge pending".into())),
             503
         );
+        let deferred = GraphError::OpenDeferred {
+            retry_after_secs: 7,
+            message: "backpressure, collection open capacity saturated".into(),
+        };
+        assert_eq!(graph_error_status(&deferred), 503);
+        assert_eq!(graph_error_retry_after_secs(&deferred), Some(7));
+        assert!(!deferred.should_quarantine_collection());
+        assert_eq!(
+            graph_error_retry_after_secs(&GraphError::PurgePending("purge pending".into())),
+            Some(PURGE_PENDING_RETRY_AFTER_SECS)
+        );
+        assert_eq!(
+            graph_error_retry_after_secs(&GraphError::New("Lock poisoned: x".into())),
+            None
+        );
+        assert_eq!(
+            graph_error_status(&GraphError::New(format!(
+                "Collection name 'user' {ROOT_ENGINE_NAME_REFUSAL}"
+            ))),
+            400
+        );
+        assert_eq!(
+            graph_error_status(&GraphError::New(format!(
+                "Collection name \"user/\" {}",
+                crate::helix_engine::storage_core::collection_manager::PATH_NAME_REFUSAL
+            ))),
+            400
+        );
         assert_eq!(
             graph_error_status(&GraphError::VectorError("Vector not found: x".into())),
             404
@@ -2215,6 +2347,40 @@ mod segment_circuit_breaker_tests {
                 "expected 404 must not be logged as a server failure: {error}"
             );
         }
+
+        // A "later" is a 503, and no failure of the server either.
+        for error in [
+            GraphError::PurgePending("purge pending".into()),
+            GraphError::OpenDeferred {
+                retry_after_secs: 1,
+                message: "backpressure, collection open capacity saturated".into(),
+            },
+        ] {
+            let status = graph_error_status(&error);
+            assert_eq!(status, 503);
+            assert_eq!(
+                handler_error_log_class(&error, status),
+                HandlerErrorLogClass::RetryLater,
+                "a deferred request must not be logged as a server failure: {error}"
+            );
+        }
+
+        // The last open's error again is answered as that error was, and is
+        // one line a cooldown in the collection manager, not one a request.
+        let replayed = GraphError::OpenReplay("Graph error: object store timed out".into());
+        assert_eq!(graph_error_status(&replayed), 500);
+        assert_eq!(
+            handler_error_log_class(&replayed, 500),
+            HandlerErrorLogClass::OpenReplay
+        );
+        let absent_again = GraphError::OpenReplay(
+            "Graph error: Collection 'gone' not found (no manifest in object store)".into(),
+        );
+        assert_eq!(graph_error_status(&absent_again), 404);
+        assert_eq!(
+            handler_error_log_class(&absent_again, 404),
+            HandlerErrorLogClass::ClientOutcome
+        );
 
         // Cancellation is returned through the generic backend-error wrapper,
         // so it currently maps to 500. It is still an expected outcome because

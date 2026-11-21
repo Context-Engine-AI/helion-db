@@ -36,10 +36,12 @@ use super::backend_lsm::{
     collections_root_prefix, decode_dup_full_key, dup_composite, dup_key_prefix, dup_scan_plan,
     ensure_lsm_read_not_cancelled, list_child_collection_names, list_drop_tombstones,
     lsm_multi_get_enabled, lsm_scan_options, lsm_streaming_scan_options, ns_prefix,
-    prefix_filter_policies_from_env, prefixed, reader_options_from_env,
+    prefix_filter_policies_from_env, prefixed, reader_active_poll_interval_from_env,
+    reader_idle_poll_interval_from_env, reader_options_from_env, reader_tier_in_place_enabled,
     scan_prefix_for_namespace_range, shared_db_cache, shared_lsm_handle, shared_merge_operator,
     DupScanCursor, LsmBackend,
 };
+use super::wal_whole_get;
 
 fn reader_io<E: std::fmt::Display>(e: E) -> BackendError {
     let msg = e.to_string();
@@ -100,7 +102,11 @@ pub struct LsmReader {
     /// at an OLDER state than the one it replaces, so callers that validate
     /// a sequence of latest-state reads (e.g. the sparse cache epoch check)
     /// must also see an unchanged generation.
-    generation: std::sync::atomic::AtomicU64,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Set when a check outside the `DbReader`'s own poll found its
+    /// checkpoint absent ([`Self::end`]); [`Self::close_reason`] then reads
+    /// `DatabaseMissing` whatever the `DbReader` recorded.
+    ended: Arc<std::sync::atomic::AtomicBool>,
     /// `Handle` to the process-shared LSM runtime (see
     /// [`super::backend_lsm::shared_lsm_runtime`]), NOT an owned runtime — so N
     /// reader replicas / collections share one worker pool.
@@ -110,6 +116,13 @@ pub struct LsmReader {
     /// ([`Self::list_collection_prefixes`]) without reopening the store.
     store: Arc<dyn ObjectStore>,
     path: String,
+    /// RAII guard that unregisters this collection's cache dir from the
+    /// open registry on drop, so the evictor can reclaim it.
+    _cache_dir_guard: Option<super::backend_lsm::cache_evictor::CacheDirGuard>,
+    /// The active and the idle poll interval, when this reader moves between
+    /// its poll tiers without a new `DbReader` (`HELIX_LSM_READER_TIER_IN_PLACE`,
+    /// read here once, at the open). `None`: every tier change is a reopen.
+    tiers: Option<(std::time::Duration, std::time::Duration)>,
 }
 
 impl LsmReader {
@@ -128,14 +141,33 @@ impl LsmReader {
     pub fn open_with_store(path: &str, store: Arc<dyn ObjectStore>) -> Result<Self, BackendError> {
         let rt = shared_lsm_handle();
         let options = reader_options_from_env(path);
+        // Register cache dir BEFORE opening so the evictor cannot delete it during build.
+        // If open fails, the guard's Drop will unregister it.
+        let cache_dir_guard = super::backend_lsm::cache_subtree_for_lsm_path(path)
+            .map(super::backend_lsm::cache_evictor::register_cache_dir);
         let reader = Self::build_reader(&rt, path, store.clone(), options)?;
         Ok(Self {
             reader: std::sync::RwLock::new(Arc::new(reader)),
-            generation: std::sync::atomic::AtomicU64::new(0),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ended: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rt,
             store,
             path: path.to_string(),
+            _cache_dir_guard: cache_dir_guard,
+            tiers: reader_tier_in_place_enabled().then(|| {
+                (
+                    reader_active_poll_interval_from_env(),
+                    reader_idle_poll_interval_from_env(),
+                )
+            }),
         })
+    }
+
+    /// [`super::backend_lsm::batch_row_read_in_flight`] on this collection.
+    pub(crate) fn batch_row_read_in_flight(
+        &self,
+    ) -> slatedb::cached_object_store_stats::BatchRowRead {
+        super::backend_lsm::batch_row_read_in_flight(&self.path)
     }
 
     /// Build a `DbReader` for `path` with the shared cache/merge-operator/filter
@@ -150,7 +182,7 @@ impl LsmReader {
         store: Arc<dyn ObjectStore>,
         options: slatedb::config::DbReaderOptions,
     ) -> Result<DbReader, BackendError> {
-        let mut builder = DbReader::builder(path, store)
+        let mut builder = DbReader::builder(path, wal_whole_get::for_reader(store))
             .with_options(options)
             .with_db_cache(shared_db_cache())
             .with_merge_operator(shared_merge_operator());
@@ -180,6 +212,39 @@ impl LsmReader {
     /// Reader-swap generation; see the `generation` field.
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The current `DbReader` and the swap generation it is the reader of,
+    /// for a question whose answer can come back after a swap. A swap moves
+    /// the generation under the slot's lock.
+    fn reader_to_ask(&self) -> (Arc<DbReader>, u64) {
+        let slot = self
+            .reader
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (Arc::clone(&slot), self.generation())
+    }
+
+    /// Test-only: the current `DbReader`, for a test that closes it once a
+    /// refresh has replaced it, as that refresh's delayed task does 30 s on.
+    #[cfg(test)]
+    pub(crate) fn current_reader_for_test(&self) -> Arc<DbReader> {
+        self.current_reader()
+    }
+
+    /// `(swap generation, durable sequence)` of the view a read starting now
+    /// gets, from memory. Compares as a tuple: a greater value means a later
+    /// read sees a reopened reader, or data an earlier read could not.
+    /// `DbReader` publishes the sequence a moment before its reads see it, so
+    /// a read pinned right after this can still be one step behind it.
+    pub(crate) fn announced_view(&self) -> (u64, u64) {
+        loop {
+            let generation = self.generation();
+            let seq = self.current_reader().subscribe().borrow().durable_seq;
+            if self.generation() == generation {
+                return (generation, seq);
+            }
+        }
     }
 
     /// Reopen the underlying `DbReader` against the CURRENT manifest with the
@@ -217,7 +282,37 @@ impl LsmReader {
         let mut options = reader_options_from_env(&self.path);
         options.manifest_poll_interval = interval;
         super::backend_lsm::clamp_reader_checkpoint_lifetime(&mut options);
+        let refused = || {
+            BackendError::Io(format!(
+                "{LSM_READER_DATABASE_MISSING}: another database at this path since the reader opened"
+            ))
+        };
+        // A reader that ended this way stays ended until its storage is
+        // evicted, whoever found it out: the check below, or a poll. A new
+        // `DbReader` swapped in here would bring it back with no close
+        // reason, on the storage object of the database that is gone.
+        if self.close_reason() == Some(slatedb::CloseReason::DatabaseMissing) {
+            return Err(refused());
+        }
+        let current = self.current_reader();
+        let held = current.current_checkpoint();
         let fresh = Self::build_reader(&self.rt, &self.path, self.store.clone(), options)?;
+        // A collection dropped and created again since `current` opened is
+        // another database at the same path. `fresh` reads it rightly, but
+        // the storage object over this reader holds what it derived from the
+        // dropped rows (its text-walk lists, for one), keyed by sequence
+        // numbers that begin again. So no swap: `current` is closed, reads
+        // are refused, and the sweep evicts the storage as it does when a
+        // poll finds the database gone; the next read opens it cold. A lease
+        // the collector took looks the same from here and ends the same way.
+        if current.close_if_absent_from_reopened(&held, &fresh) {
+            // Takes back the checkpoint `fresh` wrote into the new database.
+            if let Err(error) = block_on_lsm(&self.rt, async move { fresh.close().await }) {
+                tracing::debug!(%error, path = %self.path, "closing the unused DbReader failed");
+            }
+            self.end(current);
+            return Err(refused());
+        }
         let previous = {
             let mut slot = self
                 .reader
@@ -234,6 +329,157 @@ impl LsmReader {
             }
         });
         Ok(())
+    }
+
+    /// What is left to do for `current` once a check has closed its status:
+    /// remember the answer, since a `DbReader` that closed earlier keeps the
+    /// reason it closed with, and stop its poller. `current` refuses reads
+    /// from here on, but the poller runs until the reader is closed, and
+    /// `Drop` leaves a reader with a close reason alone. Detached: a close
+    /// waits for the reads in flight.
+    fn end(&self, current: Arc<DbReader>) {
+        self.ended.store(true, std::sync::atomic::Ordering::Release);
+        self.rt.spawn(async move {
+            // The error is the `DatabaseMissing` it was closed with.
+            let _ = current.close().await;
+        });
+    }
+
+    /// Whether this reader has ended with `DatabaseMissing`, after asking
+    /// now if it had not: the poll's check with one manifest load of its
+    /// own, for a caller that cannot wait for the next poll. An error of
+    /// that load is the caller's to read; the reader is left as it was.
+    ///
+    /// The answer counts only for the reader that is still this one's when
+    /// it comes back. A tier change may have replaced the reader asked
+    /// while its load ran; the swap closes the replaced reader 30 s on, and
+    /// a reader deletes its checkpoint as it closes. A load that returns
+    /// after that says "absent" of a reader that is gone, and used to end
+    /// the one that replaced it: an eviction and a cold open for nothing.
+    /// The reader that is there is then asked, once.
+    pub(crate) fn ended_or_checkpoint_absent(&self) -> Result<bool, BackendError> {
+        for _ in 0..2 {
+            if self.close_reason() == Some(slatedb::CloseReason::DatabaseMissing) {
+                return Ok(true);
+            }
+            let (asked, asked_of) = self.reader_to_ask();
+            let reader = Arc::clone(&asked);
+            let absent = block_on_lsm(&self.rt, async move {
+                reader.close_if_absent_from_manifest().await
+            })?;
+            if self.generation() != asked_of {
+                continue;
+            }
+            if absent {
+                self.end(asked);
+            }
+            return Ok(absent);
+        }
+        // Replaced during both loads: the reader that is here opened a
+        // moment ago on the database that is there.
+        Ok(false)
+    }
+
+    /// [`Self::ended_or_checkpoint_absent`] asked and not waited for, by a
+    /// caller that may not wait on the object store (the feed poller's one
+    /// thread). If the checkpoint is absent the reader ends when the load
+    /// returns, and the next request for its collection finds it ended.
+    pub(crate) fn ask_whether_checkpoint_is_absent(&self) {
+        if self.close_reason().is_some() {
+            return;
+        }
+        let (asked, asked_of) = self.reader_to_ask();
+        let ended = Arc::clone(&self.ended);
+        let generation = Arc::clone(&self.generation);
+        self.rt.spawn(async move {
+            if let Ok(true) = asked.close_if_absent_from_manifest().await {
+                // Replaced while the load ran: see `ended_or_checkpoint_absent`.
+                // Not asked again here; the next change or poll does that.
+                if generation.load(std::sync::atomic::Ordering::SeqCst) != asked_of {
+                    return;
+                }
+                ended.store(true, std::sync::atomic::Ordering::Release);
+                let _ = asked.close().await;
+            }
+        });
+    }
+
+    /// Test-only: close the current `DbReader` now, as the delayed task of a
+    /// refresh does to the replaced one 30 s after the swap. A read begun on
+    /// it before fails from here on.
+    #[cfg(test)]
+    pub(crate) fn close_current_for_test(&self) -> Result<(), BackendError> {
+        let reader = self.current_reader();
+        block_on_lsm(&self.rt, async move { reader.close().await })
+    }
+
+    /// Move to the poll tier of `interval` and catch up with the manifest,
+    /// which is what the reopen of [`Self::refresh_with_poll_interval`] gave a
+    /// tier change. The open `DbReader` is told its new interval and asked for
+    /// a poll: no new checkpoint, no replay of the WAL tail it has already
+    /// replayed, and the swap generation stays, so no read waits for a
+    /// reconcile it has no data for. Returns when that poll has finished.
+    ///
+    /// A `DbReader` that cannot take `interval` is reopened as before; see
+    /// [`Self::set_poll_interval_in_place`].
+    pub(crate) fn retier(&self, interval: std::time::Duration) -> Result<(), BackendError> {
+        if self.set_poll_interval_in_place(interval) {
+            metrics::counter!("helix_lsm_reader_retier_total", "how" => "in_place").increment(1);
+            return self.poll_now(None).map(|_| ());
+        }
+        metrics::counter!("helix_lsm_reader_retier_total", "how" => "reopen").increment(1);
+        self.refresh_with_poll_interval_inner(interval)
+    }
+
+    /// Tell the open `DbReader` to poll every `interval` from its next tick
+    /// on. `false` when it was not done and the caller has to reopen:
+    /// - the switch is off;
+    /// - `interval` is longer than both tiers: the lease this reader was
+    ///   opened with (`clamp_reader_checkpoint_lifetime`) covers the idle
+    ///   tier and nothing longer;
+    /// - `interval` is shorter than the tick this `DbReader` was opened with,
+    ///   which it rounds up to. In production both tiers are opened at the
+    ///   active interval, so that is a reader left by a reopen at another one.
+    fn set_poll_interval_in_place(&self, interval: std::time::Duration) -> bool {
+        let Some((active, idle)) = self.tiers else {
+            return false;
+        };
+        if interval > active.max(idle) {
+            return false;
+        }
+        let reader = self.current_reader();
+        reader.set_manifest_poll_interval(interval).is_ok()
+            && reader.manifest_poll_interval() == interval
+    }
+
+    /// Ask the open `DbReader` for a manifest poll now and wait for it, at
+    /// most `wait` when one is given. `Ok(true)`: a poll that began after
+    /// this call has finished, so what was durable before it is readable.
+    /// `Ok(false)`: `wait` passed first; the poll goes on by itself.
+    pub(crate) fn poll_now(&self, wait: Option<std::time::Duration>) -> Result<bool, BackendError> {
+        let reader = self.current_reader();
+        block_on_lsm_mapped(
+            &self.rt,
+            async move {
+                match wait {
+                    None => reader.poll_manifest().await.map(|()| true),
+                    Some(wait) => match tokio::time::timeout(wait, reader.poll_manifest()).await {
+                        Ok(polled) => polled.map(|()| true),
+                        Err(_) => Ok(false),
+                    },
+                }
+            },
+            reader_io,
+        )
+    }
+
+    /// The poll tier of a reader that changes tiers in place, read off its
+    /// `DbReader`: there is no second copy of it to drift. `None` when every
+    /// tier change is a reopen, where the caller keeps its own flag.
+    pub(crate) fn in_place_tier_is_fast(&self) -> Option<bool> {
+        let (active, idle) = self.tiers?;
+        let interval = self.current_reader().manifest_poll_interval();
+        Some(interval <= active || interval < idle)
     }
 
     /// List the sibling collection names in the object store: the immediate
@@ -267,6 +513,11 @@ impl LsmReader {
     }
 
     pub(crate) fn close_reason(&self) -> Option<slatedb::CloseReason> {
+        // A `DbReader` that closed for another reason before the reopen keeps
+        // that reason, and only some reasons are evicted.
+        if self.ended.load(std::sync::atomic::Ordering::Acquire) {
+            return Some(slatedb::CloseReason::DatabaseMissing);
+        }
         self.current_reader().status().close_reason
     }
 
@@ -360,8 +611,25 @@ impl LsmReader {
         ns: Namespace<'_>,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
+        self.collect_values_many_at(snap, ns, keys, lsm_multi_get_enabled())
+    }
+
+    /// [`Self::collect_values_many_with_at`] with the read path chosen by the
+    /// caller. `multi_get` answers a batch of keys that mostly do not exist
+    /// with one filter read per SST; single gets, 96 in flight, overlap the
+    /// waits of keys that do exist, which is why readers run with the switch
+    /// off.
+    pub(crate) fn collect_values_many_at(
+        &self,
+        snap: Option<&Arc<DbSnapshot>>,
+        ns: Namespace<'_>,
+        keys: &[Vec<u8>],
+        multi_get: bool,
+    ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
+        #[cfg(test)]
+        super::backend_lsm::note_key_batch_for_test(&self.path);
         let full_keys: Vec<Vec<u8>> = keys.iter().map(|key| prefixed(ns, key)).collect();
-        if lsm_multi_get_enabled() {
+        if multi_get {
             // One ordered multi_get pass (fork API): shares block fetches
             // across keys and preserves input order.
             let fetched = match snap {
@@ -489,6 +757,19 @@ impl LsmReader {
         snap: Option<&Arc<DbSnapshot>>,
         ns: Namespace<'_>,
         key: &[u8],
+        visit: impl FnMut(&[u8]) -> bool,
+    ) -> Result<(), BackendError> {
+        self.for_each_dup_from_at(snap, ns, key, &[], visit)
+    }
+
+    /// [`Self::for_each_dup_with_at`] from the first value that is not below
+    /// `from`. The scan starts there, so no row before it is read.
+    pub(crate) fn for_each_dup_from_at(
+        &self,
+        snap: Option<&Arc<DbSnapshot>>,
+        ns: Namespace<'_>,
+        key: &[u8],
+        from: &[u8],
         mut visit: impl FnMut(&[u8]) -> bool,
     ) -> Result<(), BackendError> {
         let kp = dup_key_prefix(ns, key);
@@ -499,12 +780,12 @@ impl LsmReader {
                 let mut iter = match snap {
                     Some(snapshot) => {
                         snapshot
-                            .scan_prefix_with_options(kp.clone(), .., &lsm_scan_options())
+                            .scan_prefix_with_options(kp.clone(), from.., &lsm_scan_options())
                             .await
                     }
                     None => {
                         reader
-                            .scan_prefix_with_options(kp.clone(), .., &lsm_scan_options())
+                            .scan_prefix_with_options(kp.clone(), from.., &lsm_scan_options())
                             .await
                     }
                 }
@@ -592,7 +873,7 @@ impl LsmReader {
         ns: Namespace<'_>,
         range: KeyRange,
         scan_options: ScanOptions,
-        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
+        mut visit: impl FnMut(&[u8], &[u8], &[u8]) -> bool,
     ) -> Result<(), BackendError> {
         let prefix = ns_prefix(ns);
         let plan = dup_scan_plan(ns, &range);
@@ -636,7 +917,7 @@ impl LsmReader {
                             Some(parts) => parts,
                             None => continue,
                         };
-                    if !visit(logical_key, logical_value) {
+                    if !visit(logical_key, logical_value, kv.value.as_ref()) {
                         break;
                     }
                 }
@@ -650,9 +931,21 @@ impl LsmReader {
         &self,
         ns: Namespace<'_>,
         range: KeyRange,
-        visit: impl FnMut(&[u8], &[u8]) -> bool,
+        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
     ) -> Result<(), BackendError> {
-        self.scan_dup_with_options(None, ns, range, lsm_scan_options(), visit)
+        self.scan_dup_with_options(None, ns, range, lsm_scan_options(), |k, v, _| visit(k, v))
+    }
+
+    /// Dup scan that also yields each row's stored SlateDB value (see the
+    /// writer's `put_dup_stored`), served from `snap` when present.
+    pub(crate) fn scan_dup_stored_at(
+        &self,
+        snap: Option<&Arc<DbSnapshot>>,
+        ns: Namespace<'_>,
+        range: KeyRange,
+        visit: impl FnMut(&[u8], &[u8], &[u8]) -> bool,
+    ) -> Result<(), BackendError> {
+        self.scan_dup_with_options(snap, ns, range, lsm_scan_options(), visit)
     }
 
     pub(crate) fn scan_streaming(
@@ -683,7 +976,8 @@ impl LsmReader {
         mut visit: impl FnMut(&[u8], &[u8]) -> bool,
     ) -> Result<(), BackendError> {
         if is_dup(ns) {
-            return self.scan_dup_with_options(snap, ns, range, scan_options, visit);
+            return self
+                .scan_dup_with_options(snap, ns, range, scan_options, |k, v, _| visit(k, v));
         }
         let prefix = ns_prefix(ns);
         let lo: Bound<Vec<u8>> = match &range.start {
@@ -769,9 +1063,9 @@ impl LsmReader {
         snap: Option<&Arc<DbSnapshot>>,
         ns: Namespace<'_>,
         range: KeyRange,
-        visit: impl FnMut(&[u8], &[u8]) -> bool,
+        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
     ) -> Result<(), BackendError> {
-        self.scan_dup_with_options(snap, ns, range, lsm_scan_options(), visit)
+        self.scan_dup_with_options(snap, ns, range, lsm_scan_options(), |k, v, _| visit(k, v))
     }
 }
 
@@ -904,6 +1198,104 @@ mod tests {
         );
     }
 
+    /// A rebuilt `DbReader` (poll-tier promote/demote, refresh) must hit the
+    /// shared cache for the index, filter and block the previous handle loaded;
+    /// with sharing off (the `HELIX_LSM_SHARE_SST_CACHE=0` kill switch) it
+    /// re-loads them.
+    #[test]
+    #[serial_test::serial]
+    fn rebuilt_reader_reuses_shared_cache_entries_for_compacted_ssts() {
+        use object_store::memory::InMemory;
+        use slatedb::{scope_query_metrics, QueryMetricsObserver};
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "helion/shared-cache-reopen";
+        let writer = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let mut w = writer.begin_write().unwrap();
+        writer.put(&mut w, Namespace::Nodes, b"k", b"v").unwrap();
+        writer.commit(w).unwrap();
+        writer.close().unwrap();
+
+        let key = super::super::backend_lsm::prefixed(Namespace::Nodes, b"k");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let misses_on_reopened_reader = |share: bool| {
+            let cache = shared_db_cache();
+            slatedb::db_cache::set_share_compacted_entries(share);
+            rt.block_on(async {
+                let open = || {
+                    DbReader::builder(path, store.clone())
+                        .with_db_cache(cache.clone())
+                        .with_merge_operator(shared_merge_operator())
+                        .build()
+                };
+                let first = open().await.unwrap();
+                assert_eq!(first.get(&key).await.unwrap().as_deref(), Some(&b"v"[..]));
+                let second = open().await.unwrap();
+                let observer = QueryMetricsObserver::default();
+                let got = scope_query_metrics(observer.clone(), second.get(&key)).await;
+                assert_eq!(got.unwrap().as_deref(), Some(&b"v"[..]));
+                first.close().await.unwrap();
+                second.close().await.unwrap();
+                observer.snapshot().block_cache
+            })
+        };
+
+        let isolated = misses_on_reopened_reader(false);
+        let shared = misses_on_reopened_reader(true);
+        assert!(
+            isolated.misses > 0,
+            "per-handle scopes re-load: {isolated:?}"
+        );
+        assert_eq!(shared.misses, 0, "shared scope must hit: {shared:?}");
+        assert!(shared.hits > 0, "{shared:?}");
+    }
+
+    /// A reader replays each WAL block once, under a cache scope of its own
+    /// that no later reader shares. In the one process-wide block cache those
+    /// blocks only push out the ones reads use, so a replay must leave the
+    /// cache as it found it.
+    #[test]
+    fn reader_wal_replay_leaves_the_block_cache_alone() {
+        use object_store::memory::InMemory;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "helion/replay-block-cache";
+        // The writer stays open and flushes nothing: every row is in the WAL tail.
+        let writer = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        for i in 0..4u8 {
+            let mut w = writer.begin_write().unwrap();
+            writer
+                .put(&mut w, Namespace::Nodes, &[b'k', i], &vec![i; 8192])
+                .unwrap();
+            writer.commit(w).unwrap();
+        }
+
+        let cache = super::super::backend_lsm::build_db_cache(64 << 20, 16 << 20, 1);
+        let key = super::super::backend_lsm::prefixed(Namespace::Nodes, &[b'k', 3]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let reader = DbReader::builder(path, store.clone())
+                .with_db_cache(cache.clone())
+                .with_merge_operator(shared_merge_operator())
+                .build()
+                .await
+                .unwrap();
+            // Answered from the replayed tail: the replay did read its blocks.
+            assert_eq!(
+                reader.get(&key).await.unwrap().as_deref(),
+                Some(&[3u8; 8192][..])
+            );
+            // Bytes, not `entry_count()`: the in-memory cache counts no entries.
+            let used = match cache.usage_snapshot().memory {
+                slatedb::db_cache::CacheUsageSnapshot::Ready { used_bytes, .. } => used_bytes,
+                other => panic!("the cache reports no memory use: {other:?}"),
+            };
+            assert_eq!(used, 0, "the replay put its WAL blocks in the cache");
+            reader.close().await.unwrap();
+        });
+        writer.close().unwrap();
+    }
+
     /// HA / disposable-reader proof: object storage is the durable record; a
     /// reader's local state (DbReader snapshot + cache) is throwaway. A writer
     /// commits and is dropped; reader A reads then is dropped (simulating a reader
@@ -975,6 +1367,185 @@ mod tests {
             vec![b"a".to_vec()],
             "fresh reader must read committed dup rows off object storage after cache loss"
         );
+    }
+
+    /// Sets an env var for a test and removes it afterwards.
+    struct TierEnv(&'static str);
+    impl TierEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            std::env::set_var(key, value);
+            Self(key)
+        }
+    }
+    impl Drop for TierEnv {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
+    /// A writer and a reader over one in-memory store. The reader is opened
+    /// on a 60 s poll, so nothing it sees after the open comes from its own
+    /// ticks: it was polled, or reopened.
+    fn tier_pair(path: &str) -> (LsmBackend, LsmReader) {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let writer = LsmBackend::open_with_store(path, store.clone()).expect("open writer");
+        let reader = LsmReader::open_with_store(path, store).expect("open reader");
+        (writer, reader)
+    }
+
+    fn tier_commit(writer: &LsmBackend, key: &[u8]) {
+        let mut w = writer.begin_write().unwrap();
+        writer.put(&mut w, Namespace::Nodes, key, b"v").unwrap();
+        writer.commit(w).unwrap();
+    }
+
+    fn tier_sees(reader: &LsmReader, key: &[u8]) -> bool {
+        reader
+            .get_with(Namespace::Nodes, key, |v| v.is_some())
+            .unwrap()
+    }
+
+    /// The mark of a batched row read names the root the collection's objects
+    /// lie under, made by its writer or by its reader: while it is in flight
+    /// the part cache holds the fills of this collection's parts to their
+    /// turn, and of no other collection's, however alike its path. A mark
+    /// that named another root would leave a batch's fills to start all at
+    /// once.
+    #[test]
+    fn a_batched_row_read_marks_the_parts_of_its_own_collection() {
+        let (writer, reader) = tier_pair("marks/own");
+        tier_commit(&writer, b"k1");
+        let objects: Vec<object_store::path::Path> = reader
+            .rt
+            .block_on(
+                reader
+                    .store
+                    .list(None)
+                    .map_ok(|object| object.location)
+                    .try_collect(),
+            )
+            .expect("list the collection's objects");
+        assert!(!objects.is_empty());
+        let stats = slatedb::cached_object_store_stats::ranged_miss_stats();
+        let marked = |location: &str| stats.in_batch_row_read(&location.into());
+        let holds = |mark: slatedb::cached_object_store_stats::BatchRowRead| {
+            for object in &objects {
+                assert!(stats.in_batch_row_read(object), "{object}");
+            }
+            assert!(marked("marks/own/compacted/x.sst"));
+            for other in ["marks/own2/x.sst", "marks/x.sst", "own/x.sst"] {
+                assert!(!marked(other), "{other}");
+            }
+            drop(mark);
+            for object in &objects {
+                assert!(!stats.in_batch_row_read(object), "{object}");
+            }
+        };
+        holds(writer.batch_row_read_in_flight());
+        holds(reader.batch_row_read_in_flight());
+    }
+
+    /// A poll-tier change is told to the open `DbReader`: the same reader and
+    /// the same swap generation afterwards, and the commit that landed in
+    /// between is readable when the change returns. An interval that reader
+    /// cannot take is the reopen every tier change used to be.
+    #[test]
+    #[serial_test::serial]
+    fn lsm_reader_changes_poll_tier_without_a_new_db_reader() {
+        let _poll = TierEnv::set("HELIX_LSM_READER_MANIFEST_POLL_MS", "60000");
+        let _idle = TierEnv::set("HELIX_LSM_READER_IDLE_POLL_MS", "300000");
+        let _on = TierEnv::set("HELIX_LSM_READER_TIER_IN_PLACE", "1");
+        let active = std::time::Duration::from_secs(60);
+        let idle = std::time::Duration::from_secs(300);
+        let (writer, reader) = tier_pair("reader-retier-in-place-test");
+        let opened = reader.current_reader();
+        assert_eq!(reader.in_place_tier_is_fast(), Some(true));
+
+        tier_commit(&writer, b"k1");
+        reader.retier(idle).expect("demote");
+        assert!(Arc::ptr_eq(&opened, &reader.current_reader()));
+        assert_eq!(reader.generation(), 0);
+        assert_eq!(reader.in_place_tier_is_fast(), Some(false));
+        assert!(
+            tier_sees(&reader, b"k1"),
+            "a tier change polls the manifest"
+        );
+
+        tier_commit(&writer, b"k2");
+        reader.retier(active).expect("promote");
+        assert!(Arc::ptr_eq(&opened, &reader.current_reader()));
+        assert_eq!(reader.generation(), 0);
+        assert_eq!(reader.in_place_tier_is_fast(), Some(true));
+        assert!(tier_sees(&reader, b"k2"));
+
+        // Longer than both tiers: the lease this reader was opened with does
+        // not cover it.
+        tier_commit(&writer, b"k3");
+        reader
+            .retier(std::time::Duration::from_secs(3600))
+            .expect("reopen at an hour");
+        assert!(!Arc::ptr_eq(&opened, &reader.current_reader()));
+        assert_eq!(reader.generation(), 1);
+        assert_eq!(reader.in_place_tier_is_fast(), Some(false));
+        assert!(tier_sees(&reader, b"k3"));
+
+        // And back: a reader opened on an hour's tick cannot poll every
+        // minute, so this is a reopen too.
+        tier_commit(&writer, b"k4");
+        reader.retier(active).expect("reopen at a minute");
+        assert_eq!(reader.generation(), 2);
+        assert_eq!(reader.in_place_tier_is_fast(), Some(true));
+        assert!(tier_sees(&reader, b"k4"));
+    }
+
+    /// `HELIX_LSM_READER_TIER_IN_PLACE=0`: a tier change is a reopen, and the
+    /// reader has no tier of its own to report.
+    #[test]
+    #[serial_test::serial]
+    fn lsm_reader_tier_change_reopens_when_in_place_is_switched_off() {
+        let _poll = TierEnv::set("HELIX_LSM_READER_MANIFEST_POLL_MS", "60000");
+        let _off = TierEnv::set("HELIX_LSM_READER_TIER_IN_PLACE", "0");
+        let (writer, reader) = tier_pair("reader-retier-reopen-test");
+        let opened = reader.current_reader();
+        assert_eq!(reader.in_place_tier_is_fast(), None);
+
+        tier_commit(&writer, b"k1");
+        reader
+            .retier(std::time::Duration::from_secs(300))
+            .expect("demote by a reopen");
+        assert!(!Arc::ptr_eq(&opened, &reader.current_reader()));
+        assert_eq!(reader.generation(), 1);
+        assert!(tier_sees(&reader, b"k1"));
+    }
+
+    /// `poll_now` is the catch-up a read waits for when it promotes its
+    /// collection: with time to wait it returns after the poll, and with none
+    /// it returns at once and the poll still comes.
+    #[test]
+    #[serial_test::serial]
+    fn lsm_reader_poll_now_reads_a_commit_its_own_poll_would_not() {
+        let _poll = TierEnv::set("HELIX_LSM_READER_MANIFEST_POLL_MS", "60000");
+        let (writer, reader) = tier_pair("reader-poll-now-test");
+
+        tier_commit(&writer, b"k1");
+        assert!(reader
+            .poll_now(Some(std::time::Duration::from_secs(30)))
+            .expect("poll"));
+        assert!(tier_sees(&reader, b"k1"));
+        assert_eq!(reader.generation(), 0);
+
+        tier_commit(&writer, b"k2");
+        reader
+            .poll_now(Some(std::time::Duration::ZERO))
+            .expect("ask for a poll");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !tier_sees(&reader, b"k2") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the poll that was asked for never came"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Change-feed promotion path: `refresh_with_poll_interval` reopens the

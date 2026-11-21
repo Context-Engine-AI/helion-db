@@ -177,6 +177,14 @@ impl UploadHandler {
     }
 
     async fn upload_with_retry(&self, job: &UploadJob) -> Result<UploadedMemtable, SlateDBError> {
+        // HELION LOCAL PATCH (see `L0FlushGate`): declared before `built`, so
+        // it is given back after the encoded SSTs are freed, on every way out.
+        let admitted = tokio::sync::Mutex::new(
+            self.db
+                .memtable_flusher()
+                .admit_at_gate(&self.db, &job.imm_memtable)
+                .await,
+        );
         // Build once, retry only the upload. `write_sst` takes
         // `&EncodedSsTable`, so the encoded SSTs stay alive for retries —
         // no need to rebuild from the memtable on transient upload errors.
@@ -197,9 +205,12 @@ impl UploadHandler {
         // uploads that already landed before the abort are left for the
         // garbage collector to reclaim, since the worker allocates ids
         // internally and they are not visible here for explicit cleanup.
-        let segments =
-            futures::future::try_join_all(built.iter().map(|sst| self.upload_segment_sst(sst)))
-                .await?;
+        let segments = futures::future::try_join_all(
+            built
+                .iter()
+                .map(|sst| self.upload_segment_sst(sst, job, &admitted)),
+        )
+        .await?;
 
         Ok(UploadedMemtable {
             imm_memtable: Arc::clone(&job.imm_memtable),
@@ -215,6 +226,8 @@ impl UploadHandler {
     async fn upload_segment_sst(
         &self,
         sst: &EncodedSegmentSst,
+        job: &UploadJob,
+        admitted: &tokio::sync::Mutex<Option<Box<dyn Send>>>,
     ) -> Result<SegmentedSstHandle, SlateDBError> {
         let sst_id =
             SsTableId::Compacted(self.db.rand.rng().gen_ulid(self.db.system_clock.as_ref()));
@@ -239,7 +252,32 @@ impl UploadHandler {
                         );
                         return Err(e);
                     }
+                    // HELION LOCAL PATCH: nothing here writes a line for an
+                    // upload that failed and is tried again; the gate is told.
+                    // `{:?}` as in the line above: the error's own text is
+                    // its class alone ("io error"), the store's is under it.
+                    let flusher = self.db.memtable_flusher();
+                    if let Some(gate) = flusher.gate.as_ref() {
+                        gate.upload_failed(&flusher.path, &format!("{e:?}"), self.retry_backoff);
+                    }
+                    // HELION LOCAL PATCH (see `L0FlushGate`): the allowance is
+                    // given back for the wait and asked for again before the
+                    // next attempt. Nothing more is taken while this sleeps,
+                    // and what the flush keeps, its memtable and the encoded
+                    // SST, shows in the memory the gate reads. Kept through
+                    // the wait, it would hold every other database's flush
+                    // behind an upload that cannot get through.
+                    // shortcut: one allowance a flush, shared by its segments, upgrade to one each if a database ever flushes several.
+                    *admitted.lock().await = None;
                     self.db.system_clock.sleep(self.retry_backoff).await;
+                    let mut admitted = admitted.lock().await;
+                    if admitted.is_none() {
+                        *admitted = self
+                            .db
+                            .memtable_flusher()
+                            .admit_at_gate(&self.db, &job.imm_memtable)
+                            .await;
+                    }
                 }
             }
         }

@@ -24,11 +24,10 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use log::error;
 use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
-use super::{GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
+use super::{log_delete_error, GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
 
 #[derive(Clone)]
 pub(crate) struct CompactionsGcTask {
@@ -118,10 +117,7 @@ impl GcTask for CompactionsGcTask {
                     .delete_compactions_unchecked(compactions_metadata.id)
                     .await
                 {
-                    error!(
-                        "error deleting compactions [id={:?}, error={}]",
-                        compactions_metadata.id, e
-                    );
+                    log_delete_error("compactions", &compactions_metadata.id, &e);
                 } else {
                     self.stats.gc_compactions_count.increment(1);
                 }

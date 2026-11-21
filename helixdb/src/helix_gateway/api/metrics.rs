@@ -9,6 +9,7 @@
 //! `/metrics` endpoint is never scraped — important for embedded / test usage
 //! where we don't want a background Prometheus exporter task.
 
+use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
@@ -78,6 +79,7 @@ const COUNT_HISTOGRAMS: &[&str] = &[
     "helix_graph_delete_items",
     "helix_point_scan_returned_points",
     "helix_point_scan_scanned_points",
+    "helix_qdrant_delete_candidate_rows",
     "helix_qdrant_delete_matched_ids",
     "helix_sparse_upsert_batch_dedup_count",
 ];
@@ -252,5 +254,46 @@ fn refresh_runtime_gauges(input: &HandlerInput) {
     }
     if let Some(value) = memory.high_bytes {
         metrics::gauge!("helix_collection_open_memory_high_bytes").set(value as f64);
+    }
+
+    // Ranged object-store cache misses (`HELIX_LSM_CACHE_RANGED_MISS`): process-wide
+    // totals kept by the vendored SlateDB fork.
+    let ranged = slatedb::cached_object_store_stats::ranged_miss_stats();
+    metrics::counter!("helix_lsm_cache_ranged_miss_total")
+        .absolute(ranged.misses.load(Ordering::Relaxed));
+    metrics::counter!("helix_lsm_cache_ranged_miss_bytes_total")
+        .absolute(ranged.bytes.load(Ordering::Relaxed));
+    for (outcome, count) in [
+        ("ok", &ranged.fills_ok),
+        ("err", &ranged.fills_err),
+        ("skipped", &ranged.fills_skipped),
+        // Started while the exact scorer read a batch of rows, and left out.
+        ("skipped_in_batch", &ranged.fills_skipped_in_batch),
+    ] {
+        metrics::counter!("helix_lsm_cache_ranged_fill_total", "outcome" => outcome)
+            .absolute(count.load(Ordering::Relaxed));
+    }
+    metrics::counter!("helix_lsm_cache_ranged_wait_total")
+        .absolute(ranged.waits.load(Ordering::Relaxed));
+
+    // What the on-disk part cache's evictors removed from directories over
+    // their share, and what the open directories hold, by the directory's size
+    // class: process-wide totals kept by the vendored SlateDB fork (a store's
+    // own stats reach no recorder here, and a removed file is a debug line).
+    let trims = slatedb::cached_object_store_stats::trim_stats();
+    let open_dirs = slatedb::cached_object_store_stats::open_dirs_by_size();
+    for (class, size) in slatedb::cached_object_store_stats::CACHE_DIR_SIZES
+        .into_iter()
+        .enumerate()
+    {
+        metrics::counter!("helix_lsm_cache_trims_total", "cause" => "share", "size" => size)
+            .absolute(trims.trims[class].load(Ordering::Relaxed));
+        metrics::counter!("helix_lsm_cache_trimmed_files_total", "cause" => "share", "size" => size)
+            .absolute(trims.files[class].load(Ordering::Relaxed));
+        metrics::counter!("helix_lsm_cache_trimmed_bytes_total", "cause" => "share", "size" => size)
+            .absolute(trims.bytes[class].load(Ordering::Relaxed));
+        metrics::gauge!("helix_lsm_cache_open_dirs", "size" => size).set(open_dirs[class].0 as f64);
+        metrics::gauge!("helix_lsm_cache_open_dir_bytes", "size" => size)
+            .set(open_dirs[class].1 as f64);
     }
 }

@@ -80,6 +80,10 @@ struct WalBufferManagerInner {
     recent_flushed_wal_id: u64,
     /// The oracle to track the last flushed sequence number.
     oracle: Arc<DbOracle>,
+    /// HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): what the flush
+    /// task ended with. Nothing flushes a WAL or tells its waiters after
+    /// that, so [`WalBufferManager::append`] takes no entry more.
+    ended: Option<SlateDBError>,
 }
 
 /// Stores entries to the write-ahead log (WAL) in memory.
@@ -130,6 +134,7 @@ impl WalBufferManager {
             flush_tx: None,
             task_executor: None,
             oracle,
+            ended: None,
         };
         Self {
             inner: Arc::new(parking_lot::RwLock::new(inner)),
@@ -226,9 +231,14 @@ impl WalBufferManager {
         &self,
         entries: &[RowEntry],
     ) -> Result<WatchableOnceCellReader<Result<(), SlateDBError>>, SlateDBError> {
-        // TODO: check if the wal buffer is in a fatal error state.
-
         let mut inner = self.inner.write();
+        // HELION LOCAL PATCH: the flush task marks the Db closed, then cleans
+        // up, and only after it has ended is the batch writer cancelled. A
+        // write that passed the closed check before that and is appended after
+        // the cleanup would wait for ever on a WAL nobody flushes or tells.
+        if let Some(error) = &inner.ended {
+            return Err(error.clone());
+        }
         for entry in entries {
             inner.current_wal.append(entry.clone());
         }
@@ -586,6 +596,11 @@ impl MessageHandler<WalFlushWork> for WalFlushHandler {
                 let _ = result_tx.send(Err(error.clone()));
             }
         }
+
+        // HELION LOCAL PATCH: no entry after this one freeze (see `append`).
+        // Set before it, so what was appended until now is frozen and told
+        // below, and what comes later is refused.
+        self.wal_buffer_manager.inner.write().ended = Some(error.clone());
 
         // notify all the flushing wals to be finished with fatal error or shutdown
         // error. we need ensure all the wal tables finally get notified. freeze current

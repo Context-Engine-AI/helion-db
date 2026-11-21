@@ -1135,6 +1135,159 @@ fn bench_oversampling_sweep(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Broad-filter scan benchmark: scan vs HNSW-filtered at 25%/10%/1% selectivity
+// ---------------------------------------------------------------------------
+
+fn setup_broad_filter_core(count: usize, dim: usize) -> (Env, TempDir, VectorCore, Vec<Vec<f32>>) {
+    let (env, temp_dir) = setup_temp_env();
+    let mut txn = env.write_txn().unwrap();
+    let core = VectorCore::new_named_with_dir(
+        &env,
+        &mut txn,
+        &format!("broad_{dim}d"),
+        HNSWConfig::new(Some(16), Some(128), Some(128)),
+        DistanceMetric::Cosine,
+        SpindleConfig {
+            mode: SpindleMode::None,
+            keep_original: false,
+            ..SpindleConfig::default()
+        },
+        Some(temp_dir.path()),
+        dim,
+        None,
+        bench_backend(&env),
+    )
+    .unwrap();
+
+    let vectors = generate_lowrank_vectors(count, dim, dim.min(80), 42);
+    for (i, v) in vectors.iter().enumerate() {
+        core.insert_flat(&mut txn, v, Some((i + 1) as u128), None)
+            .unwrap();
+    }
+    core.build_index_from_flat(&mut txn).unwrap();
+    txn.commit().unwrap();
+    core.flush_mmap().unwrap();
+
+    let queries = generate_lowrank_vectors(20, dim, dim.min(80), 99);
+    (env, temp_dir, core, queries)
+}
+
+fn prefilter_at_selectivity(count: usize, selectivity: f32, seed: u64) -> HashSet<u128> {
+    let target = (count as f32 * selectivity).round() as usize;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut ids: Vec<u128> = (1..=count as u128).collect();
+    // Fisher-Yates partial shuffle to pick `target` random ids.
+    for i in 0..target.min(ids.len()) {
+        let j = rng.random_range(i..ids.len());
+        ids.swap(i, j);
+    }
+    ids.truncate(target);
+    ids.into_iter().collect()
+}
+
+fn bench_broad_filter_scan(c: &mut Criterion) {
+    let count = env_usize("BROAD_BENCH_COUNT", 50_000);
+    let k = 10usize;
+
+    for &dim in &[768usize, 64] {
+        let state: OnceCell<(Env, TempDir, VectorCore, Vec<Vec<f32>>)> = OnceCell::new();
+
+        let mut group = c.benchmark_group(format!("broad_filter_scan_{dim}d"));
+        group.measurement_time(Duration::from_secs(10));
+
+        for &selectivity in &[0.25_f32, 0.10, 0.01] {
+            let sel_label = format!("sel_{:.0}pct", selectivity * 100.0);
+
+            // --- Scan path ---
+            group.bench_function(BenchmarkId::new("scan", &sel_label), |b| {
+                let (env, _td, core, queries) =
+                    state.get_or_init(|| setup_broad_filter_core(count, dim));
+                let backend = bench_backend(env);
+                let prefilter = prefilter_at_selectivity(count, selectivity, 7);
+                let sel_hint = Some(selectivity);
+                type NoRecheck = fn(u128) -> bool;
+                b.iter(|| {
+                    let r = backend.begin_read().unwrap();
+                    for query in queries {
+                        let result = core
+                            .search_broad_prefilter_scan::<NoRecheck>(
+                                &r, query, k, &prefilter, None, sel_hint,
+                            )
+                            .unwrap();
+                        black_box(&result);
+                    }
+                });
+            });
+
+            // --- HNSW-filtered path ---
+            group.bench_function(BenchmarkId::new("hnsw_filtered", &sel_label), |b| {
+                let (env, _td, core, queries) =
+                    state.get_or_init(|| setup_broad_filter_core(count, dim));
+                let backend = bench_backend(env);
+                let prefilter = prefilter_at_selectivity(count, selectivity, 7);
+                let sel_hint = Some(selectivity);
+                let filter = |id: u128| prefilter.contains(&id);
+                b.iter(|| {
+                    let r = backend.begin_read().unwrap();
+                    for query in queries {
+                        let result = core
+                            .search_with_id_filter_ef_observed(
+                                &r,
+                                query,
+                                k,
+                                Some(std::slice::from_ref(&filter)),
+                                true,
+                                sel_hint,
+                                None,
+                                None,
+                            )
+                            .unwrap();
+                        black_box(&result);
+                    }
+                });
+            });
+        }
+        group.finish();
+
+        // Print recall once outside the measurement loop.
+        let (env, _td, core, queries) = state.get_or_init(|| setup_broad_filter_core(count, dim));
+        let backend = bench_backend(env);
+        let r = backend.begin_read().unwrap();
+        eprintln!("\n--- Recall report: {dim}d, {count} points, k={k} ---");
+        for &selectivity in &[0.25_f32, 0.10, 0.01] {
+            let prefilter = prefilter_at_selectivity(count, selectivity, 7);
+            let sel_hint = Some(selectivity);
+            let mut recall_sum = 0.0f64;
+            type NoRecheck = fn(u128) -> bool;
+            for query in queries {
+                let exact = core
+                    .search_exact_ids_with_selectivity(
+                        &r,
+                        query,
+                        prefilter.iter().copied(),
+                        k,
+                        sel_hint,
+                    )
+                    .unwrap();
+                let exact_ids: HashSet<u128> = exact.iter().map(|h| h.id).collect();
+
+                let scan = core
+                    .search_broad_prefilter_scan::<NoRecheck>(
+                        &r, query, k, &prefilter, None, sel_hint,
+                    )
+                    .unwrap()
+                    .unwrap_or_default();
+                let scan_ids: HashSet<u128> = scan.iter().map(|h| h.id).collect();
+                let overlap = exact_ids.intersection(&scan_ids).count();
+                recall_sum += overlap as f64 / k as f64;
+            }
+            let recall = recall_sum / queries.len() as f64;
+            eprintln!("  sel={:.0}%  recall@{k}={recall:.4}", selectivity * 100.0);
+        }
+    }
+}
+
 criterion_group!(
     benches,
     bench_vector_insertion,
@@ -1147,6 +1300,7 @@ criterion_group!(
     bench_spindle_search,
     bench_spindle_search_clustered,
     bench_spindle_search_lowrank,
-    bench_oversampling_sweep
+    bench_oversampling_sweep,
+    bench_broad_filter_scan
 );
 criterion_main!(benches);

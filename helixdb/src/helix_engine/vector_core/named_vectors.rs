@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+#[path = "named_vectors_exact_search.rs"]
+mod exact_search;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Instant;
 
@@ -15,14 +17,25 @@ use crate::protocol::value::Value;
 
 use super::{
     hnsw::HNSW,
+    merge_windows::MergeWindows,
     sparse::{SparseMetadataFlushStats, SparseVector, SparseVectorConfig, SparseVectorCore},
     spindle::SpindleConfig,
     vector::HVector,
     vector_core::{
         acquire_build_permit, delete_vacuum_fraction, lsm_delete_tombstones_enabled, HNSWConfig,
-        VectorCore, VectorSearchMetrics,
+        NewerCopies, StoredReach, VectorCore, VectorSearchMetrics, HNSW_DIVERSE_MIN_POINTS,
     },
 };
+
+#[cfg(test)]
+pub(crate) use exact_search::with_exact_scan_rows_per_id_for_test;
+
+#[cfg(test)]
+#[path = "named_vectors_exact_scan_tests.rs"]
+mod exact_scan_tests;
+#[cfg(test)]
+#[path = "named_vectors_exact_validation_tests.rs"]
+mod exact_validation_tests;
 
 const LSM_CORE_OPEN_MAX_CONCURRENCY: usize = 8;
 
@@ -67,6 +80,84 @@ pub enum DenseVectorSegmentRole {
     Mutable,
     Building,
     Indexed,
+}
+
+/// Written into a mutable tail's own keyspace in the same batch that persists
+/// its seal to `Building`. Such a segment holds the only copy of its points
+/// until its build publishes, so dense search keeps scanning it. Unmarked
+/// `Building` segments (merge targets, tails sealed before this marker) stay
+/// hidden: a merge target's points are still served by its source segments.
+const SEALED_TAIL_MARKER_KEY: &[u8] = b"__helix_segment:sealed_tail";
+
+/// Written into a merge target's keyspace in the commit that registers it as
+/// `Building` (merge phase A); phase D promotes it. A marked target still
+/// `Building` is a dead merge's or a dropped regraph's: its sources retire
+/// only in phase D, so it never holds a row's only copy, and it may hold rows
+/// deleted while it was written. The index job reaps it instead of building it.
+const MERGE_TARGET_MARKER_KEY: &[u8] = b"__helix_segment:merge_target";
+
+/// Prefix of the keys of the metadata table that name the dense segments
+/// which left a stored layout: one key a physical name, its value the time
+/// the name left, in milliseconds since the epoch (8 bytes, big endian).
+///
+/// A segment that leaves the layout keeps its rows until something clears
+/// them, and what clears them is queued in memory: a writer that stops first
+/// leaves rows under a name nothing stored names. The key is that record. It
+/// is put by the store of the layout that drops the name, in that store's
+/// transaction, so the two are stored together or not at all. It is deleted
+/// once every table of the name was read empty, and by the store of a layout
+/// that lists the name again.
+///
+/// One key a name and not one row of all names: a row rewritten whole by two
+/// threads keeps the older copy of one of them. An image without this code
+/// reads the metadata table by exact key and never meets one.
+pub(crate) const DEAD_SEGMENT_KEY_PREFIX: &[u8] = b"dense_segment_dead:v1:";
+
+/// The key of [`DEAD_SEGMENT_KEY_PREFIX`] for `physical_name`.
+pub(crate) fn dead_segment_key(physical_name: &str) -> Vec<u8> {
+    [DEAD_SEGMENT_KEY_PREFIX, physical_name.as_bytes()].concat()
+}
+
+/// The segment a key of [`DEAD_SEGMENT_KEY_PREFIX`] names.
+fn dead_segment_name(key: &[u8]) -> Option<&str> {
+    std::str::from_utf8(key.strip_prefix(DEAD_SEGMENT_KEY_PREFIX)?)
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
+/// The time a dead key's `value` holds. One that is no time reads as the
+/// latest there is: nothing that waits for a name to have been dead for a
+/// while takes it for an old one.
+fn dead_segment_time(value: &[u8]) -> u64 {
+    value.try_into().map(u64::from_be_bytes).unwrap_or(u64::MAX)
+}
+
+/// `HELIX_DENSE_DEAD_NAMES=0` keeps no record of the names that leave a
+/// layout: a writer then puts, reads and deletes no key of
+/// [`DEAD_SEGMENT_KEY_PREFIX`], as an image before them. Read at each open
+/// of a collection.
+pub(crate) fn dead_segment_names_enabled() -> bool {
+    std::env::var("HELIX_DENSE_DEAD_NAMES")
+        .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+        .unwrap_or(true)
+}
+
+/// `HELIX_DENSE_SEARCH_SEALED_TAILS=0` hides every `Building` segment again
+/// (pre-fix behavior: sealed points vanish from dense search until promoted).
+fn search_sealed_tails_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("HELIX_DENSE_SEARCH_SEALED_TAILS")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "FALSE" | "no" | "off"))
+            .unwrap_or(true)
+    });
+    *ENABLED
+}
+
+fn sealed_tail_marker_ns(physical_name: &str) -> Namespace<'_> {
+    Namespace::Segment {
+        physical_name,
+        db: crate::helix_engine::storage_core::backend::SegmentDb::VectorData,
+    }
 }
 
 /// ANN index algorithm used by `build_dense_segment` for newly built dense
@@ -130,6 +221,11 @@ pub struct StagedDeleteTombstones {
     /// guards them against stale-snapshot cache refills. Empty when ownership
     /// is unknown (stale-plan fallback), in which case every segment guards.
     hard_deleted_by_segment: Vec<(String, Vec<u128>)>,
+    /// Rows removed from named segments only (`delete_replaced_vectors_be`,
+    /// `delete_from_segment_be`): the ids may live on elsewhere, as a
+    /// rewritten point does in the tail its batch appended it to, so only
+    /// the segments a row left drop their cached entries for them.
+    owners_only: bool,
 }
 
 impl StagedDeleteTombstones {
@@ -163,6 +259,40 @@ pub(crate) struct HvtqSidecarBackfillPlan {
 impl HvtqSidecarBackfillPlan {
     pub(crate) fn physical_name(&self) -> &str {
         &self.physical_name
+    }
+}
+
+/// What the link pass plans for one segment
+/// (`NamedVectorManager::plan_stored_links_be`).
+#[derive(Debug)]
+pub(crate) struct StoredLinks {
+    pub space: String,
+    pub segment: String,
+    /// Served rows of the segment no stored link leads to.
+    pub unreached: usize,
+    /// `(row, point)`: the point's id goes at the end of the row's level-0
+    /// list.
+    pub links: Vec<(u128, u128)>,
+    /// Rows the call looked at that no row had room for, near them or
+    /// below: they get no link and stay unreached.
+    pub without_room: usize,
+    /// The last row the call looked at, where rows are left after it: the
+    /// segment is not marked, and the next call goes on from there. `None`
+    /// where it came to the end, and the segment is marked.
+    pub upto: Option<u128>,
+    /// The count of deleted rows the pass began at in the segment, which
+    /// the mark or the place is written with, and the count the segment had
+    /// when the plan read it (`VectorCore::link_pass_counts`).
+    pub began_at: u64,
+    pub deleted_rows: u64,
+}
+
+impl StoredLinks {
+    /// True when the mark this plan's write leaves reads as done: the call
+    /// came to the end, and no delete has taken a row of the segment since
+    /// the pass began there.
+    pub(crate) fn marks_done(&self) -> bool {
+        self.upto.is_none() && self.deleted_rows <= self.began_at
     }
 }
 
@@ -307,6 +437,22 @@ fn finish_sidecar_cleanup_stats(
 pub struct PreparedMerge {
     pub merge_targets: Vec<String>,
     pub prepared_index: super::vector_core::PreparedIndex,
+}
+
+/// What `export_for_regraph_be` read of the segment a regraph rebuilds. A row
+/// is its id, its vector and the fields it was written with.
+#[derive(Default)]
+pub(crate) struct RegraphExport {
+    /// The rows of ids no more recent segment holds.
+    pub rows: Vec<(u128, Vec<f32>, HashMap<String, Value>)>,
+    /// Rows left out: delete-tombstoned ids and re-upsert tombstoned copies.
+    pub dropped: u64,
+    /// The rows of ids a more recent segment holds too, each with the fields
+    /// of those copies, the one search serves first.
+    pub doubled: Vec<(
+        (u128, Vec<f32>, HashMap<String, Value>),
+        Vec<HashMap<String, Value>>,
+    )>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -485,7 +631,8 @@ fn take_candidate_ids_present_in_segment(
 
 /// Collapse duplicate ids in a merged multi-segment result, keeping the copy
 /// from the NEWEST segment (lowest recency rank); ties broken by smaller
-/// distance. Then orders survivors by distance and truncates to `k`. This is
+/// distance. Then orders survivors by distance, equally far ones by id
+/// whichever segment holds them, and truncates to `k`. This is
 /// the read-path recency fix: while old and re-upserted copies of an id coexist
 /// (the entire pre-merge window) a query nearer the OLD vector must still return
 /// the NEW one. Cost: one `HashMap<u128,(rank,dist)>` pass over `combined`
@@ -513,11 +660,8 @@ fn dedup_keep_newest(mut combined: Vec<(u32, HVector)>, k: usize) -> Vec<HVector
         }
     });
     let mut survivors: Vec<HVector> = combined.into_iter().map(|(_, hv)| hv).collect();
-    survivors.sort_by(|lhs, rhs| {
-        lhs.get_distance()
-            .partial_cmp(&rhs.get_distance())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // `HVector` orders the nearer, then the smaller id, as the greater.
+    survivors.sort_by(|lhs, rhs| rhs.cmp(lhs));
     survivors.truncate(k);
     survivors
 }
@@ -533,6 +677,19 @@ fn dedup_keep_newest(mut combined: Vec<(u32, HVector)>, k: usize) -> Vec<HVector
 /// Sparse vector spaces remain one core per logical name.
 /// Sentinel: use global config threshold (no per-collection override).
 const INDEXING_THRESHOLD_USE_GLOBAL: usize = usize::MAX;
+
+/// `NamedVectorManager::dense_spaces_read_at` when the shared segment list
+/// did not come from a read with a sequence: any writer or LMDB list, and a
+/// replica's until its first reconcile.
+const DENSE_SPACES_READ_AT_UNKNOWN: u64 = u64::MAX;
+
+/// How long a replica keeps the core of a segment its list has stopped
+/// naming. A read pinned before a merge searches the replaced segments from
+/// its own list (`dense_segment_infos_at`) for as long as it runs; 30 s is
+/// also how long a replaced `DbReader` stays open for the reads pinned on
+/// it. Tests keep the bare two-reconcile rule unless they set a grace.
+const RETIRED_CORE_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(test) { 0 } else { 30 });
 
 /// Process-wide dedup set for "missing dense segment" warnings. Keyed by
 /// `(collection, vector, segment)` so each stale segment is logged exactly
@@ -576,6 +733,156 @@ fn note_missing_segment(collection: &str, vector: &str, segment: &str, site: &'s
     }
 }
 
+/// Tests: whether `note_missing_segment` has warned of this segment since the
+/// last call. Forgets the sighting, so each search path can be asked in turn,
+/// and sees the paths whose segments run on worker threads, where a test's
+/// recorder does not reach.
+#[cfg(test)]
+pub(crate) fn take_missing_segment_note(collection: &str, vector: &str, segment: &str) -> bool {
+    MISSING_SEGMENT_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(
+            collection.to_string(),
+            vector.to_string(),
+            segment.to_string(),
+        ))
+}
+
+/// Tests: (collection, segment, site, thread) for each time a search found a
+/// retired segment without a core (`note_unreachable_segment`).
+#[cfg(test)]
+static RETIRED_SEGMENT_SIGHTINGS: Mutex<
+    Vec<(String, String, &'static str, std::thread::ThreadId)>,
+> = Mutex::new(Vec::new());
+
+/// Tests: the sites that found `segment` retired and without a core since the
+/// last call, each with whether it ran on the calling thread. That tells the
+/// two searches that run their segments on worker threads from the rest.
+#[cfg(test)]
+pub(crate) fn take_retired_segment_sightings(
+    collection: &str,
+    segment: &str,
+) -> Vec<(&'static str, bool)> {
+    let caller = std::thread::current().id();
+    let mut taken = Vec::new();
+    RETIRED_SEGMENT_SIGHTINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(seen_collection, seen_segment, site, thread)| {
+            let mine = seen_collection == collection && seen_segment == segment;
+            if mine {
+                taken.push((*site, *thread == caller));
+            }
+            !mine
+        });
+    taken
+}
+
+/// Segments whose rows a merge selection could not count, keyed like
+/// [`MISSING_SEGMENT_REGISTRY`]: each is warned of once per process.
+static UNCOUNTED_SEGMENT_REGISTRY: LazyLock<Mutex<HashSet<(String, String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// A merge selection could not count a segment's rows and read them as 0.
+/// By size ratio the space then picks no merge
+/// (`helix_dense_merge_selection_skipped_total`), so a count that keeps
+/// failing is a space that has stopped merging: say which segment and why,
+/// once.
+fn note_uncounted_segment(collection: &str, vector: &str, segment: &str, error: &VectorError) {
+    let key = (
+        collection.to_string(),
+        vector.to_string(),
+        segment.to_string(),
+    );
+    let first_sighting = match UNCOUNTED_SEGMENT_REGISTRY.lock() {
+        Ok(mut set) => set.insert(key),
+        // Poisoned mutex: log anyway rather than go silent.
+        Err(_) => true,
+    };
+    if first_sighting {
+        tracing::warn!(
+            collection = %collection,
+            vector = %vector,
+            segment = %segment,
+            error = %error,
+            "Dense segment's rows could not be counted for a merge selection; they read as 0"
+        );
+    }
+}
+
+/// One change of an LSM collection's dense layout at a time: held from before
+/// the change touches memory or the store until its store has returned.
+///
+/// The layout is stored whole, as memory has it. Two stores that could cross
+/// leave the older reading stored last, and a store between a seal's store
+/// and the seal's change of memory leaves the next tail out of it: rows
+/// appended to a tail no stored layout names are lost to the next writer.
+/// The store function and the allocator of segment ids take this by
+/// reference, so neither runs without it.
+///
+/// Order: after the collection's point-mutation gate where that is held (a
+/// regraph's retire and swap), before `dense_spaces`, then `cores`. No append
+/// and no search takes it. It is held across the store's commit, which waits
+/// for the WAL, and never across a build.
+pub(crate) struct DenseLayoutChange<'a> {
+    _held: std::sync::MutexGuard<'a, ()>,
+}
+
+/// A seal of an LSM tail that memory does not have yet: the tail it turns
+/// `Building` and the next tail, opened and found empty. Made by
+/// [`NamedVectorManager::prepare_tail_seal_lsm`], stored by its caller, then
+/// put into memory by [`NamedVectorManager::apply_tail_seal`].
+pub(crate) struct PreparedTailSeal {
+    logical_name: String,
+    sealed: String,
+    next_name: String,
+    next_core: VectorCore,
+    next_segment_id: u64,
+    skipped: Vec<String>,
+}
+
+impl PreparedTailSeal {
+    /// The tail this seal turns `Building`.
+    pub(crate) fn sealed(&self) -> &str {
+        &self.sealed
+    }
+
+    /// `layout` with this seal in it. The one function for the copy that is
+    /// stored and for memory, so the two come out the same.
+    pub(crate) fn flip_in(&self, layout: &mut HashMap<String, DenseVectorSpaceMetadata>) {
+        let Some(space) = layout.get_mut(&self.logical_name) else {
+            return;
+        };
+        for segment in &mut space.segments {
+            if segment.physical_name == self.sealed {
+                segment.role = DenseVectorSegmentRole::Building;
+            }
+        }
+        space.next_segment_id = space.next_segment_id.max(self.next_segment_id);
+        if !space
+            .segments
+            .iter()
+            .any(|segment| segment.physical_name == self.next_name)
+        {
+            space.segments.push(DenseVectorSegmentMetadata {
+                physical_name: self.next_name.clone(),
+                role: DenseVectorSegmentRole::Mutable,
+            });
+        }
+    }
+}
+
+/// What [`NamedVectorManager::allocate_dense_core_lsm`] opened.
+struct AllocatedDenseCore {
+    name: String,
+    core: VectorCore,
+    /// The space's next id once `name` is taken.
+    next_segment_id: u64,
+    /// Ids passed over on the way: they hold rows no layout names.
+    skipped: Vec<String>,
+}
+
 pub struct NamedVectorManager {
     /// Owning collection name (trailing path component of the LMDB env
     /// directory). Threaded through so missing-segment diagnostics can
@@ -583,9 +890,29 @@ pub struct NamedVectorManager {
     collection_name: String,
     configs: RwLock<HashMap<String, NamedVectorConfig>>,
     dense_spaces: RwLock<HashMap<String, DenseVectorSpaceMetadata>>,
+    /// See [`DenseLayoutChange`].
+    dense_layout_change: Mutex<()>,
+    /// Sequence of the read a replica's reconcile took `dense_spaces` from.
+    /// Stored and loaded under that lock, so the two are read as a pair.
+    dense_spaces_read_at: AtomicU64,
+    /// Store sequence at which the writer last dropped a segment from a list
+    /// in `dense_spaces`: the sources of a merge, an emptied segment. A
+    /// writer read pinned below it can hold rows that only a dropped segment
+    /// has at its snapshot. Stored and loaded under that lock, so the list and
+    /// the mark are read as a pair.
+    dense_segments_dropped_at: AtomicU64,
     cores: RwLock<HashMap<String, VectorCore>>,
+    /// Replicas: when a reconcile first found each open core's segment off
+    /// the list, and how long (ms) such a core is kept from then on.
+    retired_cores: Mutex<HashMap<String, Instant>>,
+    retired_core_grace_ms: AtomicU64,
     dirty_retired_segments: RwLock<HashSet<String>>,
     dirty_retired_segment_hook: RwLock<Option<Arc<dyn Fn(String) + Send + Sync + 'static>>>,
+    /// The names that have a key of [`DEAD_SEGMENT_KEY_PREFIX`] stored, each
+    /// with its time: read at open, and from then on changed only by a write
+    /// of the keys that has committed. `None` where no record is kept: on a
+    /// reader replica, on LMDB, and with `HELIX_DENSE_DEAD_NAMES=0`.
+    dead_segments: RwLock<Option<HashMap<String, u64>>>,
     sparse_configs: RwLock<HashMap<String, SparseVectorConfig>>,
     sparse_cores: RwLock<HashMap<String, SparseVectorCore>>,
     /// Per-collection indexing threshold override.
@@ -618,6 +945,11 @@ pub struct NamedVectorManager {
     /// the durable set after a restart. Best-effort: a poisoned lock degrades to
     /// "0 tombstones" (no merge pressure), never incorrect search.
     tombstone_counts: RwLock<HashMap<String, usize>>,
+    /// Point removals that merges in flight must keep out of their targets.
+    pub(crate) merge_windows: MergeWindows,
+    /// Rows without a point that this collection's last unfiltered dense
+    /// searches met: how many more hits the next one asks for.
+    pub(crate) rows_without_point_met: AtomicUsize,
 }
 
 /// Process-wide feature gate for re-upsert tombstoning. Default OFF while the
@@ -1088,16 +1420,165 @@ impl NamedVectorManager {
             collection_name,
             configs: RwLock::new(HashMap::new()),
             dense_spaces: RwLock::new(HashMap::new()),
+            dense_layout_change: Mutex::new(()),
+            dense_spaces_read_at: AtomicU64::new(DENSE_SPACES_READ_AT_UNKNOWN),
+            dense_segments_dropped_at: AtomicU64::new(0),
             cores: RwLock::new(HashMap::new()),
+            retired_cores: Mutex::new(HashMap::new()),
+            retired_core_grace_ms: AtomicU64::new(RETIRED_CORE_GRACE.as_millis() as u64),
             dirty_retired_segments: RwLock::new(HashSet::new()),
             dirty_retired_segment_hook: RwLock::new(None),
+            dead_segments: RwLock::new(None),
             sparse_configs: RwLock::new(HashMap::new()),
             sparse_cores: RwLock::new(HashMap::new()),
             indexing_threshold_override: AtomicUsize::new(INDEXING_THRESHOLD_USE_GLOBAL),
             graph_out_edges_db: RwLock::new(None),
             backend: RwLock::new(None),
             tombstone_counts: RwLock::new(HashMap::new()),
+            merge_windows: MergeWindows::default(),
+            rows_without_point_met: AtomicUsize::new(0),
         }
+    }
+
+    /// Begins a change of the dense layout: see [`DenseLayoutChange`]. A
+    /// holder that panicked left the lock poisoned and nothing torn behind
+    /// it, since the lock guards no data: it is taken all the same.
+    pub(crate) fn begin_dense_layout_change(&self) -> DenseLayoutChange<'_> {
+        DenseLayoutChange {
+            _held: self
+                .dense_layout_change
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
+    /// Takes the dead names the store has at open (`rows`: the keys of
+    /// [`DEAD_SEGMENT_KEY_PREFIX`] and their values), once the spaces are
+    /// loaded, and keeps the record from then on. Each space's next id is
+    /// lifted above every dead name of it, so no allocation starts at one. A
+    /// name the layout lists as well is said at ERROR and served as listed:
+    /// the next store of the layout deletes its key.
+    pub(crate) fn load_dead_segments(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), VectorError> {
+        let mut dead = HashMap::with_capacity(rows.len());
+        for (key, value) in rows {
+            match dead_segment_name(key) {
+                Some(name) => {
+                    dead.insert(name.to_string(), dead_segment_time(value));
+                }
+                None => tracing::warn!(
+                    collection = %self.collection_name,
+                    "A key under the prefix of the dead dense segments names no segment; passed over"
+                ),
+            }
+        }
+        {
+            let mut dense_spaces = self
+                .dense_spaces
+                .write()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+            for (logical_name, space) in dense_spaces.iter_mut() {
+                for segment in &space.segments {
+                    if dead.contains_key(&segment.physical_name) {
+                        tracing::error!(
+                            collection = %self.collection_name,
+                            vector = %logical_name,
+                            segment = %segment.physical_name,
+                            "A dense segment the layout lists has a dead key; it is served as listed, and the next store of the layout deletes the key"
+                        );
+                    }
+                }
+                let above_dead = dead
+                    .keys()
+                    .filter_map(|name| segment_id_from_name(logical_name, name))
+                    .max()
+                    .map_or(0, |id| id + 1);
+                if space.next_segment_id < above_dead {
+                    tracing::warn!(
+                        collection = %self.collection_name,
+                        vector = %logical_name,
+                        stored = space.next_segment_id,
+                        lifted_to = above_dead,
+                        "A dense space's next segment id was at or below a dead name's; lifted above it"
+                    );
+                    space.next_segment_id = above_dead;
+                }
+            }
+        }
+        *self
+            .dead_segments
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dead);
+        Ok(())
+    }
+
+    /// Whether `physical_name` has a dead key stored. False where no record
+    /// is kept.
+    pub(crate) fn is_dead_segment(&self, physical_name: &str) -> bool {
+        self.dead_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|dead| dead.contains_key(physical_name))
+    }
+
+    /// How many names have a dead key stored.
+    pub(crate) fn dead_segment_count(&self) -> usize {
+        self.dead_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, HashMap::len)
+    }
+
+    /// Of `names`, those that have a dead key stored. `None` where no record
+    /// is kept: no dead key is then written either.
+    pub(crate) fn dead_among<'a>(
+        &self,
+        names: impl Iterator<Item = &'a str>,
+    ) -> Option<Vec<String>> {
+        let dead = self
+            .dead_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dead = dead.as_ref()?;
+        Some(
+            names
+                .filter(|name| dead.contains_key(*name))
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    /// Puts into the record what a write of dead keys did, once that write
+    /// has committed and not before: `recorded` were put with their times,
+    /// the keys of `gone` deleted. A name is dead here only as long as the
+    /// store says so.
+    pub(crate) fn dead_segments_stored(&self, recorded: &[(String, u64)], gone: &[String]) {
+        let mut dead = self
+            .dead_segments
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(dead) = dead.as_mut() else {
+            return;
+        };
+        for name in gone {
+            dead.remove(name);
+        }
+        for (name, at) in recorded {
+            dead.insert(name.clone(), *at);
+        }
+    }
+
+    /// The record of dead names with their times; `None` where none is kept.
+    #[cfg(test)]
+    pub(crate) fn dead_segment_times(&self) -> Option<HashMap<String, u64>> {
+        self.dead_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Total in-memory tombstone count across all segments. O(segments), no
@@ -1173,6 +1654,362 @@ impl NamedVectorManager {
                     "NamedVectorManager backend not attached before core creation".to_string(),
                 )
             })
+    }
+
+    /// Mark `physical_name` as a sealed mutable tail (see
+    /// [`SEALED_TAIL_MARKER_KEY`]); commit it before the seal flips the role.
+    pub fn mark_sealed_tail_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        physical_name: &str,
+    ) -> Result<(), VectorError> {
+        self.current_backend()?
+            .put(
+                w,
+                sealed_tail_marker_ns(physical_name),
+                SEALED_TAIL_MARKER_KEY,
+                b"1",
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    /// Mark `physical_name` as a merge target (see [`MERGE_TARGET_MARKER_KEY`]).
+    pub fn mark_merge_target_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        physical_name: &str,
+    ) -> Result<(), VectorError> {
+        self.current_backend()?
+            .put(
+                w,
+                sealed_tail_marker_ns(physical_name),
+                MERGE_TARGET_MARKER_KEY,
+                b"1",
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    fn merge_target_marked_be(
+        &self,
+        r: &AnyRead<'_>,
+        physical_name: &str,
+    ) -> Result<bool, VectorError> {
+        self.current_backend()?
+            .get_with(
+                r,
+                sealed_tail_marker_ns(physical_name),
+                MERGE_TARGET_MARKER_KEY,
+                |value| value.is_some(),
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    /// The `(physical_name, role)` pairs of a space, in metadata order.
+    fn dense_segment_infos(
+        space: &DenseVectorSpaceMetadata,
+    ) -> Vec<(String, DenseVectorSegmentRole)> {
+        space
+            .segments
+            .iter()
+            .map(|segment| (segment.physical_name.clone(), segment.role))
+            .collect()
+    }
+
+    /// The `(physical_name, role)` pairs a dense read of `name` starts from.
+    ///
+    /// A replica has one shared list, swapped by each reconcile, while every
+    /// read stays pinned to the sequence it began at. Searched with the list
+    /// of another sequence a read loses points that exist for it: a tail
+    /// sealed since is `Building` with no marker at an older snapshot, a
+    /// merge target has no rows there, and the sources of a merge are being
+    /// reaped at a newer one. So a pinned replica read at any other sequence
+    /// than the shared list's takes the list from the metadata it reads
+    /// itself, as `has_payload_index_at` does for a payload index.
+    ///
+    /// The cores stay shared. A read older than the shared list reaches the
+    /// segments retired since through cores the reconcile keeps for
+    /// `RETIRED_CORE_GRACE` after a retirement. The third value names those
+    /// segments, so that a search which outlives the grace counts one it can
+    /// no longer reach as its own loss (`note_unreachable_segment`), not as
+    /// a segment the metadata names and nothing can serve. A read ahead of
+    /// the shared list searches its own list once every segment in it has a
+    /// core; until that reconcile lands it searches the shared list, exactly
+    /// as it did before reads had their own.
+    ///
+    /// A writer changes its one list in place. A list that gained a segment or
+    /// flipped a role since the read began is still right for it: the new
+    /// rows are not at its snapshot, and `sealed_tail_for_read_be` settles a
+    /// sealed tail. A list that dropped a segment is not: the rows the read
+    /// has there are listed nowhere else, and what replaced them (a merge
+    /// target) is empty at its snapshot. That search is answered on the new
+    /// read returned here instead, taken with the list under the lock a drop
+    /// holds for writing, so nothing can be dropped between the two and one
+    /// new read always suffices. Search with it in place of `r`.
+    fn dense_segment_infos_at<'r>(
+        &self,
+        r: &AnyRead<'r>,
+        name: &str,
+    ) -> Result<
+        (
+            Option<AnyRead<'r>>,
+            Vec<(String, DenseVectorSegmentRole)>,
+            Vec<String>,
+        ),
+        VectorError,
+    > {
+        let (shared, shared_read_at) = {
+            let dense_spaces = self
+                .dense_spaces
+                .read()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+            let space = dense_spaces.get(name).ok_or_else(|| {
+                VectorError::VectorCoreError(format!("Named vector '{}' not found", name))
+            })?;
+            if let AnyRead::Lsm(read) = r {
+                let dropped_at = self.dense_segments_dropped_at.load(AtomicOrdering::Acquire);
+                if read.snapshot_seq().is_some_and(|seq| seq < dropped_at) {
+                    let backend = self.current_backend()?;
+                    if let AnyBackend::Lsm(lsm) = backend.as_ref() {
+                        let newer = lsm
+                            .begin_read()
+                            .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+                        metrics::counter!("helix_dense_search_newer_read_total").increment(1);
+                        return Ok((
+                            Some(AnyRead::Lsm(newer)),
+                            Self::dense_segment_infos(space),
+                            Vec::new(),
+                        ));
+                    }
+                }
+            }
+            (
+                Self::dense_segment_infos(space),
+                self.dense_spaces_read_at.load(AtomicOrdering::Acquire),
+            )
+        };
+        let pinned_at = match r {
+            AnyRead::LsmReader(_) => r.snapshot_seq(),
+            _ => None,
+        };
+        let Some(pinned_at) = pinned_at.filter(|seq| *seq != shared_read_at) else {
+            return Ok((None, shared, Vec::new()));
+        };
+        let own = self.current_backend().ok().and_then(|backend| {
+            crate::helix_engine::storage_core::storage_core::HelixGraphStorage::dense_space_at(
+                &backend, r, name,
+            )
+        });
+        let Some(mut own) = own
+            .map(|space| Self::dense_segment_infos(&space))
+            .filter(|own| *own != shared)
+        else {
+            return Ok((None, shared, Vec::new()));
+        };
+        let older = shared_read_at != DENSE_SPACES_READ_AT_UNKNOWN && pinned_at < shared_read_at;
+        if older {
+            let retired: Vec<String> = own
+                .iter()
+                .filter(|(physical_name, _)| !shared.iter().any(|(kept, _)| kept == physical_name))
+                .map(|(physical_name, _)| physical_name.clone())
+                .collect();
+            metrics::counter!("helix_dense_read_segment_list_total", "outcome" => "own")
+                .increment(1);
+            return Ok((None, own, retired));
+        }
+        let cores = self
+            .cores
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+        let cores_open = own
+            .iter()
+            .all(|(physical_name, _)| cores.contains_key(physical_name));
+        drop(cores);
+        let outcome = if cores_open {
+            "own"
+        } else {
+            own = shared;
+            "shared_cores_not_open"
+        };
+        metrics::counter!("helix_dense_read_segment_list_total", "outcome" => outcome).increment(1);
+        Ok((None, own, Vec::new()))
+    }
+
+    /// A search found no core for a segment of its list. One the shared list
+    /// has retired is what a read older than `RETIRED_CORE_GRACE` loses; any
+    /// other is a segment the metadata names and nothing can serve.
+    fn note_unreachable_segment(
+        &self,
+        vector: &str,
+        segment: &str,
+        retired: &[String],
+        site: &'static str,
+    ) {
+        if retired.iter().any(|name| name == segment) {
+            metrics::counter!(
+                "helix_dense_read_segment_list_total",
+                "outcome" => "own_core_missing"
+            )
+            .increment(1);
+            #[cfg(test)]
+            RETIRED_SEGMENT_SIGHTINGS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((
+                    self.collection_name.clone(),
+                    segment.to_string(),
+                    site,
+                    std::thread::current().id(),
+                ));
+        } else {
+            note_missing_segment(&self.collection_name, vector, segment, site);
+        }
+    }
+
+    /// Tests: how long a replica keeps the core of a segment off its list.
+    #[cfg(test)]
+    pub(crate) fn set_retired_core_grace(&self, grace: std::time::Duration) {
+        self.retired_core_grace_ms
+            .store(grace.as_millis() as u64, AtomicOrdering::Release);
+    }
+
+    /// The LSM writer's present store sequence, the mark a drop leaves in
+    /// `dense_segments_dropped_at`; zero where reads are not pinned at one.
+    /// A drop that cannot take its mark fails instead of going unnoticed.
+    fn present_writer_seq(&self) -> Result<u64, VectorError> {
+        match self.current_backend().as_deref() {
+            Ok(AnyBackend::Lsm(lsm)) => Ok(lsm
+                .begin_read()
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?
+                .snapshot_seq()
+                .unwrap_or(0)),
+            _ => Ok(0),
+        }
+    }
+
+    pub fn sealed_tail_marked_be(
+        &self,
+        r: &AnyRead<'_>,
+        physical_name: &str,
+    ) -> Result<bool, VectorError> {
+        self.current_backend()?
+            .get_with(
+                r,
+                sealed_tail_marker_ns(physical_name),
+                SEALED_TAIL_MARKER_KEY,
+                |value| value.is_some(),
+            )
+            .map_err(|e| VectorError::VectorCoreError(e.to_string()))
+    }
+
+    /// The space's current mutable tail, if any.
+    pub fn mutable_dense_segment_name(&self, logical_name: &str) -> Option<String> {
+        let dense_spaces = self.dense_spaces.read().ok()?;
+        mutable_segment_name(dense_spaces.get(logical_name)?)
+    }
+
+    /// Segments a dense read searches: every non-`Building` segment plus the
+    /// `Building` ones that are sealed tails for it. Call without holding
+    /// `dense_spaces`: the probes are backend reads.
+    fn searchable_dense_segments_be(
+        &self,
+        r: &AnyRead<'_>,
+        logical_name: &str,
+        segments: Vec<(String, DenseVectorSegmentRole)>,
+    ) -> Result<Vec<(String, DenseVectorSegmentRole)>, VectorError> {
+        let mut searchable = Vec::with_capacity(segments.len());
+        for (physical_name, role) in segments {
+            if role == DenseVectorSegmentRole::Building
+                && !self.sealed_tail_for_read_be(r, logical_name, &physical_name)?
+            {
+                continue;
+            }
+            searchable.push((physical_name, role));
+        }
+        Ok(searchable)
+    }
+
+    /// `id`'s vector in dense space `logical_name` as stored in the copy
+    /// search serves: the newest segment that holds it. A merge target not
+    /// yet published is read last: its sources still serve its rows and it
+    /// may hold a row rewritten since the merge read it, but a reader whose
+    /// layout lags a publish finds the row nowhere else. A segment that
+    /// cannot be read counts as not holding the id.
+    pub fn stored_dense_vector_be(
+        &self,
+        r: &AnyRead<'_>,
+        logical_name: &str,
+        id: u128,
+    ) -> Option<Vec<f32>> {
+        let segment_infos =
+            Self::dense_segment_infos(self.dense_spaces.read().ok()?.get(logical_name)?);
+        let cores = self.cores.read().ok()?;
+        let (targets, serving): (Vec<_>, Vec<_>) =
+            dense_segments_by_recency(logical_name, &segment_infos)
+                .into_iter()
+                .partition(|(name, role)| {
+                    *role == DenseVectorSegmentRole::Building
+                        && self.merge_target_marked_be(r, name).unwrap_or(true)
+                });
+        serving
+            .into_iter()
+            .chain(targets)
+            .filter_map(|(name, _)| cores.get(name)?.get_vector(r, id, 0, true).ok())
+            .map(|vector| vector.get_data().to_vec())
+            .find(|data| !data.is_empty())
+    }
+
+    /// `segments` of `logical_name` in search's order, newest first: a merge
+    /// that reads its sources in this order keeps, of two copies of an id,
+    /// the one search serves.
+    pub(crate) fn newest_first(logical_name: &str, segments: &[String]) -> Vec<String> {
+        let segment_infos: Vec<(String, DenseVectorSegmentRole)> = segments
+            .iter()
+            .map(|name| (name.clone(), DenseVectorSegmentRole::Indexed))
+            .collect();
+        dense_segments_by_recency(logical_name, &segment_infos)
+            .into_iter()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Whether `Building` segment `physical_name` is a sealed tail for `r`,
+    /// and so holds the only copy of its rows. The marker says so to a read
+    /// begun after the seal. A read begun before it has no marker at its
+    /// snapshot, yet the list it searches can already show the seal: a writer
+    /// flips its list in place, and a replica read can be handed a newer
+    /// shared list. For that read the segment is still the mutable tail in
+    /// the metadata it reads itself; skipping it lost every row of the tail.
+    fn sealed_tail_for_read_be(
+        &self,
+        r: &AnyRead<'_>,
+        logical_name: &str,
+        physical_name: &str,
+    ) -> Result<bool, VectorError> {
+        if !search_sealed_tails_enabled() {
+            return Ok(false);
+        }
+        if self.sealed_tail_marked_be(r, physical_name)? {
+            return Ok(true);
+        }
+        // Never a tail, and its marker spares every search the metadata read
+        // below for as long as a merge is writing its target.
+        if self.merge_target_marked_be(r, physical_name)? {
+            return Ok(false);
+        }
+        let backend = self.current_backend()?;
+        Ok(
+            crate::helix_engine::storage_core::storage_core::HelixGraphStorage::dense_space_at(
+                &backend,
+                r,
+                logical_name,
+            )
+            .is_some_and(|space| {
+                space.segments.iter().any(|segment| {
+                    segment.physical_name == physical_name
+                        && segment.role == DenseVectorSegmentRole::Mutable
+                })
+            }),
+        )
     }
 
     pub fn attach_dirty_retired_segment_hook<F>(&self, hook: F)
@@ -1920,6 +2757,94 @@ impl NamedVectorManager {
         }
     }
 
+    /// Opens the first segment of `logical_name`, from id `next_segment_id`
+    /// on, that holds no row. Nothing in memory changes here and no lock of
+    /// the manager is held across the probe, which reads the store: the
+    /// caller takes the id by putting the answer's `next_segment_id` into the
+    /// space, and hands the ids passed over to
+    /// [`Self::note_skipped_segment_ids`]. Two callers cannot be handed one
+    /// id: each holds the layout change.
+    fn allocate_dense_core_lsm(
+        &self,
+        _held: &DenseLayoutChange<'_>,
+        data_dir: &Path,
+        logical_name: &str,
+        config: &NamedVectorConfig,
+        hnsw_config: HNSWConfig,
+        mut next_segment_id: u64,
+    ) -> Result<AllocatedDenseCore, VectorError> {
+        // LSM writer never reuses segment names to avoid reader serving stale
+        // vectors from retired cores. Always allocate next_segment_id and increment.
+        // The LMDB path (allocate_dense_core_locked) still reuses names safely via
+        // the deferred dirty-segment reaper protocol.
+        let mut skipped = Vec::new();
+        loop {
+            let name = next_segment_name(logical_name, next_segment_id);
+            next_segment_id += 1;
+            // A dead name is not handed out again, whether it reads empty or
+            // not: its key says rows of it may be left, and a segment opened
+            // under it would be listed and dead at once. An open lifts the
+            // next id above them, so this is met only where the stored
+            // layout had a higher next id than memory.
+            if self.is_dead_segment(&name) {
+                metrics::counter!("helix_dense_dead_name_refused_total").increment(1);
+                tracing::warn!(
+                    collection = %self.collection_name,
+                    vector = %logical_name,
+                    segment = %name,
+                    "A fresh dense segment id is a dead name's; passed over"
+                );
+                continue;
+            }
+            let core =
+                self.create_dense_core_attached_lsm(data_dir, &name, config, hnsw_config.clone())?;
+            let is_empty = {
+                let read = core
+                    .backend
+                    .begin_read()
+                    .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
+                core.is_empty(&read)?
+            };
+            if is_empty {
+                return Ok(AllocatedDenseCore {
+                    name,
+                    core,
+                    next_segment_id,
+                    skipped,
+                });
+            }
+            // Rare: a fresh segment opened dirty backend state (orphaned from a
+            // previous writer crash). It is passed over for the next ID.
+            skipped.push(name);
+        }
+    }
+
+    /// Counts and reports the ids an allocation passed over. Each holds rows
+    /// under a name no layout has, and they may be the only copy of a write
+    /// that was acknowledged. They are not marked dirty and so not handed to
+    /// the reaper, as they were while the allocation itself changed memory:
+    /// nothing may clear them before they are counted against the segments
+    /// that are listed.
+    fn note_skipped_segment_ids(&self, logical_name: &str, skipped: &[String]) {
+        for physical_name in skipped {
+            metrics::counter!(
+                "helix_segment_dirty_retired_discovered_total",
+                "collection" => self.collection_name.clone(),
+                "outcome" => "new",
+            )
+            .increment(1);
+            tracing::error!(
+                collection = %self.collection_name,
+                vector = %logical_name,
+                segment = %physical_name,
+                "A fresh dense segment id holds rows that no layout names; passed over, its rows left as they are"
+            );
+        }
+    }
+
+    /// [`Self::allocate_dense_core_lsm`] as the tests of this file drive it:
+    /// on a space of their own, which takes the id at once.
+    #[cfg(test)]
     fn allocate_dense_core_locked_lsm(
         &self,
         data_dir: &Path,
@@ -1929,35 +2854,18 @@ impl NamedVectorManager {
         space: &mut DenseVectorSpaceMetadata,
         _cores: &HashMap<String, VectorCore>,
     ) -> Result<(String, VectorCore), VectorError> {
-        // LSM writer never reuses segment names to avoid reader serving stale
-        // vectors from retired cores. Always allocate next_segment_id and increment.
-        // The LMDB path (allocate_dense_core_locked) still reuses names safely via
-        // the deferred dirty-segment reaper protocol.
-        loop {
-            let id = space.next_segment_id;
-            space.next_segment_id += 1;
-            let physical_name = next_segment_name(logical_name, id);
-            let core = self.create_dense_core_attached_lsm(
-                data_dir,
-                &physical_name,
-                config,
-                hnsw_config.clone(),
-            )?;
-            let is_empty = {
-                let read = core
-                    .backend
-                    .begin_read()
-                    .map_err(|e| VectorError::VectorCoreError(e.to_string()))?;
-                core.is_empty(&read)?
-            };
-            if is_empty {
-                self.observe_segment_ids_high_water(logical_name, space);
-                return Ok((physical_name, core));
-            }
-            // Rare: a fresh segment opened dirty backend state (orphaned from a
-            // previous writer crash). Mark it dirty and allocate the next ID.
-            let _ = self.mark_dirty_retired_segment(physical_name)?;
-        }
+        let held = self.begin_dense_layout_change();
+        let next = self.allocate_dense_core_lsm(
+            &held,
+            data_dir,
+            logical_name,
+            config,
+            hnsw_config,
+            space.next_segment_id,
+        )?;
+        space.next_segment_id = next.next_segment_id;
+        self.note_skipped_segment_ids(logical_name, &next.skipped);
+        Ok((next.name, next.core))
     }
 
     fn infer_legacy_space(
@@ -2242,13 +3150,19 @@ impl NamedVectorManager {
 
     /// Reader-replica reconcile for SlateDB: same in-memory refresh as
     /// `refresh_dense_view_from_metadata`, but without opening local heed DBIs.
+    ///
+    /// `read_at` is the sequence of the read `dense_spaces_meta` came from,
+    /// when that read was pinned; reads pinned anywhere else then take their
+    /// own list (`dense_segment_infos_at`). Returns how many listed segments
+    /// are left without a core, which every search skips.
     pub fn refresh_dense_view_from_metadata_lsm(
         &self,
         data_dir: &Path,
         named_vector_configs: &HashMap<String, NamedVectorConfig>,
         dense_spaces_meta: &HashMap<String, DenseVectorSpaceMetadata>,
         base_hnsw: HNSWConfig,
-    ) -> Result<(), VectorError> {
+        read_at: Option<u64>,
+    ) -> Result<usize, VectorError> {
         let mut missing_segments = Vec::new();
         {
             let mut configs = self
@@ -2361,11 +3275,27 @@ impl NamedVectorManager {
             }
         }
 
-        *self
-            .dense_spaces
-            .write()
-            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))? =
-            dense_spaces_meta.clone();
+        {
+            let mut dense_spaces = self
+                .dense_spaces
+                .write()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+            *dense_spaces = dense_spaces_meta.clone();
+            self.dense_spaces_read_at.store(
+                read_at.unwrap_or(DENSE_SPACES_READ_AT_UNKNOWN),
+                AtomicOrdering::Release,
+            );
+        }
+        let unopened = {
+            let cores = self
+                .cores
+                .read()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+            new_valid_names
+                .iter()
+                .filter(|name| !cores.contains_key(*name))
+                .count()
+        };
 
         // Identify segments to prune: absent from BOTH previous and new metadata.
         // This delays removal by one refresh, mirroring the safe ordering at lines 5677-5698
@@ -2373,6 +3303,16 @@ impl NamedVectorManager {
         // Only prune within logical spaces present in the new metadata (to avoid pruning
         // everything on an empty or default metadata read), and only segment IDs below
         // each space's next_segment_id (to avoid pruning ahead of allocation).
+        // And only once the segment has been off the list for the grace: a read
+        // pinned before it was retired still searches it from its own list.
+        let grace = std::time::Duration::from_millis(
+            self.retired_core_grace_ms.load(AtomicOrdering::Acquire),
+        );
+        let now = Instant::now();
+        let mut retired_since = self
+            .retired_cores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let stale_names: Vec<String> = {
             let cores = self
                 .cores
@@ -2385,7 +3325,7 @@ impl NamedVectorManager {
                 .map(|(name, space)| (name.as_str(), space.next_segment_id))
                 .collect();
 
-            cores
+            let stale: Vec<String> = cores
                 .keys()
                 .filter(|name| {
                     // Parse logical name from physical name (format: {logical}__seg_{id:06})
@@ -2400,9 +3340,14 @@ impl NamedVectorManager {
                     if let Some(&next_id) = next_ids.get(logical_name) {
                         // Extract segment ID from physical name using the helper
                         if let Some(seg_id) = segment_id_from_name(logical_name, name) {
-                            // Prune only if below next_segment_id and absent from both metadatas
+                            // Prune only if below next_segment_id, absent from both
+                            // metadatas, and off the list for the grace. The clock
+                            // starts at the first reconcile whose list lacks it.
                             seg_id < next_id
                                 && !new_valid_names.contains(*name)
+                                && now.duration_since(
+                                    *retired_since.entry((*name).clone()).or_insert(now),
+                                ) >= grace
                                 && !prev_valid_names.contains(*name)
                         } else {
                             false // unparseable name, don't prune
@@ -2412,10 +3357,29 @@ impl NamedVectorManager {
                     }
                 })
                 .cloned()
-                .collect()
+                .collect();
+            // A core off the list builds no sidecar from here on: the reads
+            // pinned before still search it, and a build reads the newest view.
+            for (name, core) in cores.iter() {
+                if retired_since.contains_key(name) && !new_valid_names.contains(name) {
+                    core.keep_sidecar_as_is();
+                }
+            }
+            stale
         };
 
-        if stale_names.is_empty() {
+        for name in &stale_names {
+            retired_since.remove(name);
+        }
+        drop(retired_since);
+        self.remove_retired_cores(&stale_names)?;
+        Ok(unopened)
+    }
+
+    /// Take `names` out of the core map. Their cleanup I/O runs once the
+    /// map's lock is released.
+    fn remove_retired_cores(&self, names: &[String]) -> Result<(), VectorError> {
+        if names.is_empty() {
             return Ok(());
         }
 
@@ -2428,7 +3392,7 @@ impl NamedVectorManager {
                 .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
 
             // Remove stale cores, collecting them for cleanup outside the lock
-            for name in &stale_names {
+            for name in names {
                 if let Some(core) = cores.remove(name) {
                     removed_cores.push((name.clone(), core));
                 }
@@ -2446,8 +3410,72 @@ impl NamedVectorManager {
             );
             drop(core);
         }
-
         Ok(())
+    }
+
+    /// Reader replicas: drop the cores a reconcile found off the list longer
+    /// ago than the grace. Reconciles run only from request paths, so a
+    /// collection whose last read landed inside the grace would keep those
+    /// cores, with their ordinal maps and sidecar files, until its next read
+    /// or its close. The poll-tier sweeper calls this for every open
+    /// collection. A zero grace (tests) leaves the cores to the reconcile's
+    /// two-pass rule. Returns how many it dropped.
+    pub(crate) fn drop_retired_cores_past_grace(&self) -> Result<usize, VectorError> {
+        let grace = std::time::Duration::from_millis(
+            self.retired_core_grace_ms.load(AtomicOrdering::Acquire),
+        );
+        let due: Vec<String> = {
+            let mut retired_since = self
+                .retired_cores
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if grace.is_zero() || retired_since.is_empty() {
+                return Ok(0);
+            }
+            let dense_spaces = self
+                .dense_spaces
+                .read()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+            let now = Instant::now();
+            // One the list names again is not retired, whatever its clock says.
+            let due: Vec<String> = retired_since
+                .iter()
+                .filter(|(name, since)| {
+                    now.duration_since(**since) >= grace
+                        && !dense_spaces.values().any(|space| {
+                            space
+                                .segments
+                                .iter()
+                                .any(|segment| segment.physical_name == **name)
+                        })
+                })
+                .map(|(name, _)| name.clone())
+                .collect();
+            for name in &due {
+                retired_since.remove(name);
+            }
+            due
+        };
+        self.remove_retired_cores(&due)?;
+        Ok(due.len())
+    }
+
+    /// A collection's close: unlink the sidecar files of the segments whose
+    /// cores are still kept for the grace. No read is left to use them, and
+    /// nothing else unlinks them before the collection is next opened on
+    /// this pod. By name, so a file no core has attached goes too, and a
+    /// segment the list names again keeps its files.
+    pub(crate) fn unlink_retired_sidecars(&self, dir: &Path) {
+        let retired: Vec<String> = self
+            .retired_cores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        if !retired.is_empty() {
+            let _ = self.unlink_sidecar_files_for_segments(dir, &retired);
+        }
     }
 
     fn validate_dense_segment_publishable(
@@ -2710,6 +3738,212 @@ impl NamedVectorManager {
             .unwrap_or_default()
     }
 
+    /// [`Self::list_dense_vector_spaces`] for the store of the layout. That
+    /// one answers a layout of no space when the lock is poisoned, and a
+    /// store of it leaves the collection with no segment listed: this one
+    /// fails.
+    pub(crate) fn dense_vector_spaces_to_store(
+        &self,
+    ) -> Result<HashMap<String, DenseVectorSpaceMetadata>, VectorError> {
+        self.dense_spaces
+            .read()
+            .map(|spaces| spaces.clone())
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))
+    }
+
+    /// Leaves the lock of the dense layout poisoned, as a holder of its write
+    /// lock that panicked does.
+    #[cfg(test)]
+    pub(crate) fn poison_dense_spaces(&self) {
+        let died = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _held = self.dense_spaces.write();
+                    panic!("a holder of the dense layout's lock that died");
+                })
+                .join()
+        });
+        assert!(died.is_err() && self.dense_spaces.is_poisoned());
+    }
+
+    /// What [`VectorCore::stored_reach`] reads of every segment of every dense
+    /// space, the spaces by name and a space's segments newest first. Writes
+    /// nothing. A segment with no core open here is left out.
+    ///
+    /// A row is replaced as a regraph's export has it
+    /// (`export_for_regraph_be`): by a re-upsert tombstone, or by a copy of
+    /// its id in a newer segment that search serves. The newer copies are
+    /// known from the ids already read, so only the tombstone is a read, and
+    /// only where re-upsert tombstones are switched on.
+    pub(crate) fn stored_reach_be(
+        &self,
+        r: &AnyRead<'_>,
+    ) -> Result<Vec<(String, DenseVectorSegmentMetadata, StoredReach)>, VectorError> {
+        let mut spaces: Vec<_> = self.list_dense_vector_spaces().into_iter().collect();
+        spaces.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut out = Vec::new();
+        for (space, metadata) in spaces {
+            let infos = Self::dense_segment_infos(&metadata);
+            let mut newer: HashSet<u128> = HashSet::new();
+            for (name, role) in dense_segments_by_recency(&space, &infos) {
+                let Some(segment) = metadata
+                    .segments
+                    .iter()
+                    .find(|segment| segment.physical_name == *name)
+                else {
+                    continue;
+                };
+                // The cores are locked a segment at a time, as long as a
+                // regraph's export of one holds them.
+                let reach = match self.cores_read()?.get(name) {
+                    Some(core) => {
+                        core.stored_reach(r, &|id: u128| -> Result<bool, VectorError> {
+                            Ok(newer.contains(&id)
+                                || self.is_tombstoned_for_merge_be(r, name, id)?)
+                        })?
+                    }
+                    None => continue,
+                };
+                // An unmarked Building segment is hidden from search: its
+                // rows replace none.
+                if *role != DenseVectorSegmentRole::Building
+                    || self.sealed_tail_marked_be(r, name)?
+                {
+                    newer.extend(reach.ids.iter().copied());
+                }
+                out.push((space.clone(), segment.clone(), reach));
+            }
+        }
+        Ok(out)
+    }
+
+    /// One call of the link pass over the graphs as they are stored,
+    /// read-only half. The first Indexed segment the pass has still to do
+    /// (`VectorCore::link_pass_due`; the spaces by name, a space's segments
+    /// newest first) is read, and it alone: the links that give its served
+    /// unreached rows a row leading to them, for no more than `max_rows` of
+    /// those rows, from where the call before left off
+    /// (`VectorCore::plan_stored_links`). A segment with nothing to link is
+    /// planned too, so that it is marked. Also returns how many segments the
+    /// pass has still to do, that one counted: the marks say so, and no
+    /// list is read for it.
+    ///
+    /// A row is served unless another copy has replaced it, as
+    /// `stored_reach_be` has it. Here that is asked of the unreached rows
+    /// alone, by a read of each more recent segment for each.
+    pub(crate) fn plan_stored_links_be(
+        &self,
+        r: &AnyRead<'_>,
+        max_rows: usize,
+    ) -> Result<(Option<StoredLinks>, usize), VectorError> {
+        let mut spaces: Vec<_> = self.list_dense_vector_spaces().into_iter().collect();
+        spaces.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut plan = None;
+        let mut due = 0;
+        for (space, metadata) in spaces {
+            let infos = Self::dense_segment_infos(&metadata);
+            // The segments more recent than the one looked at, whose rows
+            // search serves.
+            let mut newer = Vec::new();
+            for (name, role) in dense_segments_by_recency(&space, &infos) {
+                let cores = self.cores_read()?;
+                let core = cores.get(name);
+                let is_due = match core {
+                    Some(core) if *role == DenseVectorSegmentRole::Indexed => {
+                        core.link_pass_due(r)?
+                    }
+                    _ => false,
+                };
+                due += usize::from(is_due);
+                if let (true, None, Some(core)) = (is_due, &plan, core) {
+                    // Every row counts as served in this read; the unreached
+                    // ones another copy has replaced are left out after it.
+                    let reach = core
+                        .stored_reach(r, &|_: u128| -> Result<bool, VectorError> { Ok(false) })?;
+                    let mut unreached = Vec::new();
+                    for id in reach.unreached.unwrap_or_default() {
+                        let mut replaced = self.is_tombstoned_for_merge_be(r, name, id)?;
+                        for other in &newer {
+                            if replaced {
+                                break;
+                            }
+                            if let Some(other) = cores.get(*other) {
+                                replaced = other.contains_id(r, id)?;
+                            }
+                        }
+                        if !replaced {
+                            unreached.push(id);
+                        }
+                    }
+                    let (links, without_room, upto) =
+                        core.plan_stored_links(r, &unreached, core.link_pass_after(r)?, max_rows)?;
+                    let (began_at, deleted_rows) = core.link_pass_counts(r)?;
+                    plan = Some(StoredLinks {
+                        space: space.clone(),
+                        segment: name.clone(),
+                        unreached: unreached.len(),
+                        links,
+                        without_room,
+                        upto,
+                        began_at,
+                        deleted_rows,
+                    });
+                }
+                // An unmarked Building segment is hidden from search: its
+                // rows replace none.
+                if *role != DenseVectorSegmentRole::Building
+                    || self.sealed_tail_marked_be(r, name)?
+                {
+                    newer.push(name);
+                }
+            }
+        }
+        Ok((plan, due))
+    }
+
+    /// The write half: stages `plan` in `w` for the segments that are still
+    /// Indexed in the layout, each with its mark, or with the row the pass
+    /// has come to in it. Returns, per segment, the rows whose list changed,
+    /// for `forget_stored_links` after the commit.
+    /// Call with nothing written to the collection since `plan` was made.
+    pub(crate) fn apply_stored_links_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        plan: &[StoredLinks],
+    ) -> Result<Vec<(String, Vec<u128>)>, VectorError> {
+        let spaces = self.list_dense_vector_spaces();
+        let cores = self.cores_read()?;
+        let mut changed = Vec::new();
+        for segment in plan {
+            let indexed = spaces.get(&segment.space).is_some_and(|space| {
+                space.segments.iter().any(|listed| {
+                    listed.physical_name == segment.segment
+                        && listed.role == DenseVectorSegmentRole::Indexed
+                })
+            });
+            let Some(core) = cores.get(&segment.segment).filter(|_| indexed) else {
+                continue;
+            };
+            let rows =
+                core.apply_stored_links_be(w, &segment.links, segment.upto, segment.began_at)?;
+            changed.push((segment.segment.clone(), rows));
+        }
+        Ok(changed)
+    }
+
+    /// Drops the cached lists `apply_stored_links_be` changed, once its
+    /// batch has committed.
+    pub(crate) fn forget_stored_links(&self, changed: &[(String, Vec<u128>)]) {
+        let Ok(cores) = self.cores_read() else {
+            return;
+        };
+        for (segment, rows) in changed {
+            if let Some(core) = cores.get(segment) {
+                core.forget_neighbor_lists(rows);
+            }
+        }
+    }
+
     fn active_dense_segment_names(&self) -> Result<HashSet<String>, VectorError> {
         let spaces = self
             .dense_spaces
@@ -2881,6 +4115,34 @@ impl NamedVectorManager {
             .and_then(|configs| configs.get(name).cloned())
     }
 
+    /// True when a dense space quantizes its stored vectors. Such a space
+    /// keeps no exact sidecar for its mutable tail (`insert_flat_be`), so a
+    /// reader replica scores every tail row from a point read.
+    pub(crate) fn has_spindle_dense_space(&self) -> bool {
+        self.quantizes_a_dense_space().unwrap_or(false)
+    }
+
+    /// As `has_spindle_dense_space`, with a poisoned lock an error where
+    /// that one reads it as no quantized space: for a caller that must not
+    /// take a quantized collection for a plain one.
+    pub(crate) fn quantizes_a_dense_space(&self) -> Result<bool, VectorError> {
+        self.configs
+            .read()
+            .map(|configs| configs.values().any(|config| config.spindle.is_enabled()))
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))
+    }
+
+    /// Test-only: leaves the lock on the vector configs poisoned, as a panic
+    /// under it does.
+    #[cfg(test)]
+    pub(crate) fn poison_configs_for_test(&self) {
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = self.configs.write();
+            panic!("poisoning the vector configs lock for a test");
+        }));
+        assert!(poisoned.is_err());
+    }
+
     pub fn get_dense_space_stats(
         &self,
         txn: &RoTxn,
@@ -2972,6 +4234,41 @@ impl NamedVectorManager {
             missing_segments_count,
             missing_segments,
         })
+    }
+
+    /// Rows in the mutable tail, stopping at `limit`: what the seal rule
+    /// counts, without rescanning the other segments. A segment that is not
+    /// the tail can hold rows without a usable index (while it builds, and
+    /// for good once its entry point's rows are deleted, see
+    /// `has_entry_point_key`); sealing the tail does nothing for those.
+    pub(crate) fn mutable_tail_count_upto_be(
+        &self,
+        r: &AnyRead<'_>,
+        name: &str,
+        limit: u64,
+    ) -> Result<u64, VectorError> {
+        let spaces = self
+            .dense_spaces
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {e}")))?;
+        let space = spaces.get(name).ok_or_else(|| {
+            VectorError::VectorCoreError(format!("Named vector '{name}' not found"))
+        })?;
+        let cores = self.cores_read()?;
+        let mut count = 0u64;
+        for segment in &space.segments {
+            let Some(core) = cores.get(&segment.physical_name) else {
+                // Reported for every segment, as the full stats did: this is
+                // the index job's probe.
+                note_missing_segment(&self.collection_name, name, &segment.physical_name, "stats");
+                continue;
+            };
+            if segment.role == DenseVectorSegmentRole::Mutable {
+                count = count
+                    .saturating_add(core.level_zero_count_upto(r, limit.saturating_sub(count))?);
+            }
+        }
+        Ok(count)
     }
 
     pub fn public_score(&self, name: &str, distance: f32) -> Result<f32, VectorError> {
@@ -3589,26 +4886,13 @@ impl NamedVectorManager {
     where
         F: Fn(u128) -> bool,
     {
-        let dense_spaces = self
-            .dense_spaces
-            .read()
-            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
-        let space = dense_spaces.get(name).ok_or_else(|| {
-            VectorError::VectorCoreError(format!("Named vector '{}' not found", name))
-        })?;
-        let all_segment_infos: Vec<(String, DenseVectorSegmentRole)> = space
-            .segments
-            .iter()
-            .map(|segment| (segment.physical_name.clone(), segment.role))
-            .collect();
+        let (newer, all_segment_infos, retired) = self.dense_segment_infos_at(r, name)?;
+        let r = newer.as_ref().unwrap_or(r);
         let building_count = all_segment_infos
             .iter()
             .filter(|(_, role)| *role == DenseVectorSegmentRole::Building)
             .count();
-        let segment_infos: Vec<(String, DenseVectorSegmentRole)> = all_segment_infos
-            .into_iter()
-            .filter(|(_, role)| *role != DenseVectorSegmentRole::Building)
-            .collect();
+        let segment_infos = self.searchable_dense_segments_be(r, name, all_segment_infos)?;
         let recency_ranks = segment_recency_ranks(name, &segment_infos);
         let segment_count = segment_infos.len();
         let indexed_count = segment_infos
@@ -3619,7 +4903,6 @@ impl NamedVectorManager {
             .iter()
             .filter(|(_, role)| *role == DenseVectorSegmentRole::Mutable)
             .count();
-        drop(dense_spaces);
 
         let cores = self
             .cores
@@ -3703,12 +4986,7 @@ impl NamedVectorManager {
                 .map(
                     |(seg_idx, (segment_name, role))| -> Result<Vec<HVector>, VectorError> {
                         let Some(core) = cores_ref.get(segment_name) else {
-                            note_missing_segment(
-                                &self.collection_name,
-                                name,
-                                segment_name,
-                                "search",
-                            );
+                            self.note_unreachable_segment(name, segment_name, &retired, "search");
                             return Ok(Vec::new());
                         };
                         let seg_start = observe_hot_metrics.then(std::time::Instant::now);
@@ -3786,7 +5064,7 @@ impl NamedVectorManager {
         } else {
             for (seg_idx, (segment_name, role)) in segment_infos.iter().enumerate() {
                 let Some(core) = cores.get(segment_name) else {
-                    note_missing_segment(&self.collection_name, name, segment_name, "search");
+                    self.note_unreachable_segment(name, segment_name, &retired, "search");
                     continue;
                 };
                 let seg_start = observe_hot_metrics.then(std::time::Instant::now);
@@ -3882,20 +5160,9 @@ impl NamedVectorManager {
             return Ok(Vec::new());
         }
 
-        let dense_spaces = self
-            .dense_spaces
-            .read()
-            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
-        let space = dense_spaces.get(name).ok_or_else(|| {
-            VectorError::VectorCoreError(format!("Named vector '{}' not found", name))
-        })?;
-        let segment_infos: Vec<(String, DenseVectorSegmentRole)> = space
-            .segments
-            .iter()
-            .filter(|segment| segment.role != DenseVectorSegmentRole::Building)
-            .map(|segment| (segment.physical_name.clone(), segment.role))
-            .collect();
-        drop(dense_spaces);
+        let (newer, segment_infos, retired) = self.dense_segment_infos_at(r, name)?;
+        let r = newer.as_ref().unwrap_or(r);
+        let segment_infos = self.searchable_dense_segments_be(r, name, segment_infos)?;
 
         let can_parallelize_read = matches!(r, AnyRead::Lsm(_) | AnyRead::LsmReader(_));
         if segment_infos.len() < 2
@@ -3962,10 +5229,10 @@ impl NamedVectorManager {
             .map(
                 |(seg_idx, (segment_name, role))| -> Result<Vec<HVector>, VectorError> {
                     let Some(core) = cores_ref.get(segment_name) else {
-                        note_missing_segment(
-                            &self.collection_name,
+                        self.note_unreachable_segment(
                             name,
                             segment_name,
+                            &retired,
                             "candidate_filter_search",
                         );
                         return Ok(Vec::new());
@@ -4148,155 +5415,6 @@ impl NamedVectorManager {
         }
 
         Ok(dedup_keep_newest(combined, k))
-    }
-
-    pub fn dense_search_candidate_ids_exact_be<I>(
-        &self,
-        r: &AnyRead<'_>,
-        name: &str,
-        query: &[f32],
-        k: usize,
-        candidate_ids: I,
-        selectivity_hint: Option<f32>,
-    ) -> Result<Vec<HVector>, VectorError>
-    where
-        I: IntoIterator<Item = u128>,
-    {
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut candidate_ids = unique_candidate_ids(candidate_ids.into_iter().collect());
-        if candidate_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let dense_spaces = self
-            .dense_spaces
-            .read()
-            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
-        let space = dense_spaces.get(name).ok_or_else(|| {
-            VectorError::VectorCoreError(format!("Named vector '{}' not found", name))
-        })?;
-        let segment_infos: Vec<(String, DenseVectorSegmentRole)> = space
-            .segments
-            .iter()
-            .filter(|segment| segment.role != DenseVectorSegmentRole::Building)
-            .map(|segment| (segment.physical_name.clone(), segment.role))
-            .collect();
-        drop(dense_spaces);
-
-        let recency_ranks = segment_recency_ranks(name, &segment_infos);
-        let cores = self
-            .cores
-            .read()
-            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
-        let mut combined: Vec<(u32, HVector)> = Vec::with_capacity(k * segment_infos.len());
-        metrics::histogram!(
-            "helix_named_vector_exact_search_items",
-            "collection" => self.collection_name.clone(),
-            "vector" => name.to_string(),
-            "measurement" => "candidate_ids",
-            "segment_index" => "all",
-            "segment_count" => segment_infos.len().to_string(),
-        )
-        .record(candidate_ids.len() as f64);
-        metrics::histogram!(
-            "helix_named_vector_exact_search_items",
-            "collection" => self.collection_name.clone(),
-            "vector" => name.to_string(),
-            "measurement" => "segment_count",
-            "segment_index" => "all",
-            "segment_count" => segment_infos.len().to_string(),
-        )
-        .record(segment_infos.len() as f64);
-
-        for (segment_index, (segment_name, _)) in dense_segments_by_recency(name, &segment_infos)
-            .into_iter()
-            .enumerate()
-        {
-            if candidate_ids.is_empty() {
-                break;
-            }
-            let Some(core) = cores.get(segment_name) else {
-                note_missing_segment(&self.collection_name, name, segment_name, "exact_id_search");
-                continue;
-            };
-            let rank = recency_ranks.get(segment_name).copied().unwrap_or(u32::MAX);
-            let candidate_start = Instant::now();
-            let segment_candidate_ids =
-                take_candidate_ids_present_in_segment(core, r, &mut candidate_ids)?;
-            metrics::histogram!(
-                "helix_named_vector_exact_search_stage_ms",
-                "collection" => self.collection_name.clone(),
-                "vector" => name.to_string(),
-                "stage" => "segment_candidate_filter",
-                "segment_index" => segment_index.to_string(),
-                "segment_count" => segment_infos.len().to_string(),
-            )
-            .record(candidate_start.elapsed().as_secs_f64() * 1000.0);
-            metrics::histogram!(
-                "helix_named_vector_exact_search_items",
-                "collection" => self.collection_name.clone(),
-                "vector" => name.to_string(),
-                "measurement" => "segment_candidate_ids",
-                "segment_index" => segment_index.to_string(),
-                "segment_count" => segment_infos.len().to_string(),
-            )
-            .record(segment_candidate_ids.len() as f64);
-            if segment_candidate_ids.is_empty() {
-                continue;
-            }
-            let search_start = Instant::now();
-            let hits = core.search_exact_ids_with_selectivity(
-                r,
-                query,
-                segment_candidate_ids.iter().copied(),
-                k,
-                selectivity_hint,
-            )?;
-            metrics::histogram!(
-                "helix_named_vector_exact_search_stage_ms",
-                "collection" => self.collection_name.clone(),
-                "vector" => name.to_string(),
-                "stage" => "segment_exact_score",
-                "segment_index" => segment_index.to_string(),
-                "segment_count" => segment_infos.len().to_string(),
-            )
-            .record(search_start.elapsed().as_secs_f64() * 1000.0);
-            metrics::histogram!(
-                "helix_named_vector_exact_search_items",
-                "collection" => self.collection_name.clone(),
-                "vector" => name.to_string(),
-                "measurement" => "segment_hits",
-                "segment_index" => segment_index.to_string(),
-                "segment_count" => segment_infos.len().to_string(),
-            )
-            .record(hits.len() as f64);
-            combined.extend(hits.into_iter().map(|hit| (rank, hit)));
-        }
-
-        let dedup_start = Instant::now();
-        let results = dedup_keep_newest(combined, k);
-        metrics::histogram!(
-            "helix_named_vector_exact_search_stage_ms",
-            "collection" => self.collection_name.clone(),
-            "vector" => name.to_string(),
-            "stage" => "dedup_keep_newest",
-            "segment_index" => "all",
-            "segment_count" => segment_infos.len().to_string(),
-        )
-        .record(dedup_start.elapsed().as_secs_f64() * 1000.0);
-        metrics::histogram!(
-            "helix_named_vector_exact_search_items",
-            "collection" => self.collection_name.clone(),
-            "vector" => name.to_string(),
-            "measurement" => "results_returned",
-            "segment_index" => "all",
-            "segment_count" => segment_infos.len().to_string(),
-        )
-        .record(results.len() as f64);
-        Ok(results)
     }
 
     pub fn dense_insert(
@@ -4512,7 +5630,8 @@ impl NamedVectorManager {
         Ok(before_mutable.is_none() && mutable_segment_name(space).is_some())
     }
 
-    /// LSM cutover variant of [`dense_append_to_mutable`].
+    /// LSM cutover variant of [`dense_append_to_mutable`]; returns the tail it
+    /// appended to.
     ///
     /// This supports the already-initialized mutable-tail case. Segment creation,
     /// sealing, and HNSW build still depend on the old heed transaction shape and
@@ -4524,7 +5643,7 @@ impl NamedVectorManager {
         data: &[f32],
         id: u128,
         fields: HashMap<String, Value>,
-    ) -> Result<bool, VectorError> {
+    ) -> Result<String, VectorError> {
         let dense_spaces = self
             .dense_spaces
             .read()
@@ -4546,7 +5665,24 @@ impl NamedVectorManager {
             VectorError::VectorCoreError(format!("Segment core '{}' missing", active_name))
         })?;
         core.insert_flat_be(w, data, Some(id), Some(fields))?;
-        Ok(false)
+        Ok(active_name)
+    }
+
+    /// The input `dense_append_to_mutable_be` refuses: a name that is no
+    /// dense space, or values that are not finite. Writes nothing.
+    pub(crate) fn check_dense_append(&self, name: &str, data: &[f32]) -> Result<(), VectorError> {
+        let known = self
+            .dense_spaces
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?
+            .contains_key(name);
+        if !known {
+            return Err(VectorError::VectorCoreError(format!(
+                "Named vector '{}' not found",
+                name
+            )));
+        }
+        super::vector_core::ensure_finite_vector(data)
     }
 
     /// Return true when a dense upsert batch can append into already-open
@@ -5115,57 +6251,117 @@ impl NamedVectorManager {
         Ok(false)
     }
 
+    /// First step of the LSM twin of [`Self::seal_mutable_tail`]: decides
+    /// whether `logical_name`'s tail is sealed now and opens the tail after
+    /// it. Memory is as it was when this returns, whatever it returns: an
+    /// append still takes the old tail, and a failure here leaves the space
+    /// its tail and its next id. The caller stores the layout with the seal
+    /// in it ([`PreparedTailSeal::flip_in`]) and only then calls
+    /// [`Self::apply_tail_seal`], so the next tail is in a stored layout
+    /// before an append can reach it. Its store reads (has the tail a row,
+    /// is the next id empty) run with neither write lock held: an append and
+    /// a search go on beside them.
+    pub(crate) fn prepare_tail_seal_lsm(
+        &self,
+        held: &DenseLayoutChange<'_>,
+        r: &AnyRead<'_>,
+        data_dir: &Path,
+        logical_name: &str,
+        hnsw_config: HNSWConfig,
+    ) -> Result<Option<PreparedTailSeal>, VectorError> {
+        let config = self.get_config(logical_name).ok_or_else(|| {
+            VectorError::VectorCoreError(format!("Named vector '{}' not found", logical_name))
+        })?;
+
+        // A copy: the space stays as it is for as long as `held` is.
+        let space = self
+            .dense_spaces
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?
+            .get(logical_name)
+            .cloned()
+            .ok_or_else(|| {
+                VectorError::VectorCoreError(format!("Named vector '{}' not found", logical_name))
+            })?;
+        let Some(sealed) = mutable_segment_name(&space) else {
+            return Ok(None);
+        };
+        // Emptiness only: stop at the first row instead of counting the tail.
+        let has_vectors = self
+            .cores
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?
+            .get(&sealed)
+            .and_then(|core| core.level_zero_count_upto(r, 1).ok())
+            .is_some_and(|rows| rows > 0);
+        if !has_vectors || self.should_block_mutable_seal(&space, logical_name) {
+            return Ok(None);
+        }
+
+        let next = self.allocate_dense_core_lsm(
+            held,
+            data_dir,
+            logical_name,
+            &config,
+            hnsw_config,
+            space.next_segment_id,
+        )?;
+        Ok(Some(PreparedTailSeal {
+            logical_name: logical_name.to_string(),
+            sealed,
+            next_name: next.name,
+            next_core: next.core,
+            next_segment_id: next.next_segment_id,
+            skipped: next.skipped,
+        }))
+    }
+
+    /// Last step of an LSM tail's seal: puts a seal whose layout is stored
+    /// into memory, from where the next append takes the next tail. It takes
+    /// the write locks of `dense_spaces` and `cores`, in that order and
+    /// together, so no append finds the next tail's name without its core,
+    /// and it reads nothing from the store under them. It cannot fail: a
+    /// poisoned lock is taken all the same, since a seal that is stored and
+    /// not in memory is a stored layout ahead of memory until the next store.
+    pub(crate) fn apply_tail_seal(&self, _held: &DenseLayoutChange<'_>, seal: PreparedTailSeal) {
+        {
+            let mut dense_spaces = self
+                .dense_spaces
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut cores = self
+                .cores
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seal.flip_in(&mut dense_spaces);
+            if let Some(space) = dense_spaces.get(&seal.logical_name) {
+                self.observe_segment_ids_high_water(&seal.logical_name, space);
+            }
+            cores.insert(seal.next_name, seal.next_core);
+        }
+        self.note_skipped_segment_ids(&seal.logical_name, &seal.skipped);
+    }
+
+    /// A seal put into memory with no store, as every seal was before its
+    /// store came first: for a test that stores the layout itself, or wants
+    /// memory ahead of the store. Returns the sealed segment's name.
+    #[cfg(test)]
     pub fn seal_mutable_tail_lsm(
         &self,
         r: &AnyRead<'_>,
         data_dir: &Path,
         logical_name: &str,
         hnsw_config: HNSWConfig,
-    ) -> Result<bool, VectorError> {
-        let config = self.get_config(logical_name).ok_or_else(|| {
-            VectorError::VectorCoreError(format!("Named vector '{}' not found", logical_name))
-        })?;
-
-        let mut dense_spaces = self
-            .dense_spaces
-            .write()
-            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
-        let space = dense_spaces.get_mut(logical_name).ok_or_else(|| {
-            VectorError::VectorCoreError(format!("Named vector '{}' not found", logical_name))
-        })?;
-        let mut cores = self
-            .cores
-            .write()
-            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
-
-        if let Some(mutable_name) = mutable_segment_name(space) {
-            let has_vectors = cores
-                .get(&mutable_name)
-                .and_then(|c| c.level_zero_count(r).ok().map(|count| count > 0))
-                .unwrap_or(false);
-            if has_vectors && !self.should_block_mutable_seal(space, logical_name) {
-                for seg in &mut space.segments {
-                    if seg.physical_name == mutable_name {
-                        seg.role = DenseVectorSegmentRole::Building;
-                    }
-                }
-                let (next_name, next_core) = self.allocate_dense_core_locked_lsm(
-                    data_dir,
-                    logical_name,
-                    &config,
-                    hnsw_config,
-                    space,
-                    &cores,
-                )?;
-                cores.insert(next_name.clone(), next_core);
-                space.segments.push(DenseVectorSegmentMetadata {
-                    physical_name: next_name,
-                    role: DenseVectorSegmentRole::Mutable,
-                });
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    ) -> Result<Option<String>, VectorError> {
+        let held = self.begin_dense_layout_change();
+        let Some(seal) =
+            self.prepare_tail_seal_lsm(&held, r, data_dir, logical_name, hnsw_config)?
+        else {
+            return Ok(None);
+        };
+        let sealed = seal.sealed().to_string();
+        self.apply_tail_seal(&held, seal);
+        Ok(Some(sealed))
     }
 
     pub fn build_dense_segment(
@@ -5230,10 +6426,31 @@ impl NamedVectorManager {
         *FAN_IN
     }
 
-    /// Select merge candidates using tiered size-class compaction.
+    /// `HELIX_DENSE_MERGE_SIZE_RATIO`: a positive whole number turns on the
+    /// selection by size ratio: a merge of a space over its target takes the
+    /// two smallest indexed segments, then each next larger one while it
+    /// holds at most this many times the rows taken so far
+    /// ([`Self::merge_targets_by_size_ratio`]). Unset, 0, or anything else:
+    /// the size tiers and their fallback ([`Self::merge_targets_by_tier`]).
+    pub(crate) fn merge_size_ratio() -> Option<usize> {
+        Self::merge_size_ratio_from(
+            std::env::var("HELIX_DENSE_MERGE_SIZE_RATIO")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn merge_size_ratio_from(setting: Option<&str>) -> Option<usize> {
+        setting
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|ratio| *ratio > 0)
+    }
+
+    /// Select the segments of one merge: by size tier, or by size ratio where
+    /// `HELIX_DENSE_MERGE_SIZE_RATIO` is set.
     ///
     /// Returns `None` if no merge is needed, or `Some(targets)` with the
-    /// physical names of segments to merge (all from the same size tier).
+    /// physical names of segments to merge.
     pub fn select_merge_candidates(
         &self,
         txn: &RoTxn,
@@ -5345,6 +6562,8 @@ impl NamedVectorManager {
         // cache — never a `prefix_iter` on this scheduling hot path.
         let mut indexed: Vec<(String, usize)> = Vec::new();
         let mut delete_ratio_breach = false;
+        let mut forced: HashSet<String> = HashSet::new();
+        let mut size_unknown = false;
         for seg in &space.segments {
             if seg.role != DenseVectorSegmentRole::Indexed {
                 continue;
@@ -5360,27 +6579,125 @@ impl NamedVectorManager {
             };
             let count = {
                 let rd = core.backend.read_borrowed(txn);
-                core.level_zero_count(&rd).unwrap_or(0) as usize
+                core.level_zero_count(&rd).unwrap_or_else(|error| {
+                    note_uncounted_segment(
+                        &self.collection_name,
+                        logical_name,
+                        &seg.physical_name,
+                        &error,
+                    );
+                    size_unknown = true;
+                    0
+                }) as usize
             };
             let tombstoned = self.tombstone_count_for_segment_cached(&seg.physical_name);
             let deleted = core.deleted_count();
             if count > 0 && (deleted as f64 / count as f64) > delete_vacuum_fraction() {
                 delete_ratio_breach = true;
+                forced.insert(seg.physical_name.clone());
             }
             let effective = count.saturating_sub(tombstoned).saturating_sub(deleted);
             indexed.push((seg.physical_name.clone(), effective));
         }
 
         // A segment past the deleted-ratio ceiling schedules a merge even
-        // when the space is below its normal segment-count trigger — the
-        // fallback below picks it up (it always sorts to the smallest
-        // effective size).
+        // when the space is below its normal segment-count trigger:
+        // `merge_targets` takes it as a forced segment, or by tier in the
+        // fallback there.
         if indexed.len() <= limits.max_indexed_segments
             && !(delete_ratio_breach && indexed.len() >= 2)
         {
             return Ok(None);
         }
 
+        Ok(Self::merge_targets(
+            Self::merge_size_ratio(),
+            indexed,
+            &forced,
+            limits.max_indexed_segments,
+            max_fan_in,
+            delete_ratio_breach,
+            size_unknown,
+        ))
+    }
+
+    /// The segments of one merge of a space that is over its target or holds
+    /// a segment past the deleted-rows ceiling: `indexed` is (segment, live
+    /// rows), `forced` the segments to rewrite whatever their size, `ratio`
+    /// [`Self::merge_size_ratio`]. `size_unknown`: a segment's rows could not
+    /// be counted and read as 0.
+    fn merge_targets(
+        ratio: Option<usize>,
+        indexed: Vec<(String, usize)>,
+        forced: &HashSet<String>,
+        max_indexed_segments: usize,
+        max_fan_in: usize,
+        delete_ratio_breach: bool,
+        size_unknown: bool,
+    ) -> Option<Vec<String>> {
+        match ratio {
+            // A segment that reads as empty sorts first and would be taken
+            // whatever it holds: this pass picks nothing, the next counts again.
+            Some(_) if size_unknown => {
+                metrics::counter!(
+                    "helix_dense_merge_selection_skipped_total",
+                    "reason" => "size_unknown"
+                )
+                .increment(1);
+                None
+            }
+            Some(ratio) => Self::merge_targets_by_size_ratio(indexed, forced, ratio, max_fan_in),
+            None => Self::merge_targets_by_tier(
+                &indexed,
+                max_indexed_segments,
+                max_fan_in,
+                delete_ratio_breach,
+            ),
+        }
+    }
+
+    /// One merge by size ratio. Without a forced segment: the two smallest,
+    /// then each next larger one while it holds at most `ratio` times the
+    /// rows taken so far, up to `max_fan_in`. A segment is so rewritten only
+    /// once the smaller ones merged with it add up to 1/`ratio` of it, where
+    /// the tier fallback took every segment of a space over a target of 4 and
+    /// rewrote the biggest one at every merge. A forced segment (past the
+    /// deleted-rows ceiling, or with a graph whose entry point's row is gone)
+    /// is rewritten whatever its size, with the smallest other segment.
+    fn merge_targets_by_size_ratio(
+        mut indexed: Vec<(String, usize)>,
+        forced: &HashSet<String>,
+        ratio: usize,
+        max_fan_in: usize,
+    ) -> Option<Vec<String>> {
+        if indexed.len() < 2 {
+            return None;
+        }
+        indexed.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        if let Some(at) = indexed.iter().position(|(name, _)| forced.contains(name)) {
+            let (low, high) = if at == 0 { (0, 1) } else { (0, at) };
+            return Some(vec![indexed[low].0.clone(), indexed[high].0.clone()]);
+        }
+        let mut rows = indexed[0].1.saturating_add(indexed[1].1);
+        let mut take = 2;
+        while take < indexed.len().min(max_fan_in) && indexed[take].1 <= rows.saturating_mul(ratio)
+        {
+            rows = rows.saturating_add(indexed[take].1);
+            take += 1;
+        }
+        indexed.truncate(take);
+        Some(indexed.into_iter().map(|(name, _)| name).collect())
+    }
+
+    /// One merge by size tier (`HELIX_DENSE_MERGE_SIZE_RATIO=0`): a tier with
+    /// more than `TIER_MAX_PER_CLASS` members merges its smallest; otherwise
+    /// the fallback takes the smallest segments overall, up to `max_fan_in`.
+    fn merge_targets_by_tier(
+        indexed: &[(String, usize)],
+        max_indexed_segments: usize,
+        max_fan_in: usize,
+        delete_ratio_breach: bool,
+    ) -> Option<Vec<String>> {
         // Bucket segments into size tiers.
         let tier_of = |count: usize| -> usize {
             Self::TIER_BOUNDARIES
@@ -5389,9 +6706,8 @@ impl NamedVectorManager {
                 .unwrap_or(Self::TIER_BOUNDARIES.len())
         };
 
-        // Find the lowest tier that has > TIER_MAX_PER_CLASS members.
         let mut tier_buckets: HashMap<usize, Vec<(String, usize)>> = HashMap::new();
-        for (name, count) in &indexed {
+        for (name, count) in indexed {
             tier_buckets
                 .entry(tier_of(*count))
                 .or_default()
@@ -5418,21 +6734,21 @@ impl NamedVectorManager {
         }
 
         // Fallback: if no single tier overflows but total exceeds cap, or a
-        // segment breached the deleted-ratio ceiling, merge the 2 smallest
-        // overall. The ratio-breach case is what actually turns the vacuum
-        // ceiling into a scheduled merge when the space is otherwise under
-        // its normal segment-count trigger.
+        // segment breached the deleted-ratio ceiling, merge the smallest
+        // overall, up to the fan-in. The ratio-breach case is what turns the
+        // vacuum ceiling into a scheduled merge when the space is otherwise
+        // under its normal segment-count trigger.
         if best_tier.is_none()
             && indexed.len() >= 2
-            && (indexed.len() > limits.max_indexed_segments || delete_ratio_breach)
+            && (indexed.len() > max_indexed_segments || delete_ratio_breach)
         {
-            let mut sorted = indexed.clone();
+            let mut sorted = indexed.to_vec();
             sorted.sort_by_key(|(_, c)| *c);
             let take = sorted.len().min(max_fan_in).max(2).min(sorted.len());
             best_tier = Some((0, sorted[..take].to_vec()));
         }
 
-        Ok(best_tier.map(|(_, targets)| targets.into_iter().map(|(name, _)| name).collect()))
+        best_tier.map(|(_, targets)| targets.into_iter().map(|(name, _)| name).collect())
     }
 
     pub(crate) fn select_merge_candidates_with_limits_be(
@@ -5511,6 +6827,45 @@ impl NamedVectorManager {
             .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
         let mut indexed: Vec<(String, usize)> = Vec::new();
         let mut delete_ratio_breach = false;
+        let mut forced: HashSet<String> = HashSet::new();
+        let mut size_unknown = false;
+        let indexed_cores = || {
+            space
+                .segments
+                .iter()
+                .filter(|segment| segment.role == DenseVectorSegmentRole::Indexed)
+                .filter_map(|segment| cores.get(&segment.physical_name))
+        };
+        // A graph that hard deletes have taken more than the ceiling's share
+        // of rows from is forced like a segment past it in tombstones (see
+        // `VectorCore::deleted_graph_rows_over`): a point read a segment,
+        // and a count only where rows were deleted. A read that fails
+        // forces nothing. Nor does a segment left with fewer rows than a
+        // search walks from, as for a lost entry point below: it is scanned
+        // anyway, and forced it would take the next larger segment into its
+        // merge, which under the size-ratio rule can be the big one.
+        for seg in &space.segments {
+            if seg.role != DenseVectorSegmentRole::Indexed {
+                continue;
+            }
+            if cores.get(&seg.physical_name).is_some_and(|core| {
+                core.deleted_graph_rows_over(
+                    r,
+                    delete_vacuum_fraction(),
+                    HNSW_DIVERSE_MIN_POINTS as u64,
+                )
+                .unwrap_or(false)
+            }) {
+                delete_ratio_breach = true;
+                forced.insert(seg.physical_name.clone());
+            }
+        }
+        if indexed_cores().count() <= limits.max_indexed_segments
+            && indexed_cores().all(|core| core.deleted_count() == 0)
+            && forced.is_empty()
+        {
+            return Ok(None);
+        }
         for seg in &space.segments {
             if seg.role != DenseVectorSegmentRole::Indexed {
                 continue;
@@ -5524,11 +6879,21 @@ impl NamedVectorManager {
                 );
                 continue;
             };
-            let count = core.level_zero_count(r).unwrap_or(0) as usize;
+            let count = core.level_zero_count(r).unwrap_or_else(|error| {
+                note_uncounted_segment(
+                    &self.collection_name,
+                    logical_name,
+                    &seg.physical_name,
+                    &error,
+                );
+                size_unknown = true;
+                0
+            }) as usize;
             let tombstoned = self.tombstone_count_for_segment_cached(&seg.physical_name);
             let deleted = core.deleted_count();
             if count > 0 && (deleted as f64 / count as f64) > delete_vacuum_fraction() {
                 delete_ratio_breach = true;
+                forced.insert(seg.physical_name.clone());
             }
             indexed.push((
                 seg.physical_name.clone(),
@@ -5538,55 +6903,41 @@ impl NamedVectorManager {
 
         // A segment past the deleted-ratio ceiling (HELIX_LSM_DELETE_VACUUM_FRACTION,
         // issue #29 "fix 2") schedules a merge even when the space is below its
-        // normal segment-count trigger — the fallback below picks it up (it
-        // always sorts to the smallest effective size).
+        // normal segment-count trigger: `merge_targets` takes it as a forced
+        // segment, or by tier in the fallback there.
         if indexed.len() <= limits.max_indexed_segments
             && !(delete_ratio_breach && indexed.len() >= 2)
         {
             return Ok(None);
         }
 
-        let tier_of = |count: usize| -> usize {
-            Self::TIER_BOUNDARIES
-                .iter()
-                .position(|&b| count < b)
-                .unwrap_or(Self::TIER_BOUNDARIES.len())
-        };
-        let mut tier_buckets: HashMap<usize, Vec<(String, usize)>> = HashMap::new();
-        for (name, count) in &indexed {
-            tier_buckets
-                .entry(tier_of(*count))
-                .or_default()
-                .push((name.clone(), *count));
-        }
-
-        let mut best_tier: Option<(usize, Vec<(String, usize)>)> = None;
-        for (tier, mut members) in tier_buckets {
-            if members.len() <= Self::TIER_MAX_PER_CLASS {
-                continue;
-            }
-            members.sort_by_key(|(_, c)| *c);
-            let overflow = members.len() - Self::TIER_MAX_PER_CLASS;
-            let take = overflow.max(2).min(max_fan_in).min(members.len());
-            if best_tier
-                .as_ref()
-                .map_or(true, |(_, prev)| members.len() > prev.len())
-            {
-                best_tier = Some((tier, members[..take].to_vec()));
+        // A graph whose entry point's row is gone is scored row by row until
+        // a merge rewrites it, and by size ratio no merge takes a big segment
+        // for a long time. Segments under the exact-scan floor are scanned
+        // anyway. Two point reads a segment, only where a merge is picked. A
+        // read that fails is not a lost entry point: no rewrite for it.
+        let ratio = Self::merge_size_ratio();
+        if ratio.is_some() {
+            for (name, rows) in &indexed {
+                let Some(core) = cores.get(name).filter(|_| *rows >= HNSW_DIVERSE_MIN_POINTS)
+                else {
+                    continue;
+                };
+                if core.entry_point_row_is_gone(r).unwrap_or(false) {
+                    forced.insert(name.clone());
+                }
             }
         }
 
-        if best_tier.is_none()
-            && indexed.len() >= 2
-            && (indexed.len() > limits.max_indexed_segments || delete_ratio_breach)
-        {
-            let mut sorted = indexed.clone();
-            sorted.sort_by_key(|(_, c)| *c);
-            let take = sorted.len().min(max_fan_in).max(2).min(sorted.len());
-            best_tier = Some((0, sorted[..take].to_vec()));
-        }
-
-        Ok(best_tier.map(|(_, targets)| targets.into_iter().map(|(name, _)| name).collect()))
+        Ok(Self::merge_targets(
+            ratio,
+            indexed,
+            &forced,
+            limits.max_indexed_segments,
+            max_fan_in,
+            delete_ratio_breach,
+            size_unknown,
+        ))
     }
 
     /// Split-phase merge — read-only phase.
@@ -5691,6 +7042,94 @@ impl NamedVectorManager {
             merge_targets: merge_targets.to_vec(),
             prepared_index,
         })
+    }
+
+    /// The rows of Indexed HNSW segment `physical_name` for a rebuild of it
+    /// alone, without delete-tombstoned ids and re-upsert tombstoned copies.
+    /// The rebuilt segment takes the newest segment id, so a row carried into
+    /// it outranks every other copy of its id: the rows of ids a more recent
+    /// segment holds too come back apart, for the caller to keep those that
+    /// are their point's own. `None` when the segment has no graph or stores
+    /// fewer than `min_rows` rows: it is the rows stored that a search walks,
+    /// however few of them a rebuild would keep.
+    pub(crate) fn export_for_regraph_be(
+        &self,
+        r: &AnyRead<'_>,
+        logical_name: &str,
+        physical_name: &str,
+        min_rows: usize,
+    ) -> Result<Option<RegraphExport>, VectorError> {
+        let segment_infos = {
+            let dense_spaces = self
+                .dense_spaces
+                .read()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+            let space = dense_spaces.get(logical_name).ok_or_else(|| {
+                VectorError::VectorCoreError(format!("Named vector '{}' not found", logical_name))
+            })?;
+            Self::dense_segment_infos(space)
+        };
+        if !segment_infos
+            .iter()
+            .any(|(name, role)| name == physical_name && *role == DenseVectorSegmentRole::Indexed)
+        {
+            return Ok(None);
+        }
+        let cores = self
+            .cores
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+        let Some(core) = cores.get(physical_name) else {
+            return Ok(None);
+        };
+        if !core.has_entry_point_key(r)?
+            || core.level_zero_count_upto(r, min_rows as u64)? < min_rows as u64
+        {
+            return Ok(None);
+        }
+        let mut newer: Vec<(&String, &VectorCore)> = Vec::new();
+        for (name, role) in dense_segments_by_recency(logical_name, &segment_infos)
+            .into_iter()
+            .take_while(|(name, _)| name != physical_name)
+        {
+            // Only copies search serves supersede: an unmarked Building
+            // segment (a merge target, or a dead merge's orphan) is hidden.
+            if *role == DenseVectorSegmentRole::Building && !self.sealed_tail_marked_be(r, name)? {
+                continue;
+            }
+            newer.extend(cores.get(name).map(|core| (name, core)));
+        }
+        let mut export = RegraphExport::default();
+        for (id, data, fields) in core.export_level_zero(r)? {
+            if core.is_delete_tombstoned(id)
+                || self.is_tombstoned_for_merge_be(r, physical_name, id)?
+            {
+                export.dropped += 1;
+                continue;
+            }
+            // shortcut: one point read per copy, batch them (`get_many`) if a
+            // regraph of a collection full of doubled ids reads slowly.
+            // A more recent row that is delete-tombstoned, or marked
+            // superseded by a re-upsert, does not replace this one. Taken
+            // for the copy that does, it could leave the point's live row
+            // out, and with it the whole segment; and the next merge drops
+            // a superseded row, which would leave the point with none.
+            let mut copies = Vec::new();
+            for (newer_name, newer_core) in &newer {
+                if newer_core.contains_id(r, id)?
+                    && !newer_core.is_delete_tombstoned(id)
+                    && !self.is_tombstoned_for_merge_be(r, newer_name, id)?
+                {
+                    copies.push(newer_core.debug_fields(r, id)?);
+                }
+            }
+            if copies.is_empty() {
+                export.rows.push((id, data, fields));
+            } else {
+                export.doubled.push(((id, data, fields), copies));
+            }
+        }
+        Ok(Some(export))
     }
 
     /// Split-phase merge — write phase.
@@ -5871,8 +7310,13 @@ impl NamedVectorManager {
         Ok(merged_name)
     }
 
-    pub fn create_merge_target_lsm(
+    /// Opens a merge target and lists it in memory as `Building`, which no
+    /// append takes rows to and no search reads before it is published; the
+    /// caller stores the layout under the same `held`. The probe of the id
+    /// reads the store with no lock of the manager held.
+    pub(crate) fn create_merge_target_lsm(
         &self,
+        held: &DenseLayoutChange<'_>,
         data_dir: &Path,
         logical_name: &str,
         hnsw_config: HNSWConfig,
@@ -5880,7 +7324,24 @@ impl NamedVectorManager {
         let config = self.get_config(logical_name).ok_or_else(|| {
             VectorError::VectorCoreError(format!("Named vector '{}' not found", logical_name))
         })?;
-        let (merged_name, core) = {
+        let next_segment_id = self
+            .dense_spaces
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?
+            .get(logical_name)
+            .map(|space| space.next_segment_id)
+            .ok_or_else(|| {
+                VectorError::VectorCoreError(format!("Named vector '{}' not found", logical_name))
+            })?;
+        let target = self.allocate_dense_core_lsm(
+            held,
+            data_dir,
+            logical_name,
+            &config,
+            hnsw_config,
+            next_segment_id,
+        )?;
+        {
             let mut dense_spaces = self
                 .dense_spaces
                 .write()
@@ -5888,30 +7349,23 @@ impl NamedVectorManager {
             let space = dense_spaces.get_mut(logical_name).ok_or_else(|| {
                 VectorError::VectorCoreError(format!("Named vector '{}' not found", logical_name))
             })?;
-            let cores = self
+            let mut cores = self
                 .cores
-                .read()
+                .write()
                 .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
-            let (name, core) = self.allocate_dense_core_locked_lsm(
-                data_dir,
-                logical_name,
-                &config,
-                hnsw_config,
-                space,
-                &cores,
-            )?;
+            space.next_segment_id = space.next_segment_id.max(target.next_segment_id);
+            // Register immediately as Building so the ID is reserved in
+            // persisted metadata and the orphan cleanup can find what a
+            // crash before the publish left.
             space.segments.push(DenseVectorSegmentMetadata {
-                physical_name: name.clone(),
+                physical_name: target.name.clone(),
                 role: DenseVectorSegmentRole::Building,
             });
-            (name, core)
-        };
-        let mut cores = self
-            .cores
-            .write()
-            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
-        cores.insert(merged_name.clone(), core);
-        Ok(merged_name)
+            self.observe_segment_ids_high_water(logical_name, space);
+            cores.insert(target.name.clone(), target.core);
+        }
+        self.note_skipped_segment_ids(logical_name, &target.skipped);
+        Ok(target.name)
     }
 
     /// Phase B: append a chunk of prepared vectors to the merge target's
@@ -6354,6 +7808,9 @@ impl NamedVectorManager {
         merge_targets: &[String],
     ) -> Result<(), VectorError> {
         self.validate_dense_segment_publishable_be(r, logical_name, merged_name)?;
+        // The target is complete by now: a read at or past this sequence has
+        // all its rows, an older one is answered on a new read.
+        let dropped_at = self.present_writer_seq()?;
 
         let mut dense_spaces = self
             .dense_spaces
@@ -6368,6 +7825,8 @@ impl NamedVectorManager {
         space
             .segments
             .retain(|s| !merge_targets.contains(&s.physical_name));
+        self.dense_segments_dropped_at
+            .fetch_max(dropped_at, AtomicOrdering::Release);
         if let Some(seg) = space
             .segments
             .iter_mut()
@@ -6686,6 +8145,45 @@ impl NamedVectorManager {
             .saturating_add(deleted / TOMBSTONES_PER_MERGE_DEBT_UNIT);
 
         debt
+    }
+
+    /// True when some dense space holds more Indexed segments (with a loaded
+    /// core) than the merge target: the segment-count trigger of
+    /// `select_merge_candidates_with_limits[_be]`, read without touching rows.
+    /// `dense_segment_debt().merge_debt` cannot stand in for it: it also counts
+    /// tombstone backlog, which selects no merge by itself.
+    pub fn has_dense_space_over_merge_target(&self) -> bool {
+        let target = Self::max_indexed_segments_target();
+        let (Ok(dense_spaces), Ok(cores)) = (self.dense_spaces.read(), self.cores.read()) else {
+            return false;
+        };
+        dense_spaces.values().any(|space| {
+            space
+                .segments
+                .iter()
+                .filter(|segment| {
+                    segment.role == DenseVectorSegmentRole::Indexed
+                        && cores.contains_key(&segment.physical_name)
+                })
+                .count()
+                > target
+        })
+    }
+
+    /// True when some dense space holds a Building segment with a loaded core:
+    /// the only kind the index job can build, promote or reap. One without a
+    /// core is skipped by `prepare_building_indices_limited[_be]` and by the
+    /// orphan GC, so a job submitted for it does nothing.
+    pub fn has_building_segment_with_core(&self) -> bool {
+        let (Ok(dense_spaces), Ok(cores)) = (self.dense_spaces.read(), self.cores.read()) else {
+            return false;
+        };
+        dense_spaces.values().any(|space| {
+            space.segments.iter().any(|segment| {
+                segment.role == DenseVectorSegmentRole::Building
+                    && cores.contains_key(&segment.physical_name)
+            })
+        })
     }
 
     /// Sum of `VectorCore::deleted_count()` across every currently-open dense
@@ -7029,8 +8527,26 @@ impl NamedVectorManager {
                 .filter(|seg| seg.role == DenseVectorSegmentRole::Building)
                 .filter_map(|seg| {
                     let core = cores.get(&seg.physical_name)?;
-                    let count = core.level_zero_count(r).unwrap_or(0);
-                    if count == 0 {
+                    // A count that could not be read is not a count of none.
+                    // Taken for 0 it drops a sealed tail that waits for its
+                    // build, rows and all; the segment waits for the next
+                    // pass instead.
+                    let count = match core.level_zero_count(r) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            tracing::warn!(
+                                segment = %seg.physical_name,
+                                %error,
+                                "orphan cleanup could not count a Building segment's rows; leaving it"
+                            );
+                            return None;
+                        }
+                    };
+                    if count == 0
+                        || self
+                            .merge_target_marked_be(r, &seg.physical_name)
+                            .unwrap_or(false)
+                    {
                         Some(seg.physical_name.clone())
                     } else {
                         None
@@ -7041,6 +8557,9 @@ impl NamedVectorManager {
         if orphans.is_empty() {
             return Ok(Vec::new());
         }
+        // A sealed tail emptied by rewrites still has its rows for a read
+        // begun before them; a merge target is read by no search.
+        let dropped_at = self.present_writer_seq()?;
         {
             let mut dense_spaces = self
                 .dense_spaces
@@ -7051,6 +8570,8 @@ impl NamedVectorManager {
                     .segments
                     .retain(|s| !orphans.contains(&s.physical_name));
             }
+            self.dense_segments_dropped_at
+                .fetch_max(dropped_at, AtomicOrdering::Release);
         }
         Ok(orphans)
     }
@@ -7194,7 +8715,8 @@ impl NamedVectorManager {
             let Some(core) = cores.get(&segment.physical_name) else {
                 continue;
             };
-            if core.level_zero_count(r)? == 0 {
+            // Emptiness only: stop at the first row instead of counting the segment.
+            if core.level_zero_count_upto(r, 1)? == 0 {
                 empty_segments.push(segment.physical_name.clone());
             }
         }
@@ -7465,6 +8987,8 @@ impl NamedVectorManager {
         if empties.is_empty() {
             return Ok(false);
         }
+        // Empty by now; a read begun earlier may still have rows in them.
+        let dropped_at = self.present_writer_seq()?;
         let mut dense_spaces = self
             .dense_spaces
             .write()
@@ -7478,6 +9002,8 @@ impl NamedVectorManager {
                 .iter()
                 .any(|physical_name| physical_name == &segment.physical_name)
         });
+        self.dense_segments_dropped_at
+            .fetch_max(dropped_at, AtomicOrdering::Release);
         Ok(space.segments.len() != before)
     }
 
@@ -7812,19 +9338,38 @@ impl NamedVectorManager {
             .cores
             .read()
             .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+        let segments: Vec<(&String, &VectorCore)> = active_segments
+            .iter()
+            .filter_map(|name| cores.get(name).map(|core| (name, core)))
+            .collect();
+        // One batched read answers every (segment, id) probe: all segments of
+        // a collection share its keyspace, and a probe per pair costs a
+        // SlateDB round trip each (segments x ids of them per deleted file).
+        let probes: Vec<_> = segments
+            .iter()
+            .flat_map(|(_, core)| ids.iter().map(move |&id| core.contains_id_probe(id)))
+            .collect();
+        let batched = match segments.first() {
+            Some((_, core)) => core
+                .backend
+                .contains_many(r, &probes)
+                .map_err(|e| VectorError::VectorCoreError(e.to_string()))?,
+            None => None,
+        };
         let mut by_segment = Vec::new();
-        for segment_name in &active_segments {
-            let Some(core) = cores.get(segment_name) else {
-                continue;
-            };
+        for (index, (segment_name, core)) in segments.iter().enumerate() {
             let mut owned = Vec::new();
-            for &id in ids {
-                if core.contains_id(r, id)? {
+            for (offset, &id) in ids.iter().enumerate() {
+                let present = match &batched {
+                    Some(present) => present[index * ids.len() + offset],
+                    None => core.contains_id(r, id)?,
+                };
+                if present {
                     owned.push(id);
                 }
             }
             if !owned.is_empty() {
-                by_segment.push((segment_name.clone(), owned));
+                by_segment.push(((*segment_name).clone(), owned));
             }
         }
 
@@ -7884,6 +9429,7 @@ impl NamedVectorManager {
                 by_segment: Vec::new(),
                 id_levels,
                 hard_deleted_by_segment: Vec::new(),
+                owners_only: false,
             });
         }
 
@@ -7935,6 +9481,133 @@ impl NamedVectorManager {
         Ok(staged)
     }
 
+    /// The dense deletes of an upsert that rewrites `plan.ids`, staged ahead
+    /// of its appends in the same batch: every stored copy goes, except a row
+    /// in a space's mutable tail that the batch appends again (`appends(space,
+    /// id)`). The append overwrites that row in place; deleting it first would
+    /// also drop the sidecar slot the append publishes, which hides the point
+    /// from the writer's flat search. Those rows are returned as `(space,
+    /// tail, id)`: if the tail is sealed before the append, the append goes
+    /// to the next one and the caller removes the row
+    /// (`delete_from_segment_be`).
+    ///
+    /// Always a hard delete: a reader loads a segment's delete tombstones
+    /// only when it first opens the segment, so it would keep serving a
+    /// tombstoned old copy. A layout that moved since the plan is probed
+    /// again in the writer, as in `delete_vectors_batch_with_plan_be`. Hand
+    /// the result to `apply_delete_tombstones` once the batch has committed.
+    pub fn delete_replaced_vectors_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        plan: &DenseDeletePlan,
+        appends: &dyn Fn(&str, u128) -> bool,
+    ) -> Result<(StagedDeleteTombstones, Vec<(String, String, u128)>), VectorError> {
+        let mut staged = StagedDeleteTombstones {
+            owners_only: true,
+            ..Default::default()
+        };
+        let mut kept = Vec::new();
+        if plan.is_empty() {
+            return Ok((staged, kept));
+        }
+        // Segment names and each space's tail from one view of the layout.
+        let (active_segments, tails): (HashSet<String>, HashMap<String, String>) = {
+            let dense_spaces = self
+                .dense_spaces
+                .read()
+                .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+            (
+                dense_spaces
+                    .values()
+                    .flat_map(|space| {
+                        space
+                            .segments
+                            .iter()
+                            .map(|segment| segment.physical_name.clone())
+                    })
+                    .collect(),
+                dense_spaces
+                    .iter()
+                    .filter_map(|(name, space)| Some((mutable_segment_name(space)?, name.clone())))
+                    .collect(),
+            )
+        };
+        let planned = active_segments == plan.active_segments;
+        if !planned {
+            metrics::counter!("helix_delete_dense_plan_stale_total").increment(1);
+        }
+        let cores = self
+            .cores
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+        for segment_name in &active_segments {
+            let Some(core) = cores.get(segment_name) else {
+                continue;
+            };
+            let mut owned = Vec::new();
+            if planned {
+                if let Some((_, ids)) = plan
+                    .by_segment
+                    .iter()
+                    .find(|(name, _)| name == segment_name)
+                {
+                    owned.clone_from(ids);
+                }
+            } else {
+                for &id in &plan.ids {
+                    if core.contains_id_be(w, id)? {
+                        owned.push(id);
+                    }
+                }
+            }
+            if let Some(space) = tails.get(segment_name) {
+                owned.retain(|id| {
+                    let overwritten = appends(space, *id);
+                    if overwritten {
+                        kept.push((space.clone(), segment_name.clone(), *id));
+                    }
+                    !overwritten
+                });
+            }
+            if owned.is_empty() {
+                continue;
+            }
+            for (id, levels) in core.delete_vectors_batch_be(w, &owned)? {
+                staged.id_levels.entry(id).or_default().extend(levels);
+            }
+            staged
+                .hard_deleted_by_segment
+                .push((segment_name.clone(), owned));
+        }
+        Ok((staged, kept))
+    }
+
+    /// Hard-deletes whatever rows segment `physical_name` holds for `ids`.
+    /// Hand the result to `apply_delete_tombstones` once the batch has
+    /// committed.
+    pub(crate) fn delete_from_segment_be(
+        &self,
+        w: &mut AnyWrite<'_>,
+        physical_name: &str,
+        ids: &[u128],
+    ) -> Result<StagedDeleteTombstones, VectorError> {
+        let mut staged = StagedDeleteTombstones {
+            owners_only: true,
+            ..Default::default()
+        };
+        let cores = self
+            .cores
+            .read()
+            .map_err(|e| VectorError::VectorCoreError(format!("Lock poisoned: {}", e)))?;
+        if let Some(core) = cores.get(physical_name) {
+            staged.id_levels = core.delete_vectors_batch_be(w, ids)?;
+            staged
+                .hard_deleted_by_segment
+                .push((physical_name.to_string(), ids.to_vec()));
+        }
+        Ok(staged)
+    }
+
     /// Post-commit companion of `delete_vectors_batch_with_plan_be`: applies
     /// the staged tombstones to each segment core's in-memory set and records
     /// the metric. Also performs post-commit shared-cache invalidation at the
@@ -7947,6 +9620,18 @@ impl NamedVectorManager {
         let Ok(cores) = self.cores.read() else {
             return;
         };
+        if staged.owners_only {
+            for (segment_name, owned) in &staged.hard_deleted_by_segment {
+                if let Some(core) = cores.get(segment_name) {
+                    let levels: HashMap<u128, Vec<usize>> = owned
+                        .iter()
+                        .filter_map(|id| Some((*id, staged.id_levels.get(id)?.clone())))
+                        .collect();
+                    core.apply_hard_deletes_post_commit(owned, &levels);
+                }
+            }
+            return;
+        }
 
         // Apply tombstones to in-memory sets (only filled when tombstones enabled)
         let mut applied = 0u64;
@@ -8326,6 +10011,20 @@ mod tests {
     use tempfile::TempDir;
 
     static TOMBSTONE_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// The stored form of a dead segment's key: what an image after this one
+    /// has to read, so the bytes are pinned here.
+    #[test]
+    fn a_dead_segment_key_names_its_segment_and_holds_its_time() {
+        let key = dead_segment_key("dense__seg_000007");
+        assert_eq!(key, b"dense_segment_dead:v1:dense__seg_000007");
+        assert_eq!(dead_segment_name(&key), Some("dense__seg_000007"));
+        assert_eq!(dead_segment_name(DEAD_SEGMENT_KEY_PREFIX), None);
+        assert_eq!(dead_segment_name(b"current"), None);
+        assert_eq!(dead_segment_time(&42u64.to_be_bytes()), 42);
+        // A value that is no time is never taken for an old one.
+        assert_eq!(dead_segment_time(b"seven"), u64::MAX);
+    }
 
     struct EnvVarGuard {
         name: &'static str,
@@ -9402,6 +11101,7 @@ mod tests {
                 &configs,
                 &dense_spaces,
                 HNSWConfig::new(Some(8), Some(16), Some(32)),
+                None,
             )
             .unwrap();
         for name in names {
@@ -9673,6 +11373,149 @@ mod tests {
         let ids: Vec<u128> = results.iter().map(|vector| vector.id).collect();
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
+    }
+
+    fn merge_sizes(sizes: &[(&str, usize)]) -> Vec<(String, usize)> {
+        sizes
+            .iter()
+            .map(|(name, rows)| (name.to_string(), *rows))
+            .collect()
+    }
+
+    #[test]
+    fn size_ratio_merge_takes_a_segment_once_the_smaller_ones_reach_half_of_it() {
+        let none = HashSet::new();
+        let pick = |sizes: &[(&str, usize)]| {
+            NamedVectorManager::merge_targets_by_size_ratio(merge_sizes(sizes), &none, 2, 8)
+                .unwrap_or_default()
+        };
+        // Sealed tails beside a big segment: the tails and the 6,000 rows that
+        // are at most twice the 6,144 taken before them, not the big one.
+        assert_eq!(
+            pick(&[
+                ("big", 100_000),
+                ("t1", 2_048),
+                ("t2", 2_048),
+                ("t3", 2_048),
+                ("mid", 6_000)
+            ]),
+            ["t1", "t2", "t3", "mid"]
+        );
+        // Sizes that are not alike: the two smallest and no more.
+        assert_eq!(
+            pick(&[
+                ("e", 100_000),
+                ("a", 2_048),
+                ("b", 9_000),
+                ("c", 30_000),
+                ("d", 70_000)
+            ]),
+            ["a", "b"]
+        );
+        // The big segment joins when the smaller ones add up to half of it.
+        assert_eq!(
+            pick(&[("big", 100_000), ("a", 20_000), ("b", 30_000)]),
+            ["a", "b", "big"]
+        );
+        assert_eq!(
+            pick(&[("big", 100_001), ("a", 20_000), ("b", 30_000)]),
+            ["a", "b"]
+        );
+        // Never more than the fan-in, and nothing below two segments.
+        let nine: Vec<(&str, usize)> = ["a", "b", "c", "d", "e", "f", "g", "h", "i"]
+            .into_iter()
+            .map(|name| (name, 1))
+            .collect();
+        assert_eq!(pick(&nine).len(), 8);
+        assert!(pick(&[("only", 5)]).is_empty());
+    }
+
+    #[test]
+    fn size_ratio_merge_rewrites_a_forced_segment_with_the_smallest_other() {
+        let pick = |sizes: &[(&str, usize)], forced: &[&str]| {
+            let forced: HashSet<String> = forced.iter().map(|name| name.to_string()).collect();
+            NamedVectorManager::merge_targets_by_size_ratio(merge_sizes(sizes), &forced, 2, 8)
+                .unwrap_or_default()
+        };
+        let sizes = [("big", 100_000), ("a", 2_048), ("b", 2_048), ("c", 9_000)];
+        // A segment past the deleted-rows ceiling, or with a graph that lost
+        // its entry point: rewritten whatever its size, with the smallest other.
+        assert_eq!(pick(&sizes, &["big"]), ["a", "big"]);
+        // The smallest forced one first, also when it is the smallest of all.
+        assert_eq!(pick(&sizes, &["a", "big"]), ["a", "b"]);
+    }
+
+    /// Rows the merges rewrite per row written, over 49 sealed tails of 2,048
+    /// rows onto one segment of 100,000 rows with a target of 4 segments.
+    fn rewritten_per_row_written(pick: impl Fn(&[(String, usize)]) -> Option<Vec<String>>) -> f64 {
+        let mut segments = vec![("s0".to_string(), 100_000usize)];
+        let (mut written, mut rewritten) = (0usize, 0usize);
+        for seal in 1..=49 {
+            segments.push((format!("s{seal}"), 2_048));
+            written += 2_048;
+            while segments.len() > 4 {
+                let targets = pick(&segments).expect("a space over its target has a merge");
+                let rows: usize = segments
+                    .iter()
+                    .filter(|(name, _)| targets.contains(name))
+                    .map(|(_, rows)| rows)
+                    .sum();
+                segments.retain(|(name, _)| !targets.contains(name));
+                segments.push((format!("m{seal}_{}", segments.len()), rows));
+                rewritten += rows;
+            }
+        }
+        rewritten as f64 / written as f64
+    }
+
+    #[test]
+    fn size_ratio_merges_rewrite_a_fraction_of_what_the_tier_fallback_rewrites() {
+        let none = HashSet::new();
+        let by_ratio = rewritten_per_row_written(|segments| {
+            NamedVectorManager::merge_targets_by_size_ratio(segments.to_vec(), &none, 2, 8)
+        });
+        let by_tier = rewritten_per_row_written(|segments| {
+            NamedVectorManager::merge_targets_by_tier(segments, 4, 8, false)
+        });
+        assert!(by_ratio < 5.0, "by size ratio: {by_ratio:.1}");
+        assert!(by_tier > 18.0, "by tier: {by_tier:.1}");
+    }
+
+    #[test]
+    fn merge_size_ratio_is_off_unless_set_to_a_positive_whole_number() {
+        let ratio = NamedVectorManager::merge_size_ratio_from;
+        assert_eq!(ratio(None), None);
+        assert_eq!(ratio(Some("2")), Some(2));
+        assert_eq!(ratio(Some(" 3 ")), Some(3));
+        // 0 and anything that is not a whole number leave the size tiers.
+        assert_eq!(ratio(Some("0")), None);
+        assert_eq!(ratio(Some("2.5")), None);
+        assert_eq!(ratio(Some("off")), None);
+        assert_eq!(ratio(Some("")), None);
+    }
+
+    #[test]
+    fn a_segment_that_could_not_be_counted_picks_no_merge_by_size_ratio() {
+        let none = HashSet::new();
+        // A big segment whose count failed reads as 0 rows and sorts first.
+        let sizes = || {
+            merge_sizes(&[
+                ("big", 0),
+                ("t1", 2_048),
+                ("t2", 2_048),
+                ("t3", 2_048),
+                ("t4", 2_048),
+            ])
+        };
+        let pick = |ratio, size_unknown| {
+            NamedVectorManager::merge_targets(ratio, sizes(), &none, 4, 8, false, size_unknown)
+        };
+        // By ratio the pass picks nothing; with every count known it picks.
+        assert_eq!(pick(Some(2), true), None);
+        assert!(pick(Some(2), false).is_some());
+        // The size tiers are as they were: the unreadable segment is taken.
+        let by_tier = pick(None, true).unwrap_or_default();
+        assert!(by_tier.iter().any(|name| name == "big"), "{by_tier:?}");
     }
 
     #[test]
@@ -10265,6 +12108,77 @@ mod tests {
             "expected newest copy [0,1,0], got {:?}",
             data
         );
+    }
+
+    /// Equally far rows come back by id whichever segment holds them: three
+    /// sealed segments of one row each, written as ids 9, 3 and 7, and the
+    /// merge of two segments' hits handed over in either order. The copy of
+    /// an id that is returned is still the newest segment's.
+    #[test]
+    fn equally_far_rows_of_several_segments_come_back_by_id() {
+        let (storage, _tmp) = setup_storage();
+        create_dense(&storage, "dense");
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        for id in [9u128, 3, 7] {
+            let mut txn = storage.lmdb_env().unwrap().write_txn().unwrap();
+            let job = storage
+                .named_vectors
+                .dense_insert(
+                    storage.lmdb_env().unwrap(),
+                    &mut txn,
+                    "dense",
+                    &[1.0, 0.0, 0.0],
+                    id,
+                    HashMap::new(),
+                    hnsw.clone(),
+                    1,
+                )
+                .unwrap()
+                .unwrap();
+            storage
+                .named_vectors
+                .build_dense_segment(&mut txn, "dense", &job)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let txn = storage.lmdb_env().unwrap().read_txn().unwrap();
+        let search = |k: usize| -> Vec<u128> {
+            storage
+                .named_vectors
+                .dense_search_with_selectivity_ef::<fn(&HVector) -> bool>(
+                    storage.lmdb_env().unwrap(),
+                    &txn,
+                    "dense",
+                    &[0.0, 1.0, 0.0],
+                    k,
+                    None,
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .iter()
+                .map(HVector::get_id)
+                .collect()
+        };
+        assert_eq!(search(3), [3, 7, 9]);
+        assert_eq!(search(2), [3, 7]);
+
+        let hit = |id: u128, distance: f32| {
+            let mut hit = HVector::from_slice(id, 0, Vec::new());
+            hit.set_distance(distance);
+            hit
+        };
+        // The older segment holds id 2 nearer than the newer one does.
+        let older = || vec![(1u32, hit(2, 0.1)), (1, hit(5, 0.5)), (1, hit(6, 0.5))];
+        let newer = || vec![(0u32, hit(1, 0.5)), (0, hit(2, 0.5))];
+        for combined in [[older(), newer()].concat(), [newer(), older()].concat()] {
+            let merged: Vec<(u128, f32)> = dedup_keep_newest(combined, 3)
+                .iter()
+                .map(|hit| (hit.get_id(), hit.get_distance()))
+                .collect();
+            assert_eq!(merged, [(1, 0.5), (2, 0.5), (5, 0.5)]);
+        }
     }
 
     #[test]
@@ -11327,7 +13241,7 @@ mod tests {
     /// Indexed segment holding `ids_and_vectors` (flat-inserted, no HNSW
     /// build). Mirrors the setup used by the `plan_delete_vectors_batch_be_*`
     /// tests above.
-    fn setup_lsm_manager_with_flat_segment(
+    pub(super) fn setup_lsm_manager_with_flat_segment(
         test_name: &str,
         seg_name: &str,
         ids_and_vectors: &[(u128, [f32; 3])],
@@ -11715,27 +13629,32 @@ mod tests {
             );
         }
 
+        use crate::helix_engine::vector_core::vector_core::with_small_segment_exact_for_test;
         let r = backend.begin_read().unwrap();
-        let results = manager
-            .dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
-                &r,
-                "dense",
-                &entry_query,
-                24,
-                None,
-                false,
-                None,
-                None,
-            )
+        // The graph walk and the small-segment exact scan.
+        for exact in [false, true] {
+            let results = with_small_segment_exact_for_test(exact, || {
+                manager.dense_search_with_id_filter_ef_be::<fn(u128) -> bool>(
+                    &r,
+                    "dense",
+                    &entry_query,
+                    24,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+            })
             .unwrap();
-        assert!(
-            !results.iter().any(|v| v.get_id() == entry_id),
-            "deleted HNSW entry point must never be a search result"
-        );
-        assert!(
-            !results.is_empty(),
-            "the other 23 live vectors must still be searchable"
-        );
+            assert!(
+                !results.iter().any(|v| v.get_id() == entry_id),
+                "deleted HNSW entry point must never be a search result"
+            );
+            assert!(
+                !results.is_empty(),
+                "the other 23 live vectors must still be searchable"
+            );
+        }
     }
 
     /// Flipping the flag OFF after tombstones exist must not resurrect them:
@@ -11916,6 +13835,105 @@ mod tests {
             "a segment past the deleted-ratio ceiling must be selected even \
              though only 2 segments exist (well under the segment-count cap)",
         );
+        assert!(targets.contains(&seg_names[0].to_string()));
+    }
+
+    /// The ceiling counts the rows hard deletes took from a segment's graph
+    /// as it counts tombstoned ones. Two Indexed segments, far below the
+    /// segment-count trigger, select no merge while the first has lost a
+    /// fifth of the rows it was built with, and select one once it has lost
+    /// more. The second, with one row left, is past the ceiling and forces
+    /// nothing: no search walks it.
+    #[test]
+    fn hard_deleted_graph_rows_past_the_ceiling_force_a_merge_candidate() {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("deleted-rows-ceiling-{}", uuid::Uuid::new_v4()))
+                .expect("open in-memory LSM backend"),
+        ));
+        let manager = NamedVectorManager::new("deleted_rows_ceiling_test".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        let seg_names = ["dense__seg_000000", "dense__seg_000001"];
+        {
+            let mut cores = manager.cores.write().unwrap();
+            for name in seg_names {
+                let core = manager
+                    .create_dense_core_attached_lsm(dir.path(), name, &config, hnsw.clone())
+                    .unwrap();
+                cores.insert(name.to_string(), core);
+            }
+        }
+        manager.dense_spaces.write().unwrap().insert(
+            "dense".to_string(),
+            DenseVectorSpaceMetadata {
+                next_segment_id: 2,
+                segments: seg_names
+                    .iter()
+                    .map(|name| DenseVectorSegmentMetadata {
+                        physical_name: (*name).to_string(),
+                        role: DenseVectorSegmentRole::Indexed,
+                    })
+                    .collect(),
+            },
+        );
+        // 512 rows are left in the first segment, as many as a search walks
+        // a graph from; one is in the second.
+        {
+            let mut w = backend.begin_write().unwrap();
+            let cores = manager.cores.read().unwrap();
+            for id in 1..=512u128 {
+                cores
+                    .get(seg_names[0])
+                    .unwrap()
+                    .insert_flat_be(&mut w, &[id as f32, 1.0, 0.0], Some(id), None)
+                    .unwrap();
+            }
+            cores
+                .get(seg_names[1])
+                .unwrap()
+                .insert_flat_be(&mut w, &[1.0, 1.0, 1.0], Some(1_000), None)
+                .unwrap();
+            backend.commit(w).unwrap();
+        }
+        // The merge selected once `deleted` rows are counted as taken from
+        // the graph of segment `of`.
+        let selected = |of: usize, deleted: u64| {
+            let mut w = backend.begin_write().unwrap();
+            manager
+                .cores
+                .read()
+                .unwrap()
+                .get(seg_names[of])
+                .unwrap()
+                .put_deleted_graph_rows_for_test(&mut w, deleted);
+            backend.commit(w).unwrap();
+            let r = backend.begin_read().unwrap();
+            manager
+                .select_merge_candidates_with_limits_be(
+                    &r,
+                    "dense",
+                    DenseMergeCandidateLimits::new(4, 4),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            selected(0, 128),
+            None,
+            "128 of 640 rows is the ceiling, not past it"
+        );
+        assert_eq!(
+            selected(1, 5),
+            None,
+            "5 of 6 rows is past the ceiling, in a segment no search walks"
+        );
+        let targets = selected(0, 129).expect("129 of 641 rows is past the ceiling");
         assert!(targets.contains(&seg_names[0].to_string()));
     }
 
@@ -12411,7 +14429,7 @@ mod tests {
 
         // Reader refresh with new metadata
         manager
-            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &new_metadata, hnsw)
+            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &new_metadata, hnsw, None)
             .unwrap();
 
         // Verify: segment 0 core removed, segment 1 core retained
@@ -12477,7 +14495,13 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("dense".to_string(), space.clone());
         manager
-            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &metadata, hnsw.clone())
+            .refresh_dense_view_from_metadata_lsm(
+                dir.path(),
+                &configs,
+                &metadata,
+                hnsw.clone(),
+                None,
+            )
             .unwrap();
         assert!(manager.cores.read().unwrap().contains_key(&name_0));
 
@@ -12489,6 +14513,7 @@ mod tests {
                 &configs,
                 &empty_metadata,
                 hnsw.clone(),
+                None,
             )
             .unwrap();
 
@@ -12553,7 +14578,13 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("dense".to_string(), space.clone());
         manager
-            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &metadata, hnsw.clone())
+            .refresh_dense_view_from_metadata_lsm(
+                dir.path(),
+                &configs,
+                &metadata,
+                hnsw.clone(),
+                None,
+            )
             .unwrap();
         assert!(manager.cores.read().unwrap().contains_key(&name_0));
 
@@ -12574,7 +14605,13 @@ mod tests {
         // First refresh: segment 0 is absent from NEW metadata but present in PREVIOUS metadata.
         // Fix: it must NOT be pruned yet (delayed by one refresh).
         manager
-            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &metadata, hnsw.clone())
+            .refresh_dense_view_from_metadata_lsm(
+                dir.path(),
+                &configs,
+                &metadata,
+                hnsw.clone(),
+                None,
+            )
             .unwrap();
         assert!(
             manager.cores.read().unwrap().contains_key(&name_0),
@@ -12584,11 +14621,261 @@ mod tests {
         // Second refresh: segment 0 is absent from BOTH previous and current metadata.
         // Now it's safe to prune.
         manager
-            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &metadata, hnsw)
+            .refresh_dense_view_from_metadata_lsm(dir.path(), &configs, &metadata, hnsw, None)
             .unwrap();
         assert!(
             !manager.cores.read().unwrap().contains_key(&name_0),
             "Second refresh must prune core absent from both previous and current metadata"
+        );
+    }
+
+    #[test]
+    fn lsm_reader_keeps_a_core_for_reads_pinned_before_a_merge() {
+        // A read pinned before a merge searches the replaced segment from its
+        // own list, so a replica keeps that core for a grace however many
+        // reconciles follow, counted from the first one without the segment.
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("retired_grace_{nanos}")).unwrap(),
+        ));
+        let manager = NamedVectorManager::new("test_collection".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+        manager.set_retired_core_grace(Duration::from_secs(3600));
+
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(16), Some(32));
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let cores_empty = HashMap::new();
+        let (name_0, _core_0) = manager
+            .allocate_dense_core_locked_lsm(
+                dir.path(),
+                "dense",
+                &config,
+                hnsw.clone(),
+                &mut space,
+                &cores_empty,
+            )
+            .unwrap();
+        space.segments.push(DenseVectorSegmentMetadata {
+            physical_name: name_0.clone(),
+            role: DenseVectorSegmentRole::Indexed,
+        });
+        let mut configs = HashMap::new();
+        configs.insert("dense".to_string(), config.clone());
+        let mut metadata = HashMap::new();
+        metadata.insert("dense".to_string(), space.clone());
+        // Reconcile, then say whether segment 0 still has its core.
+        let reconcile = |metadata: &HashMap<String, DenseVectorSpaceMetadata>| {
+            manager
+                .refresh_dense_view_from_metadata_lsm(
+                    dir.path(),
+                    &configs,
+                    metadata,
+                    hnsw.clone(),
+                    None,
+                )
+                .unwrap();
+            manager.cores.read().unwrap().contains_key(&name_0)
+        };
+        assert!(reconcile(&metadata));
+        // A core off the list builds no sidecar: a build reads the newest view.
+        let sidecar_kept_as_is = || manager.cores.read().unwrap()[&name_0].sidecar_kept_as_is();
+        assert!(
+            !sidecar_kept_as_is(),
+            "a listed segment's core was held to the sidecar it has"
+        );
+
+        // The writer retires segment 0. The clock starts at the reconcile
+        // that first sees the list without it.
+        space.segments.retain(|s| s.physical_name != name_0);
+        metadata.insert("dense".to_string(), space.clone());
+        assert!(reconcile(&metadata));
+        assert!(
+            sidecar_kept_as_is(),
+            "a core off the list was left free to build a sidecar"
+        );
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            reconcile(&metadata),
+            "the second reconcile dropped a core inside its grace"
+        );
+        assert!(
+            reconcile(&metadata),
+            "the third reconcile dropped a core inside its grace"
+        );
+
+        manager.set_retired_core_grace(Duration::from_millis(40));
+        assert!(
+            !reconcile(&metadata),
+            "a core 60 ms past the first reconcile without it outlived a 40 ms grace"
+        );
+    }
+
+    /// A manager with two listed dense segments whose cores are open, the
+    /// directory their sidecars go to, and what a reconcile needs.
+    #[allow(clippy::type_complexity)]
+    fn two_listed_segments() -> (
+        NamedVectorManager,
+        TempDir,
+        HashMap<String, NamedVectorConfig>,
+        HNSWConfig,
+        DenseVectorSpaceMetadata,
+        Vec<String>,
+    ) {
+        use crate::helix_engine::storage_core::backend_lsm::LsmBackend;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let backend = Arc::new(AnyBackend::Lsm(
+            LsmBackend::open_in_memory(&format!("retired_two_{nanos}")).unwrap(),
+        ));
+        let manager = NamedVectorManager::new("test_collection".to_string());
+        manager.attach_backend(Arc::clone(&backend));
+
+        let dir = TempDir::new().unwrap();
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        let hnsw = HNSWConfig::new(Some(8), Some(16), Some(32));
+        let mut space = DenseVectorSpaceMetadata {
+            next_segment_id: 0,
+            segments: vec![],
+        };
+        let cores_empty = HashMap::new();
+        let mut names = Vec::new();
+        for _ in 0..2 {
+            let (name, _core) = manager
+                .allocate_dense_core_locked_lsm(
+                    dir.path(),
+                    "dense",
+                    &config,
+                    hnsw.clone(),
+                    &mut space,
+                    &cores_empty,
+                )
+                .unwrap();
+            space.segments.push(DenseVectorSegmentMetadata {
+                physical_name: name.clone(),
+                role: DenseVectorSegmentRole::Indexed,
+            });
+            names.push(name);
+        }
+        let mut configs = HashMap::new();
+        configs.insert("dense".to_string(), config);
+        (manager, dir, configs, hnsw, space, names)
+    }
+
+    #[test]
+    fn lsm_reader_drops_a_retired_core_past_its_grace_without_a_reconcile() {
+        // Reconciles run only from request paths. A collection that is not
+        // read again still gives up a retired core once its grace is over:
+        // the poll-tier sweeper asks for that between requests.
+        use std::time::Duration;
+
+        let (manager, dir, configs, hnsw, mut space, names) = two_listed_segments();
+        manager.set_retired_core_grace(Duration::from_secs(3600));
+        let reconcile = |space: &DenseVectorSpaceMetadata| {
+            let mut metadata = HashMap::new();
+            metadata.insert("dense".to_string(), space.clone());
+            manager
+                .refresh_dense_view_from_metadata_lsm(
+                    dir.path(),
+                    &configs,
+                    &metadata,
+                    hnsw.clone(),
+                    None,
+                )
+                .unwrap();
+        };
+        let open = |name: &String| manager.cores.read().unwrap().contains_key(name);
+        reconcile(&space);
+        assert!(open(&names[0]) && open(&names[1]));
+        assert_eq!(manager.drop_retired_cores_past_grace().unwrap(), 0);
+
+        // The writer retires segment 0 and one reconcile sees the list without
+        // it. No other reconcile follows.
+        space.segments.retain(|s| s.physical_name != names[0]);
+        reconcile(&space);
+        assert_eq!(
+            manager.drop_retired_cores_past_grace().unwrap(),
+            0,
+            "a core inside its grace was dropped"
+        );
+        assert!(open(&names[0]));
+
+        std::thread::sleep(Duration::from_millis(60));
+        manager.set_retired_core_grace(Duration::from_millis(40));
+        assert_eq!(
+            manager.drop_retired_cores_past_grace().unwrap(),
+            1,
+            "a core past its grace stayed without a reconcile"
+        );
+        assert!(!open(&names[0]), "the retired core is still open");
+        assert!(open(&names[1]), "a listed segment's core was dropped");
+        assert_eq!(manager.drop_retired_cores_past_grace().unwrap(), 0);
+    }
+
+    #[test]
+    fn lsm_reader_close_unlinks_the_sidecars_of_its_retired_cores() {
+        // A close leaves a listed segment's sidecar for the next open and
+        // takes a retired one's: nothing else would before that open.
+        use std::time::Duration;
+
+        let (manager, dir, configs, hnsw, mut space, names) = two_listed_segments();
+        manager.set_retired_core_grace(Duration::from_secs(3600));
+        let reconcile = |space: &DenseVectorSpaceMetadata| {
+            let mut metadata = HashMap::new();
+            metadata.insert("dense".to_string(), space.clone());
+            manager
+                .refresh_dense_view_from_metadata_lsm(
+                    dir.path(),
+                    &configs,
+                    &metadata,
+                    hnsw.clone(),
+                    None,
+                )
+                .unwrap();
+        };
+        reconcile(&space);
+        // Stand-ins for the files a search builds.
+        let sidecar = |name: &String| dir.path().join(format!("{name}.hvec"));
+        for name in &names {
+            std::fs::write(sidecar(name), b"sidecar").unwrap();
+        }
+
+        space.segments.retain(|s| s.physical_name != names[0]);
+        reconcile(&space);
+        assert!(
+            sidecar(&names[0]).exists(),
+            "a reconcile took a retired core's sidecar inside its grace"
+        );
+        manager.unlink_retired_sidecars(dir.path());
+        assert!(
+            !sidecar(&names[0]).exists(),
+            "a retired core's sidecar outlived the close"
+        );
+        assert!(
+            sidecar(&names[1]).exists(),
+            "the close took a listed segment's sidecar"
         );
     }
 
@@ -12661,6 +14948,7 @@ mod tests {
                 &reader_configs,
                 &reader_metadata,
                 hnsw.clone(),
+                None,
             )
             .unwrap();
         assert!(
@@ -12679,6 +14967,7 @@ mod tests {
                 &reader_configs,
                 &reader_metadata,
                 hnsw.clone(),
+                None,
             )
             .unwrap();
         assert!(
@@ -12693,6 +14982,7 @@ mod tests {
                 &reader_configs,
                 &reader_metadata,
                 hnsw.clone(),
+                None,
             )
             .unwrap();
         assert!(
@@ -13062,6 +15352,7 @@ mod tests {
                 &configs,
                 &meta,
                 HNSWConfig::new(Some(8), Some(16), Some(32)),
+                None,
             )
             .unwrap();
         let shared = Arc::new(super::super::shared_cache::SharedVectorCaches::new(
@@ -13173,6 +15464,7 @@ mod tests {
                 &configs,
                 &meta(&[SEG_A]),
                 hnsw.clone(),
+                None,
             )
             .unwrap();
 
@@ -13186,6 +15478,7 @@ mod tests {
                         &configs,
                         &meta(&[SEG_A, SEG_B]),
                         hnsw.clone(),
+                        None,
                     )
                     .unwrap()
             });
@@ -13252,6 +15545,7 @@ mod tests {
                 &configs,
                 &meta,
                 HNSWConfig::new(Some(8), Some(16), Some(32)),
+                None,
             )
             .unwrap();
         if shared_on {
@@ -13766,6 +16060,186 @@ mod tests {
             backend.commit(w).unwrap();
         }
         (backend, manager, dir, seg_a, seg_b)
+    }
+
+    /// The index job's tail count must report a segment whose core is gone
+    /// as the full stats did, wherever it stops counting.
+    #[test]
+    fn mutable_tail_count_reports_a_segment_without_a_core() {
+        // Given a tail and a second segment of one flat row each, the second
+        // with no core.
+        let (backend, manager, _dir, seg_a, seg_b) = two_segment_manager();
+        for segment in &mut manager
+            .dense_spaces
+            .write()
+            .unwrap()
+            .get_mut("dense")
+            .unwrap()
+            .segments
+        {
+            if segment.physical_name == seg_a {
+                segment.role = DenseVectorSegmentRole::Mutable;
+            }
+        }
+        manager.cores.write().unwrap().remove(&seg_b);
+        let read = backend.begin_read().unwrap();
+        // When the count stops at the tail's first row (limit 1) and when it does not.
+        for limit in [1, 10] {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let count = metrics::with_local_recorder(&recorder, || {
+                manager.mutable_tail_count_upto_be(&read, "dense", limit)
+            });
+            // Then it counts the tail and reports the missing segment.
+            assert_eq!(count.unwrap(), 1, "limit {limit}");
+            let rendered = recorder.handle().render();
+            assert!(
+                rendered.contains("helix_dense_segment_missing_total")
+                    && rendered.contains(&format!("segment=\"{seg_b}\"")),
+                "limit {limit}: {rendered}"
+            );
+        }
+    }
+
+    /// A manager over an in-memory LSM backend whose space `dense` is as a
+    /// collection has it before its first seal: the one tail `dense` with a
+    /// row in it, and 1 for its next id.
+    fn manager_with_a_first_tail(
+        test_name: &str,
+    ) -> (
+        Arc<AnyBackend>,
+        NamedVectorManager,
+        TempDir,
+        NamedVectorConfig,
+    ) {
+        let (backend, manager, dir) =
+            setup_lsm_manager_with_flat_segment(test_name, "dense", &[(1, [1.0, 0.0, 0.0])]);
+        let config = NamedVectorConfig {
+            size: 3,
+            distance: DistanceMetric::Cosine,
+            spindle: SpindleConfig::default(),
+        };
+        manager
+            .configs
+            .write()
+            .unwrap()
+            .insert("dense".to_string(), config.clone());
+        manager
+            .dense_spaces
+            .write()
+            .unwrap()
+            .get_mut("dense")
+            .unwrap()
+            .segments[0]
+            .role = DenseVectorSegmentRole::Mutable;
+        (backend, manager, dir, config)
+    }
+
+    /// A seal opens the next tail, and that can fail (it reads the store).
+    /// The space is then as it was before the seal: its tail takes the next
+    /// append and its next id is not spent. With the tail turned `Building`
+    /// before the next one was open, a failure left the space with no tail
+    /// at all, and every append to it failed from then on.
+    #[test]
+    fn a_seal_whose_next_tail_cannot_be_opened_leaves_the_space_its_tail() {
+        let (backend, manager, dir, _config) = manager_with_a_first_tail("seal_cannot_open_next");
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        let before = manager.list_dense_vector_spaces();
+
+        // When the next tail cannot be opened: the manager has lost its
+        // backend, which the tail's own core does not need to find its rows.
+        let attached = manager.backend.write().unwrap().take();
+        let failed = {
+            let read = backend.begin_read().unwrap();
+            manager.seal_mutable_tail_lsm(&read, dir.path(), "dense", hnsw.clone())
+        };
+        *manager.backend.write().unwrap() = attached;
+        assert!(failed.is_err(), "the seal opened its next tail: {failed:?}");
+
+        // Then the space is as it was, and its tail takes an append.
+        assert_eq!(manager.list_dense_vector_spaces(), before);
+        let mut w = backend.begin_write().unwrap();
+        let appended_to = manager
+            .dense_append_to_mutable_be(&mut w, "dense", &[0.0, 1.0, 0.0], 2, HashMap::new())
+            .unwrap();
+        backend.commit(w).unwrap();
+        assert_eq!(appended_to, "dense");
+
+        // And the seal after it takes the id the failed one did not spend.
+        let read = backend.begin_read().unwrap();
+        let sealed = manager
+            .seal_mutable_tail_lsm(&read, dir.path(), "dense", hnsw)
+            .unwrap();
+        assert_eq!(sealed.as_deref(), Some("dense"));
+        assert_eq!(
+            manager.mutable_dense_segment_name("dense").as_deref(),
+            Some("dense__seg_000001")
+        );
+        assert_eq!(
+            manager.list_dense_vector_spaces()["dense"].next_segment_id,
+            2
+        );
+    }
+
+    /// A fresh id that holds rows is what a writer left that died with rows
+    /// under a tail no stored layout named: they may be the only copy of a
+    /// write it had acknowledged. The seal passes the id over, and nothing
+    /// is told to clear it.
+    #[test]
+    fn a_fresh_id_that_holds_rows_is_passed_over_and_not_handed_to_the_reaper() {
+        let (backend, manager, dir, config) = manager_with_a_first_tail("fresh_id_with_rows");
+        let hnsw = HNSWConfig::new(Some(8), Some(32), Some(64));
+        // Given a row under the id the space takes next.
+        let stray = manager
+            .create_dense_core_attached_lsm(dir.path(), "dense__seg_000001", &config, hnsw.clone())
+            .unwrap();
+        let mut w = backend.begin_write().unwrap();
+        stray
+            .insert_flat_be(&mut w, &[0.0, 1.0, 0.0], Some(9), None)
+            .unwrap();
+        backend.commit(w).unwrap();
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        manager.attach_dirty_retired_segment_hook({
+            let handed = Arc::clone(&handed);
+            move |physical_name| handed.lock().unwrap().push(physical_name)
+        });
+
+        // When the tail is sealed.
+        let read = backend.begin_read().unwrap();
+        manager
+            .seal_mutable_tail_lsm(&read, dir.path(), "dense", hnsw)
+            .unwrap()
+            .expect("a tail with a row is sealed");
+
+        // Then the next tail is the id after it.
+        assert_eq!(
+            manager.mutable_dense_segment_name("dense").as_deref(),
+            Some("dense__seg_000002")
+        );
+        assert_eq!(
+            manager.list_dense_vector_spaces()["dense"].next_segment_id,
+            3
+        );
+        // And the row is where it was, with nothing queued to clear it.
+        assert_eq!(*handed.lock().unwrap(), Vec::<String>::new());
+        assert!(manager.dirty_retired_segments.read().unwrap().is_empty());
+        let read = backend.begin_read().unwrap();
+        assert!(stray.contains_id(&read, 9).unwrap());
+    }
+
+    /// What a store of the layout reads must fail where the listing answers
+    /// a layout of no space: stored, that is a collection with no segment.
+    #[test]
+    fn the_layout_to_store_is_an_error_when_its_lock_is_poisoned() {
+        let (_backend, manager, _dir, _config) = manager_with_a_first_tail("poisoned_layout");
+        assert_eq!(
+            manager.dense_vector_spaces_to_store().unwrap(),
+            manager.list_dense_vector_spaces()
+        );
+
+        manager.poison_dense_spaces();
+
+        assert!(manager.list_dense_vector_spaces().is_empty());
+        assert!(manager.dense_vector_spaces_to_store().is_err());
     }
 
     /// M7: with tombstones ON, a plan whose later segment's core has gone

@@ -64,6 +64,12 @@ where
         Self::default()
     }
 
+    /// HELION LOCAL PATCH: whether a call for `key` is in flight (or has just
+    /// finished and its waiters have not all returned yet).
+    pub(crate) fn contains(&self, key: &K) -> bool {
+        self.in_flight.lock().contains_key(key)
+    }
+
     /// Execute and return the value for a given function, making sure that only one
     /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
     /// wait until the original call completes and return the same value.

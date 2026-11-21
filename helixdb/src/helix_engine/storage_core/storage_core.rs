@@ -12,7 +12,10 @@ use crate::{
         },
         types::{graph_error_from_backend_error, GraphError},
         vector_core::{
-            named_vectors::{DenseReadTxnProvider, NamedVectorConfig, NamedVectorManager},
+            named_vectors::{
+                dead_segment_names_enabled, DenseReadTxnProvider, NamedVectorConfig,
+                NamedVectorManager, DEAD_SEGMENT_KEY_PREFIX,
+            },
             vector_core::{HNSWConfig, HnswOverrides, VectorCore},
         },
     },
@@ -55,8 +58,12 @@ use super::backend_any::{
     AnyWrite, LSM_READER_READONLY,
 };
 use super::storage_methods::{BasicStorageMethods, DBMethods};
+use super::text_walk_cache::{TextWalk, TextWalkKey};
 use super::upsert::{EdgeUpsert, NodeUpsert};
 use crate::protocol::deterministic_id;
+
+#[path = "payload_marker_backfill.rs"]
+pub(crate) mod payload_marker_backfill;
 
 const DEFAULT_LMDB_MAX_DBS: u32 = 65_536;
 
@@ -439,6 +446,13 @@ const READER_POLL_PROMOTE_FAILURE_COOLDOWN_MS: u64 = 30_000;
 /// Cap for the exponential promotion-failure backoff
 /// (30s → 1m → 2m → 4m → 8m → 15m).
 const READER_POLL_PROMOTE_FAILURE_COOLDOWN_MAX_MS: u64 = 900_000;
+/// How long the read that starts an in-place poll-tier promotion waits for
+/// the promotion's manifest poll. A poll is one LIST, the manifest and the WAL
+/// objects written since the last one, tens of milliseconds as a rule; a read
+/// is not held longer than this for a slow one.
+/// `helix_reader_poll_tier_total{direction="promote_wait_timeout"}` counts
+/// the reads that reached it.
+pub(crate) const READER_PROMOTE_POLL_WAIT: Duration = Duration::from_millis(250);
 
 impl MemoryWatermarks {
     fn detect() -> Self {
@@ -602,6 +616,50 @@ const ADJ_BACKFILL_FROM_POINTS_CURSOR_KEY: &str = "adj_backfill_from_points:curs
 const ADJ_BACKFILL_FROM_POINTS_COMPLETE_KEY: &str = "adj_backfill_from_points:complete";
 const HNSW_OVERRIDES_KEY: &str = "hnsw_overrides";
 const MAX_RAW_LMDB_KEY_BYTES: usize = 480;
+
+/// The adjacency backfill's mark in one byte: 0 not known, 1 not complete,
+/// 2 complete.
+fn adjacency_mark_code(mark: Option<bool>) -> u8 {
+    match mark {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
+}
+
+/// A metadata sidecar as built for one put: its bytes, the fingerprint of
+/// what it says, and the adjacency backfill's mark it carries.
+struct BuiltSidecar {
+    bytes: Vec<u8>,
+    fingerprint: Option<u64>,
+    mark: Option<bool>,
+}
+
+/// Stored value of an LSM keyword payload-index row indexed from a top-level
+/// (non-array) value. Array-element rows, and rows older binaries wrote,
+/// store nothing: their key alone cannot tell `"x"` from `["x"]`, which
+/// `match.text` treats differently.
+const PAYLOAD_INDEX_PLAIN_ROW: &[u8] = &[1];
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: `get_node_be` calls (payload node reads) on this thread.
+    static NODE_READS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: payload node reads issued by the current thread so far.
+#[cfg(test)]
+pub(crate) fn node_reads_for_test() -> usize {
+    NODE_READS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: run once, on this thread, by an async payload index build
+    /// between its drain and its publish.
+    static BEFORE_PAYLOAD_INDEX_PUBLISH_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
 const MAX_EDGE_PATH_COMPONENT_BYTES: usize = 400;
 const COMPACT_INDEX_KEY_PREFIX: &[u8] = b"\xffhxk1";
 
@@ -625,6 +683,20 @@ struct PayloadIndexExecutor {
     sender: flume::Sender<PayloadIndexJob>,
 }
 
+/// A worker's hold of the storage whose build it has taken. Dropped, it
+/// gives back the count the build took when it was queued
+/// (`HelixGraphStorage::counted_as_pending`): the build is over, however
+/// the worker left it.
+struct PendingPayloadIndexBuild(Arc<HelixGraphStorage>);
+
+impl Drop for PendingPayloadIndexBuild {
+    fn drop(&mut self) {
+        self.0
+            .payload_index_builds_pending
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl PayloadIndexExecutor {
     fn start() -> Self {
         let workers = payload_index_workers();
@@ -638,6 +710,8 @@ impl PayloadIndexExecutor {
                 .name(format!("helix-payload-index-{}", worker_id))
                 .spawn(move || {
                     for job in receiver {
+                        #[cfg(test)]
+                        keep_while_held_for_test(&job.collection);
                         let Some(storage) = job.storage.upgrade() else {
                             metrics::counter!(
                                 "helix_payload_index_job_skipped_total",
@@ -652,6 +726,9 @@ impl PayloadIndexExecutor {
                             );
                             continue;
                         };
+                        // Whatever way this turn of the loop ends, the
+                        // storage's count of pending builds comes back.
+                        let _pending = PendingPayloadIndexBuild(Arc::clone(&storage));
                         // A panicking job must NOT kill the worker thread — that
                         // closes the submit channel and bricks ALL future
                         // payload-index builds process-wide ("sending on a closed
@@ -719,6 +796,24 @@ impl PayloadIndexExecutor {
 static PAYLOAD_INDEX_EXECUTOR: LazyLock<PayloadIndexExecutor> =
     LazyLock::new(PayloadIndexExecutor::start);
 
+/// Test-only: a worker that takes a job of a collection named here keeps it,
+/// not yet looked at, for as long as the name stands: a job still in the
+/// queue, for all that anything but that worker can tell.
+#[cfg(test)]
+pub(crate) static PAYLOAD_INDEX_JOBS_HELD_FOR_TEST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn keep_while_held_for_test(collection: &str) {
+    while PAYLOAD_INDEX_JOBS_HELD_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|held| held == collection)
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum PayloadIndexState {
     Building {
@@ -731,7 +826,9 @@ pub enum PayloadIndexState {
     /// Build finished. `indexed_nodes` carries the final backfilled count from the
     /// `Building` state it was promoted from (0 when reconstructed at collection
     /// open, where the count is not persisted). In-memory only — never serialized.
-    Ready { indexed_nodes: u64 },
+    /// `since` is taken after the build's last commit returned (or at handle
+    /// creation): a snapshot opened later holds every index row.
+    Ready { indexed_nodes: u64, since: Instant },
     Failed {
         job_id: String,
         error: String,
@@ -761,6 +858,24 @@ pub struct PayloadIndexStatus {
     pub updated_at_millis: Option<i64>,
 }
 
+/// Counts the rows a keyword index was read for: the whole list of a value
+/// (`list`), a count of it (`count`), or a scan page's window of it
+/// (`window`). What a filter's planning costs is these rows, and nothing
+/// else said how many they were.
+fn payload_index_rows_read(read: &'static str, rows: usize) {
+    metrics::counter!("helix_payload_index_rows_read_total", "read" => read).increment(rows as u64);
+}
+
+/// One keyword value's rows in a field's index, named once for a scan page
+/// that reads them a window at a time
+/// ([`HelixGraphStorage::payload_value_rows`]). It holds no handle of the
+/// index: the page reads on from its own snapshot whatever becomes of the
+/// index while it runs.
+pub(crate) struct PayloadValueRows {
+    db_name: String,
+    keys: Vec<Vec<u8>>,
+}
+
 #[derive(Clone)]
 pub struct PayloadIndexHandle {
     pub schema: PayloadIndexSchema,
@@ -773,7 +888,10 @@ impl PayloadIndexHandle {
         Self {
             schema,
             db: Some(db),
-            state: Arc::new(RwLock::new(PayloadIndexState::Ready { indexed_nodes: 0 })),
+            state: Arc::new(RwLock::new(PayloadIndexState::Ready {
+                indexed_nodes: 0,
+                since: Instant::now(),
+            })),
         }
     }
 
@@ -781,7 +899,10 @@ impl PayloadIndexHandle {
         Self {
             schema,
             db: None,
-            state: Arc::new(RwLock::new(PayloadIndexState::Ready { indexed_nodes: 0 })),
+            state: Arc::new(RwLock::new(PayloadIndexState::Ready {
+                indexed_nodes: 0,
+                since: Instant::now(),
+            })),
         }
     }
 
@@ -827,6 +948,23 @@ impl PayloadIndexHandle {
         self.state
             .read()
             .map(|state| matches!(*state, PayloadIndexState::Ready { .. }))
+            .unwrap_or(false)
+    }
+
+    /// Ready, and complete in a snapshot opened at `opened_at`. A build flips
+    /// to Ready only after its last commit returned, so a snapshot opened
+    /// before the flip may lack rows; such a request must treat the field as
+    /// unindexed. `None` (no orderable open time: LMDB, reader replicas whose
+    /// handles come from the metadata they opened with) keeps `is_ready`.
+    pub fn is_ready_for(&self, opened_at: Option<Instant>) -> bool {
+        self.state
+            .read()
+            .map(|state| match &*state {
+                PayloadIndexState::Ready { since, .. } => {
+                    opened_at.is_none_or(|opened_at| opened_at > *since)
+                }
+                _ => false,
+            })
             .unwrap_or(false)
     }
 
@@ -905,6 +1043,7 @@ impl PayloadIndexHandle {
                     // hollow index in the status / collection-info API).
                     *state = PayloadIndexState::Ready {
                         indexed_nodes: *indexed_nodes,
+                        since: Instant::now(),
                     };
                     true
                 }
@@ -966,7 +1105,7 @@ impl PayloadIndexHandle {
 
     fn status_from_state(&self, field_name: &str, state: &PayloadIndexState) -> PayloadIndexStatus {
         match state {
-            PayloadIndexState::Ready { indexed_nodes } => PayloadIndexStatus {
+            PayloadIndexState::Ready { indexed_nodes, .. } => PayloadIndexStatus {
                 field_name: field_name.to_string(),
                 schema: self.schema.clone(),
                 status: "ready",
@@ -1041,6 +1180,50 @@ impl PayloadIndexHandle {
     }
 }
 
+/// What a reader replica's reads coordinate on so that a search runs with the
+/// dense segment list of the data view it reads.
+#[derive(Default)]
+struct ReaderViewReconcile {
+    /// Held for the length of one reconcile, whoever started it.
+    run: Mutex<()>,
+    state: Mutex<ReaderViewReconcileState>,
+    /// Signalled when a reconcile records a view or a started one ends.
+    finished: Condvar,
+}
+
+/// Views are `(reader generation, sequence)` and compare as tuples.
+#[derive(Default)]
+struct ReaderViewReconcileState {
+    /// The view the last complete reconcile is sure to cover: one that read
+    /// the metadata afresh and left every listed segment with a core.
+    covered: Option<(u64, u64)>,
+    /// The newest view a read started a reconcile for. One attempt per view:
+    /// if it fails, the timed refresh retries, not every read behind it.
+    attempted: Option<(u64, u64)>,
+    /// A reconcile started by a read has not ended yet.
+    running: bool,
+    /// A read reached its bound on the running one; nobody queues behind it.
+    gave_up: bool,
+}
+
+/// What a reader-replica read found when it checked its dense segment list
+/// against the data view it is about to read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReaderViewWait {
+    /// The list covers the view already, or this is not a reader replica.
+    Current,
+    /// Waited for a reconcile, and the list covers the view now.
+    Reconciled,
+    /// The reconcile outran the bound: the read goes on with the old list.
+    TimedOut,
+    /// A reconcile another read gave up on is still running: no wait.
+    BehindSlow,
+    /// The reconcile for this view ended without covering it (it failed,
+    /// left a listed segment without a core, or could not start). The timed
+    /// refresh retries.
+    Unreconciled,
+}
+
 pub struct HelixGraphStorage {
     collection_path: PathBuf,
     pub graph_env: Option<Env<WithTls>>,
@@ -1051,22 +1234,53 @@ pub struct HelixGraphStorage {
     pub edge_path_idx: Option<Database<Bytes, Bytes>>,
     pub metadata_db: Option<Database<Str, Bytes>>,
     pub metadata_snapshot: RwLock<StorageMetadata>,
+    /// Sequence of the read behind `metadata_snapshot` and the local sidecar.
+    /// Held while a refresh stores both, so they change in the order the
+    /// refreshes read, and never across the object-store put.
+    metadata_snapshot_read_at: parking_lot::Mutex<Option<u64>>,
     last_lsm_sidecar_upload_ms: AtomicU64,
     last_lsm_sidecar_fingerprint: AtomicU64,
+    /// The put interval held back the newest sidecar: the object store is
+    /// one change behind until [`Self::upload_held_metadata_sidecar`] sends it.
+    lsm_sidecar_put_held: std::sync::atomic::AtomicBool,
+    /// One put of the sidecar at a time, and each with the mark below as it
+    /// is when the put is made. A regular put only tries it, and is held
+    /// for the sweeper where it is taken; a backfill call's put of the mark
+    /// ([`Self::send_adjacency_backfill_mark`]) is the one that waits.
+    sidecar_put: parking_lot::Mutex<()>,
+    /// Whether the adjacency backfill from points has run to its end
+    /// ([`adjacency_mark_code`]): read from the store at an LSM open and at
+    /// a reader's view refresh, and set by a backfill call on its writer. It
+    /// is what the sidecar says and what the collection's info answers, so
+    /// that neither reads the store.
+    adjacency_backfill_mark: std::sync::atomic::AtomicU8,
+    /// The mark in the last sidecar this process put on the object store.
+    adjacency_mark_sent: std::sync::atomic::AtomicU8,
     pub secondary_indices: HashMap<String, Option<Database<Bytes, Bytes>>>,
     /// Multi-value indices (1:N) using DUP_SORT. Key = serialized Value, Values = node IDs (16 bytes each).
     pub multi_indices: HashMap<String, Option<Database<Bytes, Bytes>>>,
     pub payload_indices: RwLock<HashMap<String, PayloadIndexHandle>>,
+    /// Completed `match.text` walks keyed by index handle and snapshot sequence.
+    text_walk_cache: parking_lot::Mutex<super::text_walk_cache::TextWalkCache>,
     pub vectors: VectorCore,
     /// Named vector indexes for Qdrant-compatible multi-vector support.
     pub named_vectors: NamedVectorManager,
     pub wal: WalWriter,
     /// Guards against concurrent background optimizer threads for this collection.
     pub optimizer_running: std::sync::atomic::AtomicBool,
-    /// Epoch-millis timestamp of the most recent upsert batch. The background
-    /// optimizer uses this to decide when ingest has quiesced and the mutable
-    /// tail should be sealed even if it hasn't reached `flat_scan_threshold`.
+    /// Epoch-millis timestamp of the end of the most recent point upsert or
+    /// delete batch. The background optimizer uses this to decide when ingest
+    /// has quiesced and the mutable tail should be sealed even if it hasn't
+    /// reached `flat_scan_threshold`.
     pub last_upsert_at: std::sync::atomic::AtomicU64,
+    /// Point upsert/delete batches started, bumped under the point-mutation
+    /// gate. A regraph compares it across its export so a write it missed
+    /// stands its publish down.
+    pub point_mutations: std::sync::atomic::AtomicU64,
+    /// Point upsert/delete batches being applied right now. A sub-threshold
+    /// dense tail is sealed for quiet only while this is zero and
+    /// `last_upsert_at` is older than the quiet period.
+    pub point_mutations_in_flight: AtomicUsize,
     /// Legacy coordination gate for callers/tests that explicitly gate LMDB
     /// transaction creation. The authoritative resize fence is
     /// `active_lmdb_txns`: resize-safe transaction wrappers increment that
@@ -1122,11 +1336,24 @@ pub struct HelixGraphStorage {
     /// Serializes payload-index create/delete administration without blocking
     /// ordinary upserts from reading the current ready/building handle map.
     payload_index_admin_gate: Mutex<()>,
+    /// Payload index builds of this collection that are queued or running:
+    /// [`Self::payload_index_build_pending`].
+    payload_index_builds_pending: AtomicUsize,
+    /// Held by an async build job across its active-check + chunk/drain
+    /// commit, and by `delete_payload_index` while it cancels the job, so a
+    /// cancelled job never commits rows into a later build of the field.
+    payload_index_build_lock: Mutex<()>,
     /// Set true after the first metadata-corruption event is logged for this
     /// collection. Prevents log spam on read-heavy paths where
     /// `get_metadata()` repeatedly hits the same bad bytes every request.
     pub metadata_corruption_logged: std::sync::atomic::AtomicBool,
     pub collection_degraded: std::sync::atomic::AtomicBool,
+    /// Set before the shutdown step closes this storage's writer under
+    /// whatever still runs on it. An operation cut by that close may fail
+    /// with an error that reads like corruption, and a collection marked
+    /// degraded for it would keep the marker in its directory past the
+    /// restart and refuse writes.
+    pub(crate) closing_for_shutdown: std::sync::atomic::AtomicBool,
     degraded_reason: RwLock<Option<(&'static str, String)>>,
     /// Set true when dense layout changes (new mutable segment created) but
     /// metadata hasn't been flushed to LMDB yet. The IndexExecutor clears this
@@ -1159,6 +1386,9 @@ pub struct HelixGraphStorage {
     /// `true` just skips a redundant promotion (the next read re-checks
     /// freshness via `last_reader_read_at_ms`), and a stale `false` costs one
     /// extra harmless promotion.
+    ///
+    /// This is the tier only where a tier change is a reopen. A reader that
+    /// changes tiers in place is asked instead (`reader_poll_tier_is_fast`).
     reader_poll_tier_fast: std::sync::atomic::AtomicBool,
     /// Mutual exclusion between a poll-tier promotion and demotion for this
     /// collection: only one `refresh_with_poll_interval` swap in flight at a
@@ -1170,8 +1400,10 @@ pub struct HelixGraphStorage {
     /// exponential retry backoff in `reader_poll_promote_retry_due`. Reset to
     /// zero on a successful promotion.
     reader_promote_consecutive_failures: std::sync::atomic::AtomicU32,
-    /// Epoch-ms of the last time the write-feed change poller promoted this
-    /// collection to the fast poll tier (see `note_write_feed_promotion`).
+    /// Epoch-ms of the last write-feed change the poller saw for this
+    /// collection while it was on the fast poll tier: the promoting change
+    /// (`note_write_feed_promotion`) and every later one of the same burst
+    /// (`note_write_feed_change`).
     /// Distinct from `last_reader_read_at_ms`: this is a WRITE-driven signal,
     /// consulted only by the read-gated demotion sweep so it doesn't demote a
     /// collection out from under an active write burst nobody has read yet —
@@ -1180,6 +1412,10 @@ pub struct HelixGraphStorage {
     /// true for good on writer/Lmdb backends and whenever the write-feed
     /// isn't configured, since nothing ever calls the setter).
     last_write_promoted_at_ms: std::sync::atomic::AtomicU64,
+    /// Reader replicas: the data view the dense segment list and payload
+    /// index handles were last reconciled against, and what a read waits on
+    /// when its own view is past that (`reconcile_reader_view_if_advanced`).
+    reader_view_reconcile: ReaderViewReconcile,
     /// CAS guard serializing `recount_lsm_counters` per collection: the scan
     /// (read) + overwrite (write) pair is not atomic against concurrent
     /// writers, so two concurrent recounts racing each other could each read
@@ -1214,6 +1450,7 @@ impl Drop for HelixGraphStorage {
                 "failed to close LSM collection writer during storage drop"
             );
         }
+        self.named_vectors.unlink_retired_sidecars(self.path());
         tracing::info!(path = ?self.path(), "closing collection storage");
     }
 }
@@ -1385,7 +1622,7 @@ impl<'a> WriteView<'a> {
 /// A chunk-level edge candidate found while rebuilding `_graph` adjacency.
 /// Unlike the Symbol-node edges `relationship_upserts_from_node` derives,
 /// both endpoints here are Qdrant point ids (rendered as decimal strings
-/// by CE) belonging to the BASE collection, not this `_graph` collection.
+/// by the client) belonging to the BASE collection, not this `_graph` collection.
 /// `handle_rebuild_adjacency_for_paths` resolves and applies these to the
 /// base collection when the request carries a `base_collection`.
 pub(crate) struct ChunkEdgeCandidate {
@@ -1394,6 +1631,21 @@ pub(crate) struct ChunkEdgeCandidate {
     pub(crate) callee_point_id: String,
     pub(crate) caller_path: String,
     pub(crate) callee_path: String,
+}
+
+/// What [`HelixGraphStorage::rebuild_adjacency_for_paths`] wrote.
+#[derive(Default)]
+pub(crate) struct PathsRebuild {
+    pub(crate) nodes_upserted: usize,
+    /// The edges derived, written or not.
+    pub(crate) edges_upserted: usize,
+    /// Of them, the edges that were left: stored exactly as derived (one
+    /// that two rows derive, as the later derives it).
+    pub(crate) edges_unchanged: usize,
+    pub(crate) chunk_candidates: Vec<ChunkEdgeCandidate>,
+    /// The edges dropped and the nodes they left without an edge, when the
+    /// paths' outgoing edges were replaced; `None` when they were not.
+    pub(crate) replaced: Option<(usize, usize)>,
 }
 
 impl HelixGraphStorage {
@@ -1405,6 +1657,13 @@ impl HelixGraphStorage {
         self.graph_env.as_ref().ok_or_else(|| {
             GraphError::StorageError("LMDB env handle is unavailable on this backend".to_string())
         })
+    }
+
+    /// (entries, hits) of the text-walk cache.
+    #[cfg(test)]
+    pub(crate) fn text_walk_cache_stats(&self) -> (usize, u64) {
+        let cache = self.text_walk_cache.lock();
+        (cache.len(), cache.hits())
     }
 
     pub(crate) fn collection_path(&self) -> &Path {
@@ -1487,6 +1746,16 @@ impl HelixGraphStorage {
         let GraphError::FatalCollectionStorage { code, message } = error else {
             return;
         };
+        if self.closing_for_shutdown.load(Ordering::Acquire) {
+            tracing::warn!(
+                code = *code,
+                message = %message,
+                context,
+                path = ?self.path(),
+                "storage error under the shutdown close; collection not marked degraded"
+            );
+            return;
+        }
         let first = !self.collection_degraded.swap(true, Ordering::AcqRel);
         if let Ok(mut reason) = self.degraded_reason.write() {
             *reason = Some((*code, message.clone()));
@@ -1578,6 +1847,16 @@ impl HelixGraphStorage {
         key
     }
 
+    /// Index directions to read: 1 holds an edge under its `from_path`, 2
+    /// under its `to_path`.
+    fn edge_path_index_dirs(from_only: bool) -> &'static [u8] {
+        if from_only {
+            &[1]
+        } else {
+            &[1, 2]
+        }
+    }
+
     fn edge_path_property(edge: &Edge, key: &str) -> Option<String> {
         match edge.properties.get(key) {
             Some(Value::String(path)) if !path.is_empty() => Some(path.clone()),
@@ -1591,9 +1870,21 @@ impl HelixGraphStorage {
         path: &str,
         max_edges: usize,
     ) -> Result<Vec<u128>, GraphError> {
+        self.edge_ids_for_path_ends(txn, path, max_edges, false)
+    }
+
+    /// The edges with an end in `path`: both ends, or with `from_only` only
+    /// the edges that start there (index direction 1 is `from_path`).
+    pub fn edge_ids_for_path_ends(
+        &self,
+        txn: &RoTxn,
+        path: &str,
+        max_edges: usize,
+        from_only: bool,
+    ) -> Result<Vec<u128>, GraphError> {
         let mut seen = std::collections::HashSet::new();
         let mut ids = Vec::new();
-        for dir in [1u8, 2u8] {
+        for &dir in Self::edge_path_index_dirs(from_only) {
             let prefix = Self::edge_path_index_prefix(dir, path);
             let edge_path_idx = self.lmdb_edge_path_idx()?;
             let iter = edge_path_idx.prefix_iter(txn, &prefix)?;
@@ -1623,9 +1914,20 @@ impl HelixGraphStorage {
         path: &str,
         max_edges: usize,
     ) -> Result<Vec<u128>, GraphError> {
+        self.edge_ids_for_path_ends_be(r, path, max_edges, false)
+    }
+
+    /// Backend-routed twin of [`Self::edge_ids_for_path_ends`].
+    pub fn edge_ids_for_path_ends_be(
+        &self,
+        r: &AnyRead<'_>,
+        path: &str,
+        max_edges: usize,
+        from_only: bool,
+    ) -> Result<Vec<u128>, GraphError> {
         let mut seen = std::collections::HashSet::new();
         let mut ids = Vec::new();
-        for dir in [1u8, 2u8] {
+        for &dir in Self::edge_path_index_dirs(from_only) {
             let prefix = Self::edge_path_index_prefix(dir, path);
             self.backend
                 .scan(
@@ -1655,6 +1957,71 @@ impl HelixGraphStorage {
             }
         }
         Ok(ids)
+    }
+
+    /// The edges that start in `paths` and are not among `derived`, each with
+    /// its two ends: through the path index once its backfill is complete,
+    /// and by reading every edge until then. An edge that does not decode
+    /// cannot be told to start there and is left out.
+    fn stale_edges_starting_in_paths_be(
+        &self,
+        r: &AnyRead<'_>,
+        paths: &std::collections::HashSet<&str>,
+        derived: &std::collections::HashSet<u128>,
+    ) -> Result<std::collections::BTreeMap<u128, (u128, u128)>, GraphError> {
+        /// Edge rows held in memory by one batched read.
+        const EDGE_ROWS_PER_READ: usize = 5_000;
+
+        let mut stale = std::collections::BTreeMap::new();
+        let mut note = |edge_id: u128, data: &[u8]| {
+            if let Ok(edge) = SerializedEdge::decode_edge(data, edge_id) {
+                if matches!(
+                    edge.properties.get("from_path"),
+                    Some(Value::String(path)) if paths.contains(path.as_str())
+                ) {
+                    stale.insert(edge_id, (edge.from_node, edge.to_node));
+                }
+            }
+        };
+        if self.edge_path_index_backfill_complete_be(r)? {
+            let mut edge_ids = Vec::new();
+            for path in paths {
+                edge_ids.extend(
+                    self.edge_ids_for_path_ends_be(r, path, usize::MAX, true)?
+                        .into_iter()
+                        .filter(|edge_id| !derived.contains(edge_id)),
+                );
+            }
+            // An index row is only a hint: the edge itself says where it starts.
+            for edge_ids in edge_ids.chunks(EDGE_ROWS_PER_READ) {
+                let keys: Vec<Vec<u8>> = edge_ids
+                    .iter()
+                    .map(|edge_id| edge_id.to_be_bytes().to_vec())
+                    .collect();
+                let rows = self
+                    .backend
+                    .get_many(r, Namespace::Edges, &keys)
+                    .map_err(|e| GraphError::New(e.to_string()))?;
+                for (edge_id, row) in edge_ids.iter().zip(&rows) {
+                    if let Some(data) = row {
+                        note(*edge_id, data);
+                    }
+                }
+            }
+        } else {
+            self.backend
+                .scan(r, Namespace::Edges, KeyRange::all(), |key, data| {
+                    if let Ok(raw) = <[u8; 16]>::try_from(key) {
+                        let edge_id = u128::from_be_bytes(raw);
+                        if !derived.contains(&edge_id) {
+                            note(edge_id, data);
+                        }
+                    }
+                    true
+                })
+                .map_err(|e| GraphError::New(e.to_string()))?;
+        }
+        Ok(stale)
     }
 
     pub fn edge_path_index_backfill_complete(&self, txn: &RoTxn) -> Result<bool, GraphError> {
@@ -1787,16 +2154,9 @@ impl HelixGraphStorage {
                         continue;
                     }
                 };
-                match self.index_edge_paths(wtxn, &edge) {
-                    Ok(()) => indexed += 1,
-                    Err(err) => {
-                        tracing::warn!(
-                            "edge_path_idx backfill skipped malformed edge {}: {}",
-                            edge.id,
-                            err
-                        );
-                    }
-                }
+                // Not skipped on failure, as in the backend-routed twin.
+                self.index_edge_paths(wtxn, &edge)?;
+                indexed += 1;
             }
 
             if let Some(last) = last_edge_id {
@@ -1908,16 +2268,11 @@ impl HelixGraphStorage {
                         continue;
                     }
                 };
-                match self.index_edge_paths_be(w, &edge) {
-                    Ok(()) => indexed += 1,
-                    Err(err) => {
-                        tracing::warn!(
-                            "edge_path_idx backfill failed to index edge {}: {}",
-                            edge.id,
-                            err
-                        );
-                    }
-                }
+                // Not skipped on failure: the cursor below would pass an edge
+                // without its rows, and once the marker is set nothing looks
+                // for that edge by path again.
+                self.index_edge_paths_be(w, &edge)?;
+                indexed += 1;
             }
 
             if let Some(last) = last_edge_id {
@@ -1947,39 +2302,55 @@ impl HelixGraphStorage {
 
     /// Scan a batch of relationship points (nodes carrying `caller_symbol` and
     /// `callee_symbol`) and rebuild the native graph adjacency that the forward
-    /// CE → Helix ingest path would have written. For every relationship point we
+    /// the client → Helix ingest path would have written. For every relationship point we
     /// upsert the caller/callee `Symbol` nodes and a deterministic edge, which
     /// populates `OutEdges`/`InEdges` and the edge counter.
     ///
-    /// Returns `(nodes_upserted, edges_upserted, complete, next_cursor)`. Callers
-    /// should repeat the endpoint with the returned cursor until `complete` is
-    /// true. The operation is idempotent: re-running on the same point set just
-    /// re-puts the same deterministic node/edge rows.
+    /// Returns `(nodes_upserted, edges_upserted, complete, next_cursor,
+    /// edges_unchanged)`. Callers should repeat the endpoint with the returned
+    /// cursor until `complete` is true. The operation is idempotent: re-running
+    /// on the same point set derives the same deterministic node/edge rows.
+    ///
+    /// On LSM an edge that is stored exactly as its point derives it, with
+    /// its adjacency and path keys, is left
+    /// ([`Self::upsert_derived_edges_be`]) and counted in `edges_unchanged`:
+    /// a pass puts back every edge that is absent, changed or short of a key,
+    /// and, as before, every absent node row of an edge's end. A call still
+    /// commits its cursor, so a pass over a whole graph walks to its end and
+    /// sets its mark. `rewrite_unchanged_edges` has the call write every edge
+    /// it derives, as every call did before: for a store whose rows or keys
+    /// are not what a read of them says. It does not write an equal node row
+    /// again, as no call did.
+    ///
+    /// `force` starts the pass over (mark and cursor cleared, the scan from
+    /// the first node) and nothing more.
     pub fn backfill_adjacency_from_points_batch(
         &self,
         collection: &str,
         batch_size: usize,
         force: bool,
-    ) -> Result<(usize, usize, bool, Option<u128>), GraphError> {
+        rewrite_unchanged_edges: bool,
+    ) -> Result<(usize, usize, bool, Option<u128>, usize), GraphError> {
         let batch_size = batch_size.clamp(1, 10_000);
+
+        // A finished pass is only reported: a caller asks once per process
+        // whether a collection is done, and that must not cost a commit.
+        if !force && self.with_read_backend(|r| self.adjacency_backfill_marked_be(r))? {
+            // The sidecar says so from here on, so that a reader answers the
+            // next caller, who then need not open the collection on its
+            // writer: one put, where this process's last sidecar did not say it.
+            if let Err(error) = self.send_adjacency_backfill_mark(true) {
+                tracing::warn!(
+                    collection = self.collection_display_name(),
+                    error = %error,
+                    "a finished adjacency backfill's mark was not put in the metadata sidecar"
+                );
+            }
+            return Ok((0, 0, true, None, 0));
+        }
 
         let (node_upserts, edge_upserts, last_node_id, exhausted) =
             self.with_read_backend(|r| {
-                if !force {
-                    let complete = self
-                        .backend
-                        .get_with(
-                            r,
-                            Namespace::Metadata,
-                            ADJ_BACKFILL_FROM_POINTS_COMPLETE_KEY.as_bytes(),
-                            |v| matches!(v, Some(b"1")),
-                        )
-                        .map_err(|e| GraphError::New(e.to_string()))?;
-                    if complete {
-                        return Ok((Vec::new(), Vec::new(), None, true));
-                    }
-                }
-
                 let cursor = if force {
                     None
                 } else {
@@ -2017,8 +2388,10 @@ impl HelixGraphStorage {
                 let mut relationship_count = 0usize;
                 let mut exhausted = true;
 
+                // Streamed: a pass reads every node of the graph once, and
+                // must not push the blocks searches read out of the cache.
                 self.backend
-                    .scan(r, Namespace::Nodes, range, |key, value| {
+                    .scan_streaming(r, Namespace::Nodes, range, |key, value| {
                         let id = match <[u8; 16]>::try_from(key) {
                             Ok(bytes) => u128::from_be_bytes(bytes),
                             Err(_) => return true,
@@ -2052,8 +2425,16 @@ impl HelixGraphStorage {
 
         let nodes_upserted = node_upserts.len();
         let edges_upserted = edge_upserts.len();
+        let leave_as_derived = !rewrite_unchanged_edges && self.leaves_edges_stored_as_derived();
 
-        self.with_write_backend(|w| {
+        // Before the write that clears the mark, and whatever the put
+        // interval: the object store must not say "complete" of a pass that
+        // has started over. A put that fails fails the call, unwritten.
+        if force {
+            self.send_adjacency_backfill_mark(false)?;
+        }
+
+        let edges_unchanged = self.with_write_backend(|w| {
             if force {
                 self.backend
                     .delete(
@@ -2073,9 +2454,14 @@ impl HelixGraphStorage {
             for node in &node_upserts {
                 self.upsert_node_be(w, node)?;
             }
-            for edge in &edge_upserts {
-                self.upsert_edge_be(w, edge)?;
-            }
+            let edges_unchanged = if leave_as_derived {
+                self.upsert_derived_edges_be(w, &edge_upserts)?
+            } else {
+                for edge in &edge_upserts {
+                    self.upsert_edge_be(w, edge)?;
+                }
+                0
+            };
 
             if let Some(last) = last_node_id {
                 self.backend
@@ -2105,10 +2491,39 @@ impl HelixGraphStorage {
                     .map_err(|e| GraphError::New(e.to_string()))?;
             }
 
-            Ok(())
+            Ok(edges_unchanged)
         })?;
 
-        Ok((nodes_upserted, edges_upserted, exhausted, last_node_id))
+        // Only now that the store holds the pass's mark.
+        if exhausted {
+            if let Err(error) = self.send_adjacency_backfill_mark(true) {
+                tracing::warn!(
+                    collection = self.collection_display_name(),
+                    error = %error,
+                    "a finished adjacency backfill's mark was not put in the metadata sidecar"
+                );
+            }
+        }
+
+        Ok((
+            nodes_upserted,
+            edges_upserted,
+            exhausted,
+            last_node_id,
+            edges_unchanged,
+        ))
+    }
+
+    /// The adjacency backfill's mark as `r` reads it from the store.
+    fn adjacency_backfill_marked_be(&self, r: &AnyRead<'_>) -> Result<bool, GraphError> {
+        self.backend
+            .get_with(
+                r,
+                Namespace::Metadata,
+                ADJ_BACKFILL_FROM_POINTS_COMPLETE_KEY.as_bytes(),
+                |v| matches!(v, Some(b"1")),
+            )
+            .map_err(|e| GraphError::New(e.to_string()))
     }
 
     /// Incrementally rebuild native adjacency for a delta of changed source
@@ -2118,8 +2533,8 @@ impl HelixGraphStorage {
     /// This is the incremental counterpart to
     /// [`backfill_adjacency_from_points_batch`]: instead of a full one-shot scan
     /// gated by a completion marker (which forces a `force` full rebuild to pick
-    /// up later writes), CE calls this after re-indexing a delta of changed
-    /// files. It pairs with `delete_by_path(s)` — which CE already calls to wipe
+    /// up later writes), the client calls this after re-indexing a delta of changed
+    /// files. It pairs with `delete_by_path(s)` — which the client already calls to wipe
     /// stale edges before re-ingesting: delete clears the old adjacency for the
     /// changed paths, then this re-derives the current adjacency for just those
     /// paths from the relationship points. Edge ids are deterministic, so the
@@ -2134,30 +2549,62 @@ impl HelixGraphStorage {
     /// `delete_by_path(s)` this function pairs with — they clean up via the
     /// base collection's point-delete cascade instead, so a stale chunk edge
     /// can briefly outlive a re-indexed path until that cascade catches up.
+    ///
+    /// With `replace_outgoing` the delete is part of this call: the edges
+    /// that start in `paths` and that no relationship point derives any more
+    /// are dropped in the write batch that upserts the derived ones, with the
+    /// nodes those drops leave without an edge. The batch is stored whole or
+    /// not at all, so a reader sees the paths' old outgoing edges and then
+    /// the new ones, never none. Edges that other files have into the paths
+    /// are derived from those files' points and stay. LSM backend only: on
+    /// LMDB the call rebuilds as it does without the option. With no path
+    /// nothing is read or written, and `replaced` still says whether the
+    /// option is honoured here: how a caller asks before it relies on it.
+    ///
+    /// The nodes are worked out in the write batch, once its drops are staged
+    /// ([`Self::nodes_orphaned_by_dropping_be`]), on what other writers have
+    /// committed by then.
+    ///
+    /// On LSM an edge that is stored exactly as its point derives it is left
+    /// ([`Self::upsert_derived_edges_be`]), with or without `replace_outgoing`:
+    /// a rebuild of rows that did not change stages nothing for them, and one
+    /// that changes nothing writes no batch. `edges_unchanged` counts them.
+    ///
+    /// shortcut: the edges to drop and to upsert are chosen on the snapshot
+    /// the points are read from, and written later. A rebuild of the same
+    /// paths that commits in between is written over with what the older
+    /// points derive: an edge it derived again is dropped. The client writes a
+    /// collection's graph under one lock; closing it here needs a
+    /// per-collection write gate.
     pub(crate) fn rebuild_adjacency_for_paths(
         &self,
         collection: &str,
         paths: &[String],
-    ) -> Result<(usize, usize, Vec<ChunkEdgeCandidate>), GraphError> {
+        replace_outgoing: bool,
+    ) -> Result<PathsRebuild, GraphError> {
+        let replace_outgoing = replace_outgoing && self.backend.kind() == BackendKind::Lsm;
         if paths.is_empty() {
-            return Ok((0, 0, Vec::new()));
+            return Ok(PathsRebuild {
+                replaced: replace_outgoing.then_some((0, 0)),
+                ..Default::default()
+            });
         }
         let path_set: std::collections::HashSet<&str> = paths.iter().map(|s| s.as_str()).collect();
 
-        let (node_upserts, edge_upserts, chunk_candidates) = self.with_read_backend(|r| {
-            let mut node_upserts: Vec<NodeUpsert> = Vec::new();
-            let mut edge_upserts: Vec<EdgeUpsert> = Vec::new();
-            let mut chunk_candidates: Vec<ChunkEdgeCandidate> = Vec::new();
+        let (node_upserts, edge_upserts, chunk_candidates, stale, ends) =
+            self.with_read_backend(|r| {
+                let mut node_upserts: Vec<NodeUpsert> = Vec::new();
+                let mut edge_upserts: Vec<EdgeUpsert> = Vec::new();
+                let mut chunk_candidates: Vec<ChunkEdgeCandidate> = Vec::new();
 
-            self.backend
-                .scan(r, Namespace::Nodes, KeyRange::all(), |key, value| {
+                let mut derive = |key: &[u8], value: &[u8]| {
                     let id = match <[u8; 16]>::try_from(key) {
                         Ok(bytes) => u128::from_be_bytes(bytes),
-                        Err(_) => return true,
+                        Err(_) => return,
                     };
                     let node = match SerializedNode::decode_node(value, id) {
                         Ok(n) => n,
-                        Err(_) => return true,
+                        Err(_) => return,
                     };
 
                     // Only re-derive relationship points whose source file is in
@@ -2165,10 +2612,10 @@ impl HelixGraphStorage {
                     // adjacency untouched (no rewrite, no churn).
                     let caller_path = match node.properties.get("caller_path") {
                         Some(Value::String(s)) => s.as_str(),
-                        _ => return true,
+                        _ => return,
                     };
                     if !path_set.contains(caller_path) {
-                        return true;
+                        return;
                     }
 
                     if let Some((caller, callee, edge)) =
@@ -2182,34 +2629,127 @@ impl HelixGraphStorage {
                     {
                         chunk_candidates.push(candidate);
                     }
+                };
 
-                    true
-                })
-                .map_err(|e| GraphError::New(e.to_string()))?;
+                // A keyword index on `caller_path` names the paths' relationship
+                // points; without one every node is read to find them. The ids
+                // come back sorted, the order the scan meets them in, and each
+                // node is checked against the paths again, so both ways derive
+                // the same rows in the same order.
+                if self.has_payload_index_at("caller_path", r) == Some(PayloadIndexSchema::Keyword)
+                {
+                    let mut ids = Vec::new();
+                    for path in &path_set {
+                        ids.extend(self.get_nodes_by_payload_value_be(
+                            r,
+                            "caller_path",
+                            &Value::String((*path).to_string()),
+                        )?);
+                    }
+                    ids.sort_unstable();
+                    ids.dedup();
+                    for id in ids {
+                        let key = id.to_be_bytes();
+                        self.backend
+                            .get_with(r, Namespace::Nodes, &key, |value| {
+                                if let Some(value) = value {
+                                    derive(&key[..], value);
+                                }
+                            })
+                            .map_err(|e| GraphError::New(e.to_string()))?;
+                    }
+                } else {
+                    self.backend
+                        .scan(r, Namespace::Nodes, KeyRange::all(), |key, value| {
+                            derive(key, value);
+                            true
+                        })
+                        .map_err(|e| GraphError::New(e.to_string()))?;
+                }
 
-            Ok((node_upserts, edge_upserts, chunk_candidates))
-        })?;
+                // What the derived edges replace: the paths' other outgoing
+                // edges. Of their ends, the write batch drops those that no
+                // edge is left at.
+                let mut stale = std::collections::BTreeMap::new();
+                let mut ends: Vec<u128> = Vec::new();
+                if replace_outgoing {
+                    let derived: std::collections::HashSet<u128> =
+                        edge_upserts.iter().map(|edge| edge.id).collect();
+                    stale = self.stale_edges_starting_in_paths_be(r, &path_set, &derived)?;
+                    // A derived edge keeps both its ends.
+                    let kept: std::collections::HashSet<u128> = edge_upserts
+                        .iter()
+                        .flat_map(|edge| [edge.from_node, edge.to_node])
+                        .collect();
+                    ends = stale
+                        .values()
+                        .flat_map(|(from, to)| [*from, *to])
+                        .filter(|id| !kept.contains(id))
+                        .collect();
+                    ends.sort_unstable();
+                    ends.dedup();
+                }
+
+                Ok((node_upserts, edge_upserts, chunk_candidates, stale, ends))
+            })?;
 
         let nodes_upserted = node_upserts.len();
         let edges_upserted = edge_upserts.len();
+        let leave_as_derived = self.leaves_edges_stored_as_derived();
 
-        self.with_write_backend(|w| {
+        let (edges_unchanged, edges_deleted, nodes_deleted) = self.with_write_backend(|w| {
+            let mut edges_deleted = 0usize;
+            for edge_id in stale.keys() {
+                match self.drop_edge_be(w, edge_id) {
+                    Ok(()) => edges_deleted += 1,
+                    // Gone since it was read.
+                    Err(GraphError::EdgeNotFound) => {}
+                    Err(error) => return Err(error),
+                }
+            }
             for node in &node_upserts {
                 self.upsert_node_be(w, node)?;
             }
-            for edge in &edge_upserts {
-                self.upsert_edge_be(w, edge)?;
+            let edges_unchanged = if leave_as_derived {
+                self.upsert_derived_edges_be(w, &edge_upserts)?
+            } else {
+                for edge in &edge_upserts {
+                    self.upsert_edge_be(w, edge)?;
+                }
+                0
+            };
+            let mut orphans = self.nodes_orphaned_by_dropping_be(w, &ends, &stale)?;
+            if !orphans.is_empty() {
+                // A node whose row does not decode cannot be dropped with
+                // its index entries: it stays, as `delete_by_paths` leaves it.
+                let r = self
+                    .backend
+                    .begin_read()
+                    .map_err(|e| GraphError::New(e.to_string()))?;
+                orphans.retain(|id| {
+                    !matches!(
+                        self.get_node_be(&r, id),
+                        Err(GraphError::ConversionError(_))
+                    )
+                });
             }
-            Ok(())
+            let nodes_deleted = self.drop_node_rows_be(w, &orphans)?;
+            Ok((edges_unchanged, edges_deleted, nodes_deleted))
         })?;
 
-        Ok((nodes_upserted, edges_upserted, chunk_candidates))
+        Ok(PathsRebuild {
+            nodes_upserted,
+            edges_upserted,
+            edges_unchanged,
+            chunk_candidates,
+            replaced: replace_outgoing.then_some((edges_deleted, nodes_deleted)),
+        })
     }
 
     /// Build a chunk-edge candidate from a relationship point payload carrying
-    /// `caller_point_id`/`callee_point_id` — the CE-resolved Qdrant point ids
+    /// `caller_point_id`/`callee_point_id` — the client-resolved Qdrant point ids
     /// of the caller/callee chunks. Returns `None` unless BOTH ids are present
-    /// and non-empty; CE only sets `callee_point_id` when it resolved the
+    /// and non-empty; the client only sets `callee_point_id` when it resolved the
     /// callee to a repo-internal chunk.
     fn chunk_edge_candidate_from_node(
         properties: &HashMap<String, Value>,
@@ -2384,6 +2924,78 @@ impl HelixGraphStorage {
         format!("pidx_{}_{}", kind, encoded_field)
     }
 
+    /// Reader replicas only. A dense core opens its segment's local files of
+    /// vectors by the segment's name (`VectorCore::new_named_lsm_with_dir`),
+    /// and the names start again in a collection that is dropped and created
+    /// again: the files a reader kept would score the new collection's
+    /// points by the dropped one's vectors. So they are unlinked unless the
+    /// local copy of the metadata, written at this reader's last open of
+    /// the name, is of the database being opened: the same creation time.
+    /// No copy says nothing, and is what the eviction of a reader that lost
+    /// its database leaves.
+    ///
+    /// A reader that unlinked for nothing builds the files again from rows,
+    /// as a new pod does.
+    ///
+    /// The marker of a fatal read error ([`Self::read_degraded_marker`]) goes
+    /// with them: it was written for the database these files were of, the
+    /// open below reads it, and nothing else on a reader takes it away.
+    ///
+    /// An error is a file that is still there, or a directory that could not
+    /// be listed. The caller must not open then: the cores would open what
+    /// stayed by its name.
+    fn unlink_dense_files_of_another_database(
+        path: &Path,
+        metadata: &StorageMetadata,
+    ) -> std::io::Result<()> {
+        let same = Self::read_metadata_sidecar_from_path(path)
+            .ok()
+            .flatten()
+            .is_some_and(|local| local.metadata.created_at_millis == metadata.created_at_millis);
+        if same {
+            return Ok(());
+        }
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            // A reader's first open of the name: no directory, no files.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let (mut unlinked, mut marker) = (0u64, false);
+        let remove_stale = || -> std::io::Result<()> {
+            for entry in entries {
+                let file = entry?.path();
+                let dense = matches!(
+                    file.extension().and_then(|ext| ext.to_str()),
+                    Some("hvec" | "hvs8" | "hvtq" | "hspn")
+                );
+                let is_marker = file.file_name().and_then(|name| name.to_str())
+                    == Some(COLLECTION_DEGRADED_MARKER_FILE);
+                if !dense && !is_marker {
+                    continue;
+                }
+                match fs::remove_file(&file) {
+                    Ok(()) if dense => unlinked += 1,
+                    Ok(()) => marker = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        };
+        let removed = remove_stale();
+        if unlinked > 0 || marker {
+            metrics::counter!("helix_reader_stale_dense_files_unlinked_total").increment(unlinked);
+            tracing::info!(
+                path = ?path,
+                unlinked,
+                degraded_marker = marker,
+                "Unlinked a reader's local vector files: they are not of the collection that is at this name now"
+            );
+        }
+        removed
+    }
+
     fn new_lsm(
         path: &str,
         config: Config,
@@ -2433,12 +3045,75 @@ impl HelixGraphStorage {
             "step" => "metadata_current"
         )
         .record(metadata_started.elapsed().as_secs_f64() * 1000.0);
+        // One key more beside the metadata row: the collection's info and
+        // its sidecar say it from memory from here on.
+        let mark_started = std::time::Instant::now();
+        let adjacency_backfill_complete = Self::adjacency_mark_read_at_open(backend.get_with(
+            &read,
+            Namespace::Metadata,
+            ADJ_BACKFILL_FROM_POINTS_COMPLETE_KEY.as_bytes(),
+            |value| matches!(value, Some(b"1")),
+        ));
+        metrics::histogram!(
+            "helix_lsm_metadata_read_step_ms",
+            "step" => "adjacency_backfill_mark"
+        )
+        .record(mark_started.elapsed().as_secs_f64() * 1000.0);
+        // A writer keeps the record of the dense segments that left a stored
+        // layout (`DEAD_SEGMENT_KEY_PREFIX`), from the read its layout is
+        // from: a few keys beside the metadata row, read a block at a time.
+        // A reader replica allocates and stores nothing and reads none.
+        let dead_segments = if backend.is_reader_replica() || !dead_segment_names_enabled() {
+            None
+        } else {
+            let dead_started = std::time::Instant::now();
+            let mut rows = Vec::new();
+            backend
+                .scan_few(
+                    &read,
+                    Namespace::Metadata,
+                    KeyRange::prefix(DEAD_SEGMENT_KEY_PREFIX),
+                    |key, value| {
+                        rows.push((key.to_vec(), value.to_vec()));
+                        true
+                    },
+                )
+                .map_err(|e| GraphError::StorageError(e.to_string()))?;
+            metrics::histogram!(
+                "helix_lsm_metadata_read_step_ms",
+                "step" => "dense_dead_names"
+            )
+            .record(dead_started.elapsed().as_secs_f64() * 1000.0);
+            Some(rows)
+        };
         drop(read);
         metrics::histogram!("helix_lsm_collection_open_phase_ms", "phase" => "metadata_read")
             .record(phase_start.elapsed().as_secs_f64() * 1000.0);
 
         let phase_start = std::time::Instant::now();
-        if let Err(err) = Self::persist_metadata_sidecar_at_path(Path::new(path), &metadata, None) {
+        // Before the local copy of the metadata is written over, and before
+        // the dense cores open what the directory holds. An open that fails
+        // here leaves that copy as it was, so the next one tries again.
+        if backend.is_reader_replica() {
+            Self::unlink_dense_files_of_another_database(Path::new(path), &metadata).map_err(
+                |error| {
+                    tracing::warn!(
+                        path = ?path,
+                        %error,
+                        "A reader could not remove local files of another collection at this name: the open fails, and the next one tries again"
+                    );
+                    GraphError::StorageError(format!(
+                        "reader could not remove local files left by another collection at this name: {error}"
+                    ))
+                },
+            )?;
+        }
+        if let Err(err) = Self::persist_metadata_sidecar_at_path(
+            Path::new(path),
+            &metadata,
+            None,
+            Some(adjacency_backfill_complete),
+        ) {
             metrics::counter!("helix_metadata_sidecar_write_errors_total").increment(1);
             tracing::warn!(
                 path = ?path,
@@ -2483,6 +3158,9 @@ impl HelixGraphStorage {
                 hnsw_config.clone(),
                 metadata.dense_vector_spaces.get(&name).cloned(),
             )?;
+        }
+        if let Some(rows) = &dead_segments {
+            named_vectors.load_dead_segments(rows)?;
         }
         metrics::histogram!("helix_lsm_collection_open_phase_ms", "phase" => "dense_vectors")
             .record(phase_start.elapsed().as_secs_f64() * 1000.0);
@@ -2534,19 +3212,31 @@ impl HelixGraphStorage {
             edge_path_idx: None,
             metadata_db: None,
             metadata_snapshot: RwLock::new(metadata),
+            metadata_snapshot_read_at: parking_lot::Mutex::new(None),
             last_lsm_sidecar_upload_ms: AtomicU64::new(0),
             last_lsm_sidecar_fingerprint: AtomicU64::new(0),
+            lsm_sidecar_put_held: std::sync::atomic::AtomicBool::new(false),
+            sidecar_put: parking_lot::Mutex::new(()),
+            adjacency_backfill_mark: std::sync::atomic::AtomicU8::new(adjacency_mark_code(Some(
+                adjacency_backfill_complete,
+            ))),
+            adjacency_mark_sent: std::sync::atomic::AtomicU8::new(0),
             secondary_indices: configured_secondary_indices
                 .into_iter()
                 .map(|name| (name, None))
                 .collect(),
             multi_indices,
             payload_indices: RwLock::new(payload_indices),
+            text_walk_cache: parking_lot::Mutex::new(
+                super::text_walk_cache::TextWalkCache::from_env(),
+            ),
             vectors,
             named_vectors,
             wal,
             optimizer_running: std::sync::atomic::AtomicBool::new(false),
             last_upsert_at: std::sync::atomic::AtomicU64::new(0),
+            point_mutations: std::sync::atomic::AtomicU64::new(0),
+            point_mutations_in_flight: AtomicUsize::new(0),
             resize_gate: parking_lot::RwLock::new(()),
             resize_writers_pending: AtomicUsize::new(0),
             resize_writers_active: AtomicUsize::new(0),
@@ -2555,8 +3245,11 @@ impl HelixGraphStorage {
             active_lmdb_txns: AtomicUsize::new(0),
             write_txn_gate: Arc::new(Mutex::new(())),
             payload_index_admin_gate: Mutex::new(()),
+            payload_index_builds_pending: AtomicUsize::new(0),
+            payload_index_build_lock: Mutex::new(()),
             metadata_corruption_logged: std::sync::atomic::AtomicBool::new(false),
             collection_degraded: std::sync::atomic::AtomicBool::new(collection_degraded),
+            closing_for_shutdown: std::sync::atomic::AtomicBool::new(false),
             degraded_reason: RwLock::new(degraded_reason),
             dense_metadata_dirty: std::sync::atomic::AtomicBool::new(false),
             last_reader_refresh_ms: std::sync::atomic::AtomicU64::new(0),
@@ -2569,6 +3262,7 @@ impl HelixGraphStorage {
             last_reader_promote_failed_at_ms: AtomicU64::new(0),
             reader_promote_consecutive_failures: std::sync::atomic::AtomicU32::new(0),
             last_write_promoted_at_ms: std::sync::atomic::AtomicU64::new(0),
+            reader_view_reconcile: ReaderViewReconcile::default(),
             recount_inflight: std::sync::atomic::AtomicBool::new(false),
             payload_index_gc_inflight: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2945,16 +3639,26 @@ impl HelixGraphStorage {
             edge_path_idx: Some(edge_path_idx),
             metadata_db: Some(metadata_db),
             metadata_snapshot: RwLock::new(metadata.clone()),
+            metadata_snapshot_read_at: parking_lot::Mutex::new(None),
             last_lsm_sidecar_upload_ms: AtomicU64::new(0),
             last_lsm_sidecar_fingerprint: AtomicU64::new(0),
+            lsm_sidecar_put_held: std::sync::atomic::AtomicBool::new(false),
+            sidecar_put: parking_lot::Mutex::new(()),
+            adjacency_backfill_mark: std::sync::atomic::AtomicU8::new(0),
+            adjacency_mark_sent: std::sync::atomic::AtomicU8::new(0),
             secondary_indices,
             multi_indices,
             payload_indices: RwLock::new(payload_indices),
+            text_walk_cache: parking_lot::Mutex::new(
+                super::text_walk_cache::TextWalkCache::from_env(),
+            ),
             vectors,
             named_vectors,
             wal,
             optimizer_running: std::sync::atomic::AtomicBool::new(false),
             last_upsert_at: std::sync::atomic::AtomicU64::new(0),
+            point_mutations: std::sync::atomic::AtomicU64::new(0),
+            point_mutations_in_flight: AtomicUsize::new(0),
             resize_gate: parking_lot::RwLock::new(()),
             resize_writers_pending: AtomicUsize::new(0),
             resize_writers_active: AtomicUsize::new(0),
@@ -2963,8 +3667,11 @@ impl HelixGraphStorage {
             active_lmdb_txns: AtomicUsize::new(0),
             write_txn_gate: Arc::new(Mutex::new(())),
             payload_index_admin_gate: Mutex::new(()),
+            payload_index_builds_pending: AtomicUsize::new(0),
+            payload_index_build_lock: Mutex::new(()),
             metadata_corruption_logged: std::sync::atomic::AtomicBool::new(false),
             collection_degraded: std::sync::atomic::AtomicBool::new(collection_degraded),
+            closing_for_shutdown: std::sync::atomic::AtomicBool::new(false),
             degraded_reason: RwLock::new(degraded_reason),
             dense_metadata_dirty: std::sync::atomic::AtomicBool::new(false),
             last_reader_refresh_ms: std::sync::atomic::AtomicU64::new(0),
@@ -2977,6 +3684,7 @@ impl HelixGraphStorage {
             last_reader_promote_failed_at_ms: AtomicU64::new(0),
             reader_promote_consecutive_failures: std::sync::atomic::AtomicU32::new(0),
             last_write_promoted_at_ms: std::sync::atomic::AtomicU64::new(0),
+            reader_view_reconcile: ReaderViewReconcile::default(),
             recount_inflight: std::sync::atomic::AtomicBool::new(false),
             payload_index_gc_inflight: std::sync::atomic::AtomicBool::new(false),
         });
@@ -3834,7 +4542,7 @@ impl HelixGraphStorage {
             }
             drop(read);
 
-            // Deleting from the snapshot's ghost list alone is racy: CE uses
+            // Deleting from the snapshot's ghost list alone is racy: the client uses
             // deterministic point ids, so a delete→reindex of the same file
             // between the scan above and the write below recreates the same
             // (payload_key, node_id) entry, and an unguarded delete_dup would
@@ -4008,12 +4716,14 @@ impl HelixGraphStorage {
         metadata: &StorageMetadata,
         data_mdb_bytes: u64,
         map_size_bytes: Option<u64>,
+        adjacency_backfill_complete: Option<bool>,
     ) -> Option<u64> {
         let mut hasher = XxHash64::default();
         let bytes = sonic_rs::to_vec(metadata).ok()?;
         hasher.write(&bytes);
         hasher.write(&data_mdb_bytes.to_le_bytes());
         hasher.write(&map_size_bytes.unwrap_or(0).to_le_bytes());
+        hasher.write(&[adjacency_mark_code(adjacency_backfill_complete)]);
         Some(hasher.finish())
     }
 
@@ -4022,12 +4732,15 @@ impl HelixGraphStorage {
             return false;
         }
         if self.last_lsm_sidecar_fingerprint.load(Ordering::Acquire) == fingerprint {
+            self.lsm_sidecar_put_held.store(false, Ordering::Release);
             return false;
         }
         let now = Self::now_epoch_millis();
         let last = self.last_lsm_sidecar_upload_ms.load(Ordering::Acquire);
         let min_interval = Self::lsm_metadata_sidecar_put_interval_ms();
-        if min_interval > 0 && last > 0 && now.saturating_sub(last) < min_interval {
+        let held = min_interval > 0 && last > 0 && now.saturating_sub(last) < min_interval;
+        self.lsm_sidecar_put_held.store(held, Ordering::Release);
+        if held {
             return false;
         }
         self.last_lsm_sidecar_upload_ms
@@ -4177,24 +4890,45 @@ impl HelixGraphStorage {
         path: &Path,
         metadata: &StorageMetadata,
         map_size_bytes: Option<u64>,
+        adjacency_backfill_complete: Option<bool>,
     ) -> Result<(), GraphError> {
-        let sidecar = StorageMetadataSidecar::new(
+        let mut sidecar = StorageMetadataSidecar::new(
             metadata.clone(),
             Self::data_mdb_bytes(path)?,
             map_size_bytes,
         );
+        sidecar.adjacency_backfill_complete = adjacency_backfill_complete;
         let bytes = sonic_rs::to_vec(&sidecar)?;
         Self::persist_metadata_sidecar_bytes_at_path(path, &bytes)?;
         Ok(())
     }
 
     fn persist_metadata_sidecar_best_effort(&self, metadata: &StorageMetadata) {
+        if let Some(sidecar) = self.persist_metadata_sidecar_locally(metadata) {
+            self.upload_metadata_sidecar(sidecar);
+        }
+    }
+
+    /// Writes the local sidecar, and hands it back when the object store is
+    /// due it.
+    fn persist_metadata_sidecar_locally(&self, metadata: &StorageMetadata) -> Option<BuiltSidecar> {
+        let built = self.build_metadata_sidecar(metadata)?;
+        self.should_upload_lsm_metadata_sidecar(built.fingerprint?)
+            .then_some(built)
+    }
+
+    /// The sidecar of `metadata` with the adjacency backfill's mark as it is
+    /// now, written to the local file. `None` where it does not serialize.
+    fn build_metadata_sidecar(&self, metadata: &StorageMetadata) -> Option<BuiltSidecar> {
         let path = self.path();
         let map_size_bytes = self.lmdb_env().ok().map(|env| env.info().map_size as u64);
         let data_mdb_bytes = Self::data_mdb_bytes(path).unwrap_or(0);
+        let mark = self.adjacency_backfill_complete();
         let fingerprint =
-            Self::metadata_sidecar_fingerprint(metadata, data_mdb_bytes, map_size_bytes);
-        let sidecar = StorageMetadataSidecar::new(metadata.clone(), data_mdb_bytes, map_size_bytes);
+            Self::metadata_sidecar_fingerprint(metadata, data_mdb_bytes, map_size_bytes, mark);
+        let mut sidecar =
+            StorageMetadataSidecar::new(metadata.clone(), data_mdb_bytes, map_size_bytes);
+        sidecar.adjacency_backfill_complete = mark;
         let bytes = match sonic_rs::to_vec(&sidecar) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -4204,7 +4938,7 @@ impl HelixGraphStorage {
                     error = ?err,
                     "Failed to serialize collection metadata sidecar"
                 );
-                return;
+                return None;
             }
         };
         if let Err(err) = Self::persist_metadata_sidecar_bytes_at_path(path, &bytes) {
@@ -4215,20 +4949,143 @@ impl HelixGraphStorage {
                 "Failed to persist collection metadata sidecar"
             );
         }
-        if let Some(fingerprint) = fingerprint {
-            if !self.should_upload_lsm_metadata_sidecar(fingerprint) {
-                return;
-            }
-            if let Err(err) = self.backend.persist_lsm_metadata_sidecar(bytes) {
-                metrics::counter!("helix_metadata_sidecar_write_errors_total").increment(1);
-                tracing::warn!(
-                    path = ?path,
-                    error = ?err,
-                    "Failed to persist LSM collection metadata sidecar to object store"
-                );
-            } else {
-                self.mark_lsm_metadata_sidecar_uploaded(fingerprint);
-            }
+        Some(BuiltSidecar {
+            bytes,
+            fingerprint,
+            mark,
+        })
+    }
+
+    fn upload_metadata_sidecar(&self, sidecar: BuiltSidecar) {
+        // No wait on this path, which is a commit's or the sweeper's. The
+        // sidecar is held for the sweeper instead where another put of this
+        // collection is on its way, and where it was built before a backfill
+        // call changed the mark: that call puts the sidecar that says so,
+        // and this one must not land after it.
+        let one_at_a_time = self.sidecar_put.try_lock();
+        if one_at_a_time.is_none() || sidecar.mark != self.adjacency_backfill_complete() {
+            self.lsm_sidecar_put_held.store(true, Ordering::Release);
+            return;
+        }
+        if let Err(err) = self.put_metadata_sidecar(sidecar) {
+            // Nothing else would send this state again: the sweeper does.
+            self.lsm_sidecar_put_held.store(true, Ordering::Release);
+            metrics::counter!("helix_metadata_sidecar_write_errors_total").increment(1);
+            tracing::warn!(
+                path = ?self.path(),
+                error = ?err,
+                "Failed to persist LSM collection metadata sidecar to object store"
+            );
+        }
+    }
+
+    /// Puts `sidecar` on the object store and records what it carried. The
+    /// caller holds `sidecar_put`.
+    fn put_metadata_sidecar(&self, sidecar: BuiltSidecar) -> Result<(), BackendError> {
+        if let Err(error) = self.backend.persist_lsm_metadata_sidecar(sidecar.bytes) {
+            // A put that answers an error may have arrived all the same.
+            self.adjacency_mark_sent.store(0, Ordering::Release);
+            return Err(error);
+        }
+        if let Some(fingerprint) = sidecar.fingerprint {
+            self.mark_lsm_metadata_sidecar_uploaded(fingerprint);
+        }
+        self.adjacency_mark_sent
+            .store(adjacency_mark_code(sidecar.mark), Ordering::Release);
+        Ok(())
+    }
+
+    /// Whether the adjacency backfill from points has run to its end, as
+    /// this process knows it without a read: `None` on a backend that does
+    /// not read the mark at its open.
+    pub fn adjacency_backfill_complete(&self) -> Option<bool> {
+        match self.adjacency_backfill_mark.load(Ordering::Acquire) {
+            1 => Some(false),
+            2 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// The mark becomes `complete`, here and in the object store's sidecar,
+    /// which is put now, whatever the put interval, unless the last sidecar
+    /// this process put already says so. A backfill call on the writer calls
+    /// it under the collection's graph gate: with `false` BEFORE the write
+    /// that starts a pass over, and fails without that write when the put
+    /// fails; with `true` only once the store holds the pass's mark. So the
+    /// object store never says "complete" of a pass that is not, and a
+    /// reader that is behind it says "not complete" or nothing.
+    fn send_adjacency_backfill_mark(&self, complete: bool) -> Result<(), GraphError> {
+        let code = adjacency_mark_code(Some(complete));
+        // Nothing to say, and no wait to find that out: the backfill calls
+        // of one collection are serial under its graph gate, and a regular
+        // put only ever records the mark as it is.
+        if self.adjacency_backfill_mark.load(Ordering::Acquire) == code
+            && self.adjacency_mark_sent.load(Ordering::Acquire) == code
+        {
+            return Ok(());
+        }
+        // The one wait on this lock: for a regular put that is on its way,
+        // so that this put is the later of the two.
+        let _one_at_a_time = self.sidecar_put.lock();
+        self.adjacency_backfill_mark.store(code, Ordering::Release);
+        if self.adjacency_mark_sent.load(Ordering::Acquire) == code {
+            return Ok(());
+        }
+        let sidecar = {
+            // The local file is written in the order the refreshes write it.
+            let _in_order = self.metadata_snapshot_read_at.lock();
+            let metadata = self.metadata_snapshot()?;
+            self.build_metadata_sidecar(&metadata)
+        }
+        .ok_or_else(|| {
+            GraphError::StorageError("the metadata sidecar did not serialize".to_string())
+        })?;
+        // An error no caller classifies by its text: a sidecar that does not
+        // arrive is no fault of the collection, which is neither quarantined
+        // nor degraded for it, whatever the transfer's own error says.
+        self.put_metadata_sidecar(sidecar).map_err(|error| {
+            GraphError::Io(std::io::Error::other(format!(
+                "the metadata sidecar was not put: {error}"
+            )))
+        })?;
+        self.last_lsm_sidecar_upload_ms
+            .store(Self::now_epoch_millis(), Ordering::Release);
+        Ok(())
+    }
+
+    /// The adjacency backfill's mark as an open read it. An open does not
+    /// need the mark, so a read of it that fails does not fail the open: it
+    /// is counted and reads as no mark, and the pass is due again.
+    fn adjacency_mark_read_at_open(read: Result<bool, BackendError>) -> bool {
+        read.unwrap_or_else(|error| {
+            metrics::counter!("helix_adjacency_backfill_mark_unread_total").increment(1);
+            tracing::warn!(
+                %error,
+                "the adjacency backfill's mark was not read at an open; it reads as not complete"
+            );
+            false
+        })
+    }
+
+    /// Sends the sidecar a put interval held back. The last change of a
+    /// burst has no later refresh to send it, so the optimizer's backlog
+    /// sweeper calls this for every loaded collection; it costs two atomic
+    /// reads when nothing is held.
+    /// shortcut: a collection evicted between a held put and the next sweep
+    /// keeps the older object until its next change; send from the eviction
+    /// if stale sidecars of evicted collections are seen.
+    pub(crate) fn upload_held_metadata_sidecar(&self) {
+        if !self.lsm_sidecar_put_held.load(Ordering::Acquire) {
+            return;
+        }
+        let upload = {
+            let _in_order = self.metadata_snapshot_read_at.lock();
+            self.metadata_snapshot()
+                .ok()
+                .and_then(|metadata| self.persist_metadata_sidecar_locally(&metadata))
+        };
+        if let Some(sidecar) = upload {
+            self.upload_metadata_sidecar(sidecar);
         }
     }
 
@@ -4240,37 +5097,88 @@ impl HelixGraphStorage {
     }
 
     pub fn refresh_metadata_snapshot(&self) -> Result<(), GraphError> {
-        let metadata = self.with_read_backend(|r| self.get_metadata_be(r))?;
+        self.reread_metadata_snapshot().map(|_| ())
+    }
+
+    /// [`Self::refresh_metadata_snapshot`], handing back the metadata it read
+    /// (another refresh can replace the shared snapshot right after this one
+    /// stored it) and the sequence it was read at, when the read was pinned.
+    fn reread_metadata_snapshot(&self) -> Result<(StorageMetadata, Option<u64>), GraphError> {
+        let (metadata, read_at) =
+            self.with_read_backend(|r| Ok((self.get_metadata_be(r)?, r.snapshot_seq())))?;
+        self.store_metadata_snapshot(&metadata, read_at)?;
+        Ok((metadata, read_at))
+    }
+
+    /// The second half of a refresh: `metadata`, read at `read_at`, becomes
+    /// the snapshot and the local sidecar, unless a refresh that read later
+    /// stored first. Refreshes overlap when commits end together, and the one
+    /// that read earlier must not put either back.
+    fn store_metadata_snapshot(
+        &self,
+        metadata: &StorageMetadata,
+        read_at: Option<u64>,
+    ) -> Result<(), GraphError> {
         let sidecar_missing = !matches!(
             Self::read_metadata_sidecar_from_path(self.path()),
             Ok(Some(_))
         );
-        let changed = {
-            let mut snapshot = self.metadata_snapshot.write().map_err(|e| {
-                GraphError::StorageError(format!("metadata snapshot poisoned: {}", e))
-            })?;
-            let changed = *snapshot != metadata;
-            *snapshot = metadata.clone();
-            changed
+        let upload = {
+            let mut stored_at = self.metadata_snapshot_read_at.lock();
+            // A reader's sequence goes back when its `DbReader` is swapped for
+            // one at an older state, so only a writer's reads are put in order.
+            let read_at = read_at.filter(|_| !self.backend.is_reader_replica());
+            if matches!((read_at, *stored_at), (Some(read), Some(stored)) if read < stored) {
+                metrics::counter!("helix_metadata_refresh_skipped_older_total").increment(1);
+                return Ok(());
+            }
+            *stored_at = read_at.or(*stored_at);
+            let changed = {
+                let mut snapshot = self.metadata_snapshot.write().map_err(|e| {
+                    GraphError::StorageError(format!("metadata snapshot poisoned: {}", e))
+                })?;
+                let changed = *snapshot != *metadata;
+                *snapshot = metadata.clone();
+                changed
+            };
+            if changed || sidecar_missing {
+                self.persist_metadata_sidecar_locally(metadata)
+            } else {
+                None
+            }
         };
-        if changed || sidecar_missing {
-            self.persist_metadata_sidecar_best_effort(&metadata);
+        // A network round trip: after the lock.
+        if let Some(sidecar) = upload {
+            self.upload_metadata_sidecar(sidecar);
         }
         Ok(())
     }
 
     pub(crate) fn refresh_metadata_snapshot_best_effort(&self) {
-        if let Err(e) = self.refresh_metadata_snapshot() {
-            match metadata_refresh_error_log_class(&e) {
-                MetadataRefreshErrorLogClass::CooperativeCancellation => {
-                    tracing::debug!(
-                        error = ?e,
-                        "Metadata snapshot refresh cancelled after commit"
-                    );
+        self.reread_metadata_snapshot_best_effort();
+    }
+
+    /// The metadata just read and the sequence it was read at, or `None` when
+    /// the read failed and the snapshot is what it was.
+    fn reread_metadata_snapshot_best_effort(&self) -> Option<(StorageMetadata, Option<u64>)> {
+        match self.reread_metadata_snapshot() {
+            Ok(read) => Some(read),
+            Err(e) => {
+                match metadata_refresh_error_log_class(&e) {
+                    MetadataRefreshErrorLogClass::CooperativeCancellation => {
+                        tracing::debug!(
+                            error = ?e,
+                            "Metadata snapshot refresh cancelled after commit"
+                        );
+                    }
+                    MetadataRefreshErrorLogClass::BackendFailure => {
+                        tracing::warn!(
+                            error = ?e,
+                            "Failed to refresh metadata snapshot after commit"
+                        );
+                    }
                 }
-                MetadataRefreshErrorLogClass::BackendFailure => {
-                    tracing::warn!(error = ?e, "Failed to refresh metadata snapshot after commit");
-                }
+                None
             }
         }
     }
@@ -4287,18 +5195,50 @@ impl HelixGraphStorage {
         if !self.backend.is_reader_replica() {
             return;
         }
-        self.refresh_metadata_snapshot_best_effort();
-        let meta = match self.metadata_snapshot() {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = ?e, "reader reconcile: metadata snapshot unavailable");
-                return;
-            }
+        // One at a time: each reconcile swaps in the whole segment list of
+        // the metadata it read, so an overlapping older one would put the
+        // list back behind the view recorded below.
+        let _one_at_a_time = self
+            .reader_view_reconcile
+            .run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Before the metadata read: a reader swapped in meanwhile leaves the
+        // generation recorded below one behind, never ahead.
+        let view = self.backend.lsm_reader_view();
+        // The metadata this reconcile read itself, not the shared snapshot:
+        // another refresh may have replaced that with an older read since.
+        let reread = self.reread_metadata_snapshot_best_effort();
+        let metadata_fresh = reread.is_some();
+        let (meta, read_at) = match reread {
+            Some(read) => read,
+            None => match self.metadata_snapshot() {
+                Ok(m) => (m, None),
+                Err(e) => {
+                    tracing::warn!(error = ?e, "reader reconcile: metadata snapshot unavailable");
+                    return;
+                }
+            },
         };
-        let hnsw_overrides = self
-            .with_read_backend(|r| self.get_hnsw_overrides_be(r))
-            .ok()
-            .flatten();
+        // The list ends up at exactly the sequence its metadata was read at.
+        // `DbReader` announces a sequence a moment before its reads can see
+        // it, so the announced one stands in only for an unpinned read.
+        let covers = view.map(|(generation, announced)| (generation, read_at.unwrap_or(announced)));
+        // With them, the adjacency backfill's mark as this view holds it:
+        // what the collection's info answers on a reader, without a read.
+        let (hnsw_overrides, backfill_complete) = self
+            .with_read_backend(|r| {
+                Ok((
+                    self.get_hnsw_overrides_be(r)?,
+                    // A mark that is not read leaves the overrides as read.
+                    self.adjacency_backfill_marked_be(r).ok(),
+                ))
+            })
+            .unwrap_or((None, None));
+        if let Some(complete) = backfill_complete {
+            self.adjacency_backfill_mark
+                .store(adjacency_mark_code(Some(complete)), Ordering::Release);
+        }
         let base_config = Config::default();
         let base_hnsw = HNSWConfig::with_overrides(
             base_config.vector_config.m,
@@ -4307,13 +5247,26 @@ impl HelixGraphStorage {
             hnsw_overrides.as_ref(),
         );
         if self.backend.kind() == BackendKind::Lsm {
-            if let Err(e) = self.named_vectors.refresh_dense_view_from_metadata_lsm(
+            self.adopt_registered_payload_indexes(&meta.payload_indices);
+            match self.named_vectors.refresh_dense_view_from_metadata_lsm(
                 self.path(),
                 &meta.named_vectors,
                 &meta.dense_vector_spaces,
                 base_hnsw,
+                read_at,
             ) {
-                tracing::warn!(error = ?e, "reader reconcile: dense view refresh failed (non-fatal)");
+                // A failed metadata read reconciled against the old snapshot:
+                // the list is no newer than it was.
+                Ok(0) if metadata_fresh => self.note_reader_view_reconciled(covers),
+                Ok(0) => {}
+                // The list names a segment no search can reach. Not recorded
+                // as reconciled: the timed refresh retries the open.
+                Ok(_) => {
+                    metrics::counter!("helix_reader_view_reconcile_incomplete_total").increment(1);
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, "reader reconcile: dense view refresh failed (non-fatal)");
+                }
             }
             return;
         }
@@ -4344,6 +5297,43 @@ impl HelixGraphStorage {
         }
         if let Err(e) = wtxn.commit() {
             tracing::warn!(error = ?e, "reader reconcile: local txn commit failed (non-fatal)");
+        }
+    }
+
+    /// Give a reader replica handles for the indexes the writer has registered
+    /// since it opened the collection. Its handles came only from the metadata
+    /// it opened with, so a replica that opened a collection before its indexes
+    /// were built scanned those fields for the life of the handle.
+    /// `has_payload_index_at` still requires each read's own metadata to
+    /// register the index, so a handle adopted here cannot serve a read that
+    /// predates the index.
+    fn adopt_registered_payload_indexes(&self, registered: &HashMap<String, PayloadIndexSchema>) {
+        let stale = |handles: &HashMap<String, PayloadIndexHandle>| {
+            registered.iter().any(|(field, schema)| {
+                handles
+                    .get(field)
+                    .is_none_or(|handle| &handle.schema != schema)
+            })
+        };
+        if !self
+            .payload_indices
+            .read()
+            .is_ok_and(|handles| stale(&handles))
+        {
+            return;
+        }
+        // try_write: a writer waiting on this lock would block every query's
+        // read of it. A busy round is picked up by the next refresh.
+        let Ok(mut handles) = self.payload_indices.try_write() else {
+            return;
+        };
+        for (field, schema) in registered {
+            if handles
+                .get(field)
+                .is_none_or(|handle| &handle.schema != schema)
+            {
+                handles.insert(field.clone(), PayloadIndexHandle::ready_lsm(schema.clone()));
+            }
         }
     }
 
@@ -4432,11 +5422,136 @@ impl HelixGraphStorage {
         }
     }
 
+    fn note_reader_view_reconciled(&self, covers: Option<(u64, u64)>) {
+        let Some(covers) = covers else {
+            return;
+        };
+        let sync = &self.reader_view_reconcile;
+        sync.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .covered = Some(covers);
+        sync.finished.notify_all();
+    }
+
+    /// Tests: keep reconciles from running, as a slow one would.
+    #[cfg(test)]
+    pub(crate) fn hold_reader_view_reconcile(&self) -> MutexGuard<'_, ()> {
+        self.reader_view_reconcile
+            .run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Reader replicas: a read whose data view is past the one the dense
+    /// segment list and payload index handles were last reconciled against
+    /// reconciles first, and waits up to `wait` for it. The timed refresh
+    /// alone left a read after a quiet spell on the list of an older view:
+    /// dense search missed the points of a tail the writer had opened since,
+    /// and the points of segments a merge had replaced and reaped.
+    ///
+    /// Detection is in memory (`AnyBackend::lsm_reader_view`). The reconcile
+    /// runs on its own thread, so the bound holds whatever it is doing: a read
+    /// that reaches it goes on with the list it has, exactly as stale as
+    /// before this existed, and the reconcile finishes for the next read.
+    /// Reads arriving while that slow one still runs do not wait again, and a
+    /// view gets one attempt, so a failing reconcile cannot be retried by
+    /// every read behind it.
+    pub(crate) fn reconcile_reader_view_if_advanced(
+        self: &Arc<Self>,
+        wait: Duration,
+    ) -> ReaderViewWait {
+        let Some(view) = self.backend.lsm_reader_view() else {
+            return ReaderViewWait::Current;
+        };
+        let sync = &self.reader_view_reconcile;
+        let mut state = sync
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.covered >= Some(view) {
+            return ReaderViewWait::Current;
+        }
+        let started = Instant::now();
+        let outcome = loop {
+            if state.covered >= Some(view) {
+                break ReaderViewWait::Reconciled;
+            }
+            if !state.running {
+                if state.attempted >= Some(view) {
+                    break ReaderViewWait::Unreconciled;
+                }
+                state.attempted = Some(view);
+                let storage = Arc::clone(self);
+                let spawned = std::thread::Builder::new()
+                    .name("helix-reader-reconcile".to_string())
+                    .spawn(move || {
+                        let started = Instant::now();
+                        storage.refresh_reader_view_best_effort();
+                        metrics::histogram!("helix_reader_view_refresh_duration_ms")
+                            .record(started.elapsed().as_secs_f64() * 1000.0);
+                        let sync = &storage.reader_view_reconcile;
+                        let mut state = sync
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.running = false;
+                        state.gave_up = false;
+                        drop(state);
+                        sync.finished.notify_all();
+                    });
+                if let Err(error) = spawned {
+                    tracing::warn!(error = %error, "failed to spawn reader view reconcile");
+                    break ReaderViewWait::Unreconciled;
+                }
+                state.running = true;
+                // The timed refresh is not due again right behind this one.
+                self.last_reader_refresh_ms.store(
+                    Self::now_epoch_millis(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            } else if state.gave_up {
+                break ReaderViewWait::BehindSlow;
+            }
+            let remaining = wait.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                state.gave_up = true;
+                break ReaderViewWait::TimedOut;
+            }
+            state = sync
+                .finished
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        };
+        drop(state);
+        let label = match outcome {
+            ReaderViewWait::Current | ReaderViewWait::Reconciled => "reconciled",
+            ReaderViewWait::TimedOut => {
+                // The others waiting on the same reconcile give up with it.
+                sync.finished.notify_all();
+                "timeout"
+            }
+            ReaderViewWait::BehindSlow => "behind_slow",
+            ReaderViewWait::Unreconciled => "unreconciled",
+        };
+        metrics::counter!("helix_reader_view_reconcile_wait_total", "outcome" => label)
+            .increment(1);
+        metrics::histogram!("helix_reader_view_reconcile_wait_ms", "outcome" => label)
+            .record(started.elapsed().as_secs_f64() * 1000.0);
+        outcome
+    }
+
     /// Read-gated `DbReader` poll-tier promotion (S3 LIST-cost reduction):
     /// stamps this read as activity and, if this reader-replica collection is
     /// believed to be on the idle poll tier, schedules a single-flight background
-    /// promotion to the active/serving tier. The foreground read serves the
-    /// current checkpoint instead of participating in S3/manifest reopen work.
+    /// promotion to the active/serving tier. Where the promotion is a reopen,
+    /// the foreground read serves the current checkpoint instead of taking
+    /// part in it. Where it is done in place it is one manifest poll, and the
+    /// read that started it waits for that poll, at most
+    /// [`READER_PROMOTE_POLL_WAIT`], so that it reads what was written while
+    /// the collection sat on the idle poll; past the bound it goes on with
+    /// what it has, and so do the reads that find a promotion in flight.
     /// No-op on writer/LMDB backends and when `HELIX_LSM_READER_IDLE_AFTER_MS=0`
     /// (kill switch, preserves prior behavior exactly).
     ///
@@ -4455,10 +5570,7 @@ impl HelixGraphStorage {
         let now = Self::now_epoch_millis();
         self.last_reader_read_at_ms
             .store(now, std::sync::atomic::Ordering::Relaxed);
-        if self
-            .reader_poll_tier_fast
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.reader_poll_tier_is_fast() {
             return;
         }
         let last_failed = self
@@ -4482,16 +5594,15 @@ impl HelixGraphStorage {
         }
         let active_interval =
             crate::helix_engine::storage_core::backend_lsm::reader_active_poll_interval_from_env();
-        let promote_budget =
-            crate::helix_engine::storage_core::backend_lsm::reader_promote_budget_from_env();
         let storage = Arc::clone(self);
+        // Dropped by the thread when the promotion is over, whatever came of it.
+        let (promotion_over, wait_for_promotion) = std::sync::mpsc::channel::<()>();
+        let waits = self.backend.lsm_reader_in_place_tier_is_fast().is_some();
         if let Err(error) = std::thread::Builder::new()
             .name("helix-reader-promote".to_string())
             .spawn(move || {
-                match storage
-                    .backend
-                    .refresh_lsm_reader_with_poll_interval_bounded(active_interval, promote_budget)
-                {
+                let _promotion_over = promotion_over;
+                match storage.backend.retier_lsm_reader(active_interval) {
                     Ok(_) => {
                         storage
                             .last_reader_promote_failed_at_ms
@@ -4547,6 +5658,15 @@ impl HelixGraphStorage {
                 "reader poll-tier promotion spawn failed; serving from existing checkpoint"
             );
             self.end_poll_tier_transition();
+        } else if waits
+            && wait_for_promotion.recv_timeout(READER_PROMOTE_POLL_WAIT)
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        {
+            metrics::counter!(
+                "helix_reader_poll_tier_total",
+                "direction" => "promote_wait_timeout"
+            )
+            .increment(1);
         }
     }
 
@@ -4568,9 +5688,20 @@ impl HelixGraphStorage {
         now.saturating_sub(last) <= window.as_millis().min(u64::MAX as u128) as u64
     }
 
+    /// Which poll tier this collection's `DbReader` is on. A reader that
+    /// changes tiers in place says so itself, from the interval it polls at.
+    /// A stored flag is written after the change it records, so two threads
+    /// that change the tier at once can leave it saying fast over a reader on
+    /// the idle poll, and then no read promotes it; asking the reader has no
+    /// such state. Where a tier change is a reopen, the stored flag is the
+    /// answer, as before.
     pub(crate) fn reader_poll_tier_is_fast(&self) -> bool {
-        self.reader_poll_tier_fast
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.backend
+            .lsm_reader_in_place_tier_is_fast()
+            .unwrap_or_else(|| {
+                self.reader_poll_tier_fast
+                    .load(std::sync::atomic::Ordering::Acquire)
+            })
     }
 
     /// Single source of truth for "which poll tier does this collection's
@@ -4602,6 +5733,13 @@ impl HelixGraphStorage {
             .store(false, std::sync::atomic::Ordering::Release);
     }
 
+    /// True while a promotion or demotion holds the transition guard: the
+    /// tier flag still names the tier that transition is leaving.
+    pub(crate) fn poll_tier_transition_in_flight(&self) -> bool {
+        self.reader_poll_tier_transition
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Called by the write-feed change poller's promote success arm instead
     /// of `set_reader_poll_tier_fast(true)` directly: marks the tier fast AND
     /// stamps write-promotion recency, so the read-gated demotion sweep (which
@@ -4610,6 +5748,17 @@ impl HelixGraphStorage {
     /// demoted out from under an active write burst even if nobody has read
     /// it yet.
     pub(crate) fn note_write_feed_promotion(&self) {
+        self.note_write_feed_change();
+        self.set_reader_poll_tier_fast(true);
+    }
+
+    /// Called by the write-feed change poller for every change that finds the
+    /// collection on the short poll: moves the write stamp only. A burst that
+    /// outlasts the sweeper's window would otherwise be demoted to the idle
+    /// tier while its writes continue. Never touches the tier flag: the
+    /// sweeper may have demoted between the poller's check and this call, and
+    /// the flag must keep saying so for the next change to promote again.
+    pub(crate) fn note_write_feed_change(&self) {
         let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(d) => d.as_millis().min(u64::MAX as u128) as u64,
             Err(_) => 0,
@@ -4618,13 +5767,13 @@ impl HelixGraphStorage {
             self.last_write_promoted_at_ms
                 .store(now, std::sync::atomic::Ordering::Relaxed);
         }
-        self.set_reader_poll_tier_fast(true);
     }
 
-    /// True if the write-feed poller promoted this collection within
-    /// `window`. Naturally always `false` when the write-feed isn't
-    /// configured (nothing ever calls `note_write_feed_promotion`), so
-    /// callers don't need to separately check whether the feed is enabled.
+    /// True if the write-feed poller saw a change of this collection within
+    /// `window`, whether that change promoted it or found it on the short
+    /// poll. Naturally always `false` when the write-feed isn't configured
+    /// (nothing ever calls `note_write_feed_change`), so callers don't need
+    /// to separately check whether the feed is enabled.
     pub(crate) fn write_promoted_recently(&self, window: std::time::Duration) -> bool {
         let last = self
             .last_write_promoted_at_ms
@@ -5826,9 +6975,13 @@ impl HelixGraphStorage {
             "LMDB auto-resize"
         );
 
+        // The backend's catalog thread opens a write transaction on this env
+        // outside the resize gate: wait for a pass in hand, hold off the next.
+        let _catalog = self.backend.pause_lmdb_catalog();
         // SAFETY: exclusive resize_gate lock prevents guarded callers from
-        // creating new LMDB transactions while the map is being resized. The
-        // retrying caller already dropped its RwTxn before calling grow_map.
+        // creating new LMDB transactions while the map is being resized, and
+        // `_catalog` the catalog thread. The retrying caller already dropped
+        // its RwTxn before calling grow_map.
         unsafe { env.resize(new_size)? };
         crate::diag::log(
             "resize_done",
@@ -6135,9 +7288,13 @@ impl HelixGraphStorage {
             "LMDB sized pre-grow (ensure_map_headroom)"
         );
 
+        // The backend's catalog thread opens a write transaction on this env
+        // outside the resize gate: wait for a pass in hand, hold off the next.
+        let _catalog = self.backend.pause_lmdb_catalog();
         // SAFETY: exclusive resize_gate lock prevents guarded callers from
-        // creating new LMDB transactions while the map is being resized. The
-        // caller contract forbids an active RwTxn.
+        // creating new LMDB transactions while the map is being resized, and
+        // `_catalog` the catalog thread. The caller contract forbids an
+        // active RwTxn.
         unsafe { env.resize(target)? };
         crate::diag::log(
             "resize_done",
@@ -6233,11 +7390,6 @@ impl HelixGraphStorage {
     /// no-op that commits nothing while reporting success.
     pub fn flush_dense_metadata(&self, txn: &mut RwTxn) -> Result<(), GraphError> {
         self.set_dense_vector_spaces_metadata(txn, self.named_vectors.list_dense_vector_spaces())
-            .map(|_| ())
-    }
-
-    pub(crate) fn flush_dense_metadata_be(&self, w: &mut AnyWrite<'_>) -> Result<(), GraphError> {
-        self.set_dense_vector_spaces_metadata_be(w, self.named_vectors.list_dense_vector_spaces())
             .map(|_| ())
     }
 
@@ -6475,10 +7627,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
         counts.sort_unstable();
+        // Every open reads the adjacency backfill's mark as a step of its
+        // own, and a writer's also scans the dead dense segment names: both
+        // inside the aggregate like the first two.
         assert_eq!(
             counts,
             [
                 "helix_lsm_collection_open_phase_ms_count{phase=\"metadata_read\"} 1",
+                "helix_lsm_metadata_read_step_ms_count{step=\"adjacency_backfill_mark\"} 1",
+                "helix_lsm_metadata_read_step_ms_count{step=\"dense_dead_names\"} 1",
                 "helix_lsm_metadata_read_step_ms_count{step=\"hnsw_overrides\"} 1",
                 "helix_lsm_metadata_read_step_ms_count{step=\"metadata_current\"} 1",
             ]
@@ -6959,6 +8116,36 @@ mod tests {
     /// before commit, then via a fresh committed snapshot after commit.
     #[test]
     #[serial]
+    fn lsm_write_view_with_pending_writes_is_not_pinned_to_a_sequence() {
+        use crate::protocol::value::Value;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
+        let committed = storage.backend.begin_read().unwrap();
+        assert!(committed.snapshot_seq().is_some());
+        let mut wv = storage.begin_write_view().unwrap();
+        storage
+            .create_node_be(
+                wv.write_mut(),
+                "Sym",
+                [("k".to_string(), Value::String("v".into()))],
+                None,
+                Some(0xAB),
+            )
+            .unwrap();
+        assert_eq!(
+            wv.read_view().snapshot_seq(),
+            None,
+            "a view overlaying uncommitted writes must never key a cache"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn lsm_write_view_read_your_writes() {
         use super::super::backend::StorageBackend;
         use crate::protocol::value::Value;
@@ -7080,6 +8267,252 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "refresh must recreate a missing metadata sidecar"
+        );
+    }
+
+    /// Two refreshes overlap when two commits end together. The one that read
+    /// earlier and stores last must leave the snapshot and the local sidecar
+    /// at what the later read saw.
+    #[test]
+    #[serial]
+    fn lsm_metadata_snapshot_keeps_the_later_read_when_an_earlier_refresh_stores_last() {
+        use super::super::metadata::PayloadIndexSchema;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
+
+        // The first refresh has read and has not stored yet.
+        let (older, older_read_at) = storage
+            .with_read_backend(|r| Ok((storage.get_metadata_be(r)?, r.snapshot_seq())))
+            .unwrap();
+        assert!(older_read_at.is_some(), "a writer's read is pinned");
+
+        // A commit ends meanwhile: its refresh reads later and stores first.
+        storage
+            .with_write_backend(|w| {
+                storage
+                    .update_metadata_be(w, |metadata| {
+                        let mut indices = metadata.payload_indices.clone();
+                        indices.insert("repo".to_string(), PayloadIndexSchema::Keyword);
+                        metadata.set_payload_indices(indices);
+                        Ok(())
+                    })
+                    .map(|_| ())
+            })
+            .unwrap();
+        let newer = storage.metadata_snapshot().unwrap();
+        assert_ne!(newer, older);
+
+        storage
+            .store_metadata_snapshot(&older, older_read_at)
+            .unwrap();
+
+        assert_eq!(storage.metadata_snapshot().unwrap(), newer);
+        let sidecar = HelixGraphStorage::read_metadata_sidecar_from_path(dir.path())
+            .unwrap()
+            .expect("the commit's refresh wrote the sidecar");
+        assert_eq!(sidecar.metadata, newer);
+
+        // A read at the stored sequence is the same data, and is not refused.
+        storage.refresh_metadata_snapshot().unwrap();
+        assert_eq!(storage.metadata_snapshot().unwrap(), newer);
+    }
+
+    /// The object store gets a sidecar at most once per put interval. The
+    /// change that falls inside the interval must still arrive: held first,
+    /// sent by the sweeper's call once the interval allows.
+    #[test]
+    #[serial]
+    fn lsm_metadata_sidecar_held_back_by_the_put_interval_is_sent_later() {
+        use super::super::metadata::PayloadIndexSchema;
+
+        let _interval =
+            TestEnvRestore::set("HELIX_LSM_METADATA_SIDECAR_PUT_INTERVAL_MS", "3600000");
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
+        let index = |field: &str| {
+            storage
+                .with_write_backend(|w| {
+                    storage
+                        .update_metadata_be(w, |metadata| {
+                            let mut indices = metadata.payload_indices.clone();
+                            indices.insert(field.to_string(), PayloadIndexSchema::Keyword);
+                            metadata.set_payload_indices(indices);
+                            Ok(())
+                        })
+                        .map(|_| ())
+                })
+                .unwrap();
+        };
+        let sent = || storage.last_lsm_sidecar_fingerprint.load(Ordering::Acquire);
+        let held = || storage.lsm_sidecar_put_held.load(Ordering::Acquire);
+
+        // The first change is put at once.
+        index("repo");
+        let first = sent();
+        assert!(first != 0 && !held());
+
+        // The second falls inside the interval: the object store keeps the first.
+        index("path");
+        assert!(held());
+        assert_eq!(sent(), first);
+        storage.upload_held_metadata_sidecar();
+        assert!(held(), "still inside the interval");
+        assert_eq!(sent(), first);
+
+        // Once the interval allows, the sweeper's call sends the newest.
+        let _interval = TestEnvRestore::set("HELIX_LSM_METADATA_SIDECAR_PUT_INTERVAL_MS", "0");
+        storage.upload_held_metadata_sidecar();
+        assert!(!held());
+        assert_ne!(sent(), first);
+        let newest = sent();
+        storage.upload_held_metadata_sidecar();
+        assert_eq!(sent(), newest);
+    }
+
+    /// A sidecar is put with the adjacency backfill's mark as it is when the
+    /// put is made. One that was built while the mark said "complete" is not
+    /// put once a backfill call has said "not complete": it would land after
+    /// that call's own put and say "complete" of a pass that has started
+    /// over. It is held, and the sweeper's call sends the sidecar as it is
+    /// now. A change of the mark alone is a change of the fingerprint.
+    #[test]
+    #[serial]
+    fn lsm_metadata_sidecar_built_before_the_mark_changed_is_not_put() {
+        let _interval = TestEnvRestore::set("HELIX_LSM_METADATA_SIDECAR_PUT_INTERVAL_MS", "0");
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
+        assert_eq!(
+            storage.adjacency_backfill_complete(),
+            Some(false),
+            "an LSM open reads the mark"
+        );
+        let sent = || storage.last_lsm_sidecar_fingerprint.load(Ordering::Acquire);
+        let sent_mark = || storage.adjacency_mark_sent.load(Ordering::Acquire);
+        let held = || storage.lsm_sidecar_put_held.load(Ordering::Acquire);
+        let local_mark = || {
+            HelixGraphStorage::read_metadata_sidecar_from_path(storage.path())
+                .unwrap()
+                .unwrap()
+                .adjacency_backfill_complete
+        };
+        let metadata = storage.metadata_snapshot().unwrap();
+
+        storage.send_adjacency_backfill_mark(true).unwrap();
+        let complete = sent();
+        assert_eq!((sent_mark(), local_mark()), (2, Some(true)));
+        let built_complete = storage.build_metadata_sidecar(&metadata).unwrap();
+
+        storage.send_adjacency_backfill_mark(false).unwrap();
+        let not_complete = sent();
+        assert_ne!(
+            not_complete, complete,
+            "the mark alone changes the fingerprint"
+        );
+        assert_eq!((sent_mark(), local_mark()), (1, Some(false)));
+
+        storage.upload_metadata_sidecar(built_complete);
+        assert_eq!(
+            (sent(), sent_mark(), held()),
+            (not_complete, 1, true),
+            "a sidecar that says complete was put after the mark was cleared"
+        );
+        storage.upload_held_metadata_sidecar();
+        assert_eq!((sent(), sent_mark(), held()), (not_complete, 1, false));
+        assert_eq!(local_mark(), Some(false));
+
+        // With the mark as it was built and no other put on its way, a
+        // sidecar is put as it always was.
+        let forget_the_last_put = || {
+            storage
+                .last_lsm_sidecar_fingerprint
+                .store(7, Ordering::Release)
+        };
+        forget_the_last_put();
+        storage.upload_metadata_sidecar(storage.build_metadata_sidecar(&metadata).unwrap());
+        assert_eq!((sent(), sent_mark(), held()), (not_complete, 1, false));
+
+        // Another put of this collection is on its way: this one does not
+        // wait for it, and is held for the sweeper.
+        forget_the_last_put();
+        let second = storage.build_metadata_sidecar(&metadata).unwrap();
+        assert!(
+            returns_beside_a_put(&storage, || storage.upload_metadata_sidecar(second)),
+            "a regular put waited for the one on its way"
+        );
+        assert_eq!((sent(), held()), (7, true), "it was put all the same");
+        storage.upload_held_metadata_sidecar();
+        assert_eq!((sent(), sent_mark(), held()), (not_complete, 1, false));
+
+        // A second call with the same mark puts nothing, and does not wait
+        // for a put on its way to find that out.
+        let puts_nothing = |complete: bool| {
+            storage
+                .last_lsm_sidecar_fingerprint
+                .store(7, Ordering::Release);
+            storage.send_adjacency_backfill_mark(complete).unwrap();
+            sent() == 7
+        };
+        assert!(puts_nothing(false));
+        assert!(!puts_nothing(true));
+        assert!(puts_nothing(true));
+        assert!(
+            returns_beside_a_put(&storage, || {
+                storage.send_adjacency_backfill_mark(true).unwrap()
+            }),
+            "a call with nothing to say waited for the put lock"
+        );
+    }
+
+    /// Whether `call` returns while another holds the collection's sidecar
+    /// put lock, as a put on its way does. Five seconds, then the lock is
+    /// given up so that a call that waits ends and the test fails.
+    fn returns_beside_a_put(storage: &HelixGraphStorage, call: impl FnOnce() + Send) -> bool {
+        let on_its_way = storage.sidecar_put.lock();
+        std::thread::scope(|scope| {
+            let call = scope.spawn(call);
+            let started = std::time::Instant::now();
+            while !call.is_finished() && started.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let returned = call.is_finished();
+            drop(on_its_way);
+            returned
+        })
+    }
+
+    /// An open does not need the adjacency backfill's mark: a read of it that
+    /// fails is counted and reads as no mark, so the pass is due again.
+    #[test]
+    fn an_adjacency_backfill_mark_that_an_open_cannot_read_is_no_mark() {
+        assert!(HelixGraphStorage::adjacency_mark_read_at_open(Ok(true)));
+        assert!(!HelixGraphStorage::adjacency_mark_read_at_open(Ok(false)));
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let unread = BackendError::Io("a read that fails".to_string());
+        let read = metrics::with_local_recorder(&recorder, || {
+            HelixGraphStorage::adjacency_mark_read_at_open(Err(unread))
+        });
+        assert!(!read, "a mark that was not read reads as complete");
+        let counted = handle.render();
+        assert!(
+            counted
+                .lines()
+                .any(|line| line == "helix_adjacency_backfill_mark_unread_total 1"),
+            "{counted}"
         );
     }
 
@@ -7271,7 +8704,7 @@ mod tests {
     /// Building a payload index on the LSM backend must NOT panic and must produce
     /// a queryable index. Before the fix the payload-index build loop called the
     /// LMDB-only `get_for_update_heed`, hitting `unreachable!("heed write path is
-    /// LMDB-only")` under `HELIX_STORAGE_BACKEND=lsm` (breaking CE's `repo` filter
+    /// LMDB-only")` under `HELIX_STORAGE_BACKEND=lsm` (breaking the client's `repo` filter
     /// on the cloud backend). This drives the real `create_payload_index` build path
     /// and then the (already-routed) query path end-to-end on an in-memory LSM.
     #[test]
@@ -7288,7 +8721,7 @@ mod tests {
         .unwrap();
         assert_eq!(storage.backend.kind(), BackendKind::Lsm);
 
-        // Seed nodes carrying a "repo" payload field (CE's filter field).
+        // Seed nodes carrying a "repo" payload field (the client's filter field).
         let (n1, n2, n3): (u128, u128, u128) = (0x101, 0x102, 0x103);
         {
             let mut wv = storage.begin_write_view().unwrap();
@@ -7507,7 +8940,7 @@ mod tests {
     ///
     /// Faithful to prod: file-backed LSM, rows made durable then read back through
     /// a freshly reopened handle (SST-resident, memtable empty), seeded via the
-    /// real upsert seam with a nested `metadata.repo` payload (CE's filter field),
+    /// real upsert seam with a nested `metadata.repo` payload (the client's filter field),
     /// built via `enqueue_payload_index_build` on the background executor, across
     /// multiple chunks (small chunk size exercises the cumulative count).
     #[test]
@@ -7543,7 +8976,7 @@ mod tests {
 
         // Seed N points through the REAL upsert seam (buffered group-commit + a
         // durability flush per batch — exactly the upsert path), with a NESTED
-        // `metadata.repo` payload like live CE/qdrant points.
+        // `metadata.repo` payload like live client/qdrant points.
         let n: u128 = 800;
         let batch = 10u128;
         let mut i = 0u128;
@@ -8131,6 +9564,22 @@ file_writeback 536870912
         assert_eq!(results[0].id, 7);
     }
 
+    /// A build the executor refuses was never queued: the count taken before
+    /// it was sent is given back, and no eviction waits for it.
+    #[test]
+    fn a_payload_index_build_the_executor_refuses_is_not_pending() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage =
+            HelixGraphStorage::new(temp_dir.path().to_str().unwrap(), test_config()).unwrap();
+
+        let refused = storage.counted_as_pending(|| Err(GraphError::New("refused".into())));
+        assert!(refused.is_err());
+        assert!(!storage.payload_index_build_pending());
+
+        storage.counted_as_pending(|| Ok(())).unwrap();
+        assert!(storage.payload_index_build_pending());
+    }
+
     #[test]
     fn reloads_indexing_threshold_override_metadata() {
         let temp_dir = TempDir::new().unwrap();
@@ -8330,16 +9779,26 @@ file_writeback 536870912
             edge_path_idx: Some(edge_path_idx),
             metadata_db: Some(metadata_db),
             metadata_snapshot: RwLock::new(StorageMetadata::new(Vec::new())),
+            metadata_snapshot_read_at: parking_lot::Mutex::new(None),
             last_lsm_sidecar_upload_ms: AtomicU64::new(0),
             last_lsm_sidecar_fingerprint: AtomicU64::new(0),
+            lsm_sidecar_put_held: std::sync::atomic::AtomicBool::new(false),
+            sidecar_put: parking_lot::Mutex::new(()),
+            adjacency_backfill_mark: std::sync::atomic::AtomicU8::new(0),
+            adjacency_mark_sent: std::sync::atomic::AtomicU8::new(0),
             secondary_indices: HashMap::new(),
             multi_indices: HashMap::new(),
             payload_indices: RwLock::new(HashMap::new()),
+            text_walk_cache: parking_lot::Mutex::new(
+                crate::helix_engine::storage_core::text_walk_cache::TextWalkCache::from_env(),
+            ),
             vectors,
             named_vectors,
             wal,
             optimizer_running: std::sync::atomic::AtomicBool::new(false),
             last_upsert_at: std::sync::atomic::AtomicU64::new(0),
+            point_mutations: std::sync::atomic::AtomicU64::new(0),
+            point_mutations_in_flight: AtomicUsize::new(0),
             resize_gate: parking_lot::RwLock::new(()),
             resize_writers_pending: AtomicUsize::new(0),
             resize_writers_active: AtomicUsize::new(0),
@@ -8348,8 +9807,11 @@ file_writeback 536870912
             active_lmdb_txns: AtomicUsize::new(0),
             write_txn_gate: Arc::new(Mutex::new(())),
             payload_index_admin_gate: Mutex::new(()),
+            payload_index_builds_pending: AtomicUsize::new(0),
+            payload_index_build_lock: Mutex::new(()),
             metadata_corruption_logged: std::sync::atomic::AtomicBool::new(false),
             collection_degraded: std::sync::atomic::AtomicBool::new(false),
+            closing_for_shutdown: std::sync::atomic::AtomicBool::new(false),
             degraded_reason: RwLock::new(None),
             dense_metadata_dirty: std::sync::atomic::AtomicBool::new(false),
             last_reader_refresh_ms: std::sync::atomic::AtomicU64::new(0),
@@ -8362,6 +9824,7 @@ file_writeback 536870912
             last_reader_promote_failed_at_ms: AtomicU64::new(0),
             reader_promote_consecutive_failures: std::sync::atomic::AtomicU32::new(0),
             last_write_promoted_at_ms: std::sync::atomic::AtomicU64::new(0),
+            reader_view_reconcile: ReaderViewReconcile::default(),
             recount_inflight: std::sync::atomic::AtomicBool::new(false),
             payload_index_gc_inflight: std::sync::atomic::AtomicBool::new(false),
         };
@@ -8938,18 +10401,83 @@ file_writeback 536870912
                 .unwrap();
         });
 
-        let completed_while_write_gate_held = done_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .map(|result| result.is_ok())
-            .unwrap_or(false);
+        let while_write_gate_held = done_rx.recv_timeout(std::time::Duration::from_secs(2));
 
         drop(gate);
         resize.join().unwrap();
 
         assert!(
-            completed_while_write_gate_held,
-            "resize growth should not queue behind write_txn_gate"
+            matches!(while_write_gate_held, Ok(Ok(()))),
+            "resize growth should not queue behind write_txn_gate: {while_write_gate_held:?}"
         );
+    }
+
+    /// The backend's catalog thread opens a write transaction on the env
+    /// outside the resize gate, at open and every 250 ms. A resize that met
+    /// one was refused by LMDB (`Invalid argument`), and a pass that began
+    /// while the map was swapped read the meta page through the old mapping
+    /// and killed the process (SIGBUS). The resize waits for the pass now.
+    #[test]
+    #[serial]
+    fn ensure_map_headroom_waits_for_a_catalog_pass_in_hand() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_str().unwrap().to_string();
+        let storage = std::sync::Arc::new(HelixGraphStorage::new(&path, test_config()).unwrap());
+        let info = storage.lmdb_env().unwrap().info();
+        let initial = info.map_size;
+        let used = info.last_page_number.saturating_mul(page_size::get());
+        let requested = initial.saturating_sub(used).saturating_add(1024 * 1024);
+        assert!(
+            initial < HelixGraphStorage::max_map_size(),
+            "the test storage opens below its map cap, so the request has to grow it"
+        );
+
+        // Given a catalog pass with its write transaction open.
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel::<()>();
+        let pass_storage = std::sync::Arc::clone(&storage);
+        let pass = std::thread::spawn(move || {
+            let AnyBackend::Lmdb(backend) = &*pass_storage.backend else {
+                panic!("the default test storage is LMDB");
+            };
+            backend.hold_catalog_txn_for_test(|| {
+                opened_tx.send(()).unwrap();
+                // Bounded, so that a failed assertion below ends the test.
+                let _ = finish_rx.recv_timeout(Duration::from_secs(30));
+            })
+        });
+        opened_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the pass did not open its transaction");
+
+        // When the map has to grow.
+        let (done_tx, done_rx) = mpsc::channel();
+        let resize_storage = std::sync::Arc::clone(&storage);
+        let resize = std::thread::spawn(move || {
+            done_tx
+                .send(resize_storage.ensure_map_headroom(requested))
+                .unwrap();
+        });
+
+        // Then the resize waits for the pass,
+        let under_the_pass = done_rx.recv_timeout(Duration::from_millis(500));
+        // and grows the map once the pass has committed.
+        finish_tx.send(()).unwrap();
+        pass.join().unwrap().unwrap();
+        let after_the_pass = match under_the_pass {
+            Err(mpsc::RecvTimeoutError::Timeout) => done_rx.recv_timeout(Duration::from_secs(30)),
+            early => panic!("the resize did not wait for the catalog pass: {early:?}"),
+        };
+        resize.join().unwrap();
+        assert!(
+            matches!(after_the_pass, Ok(Ok(()))),
+            "the resize after the pass: {after_the_pass:?}"
+        );
+        let grown = storage.lmdb_env().unwrap().info().map_size;
+        assert!(grown > initial, "map {initial} -> {grown}");
     }
 
     #[test]
@@ -9082,6 +10610,377 @@ file_writeback 536870912
             metadata.payload_indices.get(field),
             Some(&PayloadIndexSchema::Keyword)
         );
+    }
+
+    /// The sweep of leftover build-delta rows takes what the sidecar held when
+    /// it began. While an index is Building every foreground write records a
+    /// row, so a sweep that scanned until it found nothing followed the
+    /// writers, a commit a batch, and the build under it did not start.
+    #[test]
+    fn lsm_build_delta_sweep_takes_only_the_rows_it_began_with() {
+        use crate::helix_engine::storage_core::backend_lsm::lsm_round_trips_for_test;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
+
+        let dir = TempDir::new().unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
+        let db_name =
+            HelixGraphStorage::payload_index_db_name("repo", &PayloadIndexSchema::Keyword);
+        // As a foreground write records its row: in a buffered commit, which
+        // the next read sees at once.
+        let record = |node: u128| {
+            storage
+                .with_write_backend_buffered(|w| {
+                    storage.record_payload_index_build_delta(w, &db_name, node, None)
+                })
+                .unwrap()
+        };
+        let recorded = || {
+            let read = storage.backend.begin_read().unwrap();
+            let mut nodes = Vec::new();
+            storage
+                .backend
+                .scan(
+                    &read,
+                    Namespace::PayloadIndexBuild(&db_name),
+                    KeyRange::all(),
+                    |key, _| {
+                        nodes.push(u128::from_be_bytes(key.try_into().unwrap()));
+                        true
+                    },
+                )
+                .unwrap();
+            nodes
+        };
+        let sweep_round_trips = || {
+            let before = lsm_round_trips_for_test();
+            storage.clear_payload_index_build_deltas(&db_name).unwrap();
+            lsm_round_trips_for_test() - before
+        };
+
+        // What the sweep costs on 150 rows while nobody writes.
+        for node in 1..=150u128 {
+            record(node);
+        }
+        assert_eq!(recorded().len(), 150);
+        let quiet = sweep_round_trips();
+        assert!(quiet > 0, "the sweep's reads and commits are counted");
+        assert!(recorded().is_empty());
+
+        // Given 100 leftover rows, and a writer that records a row every
+        // millisecond and is 50 rows in. It gives up after ten seconds, so
+        // that a sweep that follows it returns as well.
+        for node in 1..=100u128 {
+            record(node);
+        }
+        let stop = AtomicBool::new(false);
+        let written = AtomicU64::new(0);
+        let busy = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let began = Instant::now();
+                let mut node = 1_000u128;
+                while !stop.load(Ordering::Acquire) && began.elapsed() < Duration::from_secs(10) {
+                    record(node);
+                    node += 1;
+                    written.fetch_add(1, Ordering::Release);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            while written.load(Ordering::Acquire) < 50 {
+                std::thread::yield_now();
+            }
+
+            // When the sweep runs under that writer.
+            let busy = sweep_round_trips();
+            stop.store(true, Ordering::Release);
+            busy
+        });
+
+        // Then it cost what its own rows cost, not a scan and a commit for
+        // every batch the writer added meanwhile, and no leftover remains.
+        assert!(
+            busy <= 4 * quiet + 16,
+            "{busy} LSM round trips under a writer, {quiet} without"
+        );
+        assert!(recorded().iter().all(|node| *node >= 1_000));
+    }
+
+    /// The async build sweeps the build-delta rows after its Ready flip only
+    /// when it is the job that flipped it, and under the admin gate. A job
+    /// that lost the index between its drain and its publish swept anyway,
+    /// after the gate: it deleted the rows a newer build of the field had
+    /// recorded for its own drain.
+    #[test]
+    fn lsm_async_build_sweeps_deltas_only_when_it_published() {
+        fn building(storage: &HelixGraphStorage, job_id: &str) {
+            storage.payload_indices.write().unwrap().insert(
+                "repo".to_string(),
+                PayloadIndexHandle::building_lsm(PayloadIndexSchema::Keyword, job_id.to_string()),
+            );
+        }
+        // As a foreground write records its row while the index is Building.
+        fn record(storage: &HelixGraphStorage, db_name: &str, node: u128) {
+            storage
+                .with_write_backend_buffered(|w| {
+                    storage.record_payload_index_build_delta(w, db_name, node, None)
+                })
+                .unwrap();
+        }
+        fn before_publish(then: Box<dyn FnOnce()>) {
+            BEFORE_PAYLOAD_INDEX_PUBLISH_FOR_TEST.with(|hook| *hook.borrow_mut() = Some(then));
+        }
+
+        let dir = TempDir::new().unwrap();
+        let storage = Arc::new(
+            HelixGraphStorage::new(
+                dir.path().to_str().unwrap(),
+                test_config().with_lsm_in_memory(),
+            )
+            .unwrap(),
+        );
+        let schema = PayloadIndexSchema::Keyword;
+        let db_name = HelixGraphStorage::payload_index_db_name("repo", &schema);
+        let job = dummy_payload_index_job("repo");
+        let recorded = || {
+            let read = storage.backend.begin_read().unwrap();
+            let mut nodes = Vec::new();
+            storage
+                .backend
+                .scan(
+                    &read,
+                    Namespace::PayloadIndexBuild(&db_name),
+                    KeyRange::all(),
+                    |key, _| {
+                        nodes.push(u128::from_be_bytes(key.try_into().unwrap()));
+                        true
+                    },
+                )
+                .unwrap();
+            nodes
+        };
+
+        // Given a build past its drain, and a write that records one more
+        // row before the publish.
+        building(&storage, &job.job_id);
+        let (late, name) = (Arc::clone(&storage), db_name.clone());
+        before_publish(Box::new(move || record(&late, &name, 5)));
+
+        // When the job publishes.
+        storage.build_payload_index_job(&job).unwrap();
+
+        // Then the index is Ready and the row, garbage by then, is gone.
+        assert_eq!(storage.has_payload_index("repo"), Some(schema));
+        assert!(recorded().is_empty());
+
+        // Given the same job on a new build, and the index dropped and
+        // created again between its drain and its publish, with a write
+        // under the newer build.
+        building(&storage, &job.job_id);
+        let (newer, name) = (Arc::clone(&storage), db_name.clone());
+        before_publish(Box::new(move || {
+            building(&newer, "job-newer");
+            record(&newer, &name, 7);
+        }));
+
+        // When the job goes on to its publish.
+        storage.build_payload_index_job(&job).unwrap();
+
+        // Then it published nothing, and the newer build's row is still
+        // there for that build's drain.
+        assert!(storage
+            .payload_index_job_active("repo", "job-newer")
+            .unwrap());
+        assert_eq!(recorded(), vec![7]);
+    }
+
+    /// The pre-Ready drain repairs a row a backfill chunk resurrected and
+    /// consumes its delta in one checked pass, and writes nothing once its
+    /// job no longer owns the index.
+    #[test]
+    fn lsm_build_drain_repairs_resurrected_rows_in_one_pass() {
+        use crate::helix_engine::storage_core::upsert::NodeUpsert;
+
+        let dir = TempDir::new().unwrap();
+        let storage = HelixGraphStorage::new(
+            dir.path().to_str().unwrap(),
+            test_config().with_lsm_in_memory(),
+        )
+        .unwrap();
+        let schema = PayloadIndexSchema::Keyword;
+        let db_name = HelixGraphStorage::payload_index_db_name("repo", &schema);
+        let key = |s: &str| {
+            HelixGraphStorage::stable_index_key_for_value(&Value::String(s.into())).unwrap()
+        };
+        storage
+            .with_write_backend(|w| {
+                for id in 1..=3u128 {
+                    storage.upsert_node_be(
+                        w,
+                        &NodeUpsert {
+                            id,
+                            label: "point".into(),
+                            properties: HashMap::from([(
+                                "repo".to_string(),
+                                Value::String("a".into()),
+                            )]),
+                        },
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        storage
+            .create_payload_index("repo", schema.clone())
+            .unwrap();
+        // A write moved node 1 off "b" (recording it) and a chunk that had
+        // read the old value put the row back.
+        storage
+            .with_write_backend(|w| {
+                storage
+                    .backend
+                    .put_dup_stored(
+                        w,
+                        Namespace::PayloadIndex(&db_name),
+                        &key("b"),
+                        &1u128.to_be_bytes(),
+                        PAYLOAD_INDEX_PLAIN_ROW,
+                    )
+                    .map_err(|e| GraphError::New(e.to_string()))?;
+                storage.record_payload_index_build_delta(w, &db_name, 1, Some(&key("b")))
+            })
+            .unwrap();
+        storage.payload_indices.write().unwrap().insert(
+            "repo".to_string(),
+            PayloadIndexHandle::building_lsm(schema.clone(), "job".to_string()),
+        );
+        let rows = |ns| {
+            let read = storage.backend.begin_read().unwrap();
+            let mut rows = Vec::new();
+            storage
+                .backend
+                .scan_dup_stored(&read, ns, KeyRange::all(), |key, id, stored| {
+                    rows.push((key.to_vec(), id.to_vec(), stored.to_vec()));
+                    true
+                })
+                .unwrap();
+            rows
+        };
+        let deltas = || rows(Namespace::PayloadIndexBuild(&db_name)).len();
+
+        assert!(!storage
+            .drain_payload_index_build_deltas("repo", &schema, &db_name, "older")
+            .unwrap());
+        assert_eq!(deltas(), 1, "a job that lost the index wrote");
+        assert!(storage
+            .drain_payload_index_build_deltas("repo", &schema, &db_name, "job")
+            .unwrap());
+        assert_eq!(deltas(), 0);
+        let current: Vec<_> = (1..=3u128)
+            .map(|id| {
+                (
+                    key("a"),
+                    id.to_be_bytes().to_vec(),
+                    PAYLOAD_INDEX_PLAIN_ROW.to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(rows(Namespace::PayloadIndex(&db_name)), current);
+    }
+
+    /// `upsert_node_be` and `drop_node_be` hold `payload_indices.read()`
+    /// across their per-index loop, so the index/deindex calls inside it must
+    /// not read-lock the map again: std's RwLock parks a new reader behind a
+    /// queued writer (`delete_payload_index`), so a nested read deadlocks the
+    /// write and the delete.
+    #[test]
+    fn lsm_payload_index_writes_do_not_relock_the_index_map() {
+        let dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(
+            HelixGraphStorage::new(
+                dir.path().to_str().unwrap(),
+                test_config().with_lsm_in_memory(),
+            )
+            .unwrap(),
+        );
+        let schema = PayloadIndexSchema::Keyword;
+        let db_name = HelixGraphStorage::payload_index_db_name("repo", &schema);
+        let handle = PayloadIndexHandle::building_lsm(schema.clone(), "job".to_string());
+        storage
+            .payload_indices
+            .write()
+            .unwrap()
+            .insert("repo".to_string(), handle.clone());
+
+        // The loop's guard, then a writer queued behind it.
+        let outer = storage.payload_indices.read().unwrap();
+        let writer = {
+            let storage = std::sync::Arc::clone(&storage);
+            std::thread::spawn(move || drop(storage.payload_indices.write().unwrap()))
+        };
+        let queued = std::time::Instant::now();
+        while storage.payload_indices.try_read().is_ok()
+            && queued.elapsed() < std::time::Duration::from_secs(2)
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            storage.payload_indices.try_read().is_err(),
+            "writer never queued"
+        );
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let index_write = {
+            let storage = std::sync::Arc::clone(&storage);
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                let value = Value::String("a".into());
+                let result = storage.with_write_backend(|w| {
+                    storage.index_node_payload_field_be(w, "repo", &handle, 1, Some(&value))?;
+                    storage.deindex_node_payload_field_be(w, "repo", &handle, 1, Some(&value))
+                });
+                done_tx.send(result).unwrap();
+            })
+        };
+        let finished = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(outer);
+        writer.join().unwrap();
+        index_write.join().unwrap();
+        assert!(
+            matches!(finished, Ok(Ok(()))),
+            "index write under a held map guard: {finished:?}"
+        );
+
+        let deltas = || {
+            let read = storage.backend.begin_read().unwrap();
+            let mut deltas = 0;
+            storage
+                .backend
+                .scan_dup_stored(
+                    &read,
+                    Namespace::PayloadIndexBuild(&db_name),
+                    KeyRange::all(),
+                    |_, _, _| {
+                        deltas += 1;
+                        true
+                    },
+                )
+                .unwrap();
+            deltas
+        };
+        // Still recorded while building: one marker, one deleted row.
+        assert_eq!(deltas(), 2);
+        // And not once the index is Ready.
+        assert!(handle.mark_ready("job"));
+        storage
+            .with_write_backend(|w| {
+                let value = Value::String("b".into());
+                storage.index_node_payload_field_be(w, "repo", &handle, 2, Some(&value))
+            })
+            .unwrap();
+        assert_eq!(deltas(), 2);
     }
 
     #[test]
@@ -9731,8 +11630,12 @@ impl HelixGraphStorage {
                     indices.insert(name.to_string(), schema.clone());
                     metadata.set_payload_indices(indices);
                     Ok(())
-                })
-                .map(|_| ())
+                })?;
+                if *schema == PayloadIndexSchema::Keyword {
+                    // Built by this binary: its rows already carry markers.
+                    self.put_payload_marker_backfill_done(w, name)?;
+                }
+                Ok(())
             });
         }
         self.with_write_txn(|wtxn| {
@@ -9741,6 +11644,40 @@ impl HelixGraphStorage {
             self.set_payload_indices_metadata(wtxn, indices)?;
             Ok(())
         })
+    }
+
+    /// [`Self::register_payload_index_metadata`] on LSM as ONE write that is
+    /// flushed here: the metadata key and the marker record go into the same
+    /// transaction, it commits buffered, and one flush makes it durable
+    /// before this returns. The two durable commits of the plain form each
+    /// wait for the next WAL flush tick (500 ms apart in production) instead,
+    /// which made every index create on an empty collection take a second.
+    fn register_payload_index_metadata_in_one_flush(
+        &self,
+        name: &str,
+        schema: &PayloadIndexSchema,
+    ) -> Result<(), GraphError> {
+        self.ensure_not_degraded()?;
+        // Built by this binary: its rows already carry markers.
+        let marker = (*schema == PayloadIndexSchema::Keyword)
+            .then(|| payload_marker_backfill::marker_backfill_done_row(name));
+        let also: Vec<(&[u8], &[u8])> = marker
+            .iter()
+            .map(|(key, done)| (key.as_slice(), *done))
+            .collect();
+        self.update_metadata_be_buffered(&also, |metadata| {
+            let mut indices = metadata.payload_indices.clone();
+            indices.insert(name.to_string(), schema.clone());
+            metadata.set_payload_indices(indices);
+            Ok(())
+        })?;
+        self.backend
+            .flush_durable()
+            .map_err(|e| self.backend_error(e, "payload_index_register_flush_durable"))?;
+        // After the flush: the snapshot is written out as the metadata sidecar, which
+        // must not name an index the store does not hold yet.
+        self.refresh_metadata_snapshot_best_effort();
+        Ok(())
     }
 
     pub fn create_payload_index(
@@ -9795,6 +11732,7 @@ impl HelixGraphStorage {
                 // A failed prior job may have left build-delta rows behind;
                 // this build's drain must only see its own deltas.
                 self.clear_payload_index_build_deltas(&db_name)?;
+                self.clear_payload_index_rows(&db_name)?;
                 let mut cursor: Option<u128> = None;
                 let mut indexed_nodes = 0_u64;
                 let chunk_size = payload_index_chunk_size();
@@ -9817,9 +11755,14 @@ impl HelixGraphStorage {
                 }
 
                 // The backfill scan raced foreground writes (LSM write batches
-                // take no shared gate): drain the build-delta sidecar to empty
-                // so no chunk-resurrected stale row survives publication.
-                self.drain_payload_index_build_deltas(name, &schema, &db_name)?;
+                // take no shared gate): repair what the build-delta sidecar
+                // recorded so no chunk-resurrected stale row survives
+                // publication.
+                if !self.drain_payload_index_build_deltas(name, &schema, &db_name, &job_id)? {
+                    return Err(GraphError::New(format!(
+                        "payload index '{name}' build was cancelled"
+                    )));
+                }
 
                 self.register_payload_index_metadata(name, &schema)?;
                 handle.mark_ready(&job_id);
@@ -9922,6 +11865,58 @@ impl HelixGraphStorage {
         Ok(())
     }
 
+    /// `name`'s status when it is already ready or building with `schema`;
+    /// an error when it exists with another schema.
+    fn ready_or_building_payload_index(
+        &self,
+        name: &str,
+        schema: &PayloadIndexSchema,
+    ) -> Result<Option<PayloadIndexStatus>, GraphError> {
+        let payload_indices = self
+            .payload_indices
+            .read()
+            .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
+        let Some(existing) = payload_indices.get(name) else {
+            return Ok(None);
+        };
+        if existing.schema != *schema {
+            return Err(GraphError::New(format!(
+                "Payload index '{}' already exists with schema {:?}",
+                name, existing.schema
+            )));
+        }
+        let status = existing.status(name);
+        Ok(matches!(status.status, "ready" | "building").then_some(status))
+    }
+
+    /// Whether a payload index build of this collection is queued or
+    /// running. A queued job has only a `Weak` to the storage, so that it
+    /// pins no LMDB env across a drop: an eviction that closed the collection
+    /// under it dropped the build its caller was told is `building`, and the
+    /// next open knew no such index.
+    pub(crate) fn payload_index_build_pending(&self) -> bool {
+        self.payload_index_builds_pending.load(Ordering::Acquire) > 0
+    }
+
+    /// Counts a build as pending from before `submit` hands it to the
+    /// executor, since a worker may take it at once. The worker that takes
+    /// it gives the count back by a guard (`PendingPayloadIndexBuild`). A
+    /// job that `submit` refuses was never queued: its count is given back
+    /// here.
+    fn counted_as_pending(
+        &self,
+        submit: impl FnOnce() -> Result<(), GraphError>,
+    ) -> Result<(), GraphError> {
+        self.payload_index_builds_pending
+            .fetch_add(1, Ordering::AcqRel);
+        let queued = submit();
+        if queued.is_err() {
+            self.payload_index_builds_pending
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        queued
+    }
+
     pub fn enqueue_payload_index_build(
         self: &Arc<Self>,
         collection: &str,
@@ -9929,28 +11924,19 @@ impl HelixGraphStorage {
         schema: PayloadIndexSchema,
         point_writes_quiesced: bool,
     ) -> Result<PayloadIndexStatus, GraphError> {
+        // Re-sent creates for an existing index (the client sends them) answer without
+        // the admin gate: an async build holds it while clearing a dropped
+        // index's rows, and the caller holds the point-mutation gate.
+        if let Some(status) = self.ready_or_building_payload_index(name, &schema)? {
+            return Ok(status);
+        }
         let _admin_guard = self
             .payload_index_admin_gate
             .lock()
             .map_err(|e| GraphError::New(format!("Payload index admin gate poisoned: {}", e)))?;
 
-        {
-            let payload_indices = self
-                .payload_indices
-                .read()
-                .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
-            if let Some(existing) = payload_indices.get(name) {
-                if existing.schema != schema {
-                    return Err(GraphError::New(format!(
-                        "Payload index '{}' already exists with schema {:?}",
-                        name, existing.schema
-                    )));
-                }
-                let status = existing.status(name);
-                if matches!(status.status, "ready" | "building") {
-                    return Ok(status);
-                }
-            }
+        if let Some(status) = self.ready_or_building_payload_index(name, &schema)? {
+            return Ok(status);
         }
 
         let job_id = format!(
@@ -9968,15 +11954,34 @@ impl HelixGraphStorage {
                     .get_metadata_be(&r)
                     .or_else(|_| self.metadata_snapshot())?;
                 if metadata.stats.node_count == 0 {
+                    drop(r);
+                    self.clear_payload_index_rows(&Self::payload_index_db_name(name, &schema))?;
                     let handle = PayloadIndexHandle::ready_lsm(schema.clone());
-                    {
+                    let replaced = {
                         let mut payload_indices = self
                             .payload_indices
                             .write()
                             .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
-                        payload_indices.insert(name.to_string(), handle.clone());
+                        payload_indices.insert(name.to_string(), handle.clone())
+                    };
+                    let registered = if super::replication::lsm_point_write_flush_enabled() {
+                        self.register_payload_index_metadata_in_one_flush(name, &schema)
+                    } else {
+                        self.register_payload_index_metadata(name, &schema)
+                    };
+                    if let Err(e) = registered {
+                        // Not registered: a retry has to write it, so it must not be
+                        // answered "ready" from this handle. What it replaced comes back.
+                        let mut payload_indices =
+                            self.payload_indices.write().map_err(|lock_err| {
+                                GraphError::New(format!("Lock poisoned: {}", lock_err))
+                            })?;
+                        match replaced {
+                            Some(replaced) => payload_indices.insert(name.to_string(), replaced),
+                            None => payload_indices.remove(name),
+                        };
+                        return Err(e);
                     }
-                    self.register_payload_index_metadata(name, &schema)?;
                     metrics::counter!("helix_payload_index_empty_fast_path_total").increment(1);
                     return Ok(handle.status(name));
                 }
@@ -9999,7 +12004,7 @@ impl HelixGraphStorage {
                 job_id: job_id.clone(),
                 storage: Arc::downgrade(self),
             };
-            if let Err(e) = PAYLOAD_INDEX_EXECUTOR.submit(job) {
+            if let Err(e) = self.counted_as_pending(|| PAYLOAD_INDEX_EXECUTOR.submit(job)) {
                 let mut payload_indices = self
                     .payload_indices
                     .write()
@@ -10072,7 +12077,7 @@ impl HelixGraphStorage {
             job_id: job_id.clone(),
             storage: Arc::downgrade(self),
         };
-        if let Err(e) = PAYLOAD_INDEX_EXECUTOR.submit(job) {
+        if let Err(e) = self.counted_as_pending(|| PAYLOAD_INDEX_EXECUTOR.submit(job)) {
             let mut payload_indices = self
                 .payload_indices
                 .write()
@@ -10108,6 +12113,20 @@ impl HelixGraphStorage {
         let pause = payload_index_chunk_pause();
         let mut cursor = None;
         let mut indexed_nodes = 0_u64;
+        let lsm = self.backend.kind() == BackendKind::Lsm;
+        let db_name = Self::payload_index_db_name(&job.field_name, &job.schema);
+        if lsm {
+            // Mirror the sync LSM build. Under the admin gate, so a job that is
+            // no longer current never clears a newer build's rows.
+            let _admin_guard = self.payload_index_admin_gate.lock().map_err(|e| {
+                GraphError::New(format!("Payload index admin gate poisoned: {}", e))
+            })?;
+            if !self.payload_index_job_active(&job.field_name, &job.job_id)? {
+                return Ok(());
+            }
+            self.clear_payload_index_build_deltas(&db_name)?;
+            self.clear_payload_index_rows(&db_name)?;
+        }
 
         loop {
             if !self.payload_index_job_active(&job.field_name, &job.job_id)? {
@@ -10119,10 +12138,13 @@ impl HelixGraphStorage {
                 break;
             }
             let next_cursor = ids.last().copied();
-            let indexed = self.write_payload_index_chunk(job, &ids)?;
-            if !self.payload_index_job_active(&job.field_name, &job.job_id)? {
-                return Ok(());
-            }
+            let indexed = {
+                let _build = self.payload_index_build_lock()?;
+                if !self.payload_index_job_active(&job.field_name, &job.job_id)? {
+                    return Ok(());
+                }
+                self.write_payload_index_chunk(job, &ids)?
+            };
 
             indexed_nodes = indexed_nodes.saturating_add(indexed);
             self.update_payload_index_progress(
@@ -10138,6 +12160,24 @@ impl HelixGraphStorage {
             }
         }
 
+        // Backfill chunks raced foreground writes: repair any row a chunk
+        // resurrected before the index is published Ready.
+        if lsm
+            && !self.drain_payload_index_build_deltas(
+                &job.field_name,
+                &job.schema,
+                &db_name,
+                &job.job_id,
+            )?
+        {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(hook) =
+            BEFORE_PAYLOAD_INDEX_PUBLISH_FOR_TEST.with(|hook| hook.borrow_mut().take())
+        {
+            hook();
+        }
         self.publish_payload_index_ready(job)
     }
 
@@ -10197,7 +12237,7 @@ impl HelixGraphStorage {
     /// helpers, writing to SlateDB. Previously both payload-index build paths called
     /// the LMDB-only `get_for_update_heed` unconditionally, which hits the
     /// `unreachable!("heed write path is LMDB-only")` arm and panics under
-    /// `HELIX_STORAGE_BACKEND=lsm` — breaking payload-index builds (e.g. CE's `repo`
+    /// `HELIX_STORAGE_BACKEND=lsm` — breaking payload-index builds (e.g. the client's `repo`
     /// filter) on the LSM backend. The payload-index READ path was already routed
     /// (`get_nodes_by_payload_value` / `get_nodes_by_payload_range`); this closes
     /// the write side.
@@ -10267,170 +12307,248 @@ impl HelixGraphStorage {
         self.index_payload_chunk(ids, &job.field_name, &job.schema, job.db.as_ref())
     }
 
-    /// Drain one bounded batch of build-delta rows for an in-flight LSM
-    /// payload-index build (see [`Namespace::PayloadIndexBuild`]): re-delete
-    /// index rows the backfill scan may have resurrected after a racing
-    /// foreground write removed them, then reindex each dirty node from its
-    /// current value. Only the delta rows observed by THIS batch's snapshot
-    /// are consumed, so rows written concurrently survive for the next pass.
-    /// Returns the number of dirty nodes drained (0 = the sidecar was empty
-    /// at the snapshot).
-    fn drain_payload_index_build_delta_batch(
-        &self,
-        field: &str,
-        schema: &PayloadIndexSchema,
-        db_name: &str,
-    ) -> Result<u64, GraphError> {
-        const BATCH_NODES: usize = 512;
-        let mut batch: std::collections::BTreeMap<u128, Vec<Vec<u8>>> =
-            std::collections::BTreeMap::new();
-        let read = self
-            .backend
-            .begin_read()
-            .map_err(|e| self.backend_error(e, "payload_index_build_delta_scan"))?;
-        self.backend
-            .scan(
-                &read,
-                Namespace::PayloadIndexBuild(db_name),
-                KeyRange::all(),
-                |k, v| {
-                    let Ok(id_bytes) = <[u8; 16]>::try_from(k) else {
-                        return true;
-                    };
-                    let id = u128::from_be_bytes(id_bytes);
-                    // Rows sort by (node_id, value): keep taking values for an
-                    // already-admitted node, stop at the first NEW node past
-                    // the cap so no node's row set is split across batches.
-                    if batch.len() >= BATCH_NODES && !batch.contains_key(&id) {
-                        return false;
-                    }
-                    batch.entry(id).or_default().push(v.to_vec());
-                    true
-                },
-            )
-            .map_err(|e| self.backend_error(e, "payload_index_build_delta_scan"))?;
-        drop(read);
-        if batch.is_empty() {
-            return Ok(0);
-        }
-        let drained = batch.len() as u64;
-        self.with_write_backend(|w| {
-            for (id, recorded) in &batch {
-                let id_be = id.to_be_bytes();
-                // Re-delete rows a racing backfill chunk may have resurrected.
-                // The reindex below re-adds any that are still current (put
-                // after delete on the same composite key wins in the batch).
-                // Row values are `[seq: u64 BE][old_index_key...]` — an empty
-                // tail is a marker row (reindex only, nothing to re-delete).
-                for old_key in recorded
-                    .iter()
-                    .filter_map(|value| value.get(8..))
-                    .filter(|old_key| !old_key.is_empty())
-                {
-                    self.backend
-                        .delete_dup(w, Namespace::PayloadIndex(db_name), old_key, &id_be)
-                        .map_err(|e| GraphError::New(e.to_string()))?;
-                }
-                let node = self
-                    .backend
-                    .get_for_update(w, Namespace::Nodes, &id_be, |v| {
-                        v.map(|bytes| SerializedNode::decode_node(bytes, *id))
-                            .transpose()
-                    })
-                    .map_err(|e| GraphError::New(e.to_string()))??;
-                if let Some(node) = node {
-                    let value = Self::payload_value_for_key(&node.properties, field);
-                    self.deindex_node_payload_field_be_unrecorded(w, field, schema, *id, value)?;
-                    self.index_node_payload_field_be_unrecorded(w, field, schema, *id, value)?;
-                }
-                // Consume exactly the delta rows this batch observed.
-                for value in recorded {
-                    self.backend
-                        .delete_dup(w, Namespace::PayloadIndexBuild(db_name), &id_be, value)
-                        .map_err(|e| GraphError::New(e.to_string()))?;
-                }
-            }
-            Ok(())
-        })?;
-        Ok(drained)
-    }
-
-    /// Drain the build-delta sidecar to empty before an LSM payload index is
-    /// published Ready. Every recorded row is seq-unique, so a drain batch can
-    /// only consume rows its own snapshot observed: any foreground write that
-    /// interleaves with a drain batch (and could therefore have been clobbered
-    /// by that batch's stale deletes/reindex) leaves fresh rows behind that
-    /// force another pass. A pass that observes an EMPTY sidecar performed no
-    /// writes at all, so nothing it did can need repair; the backfill scan
-    /// finished before the first pass, so no chunk write can resurrect a stale
-    /// row after that observation either. Foreground writes landing after the
-    /// empty observation maintain the live index themselves — their delta
-    /// rows are pure garbage, swept by the caller after the Ready flip.
+    /// Repair, before an LSM build publishes Ready, every node the build-delta
+    /// sidecar recorded (see [`Namespace::PayloadIndexBuild`]): a backfill
+    /// chunk that read a node before a foreground write and committed after
+    /// it resurrected the old value's row. One pass over the sidecar as of a
+    /// snapshot taken after the last chunk: rows recorded later come from
+    /// writes that maintained the index themselves, with no chunk left to
+    /// undo them. Each batch commits only if none of its nodes was written
+    /// after the batch began ([`LsmCheckedTxn`]), so the repair resurrects
+    /// nothing either; a refused batch is retried in halves, a refused single
+    /// node until it commits. The build lock is held per commit only.
+    /// Returns false once `job_id` no longer owns the index.
     fn drain_payload_index_build_deltas(
         &self,
         field: &str,
         schema: &PayloadIndexSchema,
         db_name: &str,
-    ) -> Result<(), GraphError> {
-        // Generous livelock guard: each batch consumes what it saw, so this
-        // only trips if foreground writes outpace the drain for this many
-        // consecutive batches. Failing the build honestly beats publishing an
-        // index that may still carry resurrected rows.
-        const MAX_BATCHES: usize = 10_000;
-        for _ in 0..MAX_BATCHES {
-            if self.drain_payload_index_build_delta_batch(field, schema, db_name)? == 0 {
-                return Ok(());
-            }
-        }
-        Err(GraphError::New(format!(
-            "payload index '{field}' build-delta drain did not converge after {MAX_BATCHES} batches"
-        )))
-    }
-
-    /// Delete every row in the build-delta sidecar for `db_name` (bounded
-    /// batches). Used before a fresh build (a failed prior job may have left
-    /// rows) and after the Ready flip (post-drain foreground rows are garbage).
-    fn clear_payload_index_build_deltas(&self, db_name: &str) -> Result<(), GraphError> {
-        const BATCH_ROWS: usize = 4096;
-        // Bounded: leftover rows are harmless garbage (consumed by no one once
-        // the build is over), so give up quietly if a hot writer keeps adding
-        // rows faster than the sweep deletes them.
-        const MAX_BATCHES: usize = 10_000;
-        for _ in 0..MAX_BATCHES {
-            let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            let read = self
-                .backend
-                .begin_read()
-                .map_err(|e| self.backend_error(e, "payload_index_build_delta_clear"))?;
+        job_id: &str,
+    ) -> Result<bool, GraphError> {
+        const BATCH_NODES: usize = 512;
+        let read = self
+            .backend
+            .begin_read()
+            .map_err(|e| self.backend_error(e, "payload_index_build_delta_scan"))?;
+        let mut start = Bound::Unbounded;
+        loop {
+            let mut batch: Vec<(u128, Vec<Vec<u8>>)> = Vec::new();
             self.backend
                 .scan(
                     &read,
                     Namespace::PayloadIndexBuild(db_name),
-                    KeyRange::all(),
+                    KeyRange {
+                        start: start.clone(),
+                        end: Bound::Unbounded,
+                    },
                     |k, v| {
-                        rows.push((k.to_vec(), v.to_vec()));
-                        rows.len() < BATCH_ROWS
+                        let Ok(id_bytes) = <[u8; 16]>::try_from(k) else {
+                            return true;
+                        };
+                        let id = u128::from_be_bytes(id_bytes);
+                        // Rows sort by (node_id, value): whole row sets per batch.
+                        if let Some((_, values)) = batch.last_mut().filter(|(last, _)| *last == id)
+                        {
+                            values.push(v.to_vec());
+                        } else if batch.len() >= BATCH_NODES {
+                            return false;
+                        } else {
+                            batch.push((id, vec![v.to_vec()]));
+                        }
+                        true
                     },
                 )
-                .map_err(|e| self.backend_error(e, "payload_index_build_delta_clear"))?;
-            drop(read);
-            if rows.is_empty() {
-                return Ok(());
-            }
-            self.with_write_backend(|w| {
-                for (key, value) in &rows {
-                    self.backend
-                        .delete_dup(w, Namespace::PayloadIndexBuild(db_name), key, value)
-                        .map_err(|e| GraphError::New(e.to_string()))?;
+                .map_err(|e| self.backend_error(e, "payload_index_build_delta_scan"))?;
+            let Some((last, _)) = batch.last() else {
+                return Ok(true);
+            };
+            start = Bound::Excluded(last.to_be_bytes().to_vec());
+            let mut todo = vec![batch.as_slice()];
+            let mut refusals = 0u32;
+            while let Some(nodes) = todo.pop() {
+                match self.repair_payload_index_nodes(field, schema, db_name, job_id, nodes)? {
+                    None => return Ok(false),
+                    Some(true) => refusals = 0,
+                    Some(false) if nodes.len() > 1 => {
+                        let (head, tail) = nodes.split_at(nodes.len() / 2);
+                        todo.extend([tail, head]);
+                    }
+                    Some(false) => {
+                        // Lost to a write of this node: retry once it pauses.
+                        refusals = refusals.saturating_add(1);
+                        std::thread::sleep(Duration::from_millis(u64::from(refusals.min(20)) * 5));
+                        todo.push(nodes);
+                    }
                 }
-                Ok(())
-            })?;
+            }
         }
-        tracing::warn!(
-            db_name,
-            "payload index build-delta sweep did not empty the sidecar; leftover rows are inert"
-        );
-        Ok(())
+    }
+
+    /// One checked drain commit for `nodes` (id, recorded delta rows):
+    /// re-delete the rows a chunk may have resurrected, reindex each node
+    /// from its current value, and consume the rows. `Some(false)`: refused,
+    /// a node was written meanwhile; `None`: `job_id` no longer owns the
+    /// index.
+    fn repair_payload_index_nodes(
+        &self,
+        field: &str,
+        schema: &PayloadIndexSchema,
+        db_name: &str,
+        job_id: &str,
+        nodes: &[(u128, Vec<Vec<u8>>)],
+    ) -> Result<Option<bool>, GraphError> {
+        let AnyBackend::Lsm(lsm) = self.backend.as_ref() else {
+            return Err(GraphError::New(
+                "payload index build deltas are LSM-only".to_string(),
+            ));
+        };
+        let error = |e| self.backend_error(e, "payload_index_build_delta_drain");
+        // Begun before the reads below, so a write landing after any of them
+        // refuses the commit.
+        let txn = lsm.begin_checked().map_err(error)?;
+        let mut w = self.backend.begin_write().map_err(error)?;
+        for (id, recorded) in nodes {
+            let id_be = id.to_be_bytes();
+            // Re-delete rows a racing backfill chunk may have resurrected.
+            // The reindex below re-adds any that are still current (put
+            // after delete on the same composite key wins in the batch).
+            // Row values are `[seq: u64 BE][old_index_key...]` — an empty
+            // tail is a marker row (reindex only, nothing to re-delete).
+            for old_key in recorded
+                .iter()
+                .filter_map(|value| value.get(8..))
+                .filter(|old_key| !old_key.is_empty())
+            {
+                self.backend
+                    .delete_dup(&mut w, Namespace::PayloadIndex(db_name), old_key, &id_be)
+                    .map_err(error)?;
+            }
+            let node = self
+                .backend
+                .get_for_update(&w, Namespace::Nodes, &id_be, |v| {
+                    v.map(|bytes| SerializedNode::decode_node(bytes, *id))
+                        .transpose()
+                })
+                .map_err(error)??;
+            if let Some(node) = node {
+                let value = Self::payload_value_for_key(&node.properties, field);
+                self.deindex_node_payload_field_be_unrecorded(&mut w, field, schema, *id, value)?;
+                self.index_node_payload_field_be_unrecorded(&mut w, field, schema, *id, value)?;
+            }
+            for value in recorded {
+                self.backend
+                    .delete_dup(&mut w, Namespace::PayloadIndexBuild(db_name), &id_be, value)
+                    .map_err(error)?;
+            }
+            txn.mark_read(Namespace::Nodes, &id_be).map_err(error)?;
+        }
+        let AnyWrite::Lsm(w) = w else {
+            unreachable!("an LSM backend begins LSM writes")
+        };
+        let _build = self.payload_index_build_lock()?;
+        if !self.payload_index_job_active(field, job_id)? {
+            return Ok(None);
+        }
+        txn.commit_write(w).map(Some).map_err(error)
+    }
+
+    /// Delete the rows an LSM payload index left behind before a build
+    /// backfills it (LMDB clears its DB the same way). Dropping an index
+    /// leaves its rows, and nothing maintains them while no handle exists, so
+    /// a rebuild would otherwise publish rows for values the points no longer
+    /// hold. One snapshot drives the sweep: rows foreground writes add after
+    /// it are current and survive, and the backfill that follows rewrites
+    /// every current row the sweep deleted. Returns the rows deleted.
+    fn clear_payload_index_rows(&self, db_name: &str) -> Result<usize, GraphError> {
+        self.clear_dup_rows_as_of_now(Namespace::PayloadIndex(db_name), "payload_index_rows_clear")
+    }
+
+    /// Delete every row of the dup namespace `ns` that one snapshot taken
+    /// here sees, in bounded batches. Rows written after the snapshot are
+    /// left: a sweep that scans again until it finds nothing does not end
+    /// while writers keep adding rows. Returns the rows deleted.
+    fn clear_dup_rows_as_of_now(
+        &self,
+        ns: Namespace<'_>,
+        context: &'static str,
+    ) -> Result<usize, GraphError> {
+        const BATCH_ROWS: usize = 4096;
+        let read = self
+            .backend
+            .begin_read()
+            .map_err(|e| self.backend_error(e, context))?;
+        let mut start = Bound::Unbounded;
+        let mut cleared = 0usize;
+        loop {
+            // Whole keys per scan (the next scan resumes after the last one);
+            // a key's values are kept once, and deletes commit in bounded
+            // batches however many points share the key.
+            let mut keys: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+            let mut rows = 0usize;
+            self.backend
+                .scan(
+                    &read,
+                    ns,
+                    KeyRange {
+                        start: start.clone(),
+                        end: Bound::Unbounded,
+                    },
+                    |k, v| {
+                        match keys.last_mut() {
+                            Some((last, values)) if last.as_slice() == k => values.push(v.to_vec()),
+                            _ if rows >= BATCH_ROWS => return false,
+                            _ => keys.push((k.to_vec(), vec![v.to_vec()])),
+                        }
+                        rows += 1;
+                        true
+                    },
+                )
+                .map_err(|e| self.backend_error(e, context))?;
+            let Some((last_key, _)) = keys.last() else {
+                return Ok(cleared);
+            };
+            start = Bound::Excluded(last_key.clone());
+            let mut pending: Vec<(&[u8], &[u8])> = keys
+                .iter()
+                .flat_map(|(key, values)| {
+                    values.iter().map(move |v| (key.as_slice(), v.as_slice()))
+                })
+                .collect();
+            while !pending.is_empty() {
+                let batch: Vec<_> = pending.drain(..pending.len().min(BATCH_ROWS)).collect();
+                self.with_write_backend(|w| {
+                    for (key, value) in &batch {
+                        self.backend
+                            .delete_dup(w, ns, key, value)
+                            .map_err(|e| GraphError::New(e.to_string()))?;
+                    }
+                    Ok(())
+                })?;
+            }
+            cleared += rows;
+        }
+    }
+
+    /// Delete the rows the build-delta sidecar for `db_name` holds when this
+    /// is called. Used before a fresh build (a failed prior job may have left
+    /// rows) and after the Ready flip (post-drain foreground rows are garbage).
+    /// One snapshot, as for the index rows: before a build the handle is
+    /// already Building, so every foreground write records a row, and those
+    /// belong to the build that follows, not to the leftovers. Scanning again
+    /// until a scan came back empty, the sweep chased the writers for up to
+    /// 10,000 commits and the build under it did not write its first chunk.
+    fn clear_payload_index_build_deltas(&self, db_name: &str) -> Result<(), GraphError> {
+        self.clear_dup_rows_as_of_now(
+            Namespace::PayloadIndexBuild(db_name),
+            "payload_index_build_delta_clear",
+        )
+        .map(|_| ())
+    }
+
+    fn payload_index_build_lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, GraphError> {
+        self.payload_index_build_lock
+            .lock()
+            .map_err(|e| GraphError::New(format!("Payload index build lock poisoned: {}", e)))
     }
 
     fn payload_index_job_active(&self, field_name: &str, job_id: &str) -> Result<bool, GraphError> {
@@ -10493,6 +12611,16 @@ impl HelixGraphStorage {
         // thread, and poisons the admin gate (closed-channel for all later builds).
         self.register_payload_index_metadata(&job.field_name, &job.schema)?;
         handle.mark_ready(&job.job_id);
+        if self.backend.kind() == BackendKind::Lsm {
+            // Delta rows foreground writes recorded after the drain are
+            // garbage once Ready. Swept here, by the job that flipped it and
+            // still under the gate: once the gate is free a newer build of
+            // the field may be recording rows for its own drain.
+            self.clear_payload_index_build_deltas(&Self::payload_index_db_name(
+                &job.field_name,
+                &job.schema,
+            ))?;
+        }
         Ok(())
     }
 
@@ -10502,17 +12630,22 @@ impl HelixGraphStorage {
             .lock()
             .map_err(|e| GraphError::New(format!("Payload index admin gate poisoned: {}", e)))?;
         let handle = {
+            // Waits out an in-flight async chunk or drain of this index.
+            let _build = self.payload_index_build_lock()?;
             let mut payload_indices = self
                 .payload_indices
                 .write()
                 .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
-            payload_indices.remove(name)
+            let handle = payload_indices.remove(name);
+            if let Some(handle) = &handle {
+                handle.mark_cancelled();
+            }
+            handle
         };
 
         let Some(handle) = handle else {
             return Ok(());
         };
-        handle.mark_cancelled();
 
         // LSM: the heed write path (`set_payload_indices_metadata` / `db.clear`
         // via `with_write_txn`) hits `unreachable!("heed write path is LMDB-only")`
@@ -10523,8 +12656,8 @@ impl HelixGraphStorage {
         // indexed_nodes=0). Route the metadata removal through the backend seam,
         // mirroring `register_payload_index_metadata`. The in-memory handle is
         // already removed above so the index is no longer consulted; orphaned
-        // `PayloadIndex` keys left in SlateDB are harmless (never read without a
-        // handle) and are overwritten per-node on any rebuild.
+        // `PayloadIndex` keys left in SlateDB are never read without a handle;
+        // a rebuild clears them before its backfill (`clear_payload_index_rows`).
         if self.backend.kind() == BackendKind::Lsm {
             self.with_write_backend(|w| {
                 self.update_metadata_be(w, |metadata| {
@@ -10556,6 +12689,73 @@ impl HelixGraphStorage {
                 .filter(|handle| handle.is_ready())
                 .map(|handle| handle.schema.clone())
         })
+    }
+
+    /// [`Self::has_payload_index`] judged for the state `r` reads: an index
+    /// published after `r` was opened is incomplete there. A reader replica's
+    /// handles come from the metadata it opened with and are never refreshed,
+    /// while the writer may drop the index, clear its rows and rebuild it, so
+    /// a replica also requires the metadata `r` reads to register the index
+    /// (it is registered only once the rebuild's rows are complete).
+    pub fn has_payload_index_at(&self, name: &str, r: &AnyRead<'_>) -> Option<PayloadIndexSchema> {
+        let opened_at = r.snapshot_opened_at();
+        let schema = self.payload_indices.read().ok().and_then(|indices| {
+            indices
+                .get(name)
+                .filter(|handle| handle.is_ready_for(opened_at))
+                .map(|handle| handle.schema.clone())
+        })?;
+        if matches!(r, AnyRead::LsmReader(_)) && !self.payload_index_registered_be(r, name, &schema)
+        {
+            return None;
+        }
+        Some(schema)
+    }
+
+    /// The metadata `r` reads registers `name` with `schema`; any read or
+    /// decode failure counts as unregistered (the field is then unindexed).
+    fn payload_index_registered_be(
+        &self,
+        r: &AnyRead<'_>,
+        name: &str,
+        schema: &PayloadIndexSchema,
+    ) -> bool {
+        self.backend
+            .get_with(
+                r,
+                Namespace::Metadata,
+                METADATA_CURRENT_KEY.as_bytes(),
+                |v| {
+                    v.and_then(|bytes| Self::try_deserialize_metadata(bytes).ok())
+                        .is_some_and(|metadata| metadata.payload_indices.get(name) == Some(schema))
+                },
+            )
+            .unwrap_or(false)
+    }
+
+    /// The dense space `name` as the metadata `r` reads lists it, for a dense
+    /// read pinned at another sequence than the replica's shared segment list
+    /// (`NamedVectorManager::dense_segment_infos_at`). `None` on any read or
+    /// decode failure, and when that metadata has no such space.
+    pub(crate) fn dense_space_at(
+        backend: &AnyBackend,
+        r: &AnyRead<'_>,
+        name: &str,
+    ) -> Option<crate::helix_engine::vector_core::named_vectors::DenseVectorSpaceMetadata> {
+        backend
+            .get_with(
+                r,
+                Namespace::Metadata,
+                METADATA_CURRENT_KEY.as_bytes(),
+                |v| {
+                    Self::try_deserialize_metadata(v?)
+                        .ok()?
+                        .dense_vector_spaces
+                        .remove(name)
+                },
+            )
+            .ok()
+            .flatten()
     }
 
     pub fn list_payload_indexes(&self) -> Result<HashMap<String, PayloadIndexSchema>, GraphError> {
@@ -10639,6 +12839,12 @@ impl HelixGraphStorage {
         field: &str,
         value: &Value,
     ) -> Result<Vec<u128>, GraphError> {
+        // Before the map guard: the `_be` path takes its own, and a nested
+        // read deadlocks behind a queued writer.
+        if self.backend.kind() == BackendKind::Lsm {
+            let r = self.backend.read_borrowed(txn);
+            return self.get_nodes_by_payload_value_be(&r, field, value);
+        }
         let payload_indices = self
             .payload_indices
             .read()
@@ -10652,11 +12858,6 @@ impl HelixGraphStorage {
                 "Payload index '{}' is not a keyword index",
                 field
             )));
-        }
-
-        if self.backend.kind() == BackendKind::Lsm {
-            let r = self.backend.read_borrowed(txn);
-            return self.get_nodes_by_payload_value_be(&r, field, value);
         }
 
         let mut ids = Vec::new();
@@ -10715,6 +12916,7 @@ impl HelixGraphStorage {
                 )
                 .map_err(|e| GraphError::New(e.to_string()))?;
         }
+        payload_index_rows_read("list", ids.len());
         ids.sort_unstable();
         ids.dedup();
         Ok(ids)
@@ -10767,21 +12969,19 @@ impl HelixGraphStorage {
                 )
                 .map_err(|e| GraphError::New(e.to_string()))?;
         }
+        payload_index_rows_read("count", count);
         Ok(count)
     }
 
-    /// Resolve a Qdrant `match.text` (case-insensitive substring) condition by
-    /// walking the keyword index terms. Returns `Ok(None)` — "treat as
-    /// unindexed", the caller falls back to a recheck scan — when a term can't
-    /// be decoded or the walk would visit more than `walk_max` index entries
-    /// (`0` = unbounded).
-    pub(crate) fn get_nodes_by_payload_text(
+    /// The rows the keyword index of `field` lists under `value`, named for
+    /// [`Self::payload_value_ids_from_be`]. Fails as
+    /// [`Self::get_nodes_by_payload_value_be`] does where the index is not
+    /// ready or is no keyword index.
+    pub(crate) fn payload_value_rows(
         &self,
-        txn: &RoTxn,
         field: &str,
-        text: &str,
-        walk_max: usize,
-    ) -> Result<Option<Vec<u128>>, GraphError> {
+        value: &Value,
+    ) -> Result<PayloadValueRows, GraphError> {
         let payload_indices = self
             .payload_indices
             .read()
@@ -10796,10 +12996,80 @@ impl HelixGraphStorage {
                 field
             )));
         }
+        Ok(PayloadValueRows {
+            db_name: Self::payload_index_db_name(field, &handle.schema),
+            keys: Self::payload_keyword_lookup_keys(value),
+        })
+    }
 
+    /// The first `max` ids of `rows` from `from` on, in id order: a scan
+    /// page's window of the list [`Self::get_nodes_by_payload_value_be`]
+    /// reads whole. One value's rows are stored in id order, so the read
+    /// starts at `from` and ends after `max` rows of each lookup key.
+    pub(crate) fn payload_value_ids_from_be(
+        &self,
+        r: &AnyRead<'_>,
+        rows: &PayloadValueRows,
+        from: u128,
+        max: usize,
+    ) -> Result<Vec<u128>, GraphError> {
+        let from = from.to_be_bytes();
+        let mut ids = Vec::new();
+        for key in &rows.keys {
+            let mut taken = 0usize;
+            self.backend
+                .for_each_dup_from(
+                    r,
+                    Namespace::PayloadIndex(&rows.db_name),
+                    key,
+                    &from,
+                    |val_bytes| {
+                        if let Ok(arr) = <[u8; 16]>::try_from(val_bytes) {
+                            ids.push(u128::from_be_bytes(arr));
+                            taken += 1;
+                        }
+                        taken < max
+                    },
+                )
+                .map_err(|e| GraphError::New(e.to_string()))?;
+        }
+        payload_index_rows_read("window", ids.len());
+        ids.sort_unstable();
+        ids.dedup();
+        ids.truncate(max);
+        Ok(ids)
+    }
+
+    /// Resolve a Qdrant `match.text` (case-insensitive substring) condition by
+    /// walking the keyword index terms. Returns `Ok(None)` — "treat as
+    /// unindexed", the caller falls back to a recheck scan — when a term can't
+    /// be decoded or the walk would visit more than `walk_max` index entries
+    /// (`0` = unbounded).
+    pub(crate) fn get_nodes_by_payload_text(
+        &self,
+        txn: &RoTxn,
+        field: &str,
+        text: &str,
+        walk_max: usize,
+    ) -> Result<Option<Vec<u128>>, GraphError> {
+        // Before the map guard, as in `get_nodes_by_payload_value`.
         if self.backend.kind() == BackendKind::Lsm {
             let r = self.backend.read_borrowed(txn);
             return self.get_nodes_by_payload_text_be(&r, field, text, walk_max);
+        }
+        let payload_indices = self
+            .payload_indices
+            .read()
+            .map_err(|e| GraphError::New(format!("Lock poisoned: {}", e)))?;
+        let handle = payload_indices
+            .get(field)
+            .filter(|handle| handle.is_ready())
+            .ok_or_else(|| GraphError::New(format!("Payload index '{}' not found", field)))?;
+        if handle.schema != PayloadIndexSchema::Keyword {
+            return Err(GraphError::New(format!(
+                "Payload index '{}' is not a keyword index",
+                field
+            )));
         }
 
         // No exact-value shortcut: Qdrant `match.text` is a case-insensitive
@@ -10857,8 +13127,55 @@ impl HelixGraphStorage {
         capped
     }
 
+    /// The key a walk of `field` for `text` is cached under in `r`. `None`
+    /// for a read that is not pinned to a sequence, and for an index that is
+    /// not ready.
+    fn text_walk_key(
+        handle: &PayloadIndexHandle,
+        r: &AnyRead<'_>,
+        field: &str,
+        text: &str,
+    ) -> Option<TextWalkKey> {
+        let seq = r.snapshot_seq()?;
+        match &*handle.state.read().ok()? {
+            PayloadIndexState::Ready { since, .. } => Some(TextWalkKey::new(
+                field,
+                text,
+                Arc::as_ptr(&handle.state) as usize,
+                *since,
+                seq,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Whether a text walk of `field` is known to give up in `r`: the mark
+    /// [`Self::get_nodes_by_payload_text_exact_be`] leaves when one does,
+    /// read with no walk. `false` where there is no mark to read, which is
+    /// every read that is not pinned to a sequence.
+    pub(crate) fn payload_text_walk_gave_up_be(
+        &self,
+        r: &AnyRead<'_>,
+        field: &str,
+        walk_max: usize,
+    ) -> bool {
+        let Ok(payload_indices) = self.payload_indices.read() else {
+            return false;
+        };
+        let Some(key) = payload_indices
+            .get(field)
+            .filter(|handle| handle.is_ready() && handle.schema == PayloadIndexSchema::Keyword)
+            .and_then(|handle| Self::text_walk_key(handle, r, field, ""))
+        else {
+            return false;
+        };
+        let gave_up = self.text_walk_cache.lock().gave_up(&key.of_field());
+        gave_up.is_some_and(|visited| Self::payload_text_walk_capped(visited, walk_max))
+    }
+
     /// Backend twin of [`Self::get_nodes_by_payload_text`]; same `walk_max`
-    /// and `Ok(None)` contract.
+    /// and `Ok(None)` contract, except that a hashed key is kept as a
+    /// candidate (see [`Self::get_nodes_by_payload_text_exact_be`]).
     pub(crate) fn get_nodes_by_payload_text_be(
         &self,
         r: &AnyRead<'_>,
@@ -10866,6 +13183,28 @@ impl HelixGraphStorage {
         text: &str,
         walk_max: usize,
     ) -> Result<Option<Vec<u128>>, GraphError> {
+        Ok(self
+            .get_nodes_by_payload_text_exact_be(r, field, text, walk_max)?
+            .map(|(ids, _)| ids))
+    }
+
+    /// [`Self::get_nodes_by_payload_text_be`] plus whether the ids are exactly
+    /// the `match.text` matches. The walk applies `match.text`'s test (lower
+    /// case, substring) to each decoded term but also matches terms indexed
+    /// from array elements, which `match.text` rejects. When every matching
+    /// row is a plain string row ([`PAYLOAD_INDEX_PLAIN_ROW`]: a top-level
+    /// string value), no hit came from an array, so the set is exact.
+    ///
+    /// A value too long for a raw index key is indexed under a hash of it
+    /// ([`Self::compact_index_bytes`]), so the walk cannot test its text: its
+    /// ids are returned as candidates and the set is not exact.
+    pub(crate) fn get_nodes_by_payload_text_exact_be(
+        &self,
+        r: &AnyRead<'_>,
+        field: &str,
+        text: &str,
+        walk_max: usize,
+    ) -> Result<Option<(Vec<u128>, bool)>, GraphError> {
         let payload_indices = self
             .payload_indices
             .read()
@@ -10881,6 +13220,25 @@ impl HelixGraphStorage {
             )));
         }
 
+        let cache_key = Self::text_walk_key(handle, r, field, text);
+        if let Some(key) = &cache_key {
+            // The rows read do not depend on the text: a walk of this field
+            // that gave up at this snapshot gives up for this text too.
+            let gave_up = self.text_walk_cache.lock().gave_up(&key.of_field());
+            if gave_up.is_some_and(|visited| Self::payload_text_walk_capped(visited, walk_max)) {
+                return Ok(None);
+            }
+            if let Some(hit) = self.text_walk_cache.lock().get(key) {
+                if Self::payload_text_walk_capped(hit.visited, walk_max) {
+                    return Ok(None);
+                }
+                if hit.exact {
+                    metrics::counter!("helix_payload_text_walk_exact_total").increment(1);
+                }
+                return Ok(Some((hit.ids.clone(), hit.exact)));
+            }
+        }
+
         // No exact-value shortcut — see `get_nodes_by_payload_text`: the exact
         // hits are a strict subset of the substring match the filter applies.
         let needle = text.to_lowercase();
@@ -10888,38 +13246,48 @@ impl HelixGraphStorage {
         let mut ids = Vec::new();
         let mut undecodable = false;
         let mut capped = false;
+        let mut exact = true;
         let mut visited = 0usize;
         // Entries arrive grouped by term; decode a term once and reuse the
         // verdict (a memcmp) for each of its duplicate ids.
         let mut last_term: Vec<u8> = Vec::new();
-        let mut last_matched: Option<bool> = None;
+        let mut last_matched: Option<(bool, bool)> = None;
         self.backend
-            .scan(
+            .scan_dup_stored(
                 r,
                 Namespace::PayloadIndex(&db_name),
                 KeyRange::all(),
-                |key, val_bytes| {
+                |key, val_bytes, stored| {
                     visited += 1;
                     if Self::payload_text_walk_capped(visited, walk_max) {
                         capped = true;
                         return false;
                     }
-                    let matched = match last_matched {
-                        Some(matched) if key == last_term.as_slice() => matched,
-                        _ => match Self::payload_index_key_matches_text(key, &needle) {
-                            Some(matched) => {
+                    let (matched, is_string) = match last_matched {
+                        Some(verdict) if key == last_term.as_slice() => verdict,
+                        // Hashed long value: a candidate the recheck decides.
+                        // Giving up here instead sent every text lookup on a
+                        // field with one long value to a paged scan.
+                        _ if key.starts_with(COMPACT_INDEX_KEY_PREFIX) => (true, false),
+                        _ => match bincode::deserialize::<Value>(key) {
+                            Ok(value) => {
+                                let verdict = (
+                                    Self::payload_value_matches_text(&value, &needle),
+                                    matches!(value, Value::String(_)),
+                                );
                                 last_term.clear();
                                 last_term.extend_from_slice(key);
-                                last_matched = Some(matched);
-                                matched
+                                last_matched = Some(verdict);
+                                verdict
                             }
-                            None => {
+                            Err(_) => {
                                 undecodable = true;
                                 return false;
                             }
                         },
                     };
                     if matched {
+                        exact &= is_string && stored == PAYLOAD_INDEX_PLAIN_ROW;
                         if let Ok(arr) = <[u8; 16]>::try_from(val_bytes) {
                             ids.push(u128::from_be_bytes(arr));
                         }
@@ -10928,13 +13296,42 @@ impl HelixGraphStorage {
                 },
             )
             .map_err(|e| GraphError::New(e.to_string()))?;
+        if undecodable {
+            metrics::counter!("helix_payload_text_walk_total", "outcome" => "undecodable")
+                .increment(1);
+        }
+        if capped {
+            if let Some(key) = &cache_key {
+                self.text_walk_cache.lock().insert(
+                    key.of_field(),
+                    TextWalk {
+                        ids: Vec::new(),
+                        exact: false,
+                        visited,
+                    },
+                );
+            }
+        }
         if undecodable || capped {
             return Ok(None);
         }
         ids.sort_unstable();
         ids.dedup();
         metrics::counter!("helix_payload_text_walk_total", "outcome" => "walked").increment(1);
-        Ok(Some(ids))
+        if exact {
+            metrics::counter!("helix_payload_text_walk_exact_total").increment(1);
+        }
+        if let Some(key) = cache_key {
+            self.text_walk_cache.lock().insert(
+                key,
+                TextWalk {
+                    ids: ids.clone(),
+                    exact,
+                    visited,
+                },
+            );
+        }
+        Ok(Some((ids, exact)))
     }
 
     fn payload_index_key_matches_text(key: &[u8], needle_lower: &str) -> Option<bool> {
@@ -11362,17 +13759,6 @@ impl HelixGraphStorage {
         Ok(())
     }
 
-    /// True while `field`'s payload index is owned by a build job. Foreground
-    /// writers use this to decide whether to record build-delta rows (LSM
-    /// online builds only — see [`Namespace::PayloadIndexBuild`]).
-    fn payload_index_is_building(&self, field: &str) -> bool {
-        self.payload_indices
-            .read()
-            .ok()
-            .and_then(|indices| indices.get(field).map(PayloadIndexHandle::is_building))
-            .unwrap_or(false)
-    }
-
     /// Record one build-delta row for an in-flight LSM payload-index build:
     /// `old_index_key = Some(k)` remembers an index row `(k, node_id)` a
     /// foreground write just deleted (so the drain can re-delete it if the
@@ -11412,15 +13798,21 @@ impl HelixGraphStorage {
             .map_err(|e| GraphError::New(e.to_string()))
     }
 
+    /// Foreground index write; records build-delta rows while `handle` is
+    /// owned by a build job (LSM online builds only — see
+    /// [`Namespace::PayloadIndexBuild`]). Takes the caller's `handle` instead
+    /// of looking `field` up: callers hold `payload_indices.read()`, and a
+    /// second read of it deadlocks behind a queued writer.
     pub(crate) fn index_node_payload_field_be(
         &self,
         w: &mut AnyWrite<'_>,
         field: &str,
-        schema: &PayloadIndexSchema,
+        handle: &PayloadIndexHandle,
         node_id: u128,
         value: Option<&Value>,
     ) -> Result<(), GraphError> {
-        self.index_node_payload_field_be_inner(w, field, schema, node_id, value, true)
+        let record = handle.is_building();
+        self.index_node_payload_field_be_inner(w, field, &handle.schema, node_id, value, record)
     }
 
     /// [`Self::index_node_payload_field_be`] WITHOUT build-delta recording —
@@ -11450,23 +13842,25 @@ impl HelixGraphStorage {
             return Ok(());
         };
         let db_name = Self::payload_index_db_name(field, schema);
-        if record_build_delta
-            && self.backend.kind() == BackendKind::Lsm
-            && self.payload_index_is_building(field)
-        {
+        if record_build_delta && self.backend.kind() == BackendKind::Lsm {
             // Identity marker: the drain re-derives this node's index rows
             // from its then-current value, in the same batch as the node row.
             self.record_payload_index_build_delta(w, &db_name, node_id, None)?;
         }
         match schema {
             PayloadIndexSchema::Keyword => {
+                let stored: &[u8] = match value {
+                    Value::Array(_) => &[],
+                    _ => PAYLOAD_INDEX_PLAIN_ROW,
+                };
                 for encoded in Self::payload_keyword_index_keys(value) {
                     self.backend
-                        .put_dup(
+                        .put_dup_stored(
                             w,
                             Namespace::PayloadIndex(&db_name),
                             &encoded,
                             &node_id.to_be_bytes(),
+                            stored,
                         )
                         .map_err(|e| GraphError::New(e.to_string()))?;
                 }
@@ -11519,15 +13913,18 @@ impl HelixGraphStorage {
         Ok(())
     }
 
+    /// Foreground de-index; see [`Self::index_node_payload_field_be`] for
+    /// why it takes the caller's `handle`.
     pub(crate) fn deindex_node_payload_field_be(
         &self,
         w: &mut AnyWrite<'_>,
         field: &str,
-        schema: &PayloadIndexSchema,
+        handle: &PayloadIndexHandle,
         node_id: u128,
         value: Option<&Value>,
     ) -> Result<(), GraphError> {
-        self.deindex_node_payload_field_be_inner(w, field, schema, node_id, value, true)
+        let record = handle.is_building();
+        self.deindex_node_payload_field_be_inner(w, field, &handle.schema, node_id, value, record)
     }
 
     /// [`Self::deindex_node_payload_field_be`] WITHOUT build-delta recording —
@@ -11556,9 +13953,7 @@ impl HelixGraphStorage {
             return Ok(());
         };
         let db_name = Self::payload_index_db_name(field, schema);
-        let record = record_build_delta
-            && self.backend.kind() == BackendKind::Lsm
-            && self.payload_index_is_building(field);
+        let record = record_build_delta && self.backend.kind() == BackendKind::Lsm;
         match schema {
             PayloadIndexSchema::Keyword => {
                 for encoded in Self::payload_keyword_index_keys(value) {
@@ -11704,12 +14099,59 @@ impl HelixGraphStorage {
 
     #[inline]
     pub fn get_node_be(&self, r: &AnyRead<'_>, id: &u128) -> Result<Node, GraphError> {
+        #[cfg(test)]
+        NODE_READS_FOR_TEST.with(|reads| reads.set(reads.get() + 1));
         self.backend
             .get_with(r, Namespace::Nodes, &id.to_be_bytes(), |v| match v {
                 Some(data) => SerializedNode::decode_node(data, *id),
                 None => Err(GraphError::NodeNotFound),
             })
             .map_err(|e| GraphError::New(e.to_string()))?
+    }
+
+    /// [`Self::get_node_be`] for each of `ids` in one batched read, in order;
+    /// `None` for an id with no node, or with one that does not decode. On an
+    /// LSM store the reads are in flight together, so the waits of cold rows
+    /// overlap instead of adding up. `Ok(None)`: this backend has no batched
+    /// read and the caller reads one node at a time.
+    pub(crate) fn get_nodes_many_be(
+        &self,
+        r: &AnyRead<'_>,
+        ids: &[u128],
+    ) -> Result<Option<Vec<Option<Node>>>, BackendError> {
+        Ok(self.get_nodes_many_checked_be(r, ids)?.map(|rows| {
+            rows.into_iter()
+                .map(|row| row.and_then(Result::ok))
+                .collect()
+        }))
+    }
+
+    /// [`Self::get_nodes_many_be`] with a node that does not decode told
+    /// apart from an id with no node: `Some(Err(_))`, where a caller that
+    /// read one node at a time had [`Self::get_node_be`]'s error.
+    pub(crate) fn get_nodes_many_checked_be(
+        &self,
+        r: &AnyRead<'_>,
+        ids: &[u128],
+    ) -> Result<Option<Vec<Option<Result<Node, GraphError>>>>, BackendError> {
+        let keys: Vec<Vec<u8>> = ids.iter().map(|id| id.to_be_bytes().to_vec()).collect();
+        let rows = match (&*self.backend, r) {
+            (AnyBackend::Lsm(writer), AnyRead::Lsm(read)) => {
+                writer.collect_values_many_with(read, Namespace::Nodes, &keys)?
+            }
+            (AnyBackend::LsmReader(reader), AnyRead::LsmReader(snapshot)) => {
+                reader.collect_values_many_with_at(snapshot.as_ref(), Namespace::Nodes, &keys)?
+            }
+            _ => return Ok(None),
+        };
+        #[cfg(test)]
+        NODE_READS_FOR_TEST.with(|reads| reads.set(reads.get() + ids.len()));
+        Ok(Some(
+            ids.iter()
+                .zip(rows)
+                .map(|(id, row)| row.map(|bytes| SerializedNode::decode_node(&bytes, *id)))
+                .collect(),
+        ))
     }
 
     #[inline]
@@ -11772,7 +14214,7 @@ impl HelixGraphStorage {
     /// `mark_collection_degraded` calls the heed txn helpers make on LMDB
     /// errors, so a fenced or corrupted LSM collection is quarantined the same
     /// way an `MDB_PAGE_NOTFOUND`/`MDB_CORRUPTED` LMDB collection is.
-    fn backend_error(&self, error: BackendError, context: &'static str) -> GraphError {
+    pub(crate) fn backend_error(&self, error: BackendError, context: &'static str) -> GraphError {
         let err = graph_error_from_backend_error(error);
         self.mark_collection_degraded(&err, context);
         err

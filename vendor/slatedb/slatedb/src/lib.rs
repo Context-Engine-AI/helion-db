@@ -32,6 +32,14 @@ pub use fail_parallel;
 /// without having to depend on the object store crate directly.
 pub use object_store;
 
+/// HELION LOCAL PATCH (see vendor/slatedb/PROVENANCE.md): re-export the
+/// slatedb-common crate.
+///
+/// The builder takes a clock and a metrics recorder whose traits are that
+/// crate's: an embedder names them through this, as it names the crates
+/// above, without depending on slatedb-common itself.
+pub use slatedb_common;
+
 pub use batch::WriteBatch;
 pub use bytes_range::ByteRangeBounds;
 pub use cached_object_store::stats as cached_object_store_stats;
@@ -64,6 +72,7 @@ pub use garbage_collector::{GarbageCollectorBuilder, GcFilter};
 pub use instrumented_object_store::stats as instrumented_object_store_stats;
 pub use iter::IterationOrder;
 pub use manifest::VersionedManifest;
+pub use memtable_flusher::L0FlushGate;
 pub use merge_operator::{MergeOperator, MergeOperatorError};
 pub use ops::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbTransactionOps, DbWriteOps};
 pub use prefix_extractor::{PrefixExtractor, PrefixTarget};

@@ -10,12 +10,11 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use log::error;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
-use super::{GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
+use super::{log_delete_error, GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
 
 #[derive(Clone)]
 pub(crate) struct CompactedGcTask {
@@ -246,7 +245,7 @@ impl GcTask for CompactedGcTask {
             .for_each_concurrent(GC_DELETE_CONCURRENCY, |id| async move {
                 log::info!("deleting SST [id={:?}]", id);
                 if let Err(e) = self.table_store.delete_sst(&id).await {
-                    error!("error deleting SST [id={:?}, error={}]", id, e);
+                    log_delete_error("SST", &id, &e);
                 } else {
                     self.stats.gc_compacted_count.increment(1);
                 }

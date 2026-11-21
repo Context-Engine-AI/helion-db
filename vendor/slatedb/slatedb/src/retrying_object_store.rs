@@ -176,7 +176,9 @@ impl std::fmt::Display for RetryingObjectStore {
 
 /// Wrapper around MultipartUpload that adds ULID verification on complete() failure.
 struct RetryingMultipartUpload {
-    inner: Box<dyn MultipartUpload>,
+    // HELION LOCAL PATCH: shared with the futures of its parts, so that the
+    // one whose part fails can abort the upload (see `put_part`).
+    inner: Arc<tokio::sync::Mutex<Box<dyn MultipartUpload>>>,
     retrying_store: RetryingObjectStore,
     location: Path,
     put_id: String,
@@ -194,11 +196,42 @@ impl std::fmt::Debug for RetryingMultipartUpload {
 #[async_trait]
 impl MultipartUpload for RetryingMultipartUpload {
     fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
-        self.inner.put_part(data)
+        // HELION LOCAL PATCH: a part that fails aborts the upload before its
+        // error goes back. `WriteMultipart::finish` hands a part's error on
+        // without aborting, and takes the upload with it; the caller of an
+        // SST write then begins a new upload of the same SST. Every try left
+        // the parts of it that got through in the bucket, where no listing
+        // shows them. A part still in flight can arrive after the abort, and
+        // a process that dies aborts nothing: the bucket's lifecycle rule is
+        // for those.
+        let Ok(mut upload) = self.inner.try_lock() else {
+            // Held only while a failed part aborts: this upload is over.
+            return Box::pin(async {
+                Err(object_store::Error::Generic {
+                    store: "retrying_object_store",
+                    source: "multipart upload was aborted after a part failed".into(),
+                })
+            });
+        };
+        let part = upload.put_part(data);
+        drop(upload);
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            let result = part.await;
+            if result.is_err() {
+                if let Err(e) = inner.lock().await.abort().await {
+                    debug!(
+                        "abort of a multipart upload after a failed part failed [error={:?}]",
+                        e
+                    );
+                }
+            }
+            result
+        })
     }
 
     async fn complete(&mut self) -> object_store::Result<PutResult> {
-        let result = self.inner.complete().await;
+        let result = self.inner.lock().await.complete().await;
 
         match &result {
             Err(object_store::Error::AlreadyExists { .. })
@@ -221,7 +254,7 @@ impl MultipartUpload for RetryingMultipartUpload {
     }
 
     async fn abort(&mut self) -> object_store::Result<()> {
-        self.inner.abort().await
+        self.inner.lock().await.abort().await
     }
 }
 
@@ -403,7 +436,7 @@ impl ObjectStore for RetryingObjectStore {
         };
 
         Ok(Box::new(RetryingMultipartUpload {
-            inner,
+            inner: Arc::new(tokio::sync::Mutex::new(inner)),
             retrying_store: self.clone(),
             location: location.clone(),
             put_id,

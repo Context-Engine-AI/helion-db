@@ -1,7 +1,13 @@
 use crate::helix_engine::{
-    storage_core::replication::{submit_collection_optimizer, ReplicatedMutation},
+    storage_core::backend::StorageBackend,
+    storage_core::replication::{
+        link_stored_unreached, regraph_status, submit_collection_optimizer,
+        submit_collection_regraph, RegraphRefusal, ReplicatedMutation, LINK_PASS_ROWS_A_CALL,
+    },
     types::GraphError,
-    vector_core::named_vectors::{SidecarCleanupStats, SidecarQuantizeStats},
+    vector_core::named_vectors::{
+        DenseVectorSegmentRole, SidecarCleanupStats, SidecarQuantizeStats,
+    },
 };
 use crate::helix_gateway::inflight;
 use crate::helix_gateway::router::router::HandlerInput;
@@ -226,6 +232,209 @@ pub fn handle_gc_payload_index(
         }
         Err(e) => json_error(response, 400, &e.to_string()),
     }
+}
+
+/// POST /collections/{name}/regraph — queue a writer-side rebuild of the
+/// collection's dense HNSW graphs from their stored vectors.
+pub fn handle_regraph(input: &HandlerInput, response: &mut Response) -> Result<(), GraphError> {
+    let Some(name) = input.path_params.get("name") else {
+        return json_error(response, 400, "Missing collection name");
+    };
+    match submit_collection_regraph(&input.collections, input.collections.config(), name) {
+        Ok(status) => json_response(
+            response,
+            if status.state == "done" { 200 } else { 202 },
+            &status,
+        ),
+        Err(RegraphRefusal::Disabled) => json_error(
+            response,
+            403,
+            "regraph is disabled (HELIX_REGRAPH_ENABLED=0)",
+        ),
+        Err(RegraphRefusal::ReaderReplica) => {
+            json_error(response, 403, "regraph runs on the writer only")
+        }
+        Err(RegraphRefusal::NotLsm) => json_error(response, 409, "regraph needs the LSM backend"),
+        // The link pass's refusal: a regraph gives none.
+        Err(RegraphRefusal::Quantized) => {
+            json_error(response, 409, "collection has a quantized vector")
+        }
+        Err(RegraphRefusal::InProgress(state)) => json_error(
+            response,
+            409,
+            &format!("collection is {state}; retry later"),
+        ),
+        Err(RegraphRefusal::Storage(e)) if e.to_string().contains("not found") => {
+            json_error(response, 404, &e.to_string())
+        }
+        Err(RegraphRefusal::Storage(e)) => json_error(response, 503, &e.to_string()),
+    }
+}
+
+/// GET /collections/{name}/regraph — this writer's regraph status for it.
+pub fn handle_regraph_status(
+    input: &HandlerInput,
+    response: &mut Response,
+) -> Result<(), GraphError> {
+    let Some(name) = input.path_params.get("name") else {
+        return json_error(response, 400, "Missing collection name");
+    };
+    match regraph_status(&input.collections, name) {
+        Some(status) => json_response(response, 200, &status),
+        None => json_error(
+            response,
+            404,
+            "no regraph requested since this writer started",
+        ),
+    }
+}
+
+/// POST /collections/{name}/unreached/link — on the writer, give the served
+/// rows no stored link leads to (`GET /collections/{name}/unreached`) a link
+/// from a near row with room, in the segments this has not been done for.
+/// Adds links and removes none. The reply says what was done; `busy` (409)
+/// when the collection was written to meanwhile, with nothing changed. A
+/// collection with a quantized named vector is refused (409, an error and
+/// no status): asking again changes nothing.
+///
+/// A call reads one segment, the first the pass has not finished, as the
+/// count reads it, and looks at no more than `LINK_PASS_ROWS_A_CALL` of its
+/// unreached rows, a walk and at most a link each, all in this request.
+/// Repeat it until `remaining` is 0, one collection at a time. A segment
+/// it has finished is counted again once a hard delete has taken a row of
+/// its graph, and is then read again whole.
+/// `without_room` counts the rows it looked at and could not link: every
+/// near list was at its bound, a quarter past what a build fills it to, and
+/// so were the lists of the rows the pass has linked below them. A
+/// reader replica walks the new links after its restart
+/// (`readers_see_after`). Its count is read from the store and falls with
+/// the writer's before that, so it does not say that the reader walks them.
+pub fn handle_link_unreached(
+    input: &HandlerInput,
+    response: &mut Response,
+) -> Result<(), GraphError> {
+    let Some(name) = input.path_params.get("name") else {
+        return json_error(response, 400, "Missing collection name");
+    };
+    match link_stored_unreached(
+        &input.collections,
+        input.collections.config(),
+        name,
+        LINK_PASS_ROWS_A_CALL,
+    ) {
+        Ok(status) => json_response(
+            response,
+            if status.state == "done" { 200 } else { 409 },
+            &status,
+        ),
+        Err(RegraphRefusal::Disabled) => json_error(response, 403, "the link pass is disabled"),
+        Err(RegraphRefusal::ReaderReplica) => {
+            json_error(response, 403, "the link pass runs on the writer only")
+        }
+        Err(RegraphRefusal::NotLsm) => {
+            json_error(response, 409, "the link pass needs the LSM backend")
+        }
+        Err(RegraphRefusal::Quantized) => json_error(
+            response,
+            409,
+            "the link pass leaves a collection with a quantized vector alone",
+        ),
+        Err(RegraphRefusal::InProgress(state)) => json_error(
+            response,
+            409,
+            &format!("collection is {state}; retry later"),
+        ),
+        Err(RegraphRefusal::Storage(e)) if e.to_string().contains("not found") => {
+            json_error(response, 404, &e.to_string())
+        }
+        Err(RegraphRefusal::Storage(e)) => json_error(response, 503, &e.to_string()),
+    }
+}
+
+/// One dense segment as `handle_unreached` reports it.
+#[derive(Serialize)]
+struct SegmentReach {
+    space: String,
+    segment: String,
+    role: DenseVectorSegmentRole,
+    rows: usize,
+    /// Rows a search can return from here: not deleted, and not replaced by
+    /// a re-upsert tombstone or by a copy in a newer segment. 0 with rows:
+    /// the segment serves nothing.
+    served: usize,
+    /// Whether a search walks its graph: with no filter, with one.
+    walked: bool,
+    walked_filtered: bool,
+    /// Served rows no stored link leads to (their count, then their ids);
+    /// null where no search walks the segment.
+    unreached: Option<usize>,
+    unreached_ids: Option<Vec<String>>,
+    /// Rows that are not served and that no stored link leads to either.
+    unreached_unserved: Option<usize>,
+    /// `[lists, rows]` pairs: how many served rows no walk would arrive at
+    /// if it got through 0, 1, 2 and 4 lists in a row of ids a hard delete
+    /// left without a row. `unreached` is the count for this server's own
+    /// setting.
+    unreached_crossing: Option<Vec<(usize, usize)>>,
+    /// Ordinal rows whose id has no row here, and rows with no ordinal row.
+    /// A sidecar scan scores an id from the slot its ordinal row names
+    /// without reading the row, so the first must be 0 where a scan stands
+    /// in for a read of each id (`HELIX_DENSE_EXACT_SCAN_ROWS_PER_ID`); it
+    /// also counts an ordinal row that names no slot in the file, which a
+    /// scan does not score. The second are rows a scan reads one by one.
+    ordinals_without_row: usize,
+    rows_without_ordinal: usize,
+}
+
+/// GET /collections/{name}/unreached — per dense space and segment of the
+/// collection, a space's segments newest first: its rows, how many of them
+/// a search can return, whether a search walks its graph, and the served
+/// rows no stored link leads to, which no walk returns for any query. A
+/// build counts them only for the graph it has just made; this reads them
+/// from a graph as it is stored. Also how many of the segment's ordinal
+/// rows and rows are without the other.
+///
+/// Reads only, on a reader as on the writer: per segment a scan of its ids
+/// and one of its ordinal rows, per walked segment one of its neighbour
+/// lists too, so ask one collection at a time.
+pub fn handle_unreached(input: &HandlerInput, response: &mut Response) -> Result<(), GraphError> {
+    let Some(name) = input.path_params.get("name") else {
+        return json_error(response, 400, "Missing collection name");
+    };
+    let resolved = input.collections.resolve_alias(name);
+    let storage = match input.collections.get_collection(&resolved) {
+        Ok(storage) => storage,
+        Err(e) => return json_error(response, 404, &e.to_string()),
+    };
+    let read = storage
+        .backend
+        .begin_read()
+        .map_err(|e| GraphError::New(e.to_string()))
+        .and_then(|r| Ok(storage.named_vectors.stored_reach_be(&r)?));
+    let segments: Vec<SegmentReach> = match read {
+        Ok(segments) => segments
+            .into_iter()
+            .map(|(space, segment, reach)| SegmentReach {
+                space,
+                segment: segment.physical_name,
+                role: segment.role,
+                rows: reach.ids.len(),
+                served: reach.served,
+                walked: reach.walked,
+                walked_filtered: reach.walked_filtered,
+                unreached: reach.unreached.as_ref().map(Vec::len),
+                unreached_ids: reach
+                    .unreached
+                    .map(|ids| ids.iter().map(u128::to_string).collect()),
+                unreached_unserved: reach.unreached_unserved,
+                unreached_crossing: reach.unreached_crossing,
+                ordinals_without_row: reach.ordinals_without_row,
+                rows_without_ordinal: reach.rows_without_ordinal,
+            })
+            .collect(),
+        Err(e) => return json_error(response, 503, &e.to_string()),
+    };
+    json_response(response, 200, &sonic_rs::json!({"segments": segments}))
 }
 
 pub fn handle_maintenance(input: &HandlerInput, response: &mut Response) -> Result<(), GraphError> {
@@ -716,7 +925,7 @@ mod tests {
         // for that now-gone node id, bypassing the (working) deindex step.
         let mut w = storage.backend.begin_write().unwrap();
         storage
-            .index_node_payload_field_be(
+            .index_node_payload_field_be_unrecorded(
                 &mut w,
                 "metadata.repo",
                 &PayloadIndexSchema::Keyword,
@@ -783,5 +992,98 @@ mod tests {
             response.status, 200,
             "GC must succeed once the prior guard is released"
         );
+    }
+
+    /// The route's reply for a collection with five rows in one dense space:
+    /// every segment of the space with its rows, none of them walked, so no
+    /// list was read. A name with no collection is a 404.
+    #[test]
+    fn handle_unreached_lists_the_segments_of_each_dense_space() {
+        use crate::helix_engine::storage_core::replication::ReplicatedPoint;
+        use crate::helix_engine::vector_core::named_vectors::{DistanceMetric, NamedVectorConfig};
+
+        #[derive(Deserialize)]
+        struct Segment {
+            space: String,
+            rows: usize,
+            served: usize,
+            walked: bool,
+            walked_filtered: bool,
+            unreached: Option<usize>,
+            unreached_ids: Option<Vec<String>>,
+            unreached_unserved: Option<usize>,
+            unreached_crossing: Option<Vec<(usize, usize)>>,
+            ordinals_without_row: usize,
+            rows_without_ordinal: usize,
+        }
+        #[derive(Deserialize)]
+        struct Reply {
+            segments: Vec<Segment>,
+        }
+
+        let ctx = setup_with_config(Config::default().with_lsm_in_memory());
+        ctx.replication
+            .apply(ReplicatedMutation::CreateCollection {
+                name: "repo".into(),
+                vectors: HashMap::from([(
+                    "dense".to_string(),
+                    NamedVectorConfig {
+                        size: 4,
+                        distance: DistanceMetric::Cosine,
+                        spindle: Default::default(),
+                    },
+                )]),
+                sparse_vectors: HashMap::new(),
+                hnsw_overrides: None,
+            })
+            .unwrap();
+        ctx.replication
+            .apply(ReplicatedMutation::UpsertPoints {
+                collection: "repo".into(),
+                points: (1..=5u128)
+                    .map(|id| ReplicatedPoint {
+                        id,
+                        vectors: HashMap::from([(
+                            "dense".to_string(),
+                            vec![id as f32, 1.0, 0.0, 0.0],
+                        )]),
+                        sparse_vectors: HashMap::new(),
+                        payload: HashMap::new(),
+                    })
+                    .collect(),
+            })
+            .unwrap();
+
+        let asked = |name: &str| {
+            let mut input = make_input(&ctx, &format!("/collections/{name}/unreached"), Vec::new());
+            input.path_params.insert("name".into(), name.into());
+            let mut response = Response::new();
+            handle_unreached(&input, &mut response).unwrap();
+            response
+        };
+        assert_eq!(asked("nope").status, 404);
+        let response = asked("repo");
+        assert_eq!(response.status, 200);
+        let reply: Reply = sonic_rs::from_slice(&response.body).unwrap();
+        assert!(!reply.segments.is_empty());
+        assert_eq!(
+            reply.segments.iter().map(|s| s.rows).sum::<usize>(),
+            5,
+            "the space's rows over its segments"
+        );
+        for segment in &reply.segments {
+            assert_eq!(segment.space, "dense");
+            assert_eq!(segment.served, segment.rows, "one copy of each point");
+            assert!(!segment.walked && !segment.walked_filtered);
+            assert!(segment.unreached.is_none() && segment.unreached_ids.is_none());
+            assert!(segment.unreached_unserved.is_none());
+            assert!(segment.unreached_crossing.is_none());
+            // The space was made with the default quantized store, which
+            // keeps no ordinal rows: every row is one without.
+            assert_eq!(
+                (segment.ordinals_without_row, segment.rows_without_ordinal),
+                (0, segment.rows),
+            );
+        }
     }
 }

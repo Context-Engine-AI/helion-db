@@ -3,12 +3,11 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
-use log::error;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::filter::retain_allowed_by_gc_filter;
-use super::{GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
+use super::{log_delete_error, GcFilter, GcStats, GcTask, GC_DELETE_CONCURRENCY};
 
 #[derive(Clone)]
 pub(crate) struct ManifestGcTask {
@@ -114,10 +113,7 @@ impl GcTask for ManifestGcTask {
                     .delete_manifest_unchecked(manifest_metadata.id)
                     .await
                 {
-                    error!(
-                        "error deleting manifest [id={:?}, error={}]",
-                        manifest_metadata.id, e
-                    );
+                    log_delete_error("manifest", &manifest_metadata.id, &e);
                 } else {
                     self.stats.gc_manifest_count.increment(1);
                 }

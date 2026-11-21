@@ -123,12 +123,12 @@ pub enum Namespace<'a> {
     /// as [`Namespace::PayloadIndex`]. While an index is Building, foreground
     /// node mutations record `(node_id, [seq][old_index_key])` rows (an empty
     /// key tail is the "reindex me" marker) in the same write batch as the
-    /// node row; the builder drains them after its scan so a backfill chunk
-    /// that raced a foreground write cannot resurrect stale index rows. The
-    /// per-process seq makes each row unique, so a drain pass consumes only
-    /// rows its own snapshot observed and concurrent writes always leave
-    /// evidence that forces another pass; replay order is irrelevant. Unused
-    /// on LMDB (builds there hold the write gate, so the race does not exist).
+    /// node row; after its scan the builder repairs the nodes they name, in
+    /// one pass of conflict-checked commits, so a backfill chunk that raced a
+    /// foreground write cannot leave stale index rows. The per-process seq
+    /// makes each row unique, so the pass consumes only rows its snapshot
+    /// observed; replay order is irrelevant. Unused on LMDB (builds there
+    /// hold the write gate, so the race does not exist).
     PayloadIndexBuild(&'a str),
     DenseTombstones,
     /// One sub-DB of a dense vector segment, addressed by physical segment name.
@@ -175,6 +175,10 @@ impl KeyRange {
         }
     }
 }
+
+/// A row a transaction writes beside the key it updates: the row's key, and
+/// the value to put, or none to delete the key.
+pub(crate) type TransactionRow = (Vec<u8>, Option<Vec<u8>>);
 
 /// Smallest byte string strictly greater than every key with `prefix`
 /// (increment the last non-0xFF byte, drop the trailing 0xFFs). `None` when

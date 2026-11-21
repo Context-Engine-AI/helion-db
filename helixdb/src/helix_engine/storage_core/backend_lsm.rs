@@ -15,6 +15,22 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[path = "backend_lsm_cache_evictor.rs"]
+pub mod cache_evictor;
+#[path = "backend_lsm_closed_gc.rs"]
+mod closed_gc;
+#[path = "backend_lsm_dup_visit.rs"]
+mod dup_visit;
+#[path = "backend_lsm_flush_gate.rs"]
+pub(crate) mod flush_gate;
+pub(crate) use closed_gc::{
+    closed_gc_deletes, closed_gc_plan, closed_gc_puts_metadata_sidecars, gc_closed_s3_collection,
+    put_missing_s3_metadata_sidecar, ClosedGcOutcome, ClosedGcPass, ClosedGcPlan, GateWanted,
+};
+#[cfg(test)]
+pub(crate) use closed_gc::{
+    gc_closed_collection_with_store, put_missing_metadata_sidecar_with_store,
+};
 use std::future::Future;
 use std::ops::Bound;
 use std::sync::Arc;
@@ -30,7 +46,7 @@ use slatedb::config::{
     ObjectStoreCacheOptions, ScanOptions, Settings, WriteOptions,
 };
 use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
-use slatedb::db_cache::{DbCache, SplitCache};
+use slatedb::db_cache::{CacheUsageSnapshot, DbCache, SplitCache};
 use slatedb::object_store::memory::InMemory;
 use slatedb::object_store::{ObjectStore, ObjectStoreExt};
 use slatedb::{
@@ -43,7 +59,8 @@ use tokio::runtime::{Builder, Handle, Runtime};
 use crate::helix_engine::types::GraphError;
 
 use super::backend::{
-    is_dup, next_prefix, BackendError, KeyRange, Namespace, ReadTxn, StorageBackend, WriteTxn,
+    is_dup, next_prefix, BackendError, KeyRange, Namespace, ReadTxn, StorageBackend,
+    TransactionRow, WriteTxn,
 };
 use super::backend_lmdb::ns_name;
 use super::metadata::{
@@ -58,14 +75,100 @@ thread_local! {
     /// installs this only for read-like routes; durable writer operations
     /// deliberately never receive a token.
     static LSM_READ_CANCELLATION: RefCell<Option<LsmReadCancellation>> = const { RefCell::new(None) };
+    /// `Some` while this thread is inside [`opening_a_new_database`] and has
+    /// not opened its writer yet; `Some(true)` once an open there found a
+    /// database at its path.
+    static LSM_OPENS_A_NEW_DATABASE: Cell<Option<bool>> = const { Cell::new(None) };
     /// Test-only: sequential SlateDB round trips (`block_on_lsm_mapped` calls)
     /// issued by this thread.
     #[cfg(test)]
     static LSM_ROUND_TRIPS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+    /// Test-only: for each batched point read by key this thread made
+    /// (`collect_values_many` of a writer, `collect_values_many_at` of a
+    /// reader), whether a batched row read of its collection was marked in
+    /// flight then ([`batch_row_read_in_flight`]).
+    #[cfg(test)]
+    static KEY_BATCHES_MARKED_FOR_TEST: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Test-only: rows pulled by dup-namespace scans on this thread, matching
     /// or not — the quantity a prefix scan must keep proportional to its hits.
     #[cfg(test)]
     static DUP_SCAN_ROWS_FOR_TEST: Cell<usize> = const { Cell::new(0) };
+    /// Test-only: what the writers this thread opens get in place of the
+    /// process's flush gate ([`with_flush_gate_for_test`]).
+    #[cfg(test)]
+    static FLUSH_GATE_FOR_TEST: RefCell<Option<Option<Arc<dyn slatedb::L0FlushGate>>>> =
+        const { RefCell::new(None) };
+    /// Test-only: what the writers this thread opens pass their SlateDB
+    /// builder through ([`with_db_builder_for_test`]).
+    #[cfg(test)]
+    static DB_BUILDER_FOR_TEST: RefCell<Option<DbBuilderForTest>> = const { RefCell::new(None) };
+    /// Test-only: this thread's next [`LsmBackend::present_for_update`] of
+    /// any row fails ([`fail_next_present_for_update_for_test`]).
+    #[cfg(test)]
+    static FAIL_NEXT_PRESENT_FOR_UPDATE_FOR_TEST: Cell<bool> = const { Cell::new(false) };
+    /// Test-only: what [`lsm_multi_get_enabled`] answers on this thread
+    /// ([`with_lsm_multi_get_for_test`]).
+    #[cfg(test)]
+    static MULTI_GET_FOR_TEST: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Test-only: the current thread's next [`LsmBackend::present_for_update`]
+/// that has a row to read answers an error in place of reading.
+#[cfg(test)]
+pub(crate) fn fail_next_present_for_update_for_test() {
+    FAIL_NEXT_PRESENT_FOR_UPDATE_FOR_TEST.set(true);
+}
+
+/// Test-only: see [`with_db_builder_for_test`].
+#[cfg(test)]
+type DbBuilderForTest =
+    std::rc::Rc<dyn for<'a> Fn(slatedb::DbBuilder<&'a str>) -> slatedb::DbBuilder<&'a str>>;
+
+/// Test-only: runs `open`, in which every WRITER this thread opens passes its
+/// SlateDB builder through `add` last, after what the product sets. A reader
+/// replica's builder is not passed. Open one writer inside it: a second one
+/// opened there by the same thread is given `add` as well.
+#[cfg(test)]
+pub(crate) fn with_db_builder_for_test<T>(
+    add: impl for<'a> Fn(slatedb::DbBuilder<&'a str>) -> slatedb::DbBuilder<&'a str> + 'static,
+    open: impl FnOnce() -> T,
+) -> T {
+    struct Leave(Option<DbBuilderForTest>);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            DB_BUILDER_FOR_TEST.set(self.0.take());
+        }
+    }
+    let _leave = Leave(DB_BUILDER_FOR_TEST.replace(Some(std::rc::Rc::new(add))));
+    open()
+}
+
+/// Test-only: runs `open`, in which every writer this thread opens asks
+/// `gate` before a memtable flush, or no gate for `None`.
+#[cfg(test)]
+pub(crate) fn with_flush_gate_for_test<T>(
+    gate: Option<Arc<dyn slatedb::L0FlushGate>>,
+    open: impl FnOnce() -> T,
+) -> T {
+    struct Leave(Option<Option<Arc<dyn slatedb::L0FlushGate>>>);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            FLUSH_GATE_FOR_TEST.set(self.0.take());
+        }
+    }
+    let _leave = Leave(FLUSH_GATE_FOR_TEST.replace(Some(gate)));
+    open()
+}
+
+/// Test-only: runs `f` with [`lsm_multi_get_enabled`] forced on this thread:
+/// `false` is how production's readers run (`HELIX_LSM_MULTI_GET=0`).
+#[cfg(test)]
+pub(crate) fn with_lsm_multi_get_for_test<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let previous = MULTI_GET_FOR_TEST.replace(Some(on));
+    let out = f();
+    MULTI_GET_FOR_TEST.set(previous);
+    out
 }
 
 /// Test-only: SlateDB round trips issued by the current thread so far.
@@ -74,10 +177,48 @@ pub(crate) fn lsm_round_trips_for_test() -> usize {
     LSM_ROUND_TRIPS_FOR_TEST.with(Cell::get)
 }
 
+/// Test-only: notes one batched point read by key of the collection at
+/// `root`, with whether a batched row read of that collection is marked in
+/// flight now.
+#[cfg(test)]
+pub(crate) fn note_key_batch_for_test(root: &str) {
+    let object = format!("{root}/compacted/x.sst");
+    let marked = slatedb::cached_object_store_stats::ranged_miss_stats()
+        .in_batch_row_read(&object.as_str().into());
+    KEY_BATCHES_MARKED_FOR_TEST.with(|seen| seen.borrow_mut().push(marked));
+}
+
+/// Test-only: what [`note_key_batch_for_test`] noted on this thread since
+/// the last call, in order.
+#[cfg(test)]
+pub(crate) fn key_batches_marked_for_test() -> Vec<bool> {
+    KEY_BATCHES_MARKED_FOR_TEST.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
+}
+
 /// Test-only: dup-namespace rows scanned by the current thread so far.
 #[cfg(test)]
 pub(crate) fn dup_scan_rows_for_test() -> usize {
     DUP_SCAN_ROWS_FOR_TEST.with(Cell::get)
+}
+
+/// Runs `open`, in which the first writer database this thread opens must
+/// be one it creates: where a manifest is already at its path the open fails
+/// and leaves that manifest as it found it. For a prefix the caller has just
+/// purged, where a manifest can only be one put there since. Returns what
+/// `open` returned and whether a manifest was found. A writer opened in
+/// `open` after the first one is opened as ever.
+pub(crate) fn opening_a_new_database<T>(open: impl FnOnce() -> T) -> (T, bool) {
+    struct Leave(Option<bool>);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            LSM_OPENS_A_NEW_DATABASE.set(self.0);
+        }
+    }
+    let leave = Leave(LSM_OPENS_A_NEW_DATABASE.replace(Some(false)));
+    let opened = open();
+    let found = LSM_OPENS_A_NEW_DATABASE.get() == Some(true);
+    drop(leave);
+    (opened, found)
 }
 
 struct LsmReadCancellationInner {
@@ -214,6 +355,36 @@ pub(crate) fn mask_lsm_read_cancellation_for_cold_open(
     Ok(LsmReadCancellationMask { previous })
 }
 
+/// What [`allow_lsm_blocking`] / [`allow_lsm_blocking_cancellable`] set up on
+/// the calling thread, for a helper thread that serves part of the same
+/// read-only request. Both are thread-local: without them a helper's nested
+/// read (a filter reading a node from inside a scan) is refused and its reads
+/// ignore the request's cancellation.
+#[derive(Clone)]
+pub(crate) struct LsmThreadContext {
+    blocking_allowed: bool,
+    cancellation: Option<LsmReadCancellation>,
+}
+
+impl LsmThreadContext {
+    pub(crate) fn current() -> Self {
+        Self {
+            blocking_allowed: LSM_BLOCKING_ALLOWED.with(Cell::get),
+            cancellation: LSM_READ_CANCELLATION.with(|slot| slot.borrow().clone()),
+        }
+    }
+
+    /// Runs `f` on this thread as it would run on the captured one.
+    pub(crate) fn enter<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _blocking_context = self.blocking_allowed.then(LsmBlockingContext::enter);
+        let _cancellation_context = self
+            .cancellation
+            .clone()
+            .map(LsmReadCancellationContext::enter);
+        f()
+    }
+}
+
 pub(crate) fn allow_lsm_blocking<T>(f: impl FnOnce() -> T) -> T {
     let _context = LsmBlockingContext::enter();
     f()
@@ -340,11 +511,13 @@ const ENV_CACHE_SCAN_SECS: &str = "HELIX_LSM_CACHE_SCAN_SECS";
 /// unset/invalid → SlateDB default (4 MiB).
 const ENV_CACHE_PART_BYTES: &str = "HELIX_LSM_CACHE_PART_BYTES";
 /// Env knob: WAL flush interval in milliseconds (SlateDB `flush_interval`). The
-/// WAL buffer flushes at least this often; `await_durable` writes still trigger
-/// an immediate flush, so this mainly bounds how long a BUFFERED (group-commit)
-/// write may sit before the next periodic flush. Unset → SlateDB default
-/// (100 ms). Durability is unaffected (the group-commit barrier `db.flush()`
-/// forces durability before ack regardless of this interval).
+/// WAL buffer flushes at least this often. An `await_durable` write does NOT
+/// trigger a flush: it waits for the next one (this tick, a full WAL buffer,
+/// or an explicit `db.flush()`), so every durable `commit` waits up to this
+/// interval, and nearly all of it when commits follow each other in a loop.
+/// Only the group-commit barrier (`flush_durable`, `db.flush()`) flushes at
+/// once. Unset → SlateDB default (100 ms). Durability is unaffected: a durable
+/// write returns only once its WAL is on the object store.
 const ENV_FLUSH_INTERVAL_MS: &str = "HELIX_LSM_FLUSH_INTERVAL_MS";
 /// Env knob: SlateDB manifest poll interval in milliseconds. Writer and reader
 /// handles poll object storage for newer manifests at this cadence; raising it
@@ -383,11 +556,12 @@ const ENV_READER_ACTIVE_TTL_SECS: &str = "HELIX_LSM_READER_ACTIVE_TTL_SECS";
 const ENV_READER_PROMOTE_BUDGET_MS: &str = "HELIX_LSM_READER_PROMOTE_BUDGET_MS";
 /// Env knob: milliseconds a reader-replica collection may go without serving
 /// a read before the read-gated poll-tier sweep demotes it back to the idle
-/// tier (`ENV_READER_IDLE_POLL_MS`) regardless of write-feed activity — most
-/// resident collections are idle from a READ standpoint even when they are
-/// being written (e.g. mid-reindex with nobody querying yet). Promotion back
-/// to the active tier (`ENV_READER_MANIFEST_POLL_MS`) happens synchronously
-/// on the next read. `0` disables read-gated tiering entirely: collections
+/// tier (`ENV_READER_IDLE_POLL_MS`). A collection the write-feed reported a
+/// change for within the same window is left on the active tier: it is still
+/// being written, and its first reader must not start from a view one idle
+/// poll old. Promotion back to the active tier
+/// (`ENV_READER_MANIFEST_POLL_MS`) happens synchronously on the next read.
+/// `0` disables read-gated tiering entirely: collections
 /// are left wherever the write-feed / static config puts them (today's
 /// behavior) — the kill switch. Default 600000 (10 min).
 const ENV_READER_READ_IDLE_AFTER_MS: &str = "HELIX_LSM_READER_IDLE_AFTER_MS";
@@ -437,6 +611,22 @@ const ENV_MAX_UNFLUSHED_BYTES: &str = "HELIX_LSM_MAX_UNFLUSHED_BYTES";
 /// scale (more collections per writer). Unset → a bounded Helion default derived
 /// from the maintenance FD gate and expected resident collection count.
 const ENV_CACHE_MAX_OPEN_FILES: &str = "HELIX_LSM_CACHE_MAX_OPEN_FILES";
+/// Env knob: ranged object-store cache misses (vendored fork
+/// `ObjectStoreCacheOptions::ranged_miss`). A cold read of at most 1/16 of a
+/// part GETs only its own bytes while the whole part fills in the background,
+/// instead of waiting for the full part (4 MiB on readers, 64 MiB on the writer).
+/// Unset/blank → on. Kill switch: `0`/`false`/`off`; any other value that is
+/// not `1`/`true`/`yes`/`on` also turns it off.
+const ENV_CACHE_RANGED_MISS: &str = "HELIX_LSM_CACHE_RANGED_MISS";
+/// Env knob: how many object-store cache parts of one read are fetched at once
+/// (vendored fork `ObjectStoreCacheOptions::part_fetch_concurrency`). A read
+/// spanning several parts, such as a segment's `.hvec` sidecar blob, used to
+/// fetch its missing parts one after the other. The bytes returned are the
+/// same. The fork lowers the number until the parts in flight hold at most
+/// 32 MiB per read, so readers (4 MiB parts) fetch up to 8 at once and the
+/// writer (64 MiB parts) stays at one. Unset/blank → 8. Kill switch: `1` (one
+/// part at a time); `0` or anything unparsable also means one at a time.
+const ENV_CACHE_PART_FETCH_CONCURRENCY: &str = "HELIX_LSM_CACHE_PART_FETCH_CONCURRENCY";
 /// Env knob: max concurrent background compactions
 /// (`CompactorOptions::max_concurrent_compactions`). Lower bounds CPU/IO and
 /// per-collection FD pressure from compaction when many collections compact at
@@ -465,6 +655,30 @@ const ENV_COMPACTOR_COMMIT_COMPACTED_MS: &str = "HELIX_LSM_COMMIT_COMPACTED_MS";
 /// also bounds how long an L0-saturated collection can remain write-stalled.
 /// Unset/0 → SlateDB default (5s).
 const ENV_COMPACTOR_WORKER_POLL_MS: &str = "HELIX_LSM_COMPACTOR_WORKER_POLL_MS";
+/// Env knobs: the three options of the fork's size-tiered compaction scheduler
+/// (`CompactorOptions::scheduler_options`). It merges sorted runs only when at
+/// least MIN_SOURCES of them stand in a row, newest first, each no larger than
+/// SIZE_THRESHOLD times the smallest so far in that row, and takes at most
+/// MAX_SOURCES in one merge. Unset → the fork's defaults (4, 8, 4.0), under
+/// which runs that roughly double in size are never merged, whatever share of
+/// their rows a later run has deleted.
+///
+/// FOR A SMOKE POD ON A PRIVATE COPY ONLY. The three are read from the process
+/// environment at every collection open, so one value reaches every collection
+/// a writer opens, and none of them is a setting to run production on:
+/// - a minimum of 2 with a large threshold makes any two runs a row, so after
+///   every L0 compaction (each makes a new run) the scheduler merges every run
+///   of the collection into the last one again: the whole collection is
+///   rewritten once for every two L0 SSTs flushed;
+/// - a large threshold with the maximum left at 8 makes every collection of 8
+///   or more runs fail the scheduler's own backpressure check on its L0
+///   compaction until merges have brought it under 8 runs: L0 fills to its
+///   limit meanwhile and the collection's writes wait.
+/// What is taken and what is left to its default:
+/// [`compaction_scheduler_options_from_env`].
+const ENV_COMPACTION_MIN_SOURCES: &str = "HELIX_LSM_COMPACTION_MIN_SOURCES";
+const ENV_COMPACTION_MAX_SOURCES: &str = "HELIX_LSM_COMPACTION_MAX_SOURCES";
+const ENV_COMPACTION_SIZE_THRESHOLD: &str = "HELIX_LSM_COMPACTION_SIZE_THRESHOLD";
 /// Env knob: L0 SST count threshold that triggers compaction (`l0_max_ssts`).
 /// Larger tolerates more L0 files before compacting (fewer, larger compactions
 /// under sustained ingest) at the cost of more SSTs to merge on read; smaller
@@ -488,6 +702,17 @@ const ENV_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH: &str = "HELIX_LSM_MAX_WAL_FLUSHES_BEF
 const ENV_READER_WAL_REPLAY_BATCH: &str = "HELIX_LSM_READER_WAL_REPLAY_BATCH";
 const DEFAULT_READER_WAL_REPLAY_BATCH: usize = 32;
 const MAX_READER_WAL_REPLAY_BATCH: usize = 256;
+/// Env switch: a reader's `DbReader` reads a WAL object of up to 256 KiB with
+/// one GET after its HEAD instead of four ranged ones
+/// ([`super::wal_whole_get`]). Unset → on; `0` restores the four reads. Read
+/// at every reader open.
+const ENV_READER_WAL_WHOLE_GET: &str = "HELIX_LSM_READER_WAL_WHOLE_GET";
+/// Env switch: a reader replica moves a collection between its poll tiers by
+/// telling the open `DbReader` its new interval, and asks it for a poll,
+/// where it used to open a new `DbReader` (a checkpoint write and a replay of
+/// the whole WAL tail for every tier change). Unset → the reopen; `1` → in
+/// place. Read when a reader is opened.
+const ENV_READER_TIER_IN_PLACE: &str = "HELIX_LSM_READER_TIER_IN_PLACE";
 /// Env knob: number of parallel L0 flush workers (`l0_flush_parallelism`).
 /// Unset → SlateDB default (4).
 const ENV_L0_FLUSH_PARALLELISM: &str = "HELIX_LSM_L0_FLUSH_PARALLELISM";
@@ -523,6 +748,25 @@ const ENV_BLOCK_CACHE_MB: &str = "HELIX_LSM_BLOCK_CACHE_MB";
 /// shared across all handles. Unset → 128 MiB (SlateDB's per-instance meta
 /// default, now global). See [`ENV_BLOCK_CACHE_MB`].
 const ENV_META_CACHE_MB: &str = "HELIX_LSM_META_CACHE_MB";
+/// Env knob: shard count of the shared meta cache. Unset/0 → one shard per
+/// [`META_CACHE_SHARD_BYTES`] of capacity, capped at foyer's default (one per
+/// host CPU). Kill switch: `16` restores the previous split on a 16-vCPU node.
+const ENV_META_CACHE_SHARDS: &str = "HELIX_LSM_META_CACHE_SHARDS";
+/// Floor on a meta-cache shard. Foyer splits capacity evenly across shards and
+/// admits an entry only into its hash's shard. Decoded SST indexes run 5-8 MiB
+/// and filters up to 13 MiB on prod collections (2026-10-21), so the per-CPU
+/// split of 128 MiB (8 MiB shards on a 16-vCPU node) held about one index per
+/// shard and re-read and re-decoded megabytes of metadata on most lookups.
+/// 256 MiB rather than 64: with 64 MiB shards hash skew still overflowed one
+/// shard with one large collection's hot metadata alone in ~8% of placements (review model,
+/// 2026-10-22), and 4 vs 16 shards measured the same read throughput.
+const META_CACHE_SHARD_BYTES: usize = 256 * 1024 * 1024;
+/// Env knob: share compacted-SST block/index/filter entries in the shared cache
+/// across every `Db`/`DbReader` handle (vendored fork switch). Without it each
+/// handle keys entries by its own scope, so every reader reopen (poll-tier
+/// promote/demote, refresh) starts its collection cold and strands the old
+/// handle's entries until LRU eviction. Default on; `0` is the kill switch.
+const ENV_SHARE_SST_CACHE: &str = "HELIX_LSM_SHARE_SST_CACHE";
 /// Env knob: per-request S3 client timeout in ms. Unset/0 → object_store's
 /// defaults (30s total-request, 5s connect). This bounds each HTTP attempt,
 /// NOT a durable commit: SlateDB retries failed flushes above the client, so
@@ -536,13 +780,76 @@ const ENV_S3_TIMEOUT_MS: &str = "HELIX_LSM_S3_TIMEOUT_MS";
 /// (vendored fork API: one ordered lookup pass sharing block fetches across
 /// keys) instead of N concurrent independent `get`s. Kill switch: set `0` to
 /// restore the buffered-individual-gets path. Default ON.
+///
+/// One caller asks for a multi-get whatever this says: the flat scan's
+/// lookups of members a segment does not list, which almost never find a row
+/// (`HELIX_FLAT_SCAN_ROW_BATCH=0` takes those back to one get each).
 const ENV_MULTI_GET: &str = "HELIX_LSM_MULTI_GET";
+/// Env knob: point deletes read their plan in batches (one multi-get for the
+/// node rows, one for every segment ownership probe, concurrent prefix scans
+/// for the rows to remove) instead of one SlateDB round trip per id and
+/// segment. Kill switch: set `0` to restore the one-read-at-a-time path.
+/// Default ON.
+const ENV_DELETE_BATCH_READS: &str = "HELIX_LSM_DELETE_BATCH_READS";
+/// Env knob: a writer commit (batch or transaction) still pending after
+/// [`STALLED_WRITE_REFRESH_EVERY`], with L0 at its limit in the writer's view
+/// of the manifest, re-reads the manifest, and looks again every such interval
+/// until it returns. SlateDB parks writes while L0 is full and frozen
+/// memtables cannot flush, and resumes them only once its own manifest poll
+/// (`manifest_poll_interval`, 30 s in production) sees the L0 slots the
+/// compactor freed. This issues that same poll early, which removes the wait
+/// for the writer's poll (about 14 s on average, 28 s at most), not the time
+/// the compactor takes to free the slots. At most one refresh per collection
+/// per interval, each one LIST and two GETs. Kill switch: set `0` to wait for
+/// the poll as before. Default ON.
+const ENV_STALLED_WRITE_REFRESH: &str = "HELIX_LSM_STALLED_WRITE_REFRESH";
+/// See [`ENV_STALLED_WRITE_REFRESH`].
+const STALLED_WRITE_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+/// Env switch: a memtable flush starts only into memory the pod has free as it
+/// starts ([`flush_gate`]), and a collection whose flush waits for that takes
+/// no writes until the flush is in L0. Nothing bounded how many collections
+/// flush at the same moment, and a flush holds its SST encoded before it
+/// frees its memtable: twelve at once took a 6 Gi writer over its limit in
+/// 1.45 s. Kill switch: `0` opens every writer with no gate, as before. Read
+/// once, when the process opens its first writer. Default ON.
+const ENV_FLUSH_GATE: &str = "HELIX_FLUSH_GATE";
 const LSM_METADATA_SIDECAR_OBJECT: &str = "_helix/metadata.json";
+
+/// Marks a batched row read of the exact scorer on the collection at `root`
+/// (the SlateDB path its store was opened with) in flight until the value is
+/// dropped. The part cache makes the fill of a part of that collection missed
+/// meanwhile, by whatever read, wait its turn: one fetch at a time, going on
+/// after the mark is gone. A miss of any other collection's part, like a miss
+/// with no mark in flight, starts its fill at once. A fill it leaves out (too
+/// much waiting, or the budget spent when the turn comes) is
+/// `helix_lsm_cache_ranged_fill_total{outcome="skipped_in_batch"}`;
+/// `outcome="skipped"` counts every other skip, as it did.
+pub(crate) fn batch_row_read_in_flight(
+    root: &str,
+) -> slatedb::cached_object_store_stats::BatchRowRead {
+    slatedb::cached_object_store_stats::ranged_miss_stats().batch_row_read(root.into())
+}
 
 /// Whether batched point reads use SlateDB `multi_get` ([`ENV_MULTI_GET`],
 /// default true). `pub(crate)` so the reader replica honors the same knob.
 pub(crate) fn lsm_multi_get_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = MULTI_GET_FOR_TEST.get() {
+        return forced;
+    }
     env_bool_opt(ENV_MULTI_GET).unwrap_or(true)
+}
+
+/// Whether point deletes batch their reads ([`ENV_DELETE_BATCH_READS`],
+/// default true).
+pub(crate) fn lsm_delete_batch_reads_enabled() -> bool {
+    env_bool_opt(ENV_DELETE_BATCH_READS).unwrap_or(true)
+}
+
+/// Whether a stalled writer commit refreshes the manifest
+/// ([`ENV_STALLED_WRITE_REFRESH`], default true).
+fn lsm_stalled_write_refresh_enabled() -> bool {
+    env_bool_opt(ENV_STALLED_WRITE_REFRESH).unwrap_or(true)
 }
 
 /// Apply [`ENV_S3_TIMEOUT_MS`] to an S3 builder. Unset/blank/0/unparsable →
@@ -579,22 +886,122 @@ pub(crate) fn shared_db_cache() -> Arc<dyn DbCache> {
             const MIB: usize = 1024 * 1024;
             let block_bytes = env_usize_opt(ENV_BLOCK_CACHE_MB).unwrap_or(512).max(1) * MIB;
             let meta_bytes = env_usize_opt(ENV_META_CACHE_MB).unwrap_or(128).max(1) * MIB;
-            let block = FoyerCache::new_with_opts(FoyerCacheOptions {
-                max_capacity: block_bytes as u64,
-                ..Default::default()
-            });
-            let meta = FoyerCache::new_with_opts(FoyerCacheOptions {
-                max_capacity: meta_bytes as u64,
-                ..Default::default()
-            });
-            Arc::new(
-                SplitCache::new()
-                    .with_block_cache(Some(Arc::new(block)))
-                    .with_meta_cache(Some(Arc::new(meta)))
-                    .build(),
-            ) as Arc<dyn DbCache>
+            let meta_shards = meta_cache_shards(meta_bytes, FoyerCacheOptions::default().shards);
+            // Set before the first handle is built: wrappers read it at build time.
+            slatedb::db_cache::set_share_compacted_entries(
+                env_bool_opt(ENV_SHARE_SST_CACHE).unwrap_or(true),
+            );
+            let (block, cache) = build_db_cache_parts(block_bytes, meta_bytes, meta_shards);
+            // Kept for its byte accounting: the split cache answers the
+            // block and meta parts summed.
+            let _ = SHARED_BLOCK_CACHE.set(block);
+            cache
         })
         .clone()
+}
+
+/// The block part of [`shared_db_cache`], once that is built.
+static SHARED_BLOCK_CACHE: OnceLock<Arc<dyn DbCache>> = OnceLock::new();
+
+/// Sets `helix_lsm_block_cache_used_bytes` and
+/// `helix_lsm_block_cache_capacity_bytes` from the shared block cache's own
+/// accounting, and nothing before the process's first LSM open has built
+/// that cache. One cache serves every open collection, so the two series
+/// carry no collection. The cache counts no evictions: used at its capacity
+/// is the nearest sign of them.
+pub(crate) fn export_shared_block_cache_usage() {
+    let Some(block) = SHARED_BLOCK_CACHE.get() else {
+        return;
+    };
+    if let CacheUsageSnapshot::Ready {
+        used_bytes,
+        capacity_bytes: Some(capacity_bytes),
+    } = block.usage_snapshot().memory
+    {
+        metrics::gauge!("helix_lsm_block_cache_used_bytes").set(used_bytes as f64);
+        metrics::gauge!("helix_lsm_block_cache_capacity_bytes").set(capacity_bytes as f64);
+    }
+}
+
+/// [`ENV_FLUSH_GATE`]: on unless set to a false value.
+fn flush_gate_enabled() -> bool {
+    env_bool_opt(ENV_FLUSH_GATE).unwrap_or(true)
+}
+
+/// The one flush gate of the process, shared by every writer it opens so
+/// that their flushes are bounded together, or none with [`ENV_FLUSH_GATE`]
+/// off. It reads the pod's free memory as the shutdown close does
+/// (`collection_manager::free_memory_bytes`).
+fn shared_flush_gate() -> Option<Arc<dyn slatedb::L0FlushGate>> {
+    static GATE: OnceLock<Option<Arc<dyn slatedb::L0FlushGate>>> = OnceLock::new();
+    GATE.get_or_init(|| {
+        let on = flush_gate_enabled();
+        tracing::info!(
+            on,
+            switch = ENV_FLUSH_GATE,
+            "LSM flush gate: a memtable flush starts only into free memory"
+        );
+        on.then(|| {
+            Arc::new(flush_gate::FlushGate::new(Box::new(
+                super::collection_manager::free_memory_bytes,
+            ))) as Arc<dyn slatedb::L0FlushGate>
+        })
+    })
+    .clone()
+}
+
+/// The gate a writer opened now by this thread gets: [`shared_flush_gate`],
+/// or in a test what [`with_flush_gate_for_test`] set.
+fn flush_gate_for_open() -> Option<Arc<dyn slatedb::L0FlushGate>> {
+    #[cfg(test)]
+    {
+        if let Some(gate) = FLUSH_GATE_FOR_TEST.with(|gate| gate.borrow().clone()) {
+            return gate;
+        }
+    }
+    shared_flush_gate()
+}
+
+/// Shard count for the shared meta cache; see [`ENV_META_CACHE_SHARDS`].
+fn meta_cache_shards(meta_bytes: usize, default_shards: usize) -> usize {
+    env_usize_opt(ENV_META_CACHE_SHARDS)
+        .filter(|shards| *shards > 0)
+        .unwrap_or_else(|| (meta_bytes / META_CACHE_SHARD_BYTES).clamp(1, default_shards.max(1)))
+}
+
+/// The cache alone, as the tests build one of their own.
+#[cfg(test)]
+pub(crate) fn build_db_cache(
+    block_bytes: usize,
+    meta_bytes: usize,
+    meta_shards: usize,
+) -> Arc<dyn DbCache> {
+    build_db_cache_parts(block_bytes, meta_bytes, meta_shards).1
+}
+
+/// The block part, and the split cache it goes into. Block cache keeps
+/// foyer's default sharding (4 KiB entries); the meta cache takes
+/// `meta_shards`.
+fn build_db_cache_parts(
+    block_bytes: usize,
+    meta_bytes: usize,
+    meta_shards: usize,
+) -> (Arc<dyn DbCache>, Arc<dyn DbCache>) {
+    let block: Arc<dyn DbCache> = Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: block_bytes as u64,
+        ..Default::default()
+    }));
+    let meta = FoyerCache::new_with_opts(FoyerCacheOptions {
+        max_capacity: meta_bytes as u64,
+        shards: meta_shards.max(1),
+    });
+    let cache = Arc::new(
+        SplitCache::new()
+            .with_block_cache(Some(Arc::clone(&block)))
+            .with_meta_cache(Some(Arc::new(meta)))
+            .build(),
+    ) as Arc<dyn DbCache>;
+    (block, cache)
 }
 
 fn target_bytes(target: &PrefixTarget) -> &[u8] {
@@ -733,6 +1140,13 @@ fn env_usize_opt(key: &str) -> Option<usize> {
         .and_then(|v| v.trim().parse::<usize>().ok())
 }
 
+/// The most one writer holds unflushed before it stalls its writes
+/// (`max_unflushed_bytes`): [`ENV_MAX_UNFLUSHED_BYTES`], or SlateDB's default.
+pub(crate) fn lsm_max_unflushed_bytes() -> usize {
+    env_usize_opt(ENV_MAX_UNFLUSHED_BYTES)
+        .unwrap_or_else(|| Settings::default().max_unflushed_bytes)
+}
+
 /// Parse a millisecond env knob into a `Duration`, returning `None` when
 /// unset/blank/unparsable/zero so the caller keeps the SlateDB default
 /// (override-only semantics).
@@ -742,6 +1156,138 @@ fn env_duration_ms_opt(key: &str) -> Option<std::time::Duration> {
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|v| *v > 0)
         .map(std::time::Duration::from_millis)
+}
+
+/// One of the compaction scheduler's settings as the environment gives it:
+/// `None` when unset or blank, `Err` with the text when it does not parse.
+fn scheduler_setting<T: std::str::FromStr>(key: &str) -> Option<Result<T, String>> {
+    let raw = std::env::var(key).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(raw.parse::<T>().map_err(|_| raw.to_string()))
+}
+
+/// Says, once a process for each setting, that a compaction scheduler setting
+/// was left to the fork's default.
+fn warn_scheduler_setting_ignored(key: &'static str, why: &str) {
+    static WARNED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.contains(&key) {
+        return;
+    }
+    warned.push(key);
+    tracing::warn!(
+        setting = key,
+        reason = why,
+        "compaction scheduler setting ignored, the fork's default stands"
+    );
+}
+
+/// The compaction scheduler's options that the environment sets and the
+/// scheduler can merge by, under the fork's own keys
+/// ([`ENV_COMPACTION_MIN_SOURCES`] and its two neighbours). Empty when none is
+/// set, so the fork's defaults stand. `l0_floor` is the L0 SST count at which
+/// the writer stops flushing ([`l0_stall_floor`]). Left to its default, with a
+/// WARN:
+/// - a minimum under 2 (one run is no merge: the fork would rewrite runs
+///   alone, poll after poll) or above `l0_floor` (L0 is compacted only once it
+///   holds the minimum, which it could then never reach: no L0 SST would be
+///   compacted again and every write would wait at the floor);
+/// - a maximum under the minimum in force (the fork cuts a row of runs down to
+///   the maximum, so it would merge fewer runs than the minimum asks for, and
+///   cut down to 0 the row is empty, on which its scheduler panics);
+/// - a minimum above the maximum in force, for the same reason;
+/// - a threshold that is not a finite number above 1 (at 1 or under, no run
+///   larger than the one before it is ever taken).
+fn compaction_scheduler_options_from_env(l0_floor: usize) -> Vec<(&'static str, String)> {
+    let defaults = slatedb::config::SizeTieredCompactionSchedulerOptions::default();
+    let mut ignored: Vec<(&'static str, String)> = Vec::new();
+
+    let min = match scheduler_setting::<usize>(ENV_COMPACTION_MIN_SOURCES) {
+        Some(Ok(min)) if (2..=l0_floor).contains(&min) => Some(min),
+        Some(Ok(min)) => {
+            ignored.push((
+                ENV_COMPACTION_MIN_SOURCES,
+                format!("{min} is not between 2 and the L0 limit of {l0_floor}"),
+            ));
+            None
+        }
+        Some(Err(text)) => {
+            ignored.push((
+                ENV_COMPACTION_MIN_SOURCES,
+                format!("{text:?} is not a whole number"),
+            ));
+            None
+        }
+        None => None,
+    };
+    let min_in_force = min.unwrap_or(defaults.min_compaction_sources);
+    let max = match scheduler_setting::<usize>(ENV_COMPACTION_MAX_SOURCES) {
+        Some(Ok(max)) if max >= min_in_force => Some(max),
+        Some(Ok(max)) => {
+            ignored.push((
+                ENV_COMPACTION_MAX_SOURCES,
+                format!("{max} is under the minimum in force, {min_in_force}"),
+            ));
+            None
+        }
+        Some(Err(text)) => {
+            ignored.push((
+                ENV_COMPACTION_MAX_SOURCES,
+                format!("{text:?} is not a whole number"),
+            ));
+            None
+        }
+        None => None,
+    };
+    let max_in_force = max.unwrap_or(defaults.max_compaction_sources);
+    let min = match min {
+        Some(min) if min > max_in_force => {
+            ignored.push((
+                ENV_COMPACTION_MIN_SOURCES,
+                format!("{min} is above the maximum in force, {max_in_force}"),
+            ));
+            None
+        }
+        other => other,
+    };
+    let threshold = match scheduler_setting::<f32>(ENV_COMPACTION_SIZE_THRESHOLD) {
+        Some(Ok(threshold)) if threshold.is_finite() && threshold > 1.0 => Some(threshold),
+        Some(Ok(threshold)) => {
+            ignored.push((
+                ENV_COMPACTION_SIZE_THRESHOLD,
+                format!("{threshold} is not a finite number above 1"),
+            ));
+            None
+        }
+        Some(Err(text)) => {
+            ignored.push((
+                ENV_COMPACTION_SIZE_THRESHOLD,
+                format!("{text:?} is not a number"),
+            ));
+            None
+        }
+        None => None,
+    };
+    for (key, why) in &ignored {
+        warn_scheduler_setting_ignored(key, why);
+    }
+
+    let mut options = Vec::new();
+    if let Some(min) = min {
+        options.push(("min_compaction_sources", min.to_string()));
+    }
+    if let Some(max) = max {
+        options.push(("max_compaction_sources", max.to_string()));
+    }
+    if let Some(threshold) = threshold {
+        options.push(("include_size_threshold", threshold.to_string()));
+    }
+    options
 }
 
 fn env_bool_opt(key: &str) -> Option<bool> {
@@ -1004,6 +1550,22 @@ fn memory_bounded_cache_cap(
     configured_cap.min(memory_cap.max(1))
 }
 
+/// Says, once a process, that the configured cache share of a collection was
+/// cut to what the cache volume holds (see the VOLUME BOUND in
+/// [`cache_options_from_env`]).
+fn warn_cache_share_cut_to_volume(cache_dir: &str, configured: usize, held: usize) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            cache_dir,
+            configured_share_bytes = configured,
+            share_bytes = held,
+            max_open = max_open_collections_for_cache(),
+            "cache share per collection cut to what the cache volume's budget holds with every handle open"
+        );
+    });
+}
+
 /// Sanitize a collection identifier (its SlateDB path, e.g. `helion/my_coll`)
 /// into a SINGLE filesystem-safe directory component: every char outside
 /// `[A-Za-z0-9._-]` (notably the `/` path separator) becomes `_`. This yields a
@@ -1123,6 +1685,9 @@ fn build_s3_store_uncached(
 /// by the configured total. (Integer division rounds the per-collection cap
 /// down, so the sum is ≤ total, never above.) `HELIX_LSM_CACHE_COLLECTION_DIVISOR`
 /// replaces `max_open` as the divisor when set (see [`ENV_CACHE_COLLECTION_DIVISOR`]).
+/// Whatever the divisor, a collection's cap is no larger than the cache
+/// volume's budget split over `max_open`
+/// ([`cache_evictor::share_the_volume_holds`]).
 fn cache_options_from_env(collection_id: &str) -> Option<ObjectStoreCacheOptions> {
     let dir = std::env::var(ENV_CACHE_DIR).ok()?;
     if dir.trim().is_empty() {
@@ -1160,6 +1725,21 @@ fn cache_options_from_env(collection_id: &str) -> Option<ObjectStoreCacheOptions
     // across `HELIX_LSM_CACHE_COLLECTION_DIVISOR` when set.
     // Floored at 1 byte so a huge divisor never yields a zero (no-op) cap.
     let per_collection_cap = (total_cap / cache_collection_divisor()).max(1);
+    // VOLUME BOUND. The divisor bounds one collection, the handle limit decides
+    // how many are open at once, and the /cache budget evictor deletes closed
+    // collections' directories only. So the share is no larger than what the
+    // volume's budget holds with every handle open: no divisor, and no claim
+    // made anew at a smaller size, can fill the volume with open directories.
+    let per_collection_cap = match cache_evictor::share_the_volume_holds(
+        std::path::Path::new(&dir),
+        max_open_collections_for_cache(),
+    ) {
+        Some(held) if held < per_collection_cap => {
+            warn_cache_share_cut_to_volume(&dir, per_collection_cap, held);
+            held
+        }
+        _ => per_collection_cap,
+    };
     cache.max_cache_size_bytes = Some(per_collection_cap);
     // Evictor sweep cadence. The cache also evicts on write + backpressures.
     // Unset/invalid → SlateDB default; explicit 0 disables recurring sweeps
@@ -1186,6 +1766,17 @@ fn cache_options_from_env(collection_id: &str) -> Option<ObjectStoreCacheOptions
     // regardless of this setting (a strict improvement: replay-once WAL parts
     // previously churned the evictor for no read benefit).
     cache.cache_puts = true;
+    // Unset or blank keeps the default (on); anything unparsable turns it off.
+    cache.ranged_miss = match std::env::var(ENV_CACHE_RANGED_MISS) {
+        Ok(v) if !v.trim().is_empty() => env_bool_opt(ENV_CACHE_RANGED_MISS) == Some(true),
+        _ => true,
+    };
+    // Unset or blank keeps the default; anything unparsable means one at a time.
+    if let Ok(v) = std::env::var(ENV_CACHE_PART_FETCH_CONCURRENCY) {
+        if !v.trim().is_empty() {
+            cache.part_fetch_concurrency = v.trim().parse::<usize>().unwrap_or(1);
+        }
+    }
     Some(cache)
 }
 
@@ -1205,7 +1796,9 @@ fn cache_options_from_env(collection_id: &str) -> Option<ObjectStoreCacheOptions
 /// ([`ENV_COMPACTOR_POLL_MS`]), `compactor_options.commit_compacted_interval`
 /// ([`ENV_COMPACTOR_COMMIT_COMPACTED_MS`]),
 /// `compactor_options.worker.compactions_poll_interval`
-/// ([`ENV_COMPACTOR_WORKER_POLL_MS`]), and `l0_max_ssts` ([`ENV_L0_MAX_SSTS`]).
+/// ([`ENV_COMPACTOR_WORKER_POLL_MS`]), `compactor_options.scheduler_options`
+/// ([`ENV_COMPACTION_MIN_SOURCES`], [`ENV_COMPACTION_MAX_SOURCES`],
+/// [`ENV_COMPACTION_SIZE_THRESHOLD`]), and `l0_max_ssts` ([`ENV_L0_MAX_SSTS`]).
 /// Returns `None` when NO knob is configured so callers take the cache-less
 /// bare-open path (keeps in-memory/test opens free of temp dirs and at SlateDB
 /// defaults).
@@ -1224,6 +1817,15 @@ fn lsm_settings_from_env(collection_id: &str) -> Option<Settings> {
     let compactor_worker_poll_ms = env_duration_ms_opt(ENV_COMPACTOR_WORKER_POLL_MS);
     let l0_max_ssts = env_usize_opt(ENV_L0_MAX_SSTS).filter(|v| *v > 0);
     let l0_max_ssts_per_key = env_usize_opt(ENV_L0_MAX_SSTS_PER_KEY).filter(|v| *v > 0);
+    // The scheduler's minimum is checked against the L0 limits this build ends with.
+    let scheduler_options = {
+        let defaults = Settings::default();
+        compaction_scheduler_options_from_env(
+            l0_max_ssts
+                .unwrap_or(defaults.l0_max_ssts)
+                .min(l0_max_ssts_per_key.unwrap_or(defaults.l0_max_ssts_per_key)),
+        )
+    };
     let max_wal_flushes_before_l0_flush =
         env_usize_opt(ENV_MAX_WAL_FLUSHES_BEFORE_L0_FLUSH).filter(|v| *v >= 4096);
     let l0_flush_parallelism = env_usize_opt(ENV_L0_FLUSH_PARALLELISM).filter(|v| *v > 0);
@@ -1239,6 +1841,7 @@ fn lsm_settings_from_env(collection_id: &str) -> Option<Settings> {
         && compactor_poll_ms.is_none()
         && commit_compacted_ms.is_none()
         && compactor_worker_poll_ms.is_none()
+        && scheduler_options.is_empty()
         && l0_max_ssts.is_none()
         && l0_max_ssts_per_key.is_none()
         && max_wal_flushes_before_l0_flush.is_none()
@@ -1274,6 +1877,7 @@ fn lsm_settings_from_env(collection_id: &str) -> Option<Settings> {
         || compactor_poll_ms.is_some()
         || commit_compacted_ms.is_some()
         || compactor_worker_poll_ms.is_some()
+        || !scheduler_options.is_empty()
     {
         let mut compactor = settings.compactor_options.unwrap_or_default();
         if let Some(value) = max_concurrent_compactions {
@@ -1289,6 +1893,9 @@ fn lsm_settings_from_env(collection_id: &str) -> Option<Settings> {
             if let Some(worker) = compactor.worker.as_mut() {
                 worker.compactions_poll_interval = interval;
             }
+        }
+        for (key, value) in scheduler_options {
+            compactor.scheduler_options.insert(key.to_string(), value);
         }
         settings.compactor_options = Some(compactor);
     }
@@ -1362,6 +1969,20 @@ fn reader_wal_replay_batch_from_env() -> usize {
         .min(MAX_READER_WAL_REPLAY_BATCH)
 }
 
+/// [`ENV_READER_WAL_WHOLE_GET`]: on unless set to a false value.
+pub(crate) fn reader_wal_whole_get_enabled() -> bool {
+    env_bool_opt(ENV_READER_WAL_WHOLE_GET).unwrap_or(true)
+}
+
+/// [`ENV_READER_TIER_IN_PLACE`]: off unless set to a true value. A reader
+/// that is not reopened keeps one replay table for every poll that found WAL
+/// objects, until the writer's next L0 flush, and every read looks at all of
+/// them; it stays off until a reader on S3 has shown what that costs a
+/// collection that is written and read at once.
+pub(crate) fn reader_tier_in_place_enabled() -> bool {
+    env_bool_opt(ENV_READER_TIER_IN_PLACE).unwrap_or(false)
+}
+
 /// True if a freshly cold-opened reader-replica `DbReader` starts on the fast
 /// (serving) poll tier. `HelixGraphStorage` seeds its `reader_poll_tier_fast`
 /// belief from this at construction, so it starts in sync with the
@@ -1394,12 +2015,30 @@ pub(crate) fn reader_poll_tier_sweeper_enabled(idle_after: std::time::Duration) 
     !idle_after.is_zero()
 }
 
-/// SlateDB rejects a `DbReader` open unless `checkpoint_lifetime` is at least
-/// double `manifest_poll_interval` (the self-refreshing checkpoint must
-/// outlive the poll that renews it). The default lifetime is 600s, so any
-/// poll interval above 300s — e.g. the idle feed tier — must raise it too.
+/// Keeps a reader's checkpoint lease at three manifest poll intervals or more.
+///
+/// A `DbReader` renews its lease at the first poll past the lease's half-life,
+/// and a manifest stores the expiry rounded down to the second. At twice the
+/// interval, the least SlateDB accepts, the poll one interval in comes a
+/// manifest load short of half-life and the renewal waits for the next, which
+/// lands on the expiry itself: up to a second after the stored one, where a GC
+/// pass strips the lease from under the open reader. At three intervals the
+/// renewal two intervals in has a whole interval in hand. The default lifetime
+/// is 600 s, so this raises it from a 200 s poll up: the idle tier's 300 s poll
+/// gets 900 s, and a reader that dies there holds its files up to 15 minutes.
+///
+/// A reader that changes tiers in place ([`ENV_READER_TIER_IN_PLACE`]) keeps
+/// the lease it was opened with, and its polls are not in step with it: it
+/// can be demoted right before the renewal at half-life, and the poll that
+/// renews then comes an idle interval later. Four idle intervals leave a
+/// whole one in hand there as well, so every such reader is opened with
+/// that: 1,200 s at the 300 s idle poll, for a `DbReader` opened on the 5 s
+/// poll too, and a reader that dies holds its files up to 20 minutes.
 pub(crate) fn clamp_reader_checkpoint_lifetime(options: &mut DbReaderOptions) {
-    let min_lifetime = options.manifest_poll_interval.saturating_mul(2);
+    let mut min_lifetime = options.manifest_poll_interval.saturating_mul(3);
+    if reader_tier_in_place_enabled() {
+        min_lifetime = min_lifetime.max(reader_idle_poll_interval_from_env().saturating_mul(4));
+    }
     if options.checkpoint_lifetime < min_lifetime {
         options.checkpoint_lifetime = min_lifetime;
     }
@@ -1504,7 +2143,7 @@ pub(crate) fn shared_lsm_runtime() -> &'static Runtime {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|n| *n >= 1)
             .unwrap_or(default_threads);
-        Builder::new_multi_thread()
+        let rt = Builder::new_multi_thread()
             .worker_threads(threads)
             .thread_name("helix-lsm")
             .enable_all()
@@ -1512,7 +2151,11 @@ pub(crate) fn shared_lsm_runtime() -> &'static Runtime {
             .unwrap_or_else(|error| {
                 eprintln!("failed to build shared LSM tokio runtime: {error}");
                 std::process::abort();
-            })
+            });
+        // Start the cache evictor on the shared runtime. Runs once at startup
+        // (background) and then periodically to bound /cache disk usage.
+        cache_evictor::start_cache_evictor(&rt.handle(), cache_root_from_env());
+        rt
     })
 }
 
@@ -1561,16 +2204,22 @@ fn lsm_read_cancelled_error() -> BackendError {
 /// queued abandoned requests from opening a database without dropping the
 /// side-effecting build future midway through.
 pub(crate) fn ensure_lsm_read_not_cancelled() -> Result<(), BackendError> {
-    let cancelled = LSM_READ_CANCELLATION.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(LsmReadCancellation::is_cancelled_inner)
-    });
-    if cancelled {
+    if lsm_read_cancelled() {
         Err(lsm_read_cancelled_error())
     } else {
         Ok(())
     }
+}
+
+/// Whether the request this thread serves has been cancelled. Counts nothing,
+/// unlike [`ensure_lsm_read_not_cancelled`]: for a loop that turned a failed
+/// read into "no match" and must tell that from a caller that has gone.
+pub(crate) fn lsm_read_cancelled() -> bool {
+    LSM_READ_CANCELLATION.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(LsmReadCancellation::is_cancelled_inner)
+    })
 }
 
 /// Like [`block_on_lsm_read`], but preserves a caller-provided backend error
@@ -1626,6 +2275,65 @@ pub(crate) fn block_on_lsm_mapped<T, E>(
         return tokio::task::block_in_place(|| rt.block_on(future)).map_err(map_err);
     }
     rt.block_on(future).map_err(map_err)
+}
+
+/// Never resolves: every `every`, runs one `refresh` to completion.
+async fn refresh_every<F: Future<Output = ()>>(
+    every: std::time::Duration,
+    mut refresh: impl FnMut() -> F,
+) -> std::convert::Infallible {
+    loop {
+        tokio::time::sleep(every).await;
+        refresh().await;
+    }
+}
+
+/// Resolves with `op`. While `op` stays pending, `refresh` runs every `every`
+/// beside it, never ahead of it: an `op` that completes first is never
+/// refreshed, and a refresh that hangs does not hold up `op`.
+async fn refresh_while_pending<T, F: Future<Output = ()>>(
+    op: impl Future<Output = T>,
+    every: std::time::Duration,
+    refresh: impl FnMut() -> F,
+) -> T {
+    let mut op = std::pin::pin!(op);
+    let mut refresher = std::pin::pin!(refresh_every(every, refresh));
+    std::future::poll_fn(|cx| {
+        let out = op.as_mut().poll(cx);
+        if out.is_pending() {
+            // Never ready; polling it keeps its timer and refresh running.
+            let _ = refresher.as_mut().poll(cx);
+        }
+        out
+    })
+    .await
+}
+
+/// The L0 SST count at which SlateDB can refuse to flush a frozen memtable:
+/// the lower of its two L0 limits.
+fn l0_stall_floor(settings: &Settings) -> usize {
+    settings.l0_max_ssts.min(settings.l0_max_ssts_per_key)
+}
+
+/// Lets one stalled-write manifest refresh run per collection at a time, and
+/// start at most one per interval, however many commits are parked.
+#[derive(Default)]
+struct RefreshGate(tokio::sync::Mutex<Option<std::time::Instant>>);
+
+impl RefreshGate {
+    /// The permit for one refresh, held until dropped. `None` while another
+    /// holds it, or within `every` of the last one's start.
+    fn try_enter(
+        &self,
+        every: std::time::Duration,
+    ) -> Option<tokio::sync::MutexGuard<'_, Option<std::time::Instant>>> {
+        let mut last_started = self.0.try_lock().ok()?;
+        if last_started.is_some_and(|at| at.elapsed() < every) {
+            return None;
+        }
+        *last_started = Some(std::time::Instant::now());
+        Some(last_started)
+    }
 }
 
 /// Namespace key prefix: `<ns_name>\0`.
@@ -1832,6 +2540,48 @@ impl<'a> DupScanCursor<'a> {
     }
 }
 
+/// The logical key lengths of at least `min_len` that have rows in a dup
+/// namespace, ascending, with the number of rows read to find them. Each
+/// length is one contiguous region of the namespace, so its first row is one
+/// seek away; the probe reads a block at a time because it wants one row.
+async fn dup_key_lengths(
+    snapshot: &DbSnapshot,
+    ns_prefix: &[u8],
+    min_len: usize,
+) -> Result<(Vec<u32>, usize), BackendError> {
+    let Ok(min_len) = u32::try_from(min_len) else {
+        return Ok((Vec::new(), 0));
+    };
+    let lo = [ns_prefix, &min_len.to_be_bytes()[..]].concat();
+    let hi = match next_prefix(ns_prefix) {
+        Some(end) => Bound::Excluded(end),
+        None => Bound::Unbounded,
+    };
+    let probe = lsm_scan_options()
+        .with_read_ahead_bytes(1)
+        .with_max_fetch_tasks(1);
+    let mut iter = snapshot
+        .scan_with_options((Bound::Included(lo), hi), &probe)
+        .await
+        .map_err(io)?;
+    let (mut lengths, mut visited) = (Vec::new(), 0);
+    while let Some(kv) = iter.next().await.map_err(io)? {
+        visited += 1;
+        let Some((key, _)) = decode_dup_full_key(kv.key.as_ref(), ns_prefix)? else {
+            continue;
+        };
+        let len = key.len() as u32;
+        lengths.push(len);
+        let Some(next) = len.checked_add(1) else {
+            break;
+        };
+        iter.seek([ns_prefix, &next.to_be_bytes()[..]].concat())
+            .await
+            .map_err(io)?;
+    }
+    Ok((lengths, visited))
+}
+
 /// The collections root prefix for a SlateDB collection path: everything up to
 /// (not including) the final `/<name>` segment (`"helion/my_collection"` ->
 /// `"helion"`, `"my_collection"` -> `""`). Each collection's SlateDB lives at
@@ -2030,6 +2780,31 @@ pub(crate) fn collection_prefix_exists_with_store(
     })
 }
 
+pub(crate) fn s3_collection_prefix_bytes(
+    config: &S3StoreConfig<'_>,
+    collection_prefix: &str,
+) -> Result<u64, BackendError> {
+    let store = build_s3_store(config)?;
+    collection_prefix_bytes_with_store(store, collection_prefix)
+}
+
+/// Total object bytes under a collection prefix, from one LIST pass, without
+/// opening the collection.
+pub(crate) fn collection_prefix_bytes_with_store(
+    store: Arc<dyn ObjectStore>,
+    collection_prefix: &str,
+) -> Result<u64, BackendError> {
+    let prefix = ObjPath::from(collection_prefix);
+    block_on_lsm_read(&shared_lsm_handle(), async move {
+        let mut entries = store.list(Some(&prefix));
+        let mut total = 0_u64;
+        while let Some(entry) = entries.try_next().await.map_err(io)? {
+            total = total.saturating_add(entry.size as u64);
+        }
+        Ok::<u64, BackendError>(total)
+    })
+}
+
 pub(crate) fn read_s3_drop_tombstone(
     config: &S3StoreConfig<'_>,
     collection_prefix: &str,
@@ -2116,6 +2891,21 @@ fn idle_flush_after_from_env() -> Option<std::time::Duration> {
         .map(|secs| std::time::Duration::from_secs(secs as u64))
 }
 
+/// Env knob: seconds a committed write may stay unflushed on a resident WRITER
+/// whose idle flush is on. A steady trickle (a write every few seconds for
+/// hours) never goes write-quiet, so the quiet period alone lets its WAL tail
+/// grow to SlateDB's own bound of 4096 WAL SSTs, all replayed by every reader
+/// cold open. Unset → [`DEFAULT_UNFLUSHED_MAX_AGE_SECS`]; 0 → quiet period
+/// only. Cost: at most one L0 SST + manifest update per period per trickled
+/// collection.
+const ENV_UNFLUSHED_MAX_AGE_SECS: &str = "HELIX_LSM_UNFLUSHED_MAX_AGE_SECS";
+const DEFAULT_UNFLUSHED_MAX_AGE_SECS: usize = 300;
+
+fn unflushed_max_age_from_env() -> Option<std::time::Duration> {
+    let secs = env_usize_opt(ENV_UNFLUSHED_MAX_AGE_SECS).unwrap_or(DEFAULT_UNFLUSHED_MAX_AGE_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs as u64))
+}
+
 /// Write bookkeeping for the idle memtable flush ([`ENV_IDLE_FLUSH_SECS`]).
 struct IdleFlushState {
     created: std::time::Instant,
@@ -2126,6 +2916,9 @@ struct IdleFlushState {
     flushed: std::sync::atomic::AtomicU64,
     /// Millis after `created` of the last committed write.
     last_write_ms: std::sync::atomic::AtomicU64,
+    /// Millis after `created` of the oldest write no flush has covered, or
+    /// just before it. Starts at the open: a replayed tail is at least that old.
+    unflushed_since_ms: std::sync::atomic::AtomicU64,
 }
 
 impl IdleFlushState {
@@ -2135,6 +2928,7 @@ impl IdleFlushState {
             writes: std::sync::atomic::AtomicU64::new(1),
             flushed: std::sync::atomic::AtomicU64::new(0),
             last_write_ms: std::sync::atomic::AtomicU64::new(0),
+            unflushed_since_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2147,21 +2941,48 @@ impl IdleFlushState {
     /// backend's only `Db` write paths (`db()` is private to this module).
     fn note_write(&self) {
         use std::sync::atomic::Ordering;
-        self.last_write_ms
-            .store(self.elapsed_ms(), Ordering::Release);
+        let now = self.elapsed_ms();
+        self.last_write_ms.store(now, Ordering::Release);
+        // The first write after a flush that covered everything starts the
+        // unflushed tail. A flush in flight has not stored `flushed` yet, so a
+        // write landing under it keeps that flush's start instead.
+        if self.writes.load(Ordering::Acquire) == self.flushed.load(Ordering::Acquire) {
+            self.unflushed_since_ms.store(now, Ordering::Release);
+        }
         self.writes.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// The write generation to flush when writes are unflushed and none landed
-    /// within `quiet`.
-    fn due(&self, quiet: std::time::Duration) -> Option<u64> {
+    /// A successful flush that began at `started_ms` covered generation
+    /// `writes`. Anything committed since is unflushed from about its start.
+    fn note_flushed(&self, writes: u64, started_ms: u64) {
+        use std::sync::atomic::Ordering;
+        self.unflushed_since_ms.store(started_ms, Ordering::Release);
+        self.flushed.store(writes, Ordering::Release);
+    }
+
+    /// The write generation to flush, and why: writes are unflushed and either
+    /// none landed within `quiet` or the oldest of them is `max_age` old.
+    fn due(
+        &self,
+        quiet: std::time::Duration,
+        max_age: Option<std::time::Duration>,
+    ) -> Option<(u64, &'static str)> {
         use std::sync::atomic::Ordering;
         let writes = self.writes.load(Ordering::Acquire);
-        let idle_ms = self
-            .elapsed_ms()
-            .saturating_sub(self.last_write_ms.load(Ordering::Acquire));
-        let quiet_ms = u64::try_from(quiet.as_millis()).unwrap_or(u64::MAX);
-        (writes != self.flushed.load(Ordering::Acquire) && idle_ms >= quiet_ms).then_some(writes)
+        if writes == self.flushed.load(Ordering::Acquire) {
+            return None;
+        }
+        let now = self.elapsed_ms();
+        let ms_since =
+            |mark: &std::sync::atomic::AtomicU64| now.saturating_sub(mark.load(Ordering::Acquire));
+        let ms = |limit: std::time::Duration| u64::try_from(limit.as_millis()).unwrap_or(u64::MAX);
+        if ms_since(&self.last_write_ms) >= ms(quiet) {
+            Some((writes, "quiet"))
+        } else if max_age.is_some_and(|age| ms_since(&self.unflushed_since_ms) >= ms(age)) {
+            Some((writes, "age"))
+        } else {
+            None
+        }
     }
 }
 
@@ -2172,9 +2993,11 @@ fn spawn_idle_flusher(
     db: Db,
     state: &Arc<IdleFlushState>,
     quiet: std::time::Duration,
+    max_age: Option<std::time::Duration>,
 ) {
     let state = Arc::downgrade(state);
-    let tick = (quiet / 4).max(std::time::Duration::from_secs(1));
+    let shortest = max_age.map_or(quiet, |age| age.min(quiet));
+    let tick = (shortest / 4).max(std::time::Duration::from_secs(1));
     rt.spawn(async move {
         loop {
             tokio::time::sleep(tick).await;
@@ -2184,7 +3007,8 @@ fn spawn_idle_flusher(
             if db.status().close_reason.is_some() {
                 return;
             }
-            let Some(writes) = state.due(quiet) else {
+            let started_ms = state.elapsed_ms();
+            let Some((writes, trigger)) = state.due(quiet, max_age) else {
                 continue;
             };
             let flushed = db
@@ -2194,14 +3018,12 @@ fn spawn_idle_flusher(
                 .await;
             match flushed {
                 Ok(()) => {
-                    state
-                        .flushed
-                        .store(writes, std::sync::atomic::Ordering::Release);
-                    metrics::counter!("helix_lsm_idle_flush_total", "outcome" => "flushed")
+                    state.note_flushed(writes, started_ms);
+                    metrics::counter!("helix_lsm_idle_flush_total", "outcome" => "flushed", "trigger" => trigger)
                         .increment(1);
                 }
                 Err(error) => {
-                    metrics::counter!("helix_lsm_idle_flush_total", "outcome" => "error")
+                    metrics::counter!("helix_lsm_idle_flush_total", "outcome" => "error", "trigger" => trigger)
                         .increment(1);
                     tracing::debug!(%error, "idle memtable flush failed; retrying next tick");
                 }
@@ -2228,6 +3050,11 @@ pub struct LsmBackend {
     buffered_since_flush: std::sync::atomic::AtomicBool,
     /// Write bookkeeping for the idle memtable flush ([`ENV_IDLE_FLUSH_SECS`]).
     idle_flush: Arc<IdleFlushState>,
+    /// Rate limit of this collection's [`ENV_STALLED_WRITE_REFRESH`] refreshes.
+    stalled_refresh: RefreshGate,
+    /// RAII guard that unregisters this collection's cache dir from the
+    /// open registry on drop, so the evictor can reclaim it.
+    _cache_dir_guard: Option<cache_evictor::CacheDirGuard>,
     /// Test-only counter of backend reads served (one per `get_with` point read,
     /// one per KV yielded by `scan`/`scan_dup_namespace`). Lets tests assert that
     /// an indexed search is HNSW-bounded rather than a full namespace scan. Never
@@ -2245,6 +3072,9 @@ pub struct LsmRead {
     /// from a LsmWrite when this read view is derived from a write batch via
     /// WriteView::read_view; empty for ordinary begin_read() snapshots.
     pending: HashMap<Vec<u8>, Option<Bytes>>,
+    /// Taken just before the snapshot was opened: every commit that returned
+    /// before this instant is visible in `snapshot`.
+    opened_at: std::time::Instant,
 }
 impl ReadTxn for LsmRead {}
 
@@ -2254,8 +3084,23 @@ impl LsmRead {
     pub(crate) fn with_pending(
         snapshot: Arc<DbSnapshot>,
         pending: HashMap<Vec<u8>, Option<Bytes>>,
+        opened_at: std::time::Instant,
     ) -> Self {
-        Self { snapshot, pending }
+        Self {
+            snapshot,
+            pending,
+            opened_at,
+        }
+    }
+
+    pub(crate) fn opened_at(&self) -> std::time::Instant {
+        self.opened_at
+    }
+
+    /// The snapshot's sequence when this view reads only committed state;
+    /// `None` for a write view carrying uncommitted puts or deletes.
+    pub(crate) fn snapshot_seq(&self) -> Option<u64> {
+        self.pending.is_empty().then(|| self.snapshot.seq())
     }
 }
 
@@ -2268,6 +3113,8 @@ pub struct LsmWrite {
     batch: WriteBatch,
     pending: HashMap<Vec<u8>, Option<Bytes>>,
     has_writes: bool,
+    /// Merges are not in `pending`; see [`LsmCheckedTxn::commit_write`].
+    merged: bool,
     /// Run when the batch ends: `true` once it committed, `false` when it is
     /// dropped uncommitted or the commit fails. Lets a writer that published
     /// in-memory state ahead of the commit take it back on abort.
@@ -2336,10 +3183,20 @@ impl LsmBackend {
         settings: Option<Settings>,
     ) -> Result<Self, BackendError> {
         let rt = shared_lsm_handle();
+        // Register cache dir BEFORE opening so the evictor cannot delete it during build.
+        // If open fails, the guard's Drop will unregister it.
+        let cache_dir_guard =
+            cache_subtree_for_lsm_path(path).map(cache_evictor::register_cache_dir);
         let db = Self::open_db_for_request(&rt, path, store.clone(), settings.clone())?;
         let idle_flush = Arc::new(IdleFlushState::new());
         if let Some(quiet) = idle_flush_after_from_env() {
-            spawn_idle_flusher(&rt, db.clone(), &idle_flush, quiet);
+            spawn_idle_flusher(
+                &rt,
+                db.clone(),
+                &idle_flush,
+                quiet,
+                unflushed_max_age_from_env(),
+            );
         }
         Ok(Self {
             db: RwLock::new(db),
@@ -2349,9 +3206,18 @@ impl LsmBackend {
             settings,
             buffered_since_flush: std::sync::atomic::AtomicBool::new(false),
             idle_flush,
+            stalled_refresh: RefreshGate::default(),
+            _cache_dir_guard: cache_dir_guard,
             #[cfg(test)]
             read_count: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// [`batch_row_read_in_flight`] on this collection.
+    pub(crate) fn batch_row_read_in_flight(
+        &self,
+    ) -> slatedb::cached_object_store_stats::BatchRowRead {
+        batch_row_read_in_flight(&self.path)
     }
 
     /// Publish this collection on the durable-commit change feed. The feed key
@@ -2376,17 +3242,34 @@ impl LsmBackend {
         // instead of SlateDB's per-`Db` default `SplitCache` (which would silo
         // ~640 MiB per resident handle). See [`shared_db_cache`].
         let cache = shared_db_cache();
+        // See `opening_a_new_database`.
+        let create_only = LSM_OPENS_A_NEW_DATABASE.get().is_some();
         let mut builder = Db::builder(path, store)
             .with_db_cache(cache)
             .with_merge_operator(shared_merge_operator())
-            .with_manifest_id_floor(purged_manifest_ceiling(path));
+            .with_manifest_id_floor(purged_manifest_ceiling(path))
+            .with_create_only(create_only)
+            .with_l0_flush_gate(flush_gate_for_open());
         if let Some(settings) = settings {
             builder = builder.with_settings(settings);
         }
         if let Some(policies) = prefix_filter_policies_from_env() {
             builder = builder.with_filter_policies(policies);
         }
-        block_on_lsm(rt, builder.build())
+        #[cfg(test)]
+        if let Some(add) = DB_BUILDER_FOR_TEST.with(|add| add.borrow().clone()) {
+            builder = add(builder);
+        }
+        let opened = block_on_lsm_mapped(rt, builder.build(), |error: slatedb::Error| {
+            if error.code() == Some(slatedb::ErrorCode::DatabaseExists) {
+                LSM_OPENS_A_NEW_DATABASE.set(Some(true));
+            }
+            io(error)
+        });
+        if create_only && opened.is_ok() {
+            LSM_OPENS_A_NEW_DATABASE.set(None);
+        }
+        opened
     }
 
     /// Open a writer for a foreground operation without dropping the
@@ -2409,6 +3292,72 @@ impl LsmBackend {
         self.db.read().clone()
     }
 
+    /// Resolves with `write`, a commit on `db`. Unless
+    /// [`ENV_STALLED_WRITE_REFRESH`] is off, a write still pending after
+    /// [`STALLED_WRITE_REFRESH_EVERY`] runs [`Self::refresh_for_stalled_write`]
+    /// every such interval until it returns. The write, what it waits for and
+    /// its result are the caller's, unchanged.
+    async fn refresh_if_stalled<T>(&self, db: &Db, write: impl Future<Output = T>) -> T {
+        if !lsm_stalled_write_refresh_enabled() {
+            return write.await;
+        }
+        let pending_since = std::time::Instant::now();
+        let announced = Cell::new(false);
+        refresh_while_pending(write, STALLED_WRITE_REFRESH_EVERY, || {
+            self.refresh_for_stalled_write(db, pending_since, &announced)
+        })
+        .await
+    }
+
+    /// One manifest refresh for a commit pending since `pending_since`,
+    /// counted in `helix_lsm_stalled_write_refresh_total` by outcome: `freed`
+    /// (it found L0 slots the compactor freed, which is what resumes the
+    /// parked writes), `ok` (L0 unchanged), `error`, or `skipped`. Skipped
+    /// unless L0 is at its limit in this writer's view of the manifest (the
+    /// one wait a refresh can end), and while [`RefreshGate`] holds it back.
+    /// A failed refresh is only logged: it fails when the `Db` is closed or
+    /// closing, which the commit reports itself. One still in flight when its
+    /// commit returns is dropped uncounted.
+    async fn refresh_for_stalled_write(
+        &self,
+        db: &Db,
+        pending_since: std::time::Instant,
+        announced: &Cell<bool>,
+    ) {
+        // shortcut: the root tree's L0 only, upgrade if a segment extractor is ever configured.
+        let l0_ssts = db.manifest().l0().len();
+        let l0_limit = self
+            .settings
+            .as_ref()
+            .map_or_else(|| l0_stall_floor(&Settings::default()), l0_stall_floor);
+        let permit = (l0_ssts >= l0_limit)
+            .then(|| self.stalled_refresh.try_enter(STALLED_WRITE_REFRESH_EVERY))
+            .flatten();
+        let outcome = match permit {
+            None => "skipped",
+            Some(_permit) => {
+                if !announced.replace(true) {
+                    tracing::info!(
+                        path = %self.path,
+                        pending_ms = pending_since.elapsed().as_millis() as u64,
+                        l0_ssts,
+                        "LSM commit stalled on a full L0: refreshing the manifest"
+                    );
+                }
+                match db.refresh_manifest().await {
+                    Ok(()) if db.manifest().l0().len() < l0_ssts => "freed",
+                    Ok(()) => "ok",
+                    Err(error) => {
+                        tracing::debug!(%error, "manifest refresh for a stalled LSM write failed");
+                        "error"
+                    }
+                }
+            }
+        };
+        metrics::counter!("helix_lsm_stalled_write_refresh_total", "outcome" => outcome)
+            .increment(1);
+    }
+
     fn is_conflict(error: &BackendError) -> bool {
         matches!(error, BackendError::Conflict(_))
     }
@@ -2422,6 +3371,25 @@ impl LsmBackend {
     #[cfg(test)]
     pub fn read_count(&self) -> usize {
         self.read_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only: flush the memtable to an L0 SST.
+    #[cfg(test)]
+    pub(crate) fn flush_memtable_for_test(&self) {
+        block_on_lsm(
+            &self.rt,
+            self.db().flush_with_options(slatedb::config::FlushOptions {
+                flush_type: slatedb::config::FlushType::MemTable,
+            }),
+        )
+        .unwrap();
+    }
+
+    /// Test-only: flush the memtable to an L0 SST, then close the writer.
+    #[cfg(test)]
+    pub(crate) fn flush_memtable_and_close_for_test(&self) {
+        self.flush_memtable_for_test();
+        self.close().unwrap();
     }
 
     /// Test-only: zero the read counter before a measured operation.
@@ -2462,11 +3430,12 @@ impl LsmBackend {
         pending: HashMap<Vec<u8>, Option<Bytes>>,
     ) -> Result<LsmRead, BackendError> {
         let db = self.db();
+        let opened_at = std::time::Instant::now();
         let snapshot = match block_on_lsm_read_mapped(&self.rt, db.snapshot(), map_slatedb_err) {
             Ok(snapshot) => snapshot,
             Err(error) => return Err(error),
         };
-        Ok(LsmRead::with_pending(snapshot, pending))
+        Ok(LsmRead::with_pending(snapshot, pending, opened_at))
     }
 
     pub(crate) fn collect_values_many_with(
@@ -2475,12 +3444,61 @@ impl LsmBackend {
         ns: Namespace<'_>,
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
-        self.bump_reads(keys.len());
-        let mut out = vec![None; keys.len()];
+        self.collect_values_many(txn, ns, keys, lsm_multi_get_enabled())
+    }
+
+    /// [`Self::collect_values_many_with`] with the read path chosen by the
+    /// caller: `multi_get` for a batch of keys that mostly do not exist.
+    pub(crate) fn collect_values_many(
+        &self,
+        txn: &LsmRead,
+        ns: Namespace<'_>,
+        keys: &[Vec<u8>],
+        multi_get: bool,
+    ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
+        #[cfg(test)]
+        note_key_batch_for_test(&self.path);
+        self.collect_full_keys(
+            txn,
+            keys.iter().map(|key| prefixed(ns, key)).collect(),
+            multi_get,
+        )
+    }
+
+    /// Whether each `(namespace, key)` is present, in input order. Every
+    /// namespace of a collection shares one keyspace, so probes spanning many
+    /// namespaces still cost ONE batched read.
+    pub(crate) fn contains_many_with(
+        &self,
+        txn: &LsmRead,
+        keys: &[(Namespace<'_>, Vec<u8>)],
+    ) -> Result<Vec<bool>, BackendError> {
+        let full_keys = keys.iter().map(|(ns, key)| prefixed(*ns, key)).collect();
+        let values = self.collect_full_keys_with(txn, full_keys)?;
+        Ok(values.into_iter().map(|value| value.is_some()).collect())
+    }
+
+    /// Values of fully prefixed keys, aligned with `full_keys`: the overlay in
+    /// `txn` wins, the rest come from one batched snapshot read.
+    fn collect_full_keys_with(
+        &self,
+        txn: &LsmRead,
+        full_keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
+        self.collect_full_keys(txn, full_keys, lsm_multi_get_enabled())
+    }
+
+    fn collect_full_keys(
+        &self,
+        txn: &LsmRead,
+        full_keys: Vec<Vec<u8>>,
+        multi_get: bool,
+    ) -> Result<Vec<Option<Vec<u8>>>, BackendError> {
+        self.bump_reads(full_keys.len());
+        let mut out = vec![None; full_keys.len()];
         let mut snapshot_reads = Vec::new();
 
-        for (index, key) in keys.iter().enumerate() {
-            let full = prefixed(ns, key);
+        for (index, full) in full_keys.into_iter().enumerate() {
             if let Some(buffered) = txn.pending.get(&full) {
                 out[index] = buffered.as_ref().map(|bytes| bytes.to_vec());
             } else {
@@ -2493,7 +3511,7 @@ impl LsmBackend {
         }
 
         let snapshot = Arc::clone(&txn.snapshot);
-        if lsm_multi_get_enabled() {
+        if multi_get {
             // One ordered multi_get pass over the snapshot: the fork's
             // implementation shares block fetches across keys and preserves
             // input order, so values line up with `snapshot_reads`.
@@ -2555,6 +3573,181 @@ impl LsmBackend {
             .collect();
         let read = self.begin_read_with_pending(pending)?;
         self.collect_values_many_with(&read, ns, keys)
+    }
+
+    /// Whether each row is stored, or staged on `txn`, in input order:
+    /// `(ns, key, None)` a plain key, `(ns, key, Some(value))` one row of a
+    /// multi-value namespace. A row `txn` puts is there and one it deletes
+    /// is not, whatever the store holds; the rest come from ONE multi-get,
+    /// as in [`Self::get_for_update_many`]. A row is there by its key: the
+    /// stored value of a multi-value row is empty.
+    pub(crate) fn present_for_update(
+        &self,
+        txn: &LsmWrite,
+        rows: &[(Namespace<'_>, &[u8], Option<&[u8]>)],
+    ) -> Result<Vec<bool>, BackendError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        if FAIL_NEXT_PRESENT_FOR_UPDATE_FOR_TEST.replace(false) {
+            return Err(BackendError::Io("the keys' read fails for the test".into()));
+        }
+        let full_keys: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|(ns, key, value)| match value {
+                Some(value) => dup_composite(*ns, key, value),
+                None => prefixed(*ns, key),
+            })
+            .collect();
+        let pending = full_keys
+            .iter()
+            .filter_map(|full| {
+                txn.pending
+                    .get(full)
+                    .map(|value| (full.clone(), value.clone()))
+            })
+            .collect();
+        let read = self.begin_read_with_pending(pending)?;
+        // A key the read does not answer stays `None` there: not seen.
+        let values = self.collect_full_keys_with(&read, full_keys)?;
+        Ok(values.iter().map(Option::is_some).collect())
+    }
+
+    /// The keys under each `(namespace, key prefix)`, namespace prefix
+    /// stripped, in input order: the prefix scans run concurrently in ONE
+    /// round trip instead of one each. Serves plain namespaces on a snapshot
+    /// without a write overlay; `None` otherwise, and the caller scans one
+    /// prefix at a time.
+    pub(crate) fn scan_prefix_keys_many_with(
+        &self,
+        txn: &LsmRead,
+        prefixes: &[(Namespace<'_>, Vec<u8>)],
+    ) -> Result<Option<Vec<Vec<Vec<u8>>>>, BackendError> {
+        if !txn.pending.is_empty() || prefixes.iter().any(|(ns, _)| is_dup(*ns)) {
+            return Ok(None);
+        }
+        let scans: Vec<(usize, Vec<u8>)> = prefixes
+            .iter()
+            .map(|(ns, key_prefix)| {
+                let mut full = ns_prefix(*ns);
+                let strip = full.len();
+                full.extend_from_slice(key_prefix);
+                (strip, full)
+            })
+            .collect();
+        let snapshot = Arc::clone(&txn.snapshot);
+        let rows = block_on_lsm_read_mapped(
+            &self.rt,
+            async move {
+                let scans = scans.into_iter().map(|(strip, full)| {
+                    let snapshot = Arc::clone(&snapshot);
+                    async move {
+                        let mut keys = Vec::new();
+                        let mut iter = snapshot
+                            .scan_prefix_with_options(full, .., &lsm_scan_options())
+                            .await
+                            .map_err(io)?;
+                        while let Some(kv) = iter.next().await.map_err(io)? {
+                            let key = kv.key.as_ref();
+                            keys.push(key.get(strip..).unwrap_or(key).to_vec());
+                        }
+                        Ok::<Vec<Vec<u8>>, BackendError>(keys)
+                    }
+                });
+                stream::iter(scans)
+                    .buffered(LSM_BATCH_POINT_READ_CONCURRENCY)
+                    .try_collect::<Vec<_>>()
+                    .await
+            },
+            |e| e,
+        )?;
+        self.bump_reads(rows.iter().map(Vec::len).sum());
+        Ok(Some(rows))
+    }
+
+    /// The dup values whose logical key starts with each prefix, in input
+    /// order and in the order [`Self::scan`] over `KeyRange::prefix` yields
+    /// them, read concurrently in ONE round trip instead of one each. Every
+    /// prefix reads exactly its own rows: the key lengths present in the
+    /// namespace are found once, and a prefix is one bounded range per length.
+    /// With a `row_cap` a prefix stops at its first `row_cap` values and reads
+    /// a block at a time: an existence check wants one row of a prefix that
+    /// may own tens of thousands. A cap of 0 counts as 1, so an empty answer
+    /// always means the prefix has no row. `None` on a snapshot with a write
+    /// overlay, and the caller scans one prefix at a time.
+    pub(crate) fn scan_dup_prefix_values_many_with(
+        &self,
+        txn: &LsmRead,
+        ns: Namespace<'_>,
+        key_prefixes: &[Vec<u8>],
+        row_cap: Option<usize>,
+    ) -> Result<Option<Vec<Vec<Vec<u8>>>>, BackendError> {
+        if !txn.pending.is_empty() || !is_dup(ns) {
+            return Ok(None);
+        }
+        let Some(shortest) = key_prefixes.iter().map(Vec::len).min() else {
+            return Ok(Some(Vec::new()));
+        };
+        let prefix = ns_prefix(ns);
+        let options = match row_cap {
+            Some(_) => lsm_scan_options()
+                .with_read_ahead_bytes(1)
+                .with_max_fetch_tasks(1),
+            None => lsm_scan_options(),
+        };
+        let row_cap = row_cap.map_or(usize::MAX, |cap| cap.max(1));
+        let (rows, visited) = block_on_lsm_read_mapped(
+            &self.rt,
+            async {
+                let snapshot = &txn.snapshot;
+                let (lengths, probed) = dup_key_lengths(snapshot, &prefix, shortest).await?;
+                let scans = key_prefixes.iter().map(|key_prefix| {
+                    let (prefix, lengths) = (prefix.as_slice(), lengths.as_slice());
+                    let options = &options;
+                    async move {
+                        let mut values = Vec::new();
+                        for len in lengths {
+                            if values.len() >= row_cap {
+                                break;
+                            }
+                            if (*len as usize) < key_prefix.len() {
+                                continue;
+                            }
+                            let lo =
+                                [prefix, &len.to_be_bytes()[..], key_prefix.as_slice()].concat();
+                            let hi = match next_prefix(&lo) {
+                                Some(end) => Bound::Excluded(end),
+                                None => Bound::Unbounded,
+                            };
+                            let mut iter = snapshot
+                                .scan_with_options((Bound::Included(lo), hi), options)
+                                .await
+                                .map_err(io)?;
+                            while values.len() < row_cap {
+                                let Some(kv) = iter.next().await.map_err(io)? else {
+                                    break;
+                                };
+                                if let Some((_, value)) =
+                                    decode_dup_full_key(kv.key.as_ref(), prefix)?
+                                {
+                                    values.push(value.to_vec());
+                                }
+                            }
+                        }
+                        Ok::<_, BackendError>(values)
+                    }
+                });
+                let rows = stream::iter(scans)
+                    .buffered(LSM_BATCH_POINT_READ_CONCURRENCY)
+                    .try_collect::<Vec<_>>()
+                    .await?;
+                Ok::<_, BackendError>((rows, probed))
+            },
+            |e| e,
+        )?;
+        self.note_dup_scan_rows(visited + rows.iter().map(Vec::len).sum::<usize>());
+        Ok(Some(rows))
     }
 
     pub(crate) fn collect_dup_values_many_with(
@@ -2623,8 +3816,59 @@ impl LsmBackend {
         key: &[u8],
         mut update: impl FnMut(Option<&[u8]>) -> Result<(Vec<u8>, T), BackendError>,
     ) -> Result<T, BackendError> {
+        self.update_key_in_transaction(ns, key, &[], true, |value| {
+            update(value).map(|(next, result)| (next, Vec::new(), result))
+        })
+    }
+
+    /// [`Self::update_key_transactional`] with the rows `also` (key and value,
+    /// in `ns` too) written by the same transaction, committed BUFFERED:
+    /// visible at once and not yet durable. The caller owes `flush_durable`
+    /// before it acknowledges the write.
+    pub(crate) fn update_key_transactional_buffered<T>(
+        &self,
+        ns: Namespace<'_>,
+        key: &[u8],
+        also: &[(&[u8], &[u8])],
+        mut update: impl FnMut(Option<&[u8]>) -> Result<(Vec<u8>, T), BackendError>,
+    ) -> Result<T, BackendError> {
+        self.update_key_in_transaction(ns, key, also, false, |value| {
+            update(value).map(|(next, result)| (next, Vec::new(), result))
+        })
+    }
+
+    /// [`Self::update_key_transactional`] whose `update` also names rows of
+    /// `ns` for the same transaction: a key with the value to put, or with
+    /// none to delete it. They are decided from the value the transaction
+    /// read, and decided again by each run a conflict makes, so what commits
+    /// beside the new value is what follows from the value it replaced.
+    pub(crate) fn update_key_transactional_with_rows<T>(
+        &self,
+        ns: Namespace<'_>,
+        key: &[u8],
+        update: impl FnMut(Option<&[u8]>) -> Result<(Vec<u8>, Vec<TransactionRow>, T), BackendError>,
+    ) -> Result<T, BackendError> {
+        self.update_key_in_transaction(ns, key, &[], true, update)
+    }
+
+    fn update_key_in_transaction<T>(
+        &self,
+        ns: Namespace<'_>,
+        key: &[u8],
+        also: &[(&[u8], &[u8])],
+        await_durable: bool,
+        mut update: impl FnMut(Option<&[u8]>) -> Result<(Vec<u8>, Vec<TransactionRow>, T), BackendError>,
+    ) -> Result<T, BackendError> {
         let db = self.db();
         let full = prefixed(ns, key);
+        let also: Vec<(Vec<u8>, &[u8])> = also
+            .iter()
+            .map(|(key, value)| (prefixed(ns, key), *value))
+            .collect();
+        let options = WriteOptions {
+            await_durable,
+            ..Default::default()
+        };
         for attempt in 0..LSM_METADATA_TXN_MAX_ATTEMPTS {
             let result = block_on_lsm_mapped(
                 &self.rt,
@@ -2634,11 +3878,29 @@ impl LsmBackend {
                         .await
                         .map_err(map_slatedb_err)?;
                     let current = txn.get(full.as_slice()).await.map_err(map_slatedb_err)?;
-                    let (next, result) = update(current.as_deref())?;
+                    let (next, rows, result) = update(current.as_deref())?;
                     txn.put(full.as_slice(), next.as_slice())
                         .map_err(map_slatedb_err)?;
-                    txn.commit().await.map_err(map_slatedb_err)?;
+                    for (key, value) in &also {
+                        txn.put(key.as_slice(), *value).map_err(map_slatedb_err)?;
+                    }
+                    for (key, value) in &rows {
+                        let key = prefixed(ns, key);
+                        match value {
+                            Some(value) => txn.put(key.as_slice(), value.as_slice()),
+                            None => txn.delete(key.as_slice()),
+                        }
+                        .map_err(map_slatedb_err)?;
+                    }
+                    self.refresh_if_stalled(&db, txn.commit_with_options(&options))
+                        .await
+                        .map_err(map_slatedb_err)?;
                     self.idle_flush.note_write();
+                    if !await_durable {
+                        // The flush that makes it durable tells the readers.
+                        self.buffered_since_flush
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     Ok(result)
                 },
                 |e| e,
@@ -2695,7 +3957,9 @@ impl LsmBackend {
                         txn.put(key.as_slice(), next.as_slice())
                             .map_err(map_slatedb_err)?;
                     }
-                    txn.commit().await.map_err(map_slatedb_err)?;
+                    self.refresh_if_stalled(&db, txn.commit())
+                        .await
+                        .map_err(map_slatedb_err)?;
                     self.idle_flush.note_write();
                     self.publish_durable_commit();
                     Ok(true)
@@ -2725,6 +3989,161 @@ impl LsmBackend {
         ))
     }
 
+    /// Begin a [`LsmCheckedTxn`]: reads see one sequence, and the commit
+    /// fails if another commit touched a written or marked-read key since.
+    pub(crate) fn begin_checked(&self) -> Result<LsmCheckedTxn<'_>, BackendError> {
+        let txn = block_on_lsm_mapped(
+            &self.rt,
+            self.db().begin(IsolationLevel::Snapshot),
+            map_slatedb_err,
+        )?;
+        Ok(LsmCheckedTxn { backend: self, txn })
+    }
+}
+
+/// Snapshot-isolation transaction for background writers that derive writes
+/// from what they read and must lose to any foreground write of those keys.
+/// SlateDB tracks every commit's keys (plain write batches included) while a
+/// transaction is open, so the commit is refused when another commit after
+/// [`LsmBackend::begin_checked`] wrote a key this transaction writes or
+/// passed to [`Self::mark_read`].
+pub(crate) struct LsmCheckedTxn<'a> {
+    backend: &'a LsmBackend,
+    txn: slatedb::DbTransaction,
+}
+
+impl LsmCheckedTxn<'_> {
+    /// Visit rows of the non-dup namespace `ns` in `range` (unprefixed keys)
+    /// as of the transaction's start, until `visit` returns false. Streams
+    /// without filling the block cache.
+    pub(crate) fn scan(
+        &self,
+        ns: Namespace<'_>,
+        range: KeyRange,
+        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<(), BackendError> {
+        debug_assert!(!is_dup(ns));
+        let prefix = ns_prefix(ns);
+        let lo = match &range.start {
+            Bound::Unbounded => Bound::Included(prefix.clone()),
+            other => LsmBackend::prefixed_bound(&prefix, other),
+        };
+        let hi = match &range.end {
+            Bound::Unbounded => next_prefix(&prefix).map_or(Bound::Unbounded, Bound::Excluded),
+            other => LsmBackend::prefixed_bound(&prefix, other),
+        };
+        block_on_lsm_mapped(
+            &self.backend.rt,
+            async {
+                let mut iter = self
+                    .txn
+                    .scan_with_options((lo, hi), &lsm_streaming_scan_options())
+                    .await
+                    .map_err(io)?;
+                while let Some(kv) = iter.next().await.map_err(io)? {
+                    self.backend.bump_reads(1);
+                    if !visit(&kv.key[prefix.len()..], kv.value.as_ref()) {
+                        break;
+                    }
+                }
+                Ok::<(), BackendError>(())
+            },
+            |e| e,
+        )
+    }
+
+    /// Stored values of the dup rows `(key, value)` of `ns`; `None` = no row.
+    pub(crate) fn get_dup_stored(
+        &self,
+        ns: Namespace<'_>,
+        rows: &[(&[u8], &[u8])],
+    ) -> Result<Vec<Option<Bytes>>, BackendError> {
+        let keys: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|(key, value)| dup_composite(ns, key, value))
+            .collect();
+        block_on_lsm_mapped(&self.backend.rt, self.txn.multi_get(&keys), io)
+    }
+
+    /// Fail the commit if another commit writes `key` of `ns` after begin.
+    pub(crate) fn mark_read(&self, ns: Namespace<'_>, key: &[u8]) -> Result<(), BackendError> {
+        self.txn.mark_read([prefixed(ns, key)]).map_err(io)
+    }
+
+    pub(crate) fn put(
+        &self,
+        ns: Namespace<'_>,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<(), BackendError> {
+        self.txn.put(prefixed(ns, key), value).map_err(io)
+    }
+
+    /// [`LsmBackend::put_dup_stored`] in this transaction.
+    pub(crate) fn put_dup_stored(
+        &self,
+        ns: Namespace<'_>,
+        key: &[u8],
+        value: &[u8],
+        stored: &[u8],
+    ) -> Result<(), BackendError> {
+        self.txn
+            .put(dup_composite(ns, key, value), stored)
+            .map_err(io)
+    }
+
+    /// Commit `write`'s puts and deletes in this transaction (see
+    /// [`Self::commit`]). Its reads were not tracked: mark what they depend on.
+    pub(crate) fn commit_write(self, mut write: LsmWrite) -> Result<bool, BackendError> {
+        if write.merged {
+            return Err(BackendError::Unsupported(
+                "checked transactions cannot carry merges".to_string(),
+            ));
+        }
+        for (key, value) in &write.pending {
+            match value {
+                Some(value) => self.txn.put(key, value),
+                None => self.txn.delete(key),
+            }
+            .map_err(io)?;
+        }
+        let hooks = std::mem::take(&mut write.post_txn);
+        let committed = self.commit();
+        run_post_txn(hooks, matches!(committed, Ok(true)));
+        committed
+    }
+
+    /// Commit durably. `Ok(false)`: refused for a conflicting commit, nothing
+    /// written. Other failures (CAS, fencing) are errors.
+    pub(crate) fn commit(self) -> Result<bool, BackendError> {
+        let Self { backend, txn } = self;
+        let db = backend.db();
+        let committed = block_on_lsm_mapped(
+            &backend.rt,
+            async {
+                match backend.refresh_if_stalled(&db, txn.commit()).await {
+                    Ok(_) => Ok(true),
+                    Err(error) if error.kind() == slatedb::ErrorKind::Transaction => Ok(false),
+                    Err(error) => Err(error),
+                }
+            },
+            map_slatedb_err,
+        );
+        match committed {
+            Ok(true) => {
+                backend.idle_flush.note_write();
+                backend.publish_durable_commit();
+                Ok(true)
+            }
+            Err(error) if LsmBackend::is_fenced_conflict(&error) => {
+                Err(lsm_fenced_error("checked_txn", error.to_string()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl LsmBackend {
     /// Open SlateDB on AWS S3. `prefix` is the key prefix (a path within the
     /// bucket); `bucket` is the S3 bucket. Credentials and region resolve from
     /// the standard AWS environment (env vars, shared config, or the
@@ -2779,13 +4198,16 @@ impl LsmBackend {
         }
     }
 
+    /// Dup-namespace scan visiting `(logical_key, logical_value, stored)`,
+    /// where `stored` is the row's own SlateDB value (empty unless written by
+    /// [`Self::put_dup_stored`]).
     fn scan_dup_namespace_with_options(
         &self,
         r: &LsmRead,
         ns: Namespace<'_>,
         range: KeyRange,
         scan_options: ScanOptions,
-        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
+        mut visit: impl FnMut(&[u8], &[u8], &[u8]) -> bool,
     ) -> Result<(), BackendError> {
         let prefix = ns_prefix(ns);
         let plan = dup_scan_plan(ns, &range);
@@ -2822,7 +4244,7 @@ impl LsmBackend {
                                 Some(parts) => parts,
                                 None => continue,
                             };
-                        if !visit(logical_key, logical_value) {
+                        if !visit(logical_key, logical_value, kv.value.as_ref()) {
                             break;
                         }
                     }
@@ -2834,11 +4256,11 @@ impl LsmBackend {
             return Ok(());
         }
 
-        let mut pending_rows: BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>)> = BTreeMap::new();
+        let mut pending_rows: BTreeMap<Vec<u8>, (Vec<u8>, Vec<u8>, Bytes)> = BTreeMap::new();
         for (full_key, pending) in &r.pending {
-            if pending.is_none() {
+            let Some(stored) = pending else {
                 continue;
-            }
+            };
             if !full_key.starts_with(&prefix) {
                 continue;
             }
@@ -2850,7 +4272,7 @@ impl LsmBackend {
             }
             pending_rows.insert(
                 full_key.clone(),
-                (logical_key.to_vec(), logical_value.to_vec()),
+                (logical_key.to_vec(), logical_value.to_vec(), stored.clone()),
             );
         }
 
@@ -2871,12 +4293,12 @@ impl LsmBackend {
                         if pending_key.as_slice() >= full_key {
                             break;
                         }
-                        let Some((_pending_key, (logical_key, logical_value))) =
+                        let Some((_pending_key, (logical_key, logical_value, stored))) =
                             pending_iter.next()
                         else {
                             break;
                         };
-                        if !visit(&logical_key, &logical_value) {
+                        if !visit(&logical_key, &logical_value, &stored) {
                             self.note_dup_scan_rows(rows.visited());
                             return Ok(());
                         }
@@ -2889,14 +4311,14 @@ impl LsmBackend {
                     else {
                         continue;
                     };
-                    if !visit(logical_key, logical_value) {
+                    if !visit(logical_key, logical_value, kv.value.as_ref()) {
                         self.note_dup_scan_rows(rows.visited());
                         return Ok(());
                     }
                 }
                 self.note_dup_scan_rows(rows.visited());
-                for (_full_key, (logical_key, logical_value)) in pending_iter {
-                    if !visit(&logical_key, &logical_value) {
+                for (_full_key, (logical_key, logical_value, stored)) in pending_iter {
+                    if !visit(&logical_key, &logical_value, &stored) {
                         break;
                     }
                 }
@@ -2912,9 +4334,57 @@ impl LsmBackend {
         r: &LsmRead,
         ns: Namespace<'_>,
         range: KeyRange,
-        visit: impl FnMut(&[u8], &[u8]) -> bool,
+        mut visit: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<(), BackendError> {
+        self.scan_dup_namespace_with_options(r, ns, range, lsm_scan_options(), |k, v, _| {
+            visit(k, v)
+        })
+    }
+
+    /// `put_dup` whose row carries `stored` as its SlateDB value. Readers that
+    /// ignore it (`scan`, `for_each_dup`, older binaries) see a plain dup row;
+    /// rewriting the row with `put_dup` resets it to empty.
+    pub(crate) fn put_dup_stored(
+        &self,
+        txn: &mut LsmWrite,
+        ns: Namespace<'_>,
+        key: &[u8],
+        value: &[u8],
+        stored: &[u8],
+    ) -> Result<(), BackendError> {
+        let ck = dup_composite(ns, key, value);
+        let stored = Bytes::copy_from_slice(stored);
+        txn.batch.put(ck.as_slice(), stored.clone());
+        txn.pending.insert(ck, Some(stored));
+        txn.has_writes = true;
+        Ok(())
+    }
+
+    /// [`Self::scan_dup_namespace`] that also yields each row's stored value.
+    pub(crate) fn scan_dup_stored(
+        &self,
+        r: &LsmRead,
+        ns: Namespace<'_>,
+        range: KeyRange,
+        visit: impl FnMut(&[u8], &[u8], &[u8]) -> bool,
     ) -> Result<(), BackendError> {
         self.scan_dup_namespace_with_options(r, ns, range, lsm_scan_options(), visit)
+    }
+
+    /// [`StorageBackend::scan`] of a range that holds a few small rows: it
+    /// reads a block at a time, where a scan reads ahead of itself in every
+    /// table for the rows it expects to follow.
+    pub(crate) fn scan_few(
+        &self,
+        txn: &LsmRead,
+        ns: Namespace<'_>,
+        range: KeyRange,
+        visit: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<(), BackendError> {
+        let options = lsm_scan_options()
+            .with_read_ahead_bytes(1)
+            .with_max_fetch_tasks(1);
+        self.scan_with_lsm_options(txn, ns, range, options, visit)
     }
 
     pub(crate) fn scan_streaming(
@@ -2936,7 +4406,13 @@ impl LsmBackend {
         mut visit: impl FnMut(&[u8], &[u8]) -> bool,
     ) -> Result<(), BackendError> {
         if is_dup(ns) {
-            return self.scan_dup_namespace_with_options(txn, ns, range, scan_options, visit);
+            return self.scan_dup_namespace_with_options(
+                txn,
+                ns,
+                range,
+                scan_options,
+                |k, v, _| visit(k, v),
+            );
         }
 
         let prefix = ns_prefix(ns);
@@ -3170,6 +4646,10 @@ pub(crate) fn purged_manifest_ceiling(path: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Keys per delete request of a prefix purge: the most S3 takes in one
+/// multi-object delete. The requests go one at a time, in listing order.
+const PURGE_DELETE_BATCH: usize = 1_000;
+
 pub(crate) fn purge_prefix_from_store(
     rt: Handle,
     store: Arc<dyn ObjectStore>,
@@ -3182,13 +4662,15 @@ pub(crate) fn purge_prefix_from_store(
         ));
     }
     let prefix = ObjPath::from(path);
+    let started = std::time::Instant::now();
     // `manifest/` goes first so a racing opener gets 404 instead of a manifest
     // whose SSTs this pass is deleting. A reader that loaded the manifest before
     // that can still append one more version into the emptied prefix, so the
     // whole prefix is listed and swept twice; the drop tombstone's grace pass
     // (`collection_manager`) catches anything appended after the second sweep.
     let manifest_prefix = prefix.clone().join("manifest");
-    block_on_lsm(&rt, async move {
+    let purged = block_on_lsm(&rt, async move {
+        let mut purged = 0usize;
         for prefix in [&manifest_prefix, &prefix, &prefix] {
             let locations: Vec<ObjPath> = store
                 .list(Some(prefix))
@@ -3207,12 +4689,29 @@ pub(crate) fn purge_prefix_from_store(
                     .max()
                     .unwrap_or(0),
             );
-            for loc in &locations {
-                store.delete(loc).await.map_err(|e| e.to_string())?;
+            // One multi-object delete per batch, batches in listing order and one
+            // at a time: a delete per key took about 40 ms on S3, so a drop of a
+            // few thousand objects outlived its caller's timeout.
+            for batch in locations.chunks(PURGE_DELETE_BATCH) {
+                let keys = stream::iter(batch.to_vec())
+                    .map(Ok::<ObjPath, ObjectStoreError>)
+                    .boxed();
+                store
+                    .delete_stream(keys)
+                    .try_for_each(|_| std::future::ready(Ok(())))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                purged += batch.len();
             }
         }
-        Ok::<(), String>(())
+        Ok::<usize, String>(purged)
     })?;
+    tracing::info!(
+        path,
+        objects = purged,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "LSM prefix purged from the object store"
+    );
 
     if let Some(subtree) = cache_subtree_for_lsm_path(path) {
         if subtree.exists() {
@@ -3242,14 +4741,12 @@ impl StorageBackend for LsmBackend {
 
     fn begin_read(&self) -> Result<Self::Read<'_>, BackendError> {
         let db = self.db();
+        let opened_at = std::time::Instant::now();
         let snapshot = match block_on_lsm_read_mapped(&self.rt, db.snapshot(), map_slatedb_err) {
             Ok(snapshot) => snapshot,
             Err(error) => return Err(error),
         };
-        Ok(LsmRead {
-            snapshot,
-            pending: HashMap::new(),
-        })
+        Ok(LsmRead::with_pending(snapshot, HashMap::new(), opened_at))
     }
 
     fn begin_write(&self) -> Result<Self::Write<'_>, BackendError> {
@@ -3257,6 +4754,7 @@ impl StorageBackend for LsmBackend {
             batch: WriteBatch::new(),
             pending: HashMap::new(),
             has_writes: false,
+            merged: false,
             post_txn: Vec::new(),
         })
     }
@@ -3270,15 +4768,22 @@ impl StorageBackend for LsmBackend {
         // `Db::write` returns a `WriteHandle` (durability tracker); we await the
         // batch durably and discard it. Classify fencing/CAS as Conflict.
         let db = self.db();
-        let result = match block_on_lsm_mapped(&self.rt, db.write(batch.clone()), map_slatedb_err) {
+        let result = match block_on_lsm_mapped(
+            &self.rt,
+            self.refresh_if_stalled(&db, db.write(batch.clone())),
+            map_slatedb_err,
+        ) {
             Ok(_handle) => Ok(()),
             Err(error) if Self::is_fenced_conflict(&error) => {
                 let message = lsm_conflict_message(&error).unwrap_or("").to_string();
                 Err(lsm_fenced_error("commit", message))
             }
-            Err(error) if Self::is_conflict(&error) => {
-                block_on_lsm_mapped(&self.rt, db.write(batch), map_slatedb_err).map(|_handle| ())
-            }
+            Err(error) if Self::is_conflict(&error) => block_on_lsm_mapped(
+                &self.rt,
+                self.refresh_if_stalled(&db, db.write(batch)),
+                map_slatedb_err,
+            )
+            .map(|_handle| ()),
             Err(error) => Err(error),
         };
         run_post_txn(hooks, result.is_ok());
@@ -3308,7 +4813,7 @@ impl StorageBackend for LsmBackend {
         };
         let result = match block_on_lsm_mapped(
             &self.rt,
-            db.write_with_options(batch.clone(), &options),
+            self.refresh_if_stalled(&db, db.write_with_options(batch.clone(), &options)),
             map_slatedb_err,
         ) {
             Ok(_handle) => Ok(()),
@@ -3323,7 +4828,7 @@ impl StorageBackend for LsmBackend {
                 };
                 block_on_lsm_mapped(
                     &self.rt,
-                    db.write_with_options(batch, &options),
+                    self.refresh_if_stalled(&db, db.write_with_options(batch, &options)),
                     map_slatedb_err,
                 )
                 .map(|_handle| ())
@@ -3343,31 +4848,41 @@ impl StorageBackend for LsmBackend {
     /// object-store flush makes ALL prior [`commit_buffered`] writes durable.
     fn flush_durable(&self) -> Result<(), BackendError> {
         let db = self.db();
+        // Taken before the flush, not after it: a write that lands while this
+        // flush is in flight is not part of it and sets the flag again, so the
+        // flush that makes that write durable publishes it. Cleared afterwards,
+        // that later flush found no flag and the readers were not told.
+        let buffered = self
+            .buffered_since_flush
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
         let flushed = block_on_lsm_mapped(&self.rt, db.flush(), map_slatedb_err);
-        if matches!(self.close_reason(), Some(CloseReason::Fenced)) {
-            return Err(lsm_fenced_error(
+        let result = if matches!(self.close_reason(), Some(CloseReason::Fenced)) {
+            Err(lsm_fenced_error(
                 "flush_durable",
                 "SlateDB writer close reason is Fenced".to_string(),
-            ));
-        }
-        match flushed {
-            Ok(()) => {
+            ))
+        } else {
+            match flushed {
+                Err(error) if Self::is_fenced_conflict(&error) => {
+                    let message = lsm_conflict_message(&error).unwrap_or("").to_string();
+                    Err(lsm_fenced_error("flush_durable", message))
+                }
+                flushed => flushed,
+            }
+        };
+        if buffered {
+            match &result {
                 // Publish only when buffered writes actually became durable —
                 // a no-op barrier must not signal readers.
-                if self
+                Ok(()) => self.publish_durable_commit(),
+                // Nothing was published: the flag is again as this call found
+                // it, for the flush that does make those writes durable.
+                Err(_) => self
                     .buffered_since_flush
-                    .swap(false, std::sync::atomic::Ordering::Relaxed)
-                {
-                    self.publish_durable_commit();
-                }
-                Ok(())
+                    .store(true, std::sync::atomic::Ordering::Relaxed),
             }
-            Err(error) if Self::is_fenced_conflict(&error) => {
-                let message = lsm_conflict_message(&error).unwrap_or("").to_string();
-                Err(lsm_fenced_error("flush_durable", message))
-            }
-            Err(error) => Err(error),
         }
+        result
     }
 
     fn get_with<R>(
@@ -3436,6 +4951,7 @@ impl StorageBackend for LsmBackend {
         let full = prefixed(ns, key);
         txn.batch.merge(full.as_slice(), val);
         txn.has_writes = true;
+        txn.merged = true;
         Ok(())
     }
 
@@ -3447,12 +4963,7 @@ impl StorageBackend for LsmBackend {
         value: &[u8],
     ) -> Result<(), BackendError> {
         // Multi-value modeled as composite-key -> empty.
-        let ck = dup_composite(ns, key, value);
-        let empty = Bytes::new();
-        txn.batch.put(ck.as_slice(), empty.clone());
-        txn.pending.insert(ck, Some(empty));
-        txn.has_writes = true;
-        Ok(())
+        self.put_dup_stored(txn, ns, key, value, &[])
     }
 
     fn delete_dup(
@@ -3474,90 +4985,9 @@ impl StorageBackend for LsmBackend {
         txn: &Self::Read<'_>,
         ns: Namespace<'_>,
         key: &[u8],
-        mut visit: impl FnMut(&[u8]) -> bool,
+        visit: impl FnMut(&[u8]) -> bool,
     ) -> Result<(), BackendError> {
-        let kp = dup_key_prefix(ns, key);
-        if txn.pending.is_empty() {
-            block_on_lsm_read_mapped(
-                &self.rt,
-                async {
-                    let mut iter = txn
-                        .snapshot
-                        .scan_prefix_with_options(kp.clone(), .., &lsm_scan_options())
-                        .await
-                        .map_err(io)?;
-                    while let Some(kv) = iter.next().await.map_err(io)? {
-                        let k = kv.key.as_ref();
-                        let value: &[u8] = if k.len() >= kp.len() {
-                            &k[kp.len()..]
-                        } else {
-                            &[]
-                        };
-                        if !visit(value) {
-                            break;
-                        }
-                    }
-                    Ok::<(), BackendError>(())
-                },
-                |e| e,
-            )?;
-            return Ok(());
-        }
-
-        let mut pending_rows: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        for (full_key, pending) in &txn.pending {
-            if pending.is_none() {
-                continue;
-            }
-            if !full_key.starts_with(&kp) {
-                continue;
-            }
-            let value = &full_key[kp.len()..];
-            pending_rows.insert(full_key.clone(), value.to_vec());
-        }
-
-        block_on_lsm_read_mapped(
-            &self.rt,
-            async {
-                let mut pending_iter = pending_rows.into_iter().peekable();
-                let mut iter = txn
-                    .snapshot
-                    .scan_prefix_with_options(kp.clone(), .., &lsm_scan_options())
-                    .await
-                    .map_err(io)?;
-                while let Some(kv) = iter.next().await.map_err(io)? {
-                    let k = kv.key.as_ref();
-                    while let Some((pending_key, pending_value)) = pending_iter.peek() {
-                        if pending_key.as_slice() >= k {
-                            break;
-                        }
-                        if !visit(pending_value) {
-                            return Ok(());
-                        }
-                        pending_iter.next();
-                    }
-                    if txn.pending.contains_key(k) {
-                        continue;
-                    }
-                    let value: &[u8] = if k.len() >= kp.len() {
-                        &k[kp.len()..]
-                    } else {
-                        &[]
-                    };
-                    if !visit(value) {
-                        return Ok(());
-                    }
-                }
-                for (_full_key, value) in pending_iter {
-                    if !visit(&value) {
-                        break;
-                    }
-                }
-                Ok::<(), BackendError>(())
-            },
-            |e| e,
-        )?;
-        Ok(())
+        self.for_each_dup_rows(txn, ns, key, visit)
     }
 
     fn get_for_update<R>(
@@ -3583,6 +5013,10 @@ impl StorageBackend for LsmBackend {
 
 #[cfg(test)]
 mod tests {
+    mod closed_gc;
+    mod fenced_write;
+    mod flush_gate;
+
     use super::*;
     use crate::helix_engine::storage_core::backend::{KeyRange, Namespace};
     use serial_test::serial;
@@ -3787,6 +5221,59 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn meta_cache_shards_keep_each_shard_at_least_256_mib() {
+        const MIB: usize = 1024 * 1024;
+        let _unset = EnvGuard::remove(ENV_META_CACHE_SHARDS);
+        // The old per-CPU split of the 128 MiB default made 8 MiB shards.
+        assert_eq!(meta_cache_shards(128 * MIB, 16), 1);
+        assert_eq!(meta_cache_shards(1024 * MIB, 16), 4);
+        assert_eq!(
+            meta_cache_shards(4096 * MIB, 16),
+            16,
+            "capped at the CPU split"
+        );
+        assert_eq!(meta_cache_shards(16 * MIB, 16), 1, "never zero shards");
+        assert_eq!(meta_cache_shards(1024 * MIB, 0), 1);
+        {
+            let _restore = EnvGuard::set(ENV_META_CACHE_SHARDS, "16");
+            assert_eq!(meta_cache_shards(128 * MIB, 16), 16, "kill switch");
+        }
+        let _zero = EnvGuard::set(ENV_META_CACHE_SHARDS, "0");
+        assert_eq!(meta_cache_shards(1024 * MIB, 16), 4, "0 means derived");
+    }
+
+    /// The shared block cache's fill reaches `/metrics` as two gauges, of
+    /// the block part alone: the shared cache's own snapshot adds the meta
+    /// part's bytes to it.
+    #[test]
+    fn shared_block_cache_usage_is_exported_as_two_gauges_of_the_block_part() {
+        let both_parts = match shared_db_cache().usage_snapshot().memory {
+            CacheUsageSnapshot::Ready {
+                capacity_bytes: Some(both_parts),
+                ..
+            } => both_parts as f64,
+            other => panic!("unexpected usage snapshot {other:?}"),
+        };
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, export_shared_block_cache_usage);
+        let rendered = handle.render();
+        let gauge = |name: &str| -> f64 {
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.trim().parse().ok())
+                .unwrap_or_else(|| panic!("no {name}in:\n{rendered}"))
+        };
+        let capacity = gauge("helix_lsm_block_cache_capacity_bytes ");
+        assert!(
+            capacity >= 1024.0 * 1024.0 && capacity < both_parts,
+            "{capacity} of {both_parts}"
+        );
+        assert!(gauge("helix_lsm_block_cache_used_bytes ") >= 0.0);
+    }
+
+    #[test]
     fn block_on_lsm_rejects_unmarked_tokio_runtime_threads() {
         let lsm_rt = Runtime::new().unwrap();
         let outer_rt = Runtime::new().unwrap();
@@ -3836,6 +5323,41 @@ mod tests {
             result.is_ok(),
             "marked runtime use should enter a blocking section: {result:?}"
         );
+    }
+
+    /// A helper thread that enters the request thread's context may read from
+    /// inside a runtime (as a nested read does) and sees the request cancelled.
+    #[test]
+    fn lsm_thread_context_carries_blocking_and_cancellation_to_a_helper_thread() {
+        let lsm_rt = Runtime::new().unwrap();
+        let outer_rt = Runtime::new().unwrap();
+        // (a read from inside a runtime is allowed, the request is still live)
+        let on_helper = |context: &LsmThreadContext| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        context.enter(|| {
+                            let nested_read = outer_rt.block_on(async {
+                                block_on_lsm(lsm_rt.handle(), async { Ok::<_, &'static str>(()) })
+                            });
+                            (nested_read.is_ok(), ensure_lsm_read_not_cancelled().is_ok())
+                        })
+                    })
+                    .join()
+                    .unwrap()
+            })
+        };
+
+        assert_eq!(on_helper(&LsmThreadContext::current()), (false, true));
+        let unmarked_after = on_helper(&allow_lsm_blocking(LsmThreadContext::current));
+        assert_eq!(unmarked_after, (true, true));
+
+        let cancellation = LsmReadCancellation::new();
+        let context =
+            allow_lsm_blocking_cancellable(cancellation.clone(), LsmThreadContext::current);
+        assert_eq!(on_helper(&context), (true, true));
+        cancellation.cancel();
+        assert_eq!(on_helper(&context), (true, false));
     }
 
     #[test]
@@ -4154,6 +5676,283 @@ mod tests {
         be.flush_durable().unwrap();
     }
 
+    /// The wait behind [`LsmBackend::refresh_if_stalled`]: only a write that
+    /// is still pending gets refreshes, one per interval until it completes,
+    /// and a refresh that never returns does not hold the write.
+    #[test]
+    fn stalled_write_wait_refreshes_only_a_pending_write_and_never_holds_it() {
+        let rt = shared_lsm_handle();
+        let every = std::time::Duration::from_millis(5);
+
+        // A write that completes at once is never refreshed.
+        let refreshes = Cell::new(0usize);
+        let out = rt.block_on(refresh_while_pending(async { 7u8 }, every, || {
+            refreshes.set(refreshes.get() + 1);
+            async {}
+        }));
+        assert_eq!((out, refreshes.get()), (7, 0));
+
+        // Nor is one that completes before the interval has passed.
+        let out = rt.block_on(refresh_while_pending(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                8u8
+            },
+            std::time::Duration::from_secs(3600),
+            || {
+                refreshes.set(refreshes.get() + 1);
+                async {}
+            },
+        ));
+        assert_eq!((out, refreshes.get()), (8, 0));
+
+        // A parked write is refreshed every interval until it completes (the
+        // third refresh releases this one).
+        let refreshes = Cell::new(0usize);
+        let (release, parked) = tokio::sync::oneshot::channel::<u8>();
+        let mut release = Some(release);
+        let out = rt.block_on(refresh_while_pending(parked, every, || {
+            refreshes.set(refreshes.get() + 1);
+            if refreshes.get() == 3 {
+                if let Some(release) = release.take() {
+                    let _ = release.send(9);
+                }
+            }
+            async {}
+        }));
+        assert_eq!((out, refreshes.get()), (Ok(9), 3));
+
+        // A refresh that never returns does not hold the write either.
+        let (release, parked) = tokio::sync::oneshot::channel::<u8>();
+        let mut release = Some(release);
+        let out = rt.block_on(refresh_while_pending(parked, every, || {
+            if let Some(release) = release.take() {
+                let _ = release.send(4);
+            }
+            std::future::pending::<()>()
+        }));
+        assert_eq!(out, Ok(4));
+    }
+
+    /// The rule that holds however many commits are parked on a collection:
+    /// one refresh at a time, and the next no sooner than an interval after
+    /// the last one started.
+    #[test]
+    fn stalled_write_refresh_gate_admits_one_refresh_per_interval() {
+        use std::time::Duration;
+        let gate = RefreshGate::default();
+        let hour = Duration::from_secs(3600);
+
+        // While one refresh holds the permit, no other enters.
+        let permit = gate.try_enter(hour).expect("the first refresh enters");
+        assert!(gate.try_enter(Duration::ZERO).is_none());
+        drop(permit);
+
+        // Once it is done, the next enters only an interval after it started.
+        assert!(gate.try_enter(hour).is_none());
+        assert!(gate.try_enter(Duration::ZERO).is_some());
+    }
+
+    /// One durable commit of the single node row `key`.
+    fn commit_row(be: &LsmBackend, key: u8) -> Result<(), BackendError> {
+        let mut w = be.begin_write()?;
+        be.put(
+            &mut w,
+            Namespace::Nodes,
+            &u128::from(key).to_be_bytes(),
+            b"v",
+        )?;
+        be.commit(w)
+    }
+
+    /// A writer whose next commit SlateDB parks. Every commit freezes its
+    /// memtable into one L0 SST and four fill L0, so the fifth commit leaves
+    /// a frozen memtable that cannot flush. Four L0 SSTs is also when the
+    /// compactor empties L0 (within a fraction of a second here), which this
+    /// writer only learns from a manifest refresh, and its own poll is an
+    /// hour away.
+    fn writer_with_full_l0(name: &str) -> Arc<LsmBackend> {
+        let soon = std::time::Duration::from_millis(50);
+        let mut settings = Settings::default();
+        settings.manifest_poll_interval = std::time::Duration::from_secs(3600);
+        settings.l0_sst_size_bytes = 1;
+        settings.l0_max_ssts = 4;
+        settings.max_unflushed_bytes = 1;
+        if let Some(compactor) = settings.compactor_options.as_mut() {
+            compactor.poll_interval = soon;
+            compactor.commit_compacted_interval = soon;
+            if let Some(worker) = compactor.worker.as_mut() {
+                worker.compactions_poll_interval = soon;
+            }
+        }
+        let be = Arc::new(
+            LsmBackend::open_with_store_settings(name, Arc::new(InMemory::new()), Some(settings))
+                .unwrap(),
+        );
+        for key in 1..=5 {
+            commit_row(&be, key).unwrap();
+        }
+        assert_eq!(be.db().manifest().l0().len(), 4, "L0 is not full");
+        be
+    }
+
+    /// A commit that parks on a [`writer_with_full_l0`]; `Ok(true)`: committed.
+    type Commit = fn(&LsmBackend) -> Result<bool, BackendError>;
+
+    /// What a parked commit sends once it returns: its result and the metrics
+    /// it recorded, as Prometheus text.
+    type Returned = std::sync::mpsc::Receiver<(Result<bool, BackendError>, String)>;
+
+    /// Runs `commit` on its own thread, under its own metrics recorder.
+    fn park(be: &Arc<LsmBackend>, commit: Commit) -> Returned {
+        let (done, returned) = std::sync::mpsc::channel();
+        let be = Arc::clone(be);
+        std::thread::spawn(move || {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let result = metrics::with_local_recorder(&recorder, || commit(&be));
+            let _ = done.send((result, recorder.handle().render()));
+        });
+        returned
+    }
+
+    /// The `outcome` count of the stalled-write refresh counter in `rendered`.
+    fn refresh_count(rendered: &str, outcome: &str) -> u64 {
+        let series = format!("helix_lsm_stalled_write_refresh_total{{outcome=\"{outcome}\"}} ");
+        rendered
+            .lines()
+            .find_map(|line| line.strip_prefix(series.as_str()))
+            .map_or(0, |count| count.parse().expect("a counter value"))
+    }
+
+    /// One parked commit of each kind, each on its own [`writer_with_full_l0`]:
+    /// a batch commit, a buffered commit, a metadata transaction, a node
+    /// compare-and-patch and a checked transaction.
+    fn park_each_kind_of_commit(tag: &str) -> [(&'static str, Arc<LsmBackend>, Returned); 5] {
+        let commit: Commit = |be| commit_row(be, 6).map(|()| true);
+        let commit_buffered: Commit = |be| {
+            let mut w = be.begin_write()?;
+            be.put(&mut w, Namespace::Nodes, &[6], b"v")?;
+            be.commit_buffered(w).map(|()| true)
+        };
+        let transaction: Commit = |be| {
+            be.update_key_transactional(Namespace::Metadata, b"k", |_| Ok((b"v".to_vec(), true)))
+        };
+        let compare_patch: Commit =
+            |be| be.compare_patch_nodes(&[1], |_, _| Ok(Some(b"w".to_vec())));
+        let checked_transaction: Commit = |be| {
+            let txn = be.begin_checked()?;
+            txn.put(Namespace::Nodes, &[6], b"v")?;
+            txn.commit()
+        };
+        [
+            ("commit", commit),
+            ("commit_buffered", commit_buffered),
+            ("transaction", transaction),
+            ("compare_patch", compare_patch),
+            ("checked_transaction", checked_transaction),
+        ]
+        .map(|(kind, commit)| {
+            let be = writer_with_full_l0(&format!("stalled-{tag}-{kind}"));
+            let returned = park(&be, commit);
+            (kind, be, returned)
+        })
+    }
+
+    /// L0 is full and the compactor's relief is in a manifest this writer has
+    /// not read. Each kind of parked commit must return on its own refresh
+    /// instead of waiting for the poll, and with the kill switch it must wait
+    /// as before, without refreshing.
+    #[test]
+    #[serial]
+    fn stalled_write_refreshes_the_manifest_instead_of_waiting_for_the_poll() {
+        use std::sync::mpsc::TryRecvError;
+        use std::time::{Duration, Instant};
+
+        {
+            // Given the refresh switched off and one parked commit of each kind.
+            let _off = EnvGuard::set(ENV_STALLED_WRITE_REFRESH, "0");
+            assert!(!lsm_stalled_write_refresh_enabled());
+            let parked = park_each_kind_of_commit("poll-only");
+
+            // Then each is still parked once the refresh interval has passed,
+            std::thread::sleep(STALLED_WRITE_REFRESH_EVERY + Duration::from_secs(1));
+            for (kind, be, returned) in parked {
+                assert!(
+                    matches!(returned.try_recv(), Err(TryRecvError::Empty)),
+                    "with the refresh off a parked {kind} must wait for the manifest poll"
+                );
+                // and the refresh it would have issued is what releases it.
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let (result, rendered) = loop {
+                    block_on_lsm(&be.rt, be.db().refresh_manifest()).unwrap();
+                    match returned.recv_timeout(Duration::from_millis(250)) {
+                        Ok(sent) => break sent,
+                        Err(_) => assert!(
+                            Instant::now() < deadline,
+                            "a manifest refresh did not release the parked {kind}"
+                        ),
+                    }
+                };
+                assert!(matches!(result, Ok(true)), "{kind}: {result:?}");
+                assert!(
+                    !rendered.contains("helix_lsm_stalled_write_refresh_total"),
+                    "with the refresh off a parked {kind} must not count one: {rendered}"
+                );
+                be.close().unwrap();
+            }
+        }
+
+        // Given the default: each parked commit refreshes the manifest itself,
+        // finds the freed L0 slots and returns, with the poll still an hour away.
+        let _on = EnvGuard::remove(ENV_STALLED_WRITE_REFRESH);
+        assert!(lsm_stalled_write_refresh_enabled());
+        for (kind, be, returned) in park_each_kind_of_commit("refresh") {
+            let (result, rendered) = returned
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap_or_else(|_| panic!("a parked {kind} must refresh the manifest and return"));
+            assert!(matches!(result, Ok(true)), "{kind}: {result:?}");
+            assert!(
+                refresh_count(&rendered, "freed") >= 1,
+                "a parked {kind} must count the refresh that released it: {rendered}"
+            );
+            be.close().unwrap();
+        }
+    }
+
+    /// Commits parked on one writer share its refreshes: at most one per
+    /// interval between them, and that one releases them all.
+    #[test]
+    #[serial]
+    fn stalled_writes_on_one_writer_share_one_refresh_per_interval() {
+        use std::time::{Duration, Instant};
+
+        let _on = EnvGuard::remove(ENV_STALLED_WRITE_REFRESH);
+        let be = writer_with_full_l0("stalled-shared");
+        let commit: Commit = |be| commit_row(be, 6).map(|()| true);
+        let parked_at = Instant::now();
+        let parked = [(); 3].map(|()| park(&be, commit));
+
+        let (mut sent, mut freed) = (0, 0);
+        for returned in parked {
+            let (result, rendered) = returned
+                .recv_timeout(Duration::from_secs(60))
+                .expect("a parked commit must return");
+            assert!(matches!(result, Ok(true)), "{result:?}");
+            let found_freed = refresh_count(&rendered, "freed");
+            freed += found_freed;
+            sent +=
+                found_freed + refresh_count(&rendered, "ok") + refresh_count(&rendered, "error");
+        }
+        // A refresh starts no sooner than an interval after the commits parked
+        // or after the one before it.
+        let intervals = parked_at.elapsed().as_secs() / STALLED_WRITE_REFRESH_EVERY.as_secs();
+        assert!(
+            freed >= 1 && sent <= intervals,
+            "{sent} refreshes ({freed} that found freed L0 slots) in {intervals} intervals"
+        );
+        be.close().unwrap();
+    }
+
     /// Sets an env var for the duration of a test and restores the prior value
     /// (or removes it) on drop, so `#[serial]` cache tests don't leak env state.
     struct EnvGuard {
@@ -4257,6 +6056,62 @@ mod tests {
         assert!(
             !reader_cold_open_starts_fast(),
             "sweeper kill switch: nothing would ever demote, so cold opens stay idle"
+        );
+    }
+
+    /// A reader renews its lease at the first poll past the lease's half-life,
+    /// and a poll comes a little short of its tick's age, so the poll that
+    /// falls on half-life renews nothing. Whatever the interval, the renewal
+    /// must come a whole poll before the lease ends: the manifest stores the
+    /// expiry rounded down to the second, and at twice the interval the
+    /// renewal fell on the expiry itself.
+    #[test]
+    #[serial]
+    fn reader_lease_is_renewed_a_whole_poll_before_it_ends() {
+        let _idle = EnvGuard::remove(ENV_READER_IDLE_POLL_MS);
+        let lease_secs = |poll_secs: u64| {
+            let mut options = DbReaderOptions::default();
+            options.manifest_poll_interval = std::time::Duration::from_secs(poll_secs);
+            clamp_reader_checkpoint_lifetime(&mut options);
+            options.checkpoint_lifetime.as_secs()
+        };
+        for in_place in ["0", "1"] {
+            let _mode = EnvGuard::set(ENV_READER_TIER_IN_PLACE, in_place);
+            for poll in [5, 199, 200, 201, 250, 299, 300, 301, 3_600] {
+                let lease = lease_secs(poll);
+                let polls_before_renewal = (lease / 2) / poll + 1;
+                let renewed_at = polls_before_renewal * poll;
+                assert!(
+                    renewed_at + poll <= lease,
+                    "in place {in_place}, poll {poll} s, lease {lease} s: renewed {renewed_at} s in"
+                );
+            }
+        }
+        {
+            let _reopen = EnvGuard::set(ENV_READER_TIER_IN_PLACE, "0");
+            assert_eq!(lease_secs(5), 600, "the serving tier keeps the default");
+            assert_eq!(lease_secs(300), 900, "the idle tier");
+        }
+        // In place, the reader opened on the serving tier is the one that is
+        // polled at the idle interval later, on the lease it was opened with.
+        // Its demotion comes at any moment of that lease: at worst with the
+        // last poll before half-life, and the renewal is one idle poll on.
+        let _in_place = EnvGuard::set(ENV_READER_TIER_IN_PLACE, "1");
+        let idle = reader_idle_poll_interval_from_env().as_secs();
+        for opened_at in [5, 60, idle] {
+            let lease = lease_secs(opened_at);
+            let renewed_at = lease / 2 + idle;
+            assert!(
+                renewed_at + idle <= lease,
+                "opened at {opened_at} s, lease {lease} s: demoted at half-life, renewed {renewed_at} s in"
+            );
+        }
+        assert_eq!(lease_secs(5), 1_200, "four idle polls, on any tier");
+        assert_eq!(lease_secs(300), 1_200);
+        assert_eq!(
+            lease_secs(3_600),
+            10_800,
+            "a longer poll still gets its own"
         );
     }
 
@@ -4465,6 +6320,162 @@ mod tests {
         );
         // Untouched compactor defaults survive the in-place mutation.
         assert_eq!(compactor.max_concurrent_compactions, 4);
+    }
+
+    /// What the fork's scheduler reads out of the options a settings build hands it.
+    fn scheduler_options_of(
+        settings: Settings,
+    ) -> (
+        HashMap<String, String>,
+        slatedb::config::SizeTieredCompactionSchedulerOptions,
+    ) {
+        let handed = settings
+            .compactor_options
+            .expect("compactor options present")
+            .scheduler_options;
+        let read = slatedb::config::SizeTieredCompactionSchedulerOptions::from(&handed);
+        (handed, read)
+    }
+
+    /// With none of its three settings in the environment the scheduler is
+    /// handed nothing and merges by the fork's defaults, as before the settings
+    /// existed: four runs in a row, eight at most, each within four times the
+    /// smallest.
+    #[test]
+    #[serial]
+    fn compaction_scheduler_keeps_the_forks_defaults_unless_set() {
+        let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
+        let _poll = EnvGuard::set(ENV_COMPACTOR_POLL_MS, "30000");
+        let _min = EnvGuard::remove(ENV_COMPACTION_MIN_SOURCES);
+        let _max = EnvGuard::remove(ENV_COMPACTION_MAX_SOURCES);
+        let _threshold = EnvGuard::remove(ENV_COMPACTION_SIZE_THRESHOLD);
+
+        let (handed, read) = scheduler_options_of(
+            lsm_settings_from_env("helion/c").expect("compactor knob -> Some(Settings)"),
+        );
+
+        assert!(handed.is_empty(), "nothing set, nothing handed: {handed:?}");
+        assert_eq!(read.min_compaction_sources, 4);
+        assert_eq!(read.max_compaction_sources, 8);
+        assert_eq!(read.include_size_threshold, 4.0);
+    }
+
+    /// The three settings reach the scheduler under the fork's own keys, and
+    /// are enough by themselves for a settings build (no other knob is set).
+    #[test]
+    #[serial]
+    fn compaction_scheduler_follows_its_three_settings() {
+        let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
+        let _min = EnvGuard::set(ENV_COMPACTION_MIN_SOURCES, "2");
+        let _max = EnvGuard::set(ENV_COMPACTION_MAX_SOURCES, "999");
+        let _threshold = EnvGuard::set(ENV_COMPACTION_SIZE_THRESHOLD, " 1000000 ");
+
+        let settings =
+            lsm_settings_from_env("helion/c").expect("a scheduler setting alone -> Some(Settings)");
+        let cadence = settings
+            .compactor_options
+            .as_ref()
+            .expect("compactor options present")
+            .poll_interval;
+        let (handed, read) = scheduler_options_of(settings);
+
+        assert_eq!(handed.len(), 3, "{handed:?}");
+        assert_eq!(read.min_compaction_sources, 2);
+        assert_eq!(read.max_compaction_sources, 999);
+        assert_eq!(read.include_size_threshold, 1_000_000.0);
+        // The compactor's other options stay the fork's.
+        assert_eq!(
+            cadence,
+            Settings::default().compactor_options.unwrap().poll_interval
+        );
+    }
+
+    /// A value the scheduler could not merge by is left out, so its default
+    /// stands, and the values beside it are judged against what is then in
+    /// force. Each row: minimum, maximum, threshold, the two L0 limits, and the
+    /// (minimum, maximum, threshold) the scheduler ends with.
+    #[test]
+    #[serial]
+    fn compaction_scheduler_ignores_a_setting_it_cannot_merge_by() {
+        let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
+        let _poll = EnvGuard::set(ENV_COMPACTOR_POLL_MS, "30000");
+        let rows: [(&str, &str, &str, &str, &str, (usize, usize, f32)); 17] = [
+            // One run is no merge, a maximum of 0 panics the fork's scheduler,
+            // and a threshold has to be a finite number above 1.
+            ("1", "1", "0.5", "", "", (4, 8, 4.0)),
+            ("0", "0", "NaN", "", "", (4, 8, 4.0)),
+            ("two", "-3", "inf", "", "", (4, 8, 4.0)),
+            ("", " ", "-4", "", "", (4, 8, 4.0)),
+            ("", "", "1", "", "", (4, 8, 4.0)),
+            ("", "", "1.0", "", "", (4, 8, 4.0)),
+            ("", "", "1.5", "", "", (4, 8, 1.5)),
+            // L0 is compacted only once it holds the minimum, and the writer
+            // stops flushing at the lower of the two L0 limits (8 and 8 unset).
+            ("9", "", "", "", "", (4, 8, 4.0)),
+            ("8", "", "", "", "", (8, 8, 4.0)),
+            ("5", "", "", "", "4", (4, 8, 4.0)),
+            ("9", "12", "", "16", "16", (9, 12, 4.0)),
+            // The fork cuts a row of runs down to the maximum: a maximum under
+            // the minimum in force is left out, and so is a minimum above the
+            // maximum in force.
+            ("12", "", "", "16", "16", (4, 8, 4.0)),
+            ("12", "10", "", "16", "16", (4, 8, 4.0)),
+            ("5", "2", "", "", "", (5, 8, 4.0)),
+            ("", "3", "", "", "", (4, 8, 4.0)),
+            ("6", "5", "", "", "", (6, 8, 4.0)),
+            ("2", "2", "", "", "", (2, 2, 4.0)),
+        ];
+        for (min, max, threshold, l0_max, l0_max_per_key, want) in rows {
+            let _min = EnvGuard::set(ENV_COMPACTION_MIN_SOURCES, min);
+            let _max = EnvGuard::set(ENV_COMPACTION_MAX_SOURCES, max);
+            let _threshold = EnvGuard::set(ENV_COMPACTION_SIZE_THRESHOLD, threshold);
+            let _l0_max = EnvGuard::set(ENV_L0_MAX_SSTS, l0_max);
+            let _l0_max_per_key = EnvGuard::set(ENV_L0_MAX_SSTS_PER_KEY, l0_max_per_key);
+            let row = format!("{min:?} {max:?} {threshold:?} L0 {l0_max:?} {l0_max_per_key:?}");
+
+            let (handed, read) = scheduler_options_of(
+                lsm_settings_from_env("helion/c").expect("compactor knob -> Some(Settings)"),
+            );
+
+            let got = (
+                read.min_compaction_sources,
+                read.max_compaction_sources,
+                read.include_size_threshold,
+            );
+            assert_eq!(got, want, "{row}: handed {handed:?}");
+            // What is left out is not handed at all, so the default is the fork's.
+            let taken =
+                usize::from(want.0 != 4) + usize::from(want.1 != 8) + usize::from(want.2 != 4.0);
+            assert_eq!(handed.len(), taken, "{row}: handed {handed:?}");
+        }
+    }
+
+    /// Deployment contract: the scheduler's three settings are for a smoke pod
+    /// on a private copy. They are read from the process environment at every
+    /// collection open, so a line in a production manifest would reach every
+    /// collection a pod opens.
+    #[test]
+    fn public_kubernetes_config_sets_none_of_the_compaction_scheduler_settings() {
+        let manifests = [(
+            "10-configmap.yaml",
+            include_str!("../../../../deploy/lsm-cloud/kubernetes/10-configmap.yaml"),
+        )];
+        for (name, text) in manifests {
+            for key in [
+                ENV_COMPACTION_MIN_SOURCES,
+                ENV_COMPACTION_MAX_SOURCES,
+                ENV_COMPACTION_SIZE_THRESHOLD,
+            ] {
+                let set = text
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with('#'))
+                    .any(|line| line.contains(key));
+                assert!(
+                    !set,
+                    "{name} must not set {key}: it is for a smoke pod only"
+                );
+            }
+        }
     }
 
     /// Deployment contract: all three phases that release L0 pressure must
@@ -4720,6 +6731,95 @@ mod tests {
         be.close().unwrap();
         // Stop the fenced first writer's tasks; its close result is irrelevant.
         let _ = crashed.close();
+    }
+
+    /// A steady trickle never goes write-quiet. Its memtable is still flushed
+    /// each time its oldest unflushed write is [`ENV_UNFLUSHED_MAX_AGE_SECS`]
+    /// old, so the WAL tail a reader cold open replays is bounded by time.
+    #[test]
+    #[serial]
+    fn steady_trickle_is_flushed_when_its_oldest_write_is_old_enough() {
+        let _cache = EnvGuard::set(ENV_CACHE_DIR, "");
+        let _idle = EnvGuard::set(ENV_IDLE_FLUSH_SECS, "30");
+        let _age = EnvGuard::set(ENV_UNFLUSHED_MAX_AGE_SECS, "1");
+        let path = "idle-flush/trickle";
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let be = LsmBackend::open_with_store(path, store.clone()).unwrap();
+        let compacted = format!("{path}/compacted");
+
+        let mut written = 0u8;
+        let mut trickle_until = |ssts: usize| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while object_count(&store, &compacted) < ssts && std::time::Instant::now() < deadline {
+                put_one(&be, &[b't', written]);
+                written += 1;
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            object_count(&store, &compacted)
+        };
+        assert!(
+            trickle_until(1) >= 1,
+            "a write every 300ms is never 30s quiet; the 1s age bound must flush it"
+        );
+        assert!(
+            trickle_until(2) >= 2,
+            "the writes after that flush are flushed in turn once they are 1s old"
+        );
+        be.close().unwrap();
+    }
+
+    /// The age of the unflushed tail counts from its first write, not from the
+    /// flush before it: a burst after a long pause is not flushed at once.
+    #[test]
+    fn unflushed_age_counts_from_the_first_write_after_a_flush() {
+        use std::sync::atomic::Ordering;
+        // Two seconds of room: a runner that stalls between a write and the
+        // check after it must not make the write look old.
+        let (hour, bound) = (
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_secs(2),
+        );
+        let longer_than_bound = std::time::Duration::from_millis(2500);
+        let state = IdleFlushState::new();
+        state.note_flushed(state.writes.load(Ordering::Acquire), 0);
+        assert_eq!(
+            state.due(hour, Some(std::time::Duration::ZERO)),
+            None,
+            "nothing unflushed is never due"
+        );
+
+        std::thread::sleep(longer_than_bound);
+        state.note_write();
+        assert_eq!(
+            state.due(hour, Some(bound)),
+            None,
+            "2.5s after the flush, the one unflushed write is new"
+        );
+        assert_eq!(state.due(hour, None), None, "no age bound, not quiet");
+
+        std::thread::sleep(longer_than_bound);
+        let writes = state.writes.load(Ordering::Acquire);
+        assert_eq!(state.due(hour, Some(bound)), Some((writes, "age")));
+        assert_eq!(state.due(bound, None), Some((writes, "quiet")));
+    }
+
+    /// The age bound is on wherever the idle flush is on; 0 leaves the quiet
+    /// period as the only trigger.
+    #[test]
+    #[serial]
+    fn unflushed_max_age_is_on_by_default_and_zero_turns_it_off() {
+        let _unset = EnvGuard::remove(ENV_UNFLUSHED_MAX_AGE_SECS);
+        assert_eq!(
+            unflushed_max_age_from_env(),
+            Some(std::time::Duration::from_secs(300))
+        );
+        let _off = EnvGuard::set(ENV_UNFLUSHED_MAX_AGE_SECS, "0");
+        assert_eq!(unflushed_max_age_from_env(), None);
+        let _set = EnvGuard::set(ENV_UNFLUSHED_MAX_AGE_SECS, "120");
+        assert_eq!(
+            unflushed_max_age_from_env(),
+            Some(std::time::Duration::from_secs(120))
+        );
     }
 
     /// The idle flush is off unless configured, and on a clean memtable it
@@ -4996,6 +7096,42 @@ mod tests {
         }
     }
 
+    /// The share is held to the cache volume: with every handle open, the
+    /// directories at their full share stay within the budget evictor's line,
+    /// whatever the divisor says. A share the volume holds is left alone.
+    #[test]
+    #[serial]
+    fn cache_share_is_cut_to_what_the_volume_holds_with_every_handle_open() {
+        let volume = tempfile::tempdir().expect("tempdir");
+        let total = cache_evictor::volume_usage(volume.path())
+            .expect("statvfs of the temp dir")
+            .total;
+        let _dir = EnvGuard::set(
+            ENV_CACHE_DIR,
+            volume.path().to_str().expect("utf-8 temp path"),
+        );
+        let _memory_cap = EnvGuard::set(ENV_CACHE_MEMORY_MAX_PCT, "0");
+        // Not the default of 70: the bound reads the budget the evictor reads.
+        let _budget = EnvGuard::set("HELIX_LSM_CACHE_BUDGET_PCT", "40");
+        let _open = EnvGuard::set(ENV_MAX_OPEN_COLLECTIONS, "4");
+        let _divisor = EnvGuard::set(ENV_CACHE_COLLECTION_DIVISOR, "1");
+
+        // A share as large as the whole volume: four of them open cannot fit.
+        {
+            let _cap = EnvGuard::set(ENV_CACHE_MAX_BYTES, &total.to_string());
+            let cache = cache_options_from_env("helion/prod").expect("cache dir set -> Some");
+            let held = usize::try_from(total as u128 * 40 / 100 / 4).expect("fits usize");
+            assert_eq!(cache.max_cache_size_bytes, Some(held));
+        }
+        // A share the volume holds four times over is what the divisor says.
+        {
+            let small = usize::try_from(total / 100).expect("fits usize");
+            let _cap = EnvGuard::set(ENV_CACHE_MAX_BYTES, &small.to_string());
+            let cache = cache_options_from_env("helion/prod").expect("cache dir set -> Some");
+            assert_eq!(cache.max_cache_size_bytes, Some(small));
+        }
+    }
+
     #[test]
     #[serial]
     fn cache_options_default_file_handles_stays_under_fd_gate_with_128_open_collections() {
@@ -5150,6 +7286,65 @@ mod tests {
             let _part = EnvGuard::set(ENV_CACHE_PART_BYTES, "1000000");
             let cache = cache_options_from_env("helion/prod").expect("cache dir set -> Some");
             assert_eq!(cache.part_size_bytes, default_part);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn cache_options_ranged_miss_defaults_on_and_unparsable_turns_it_off() {
+        let _dir = EnvGuard::set(ENV_CACHE_DIR, "/mnt/ssd-cache");
+        let _cap = EnvGuard::set(ENV_CACHE_MAX_BYTES, "1073741824");
+        let ranged_miss = |value: Option<&str>| {
+            let _knob = match value {
+                Some(v) => EnvGuard::set(ENV_CACHE_RANGED_MISS, v),
+                None => EnvGuard::remove(ENV_CACHE_RANGED_MISS),
+            };
+            cache_options_from_env("helion/prod")
+                .expect("cache dir set -> Some")
+                .ranged_miss
+        };
+
+        for on in [None, Some(""), Some("1"), Some("true"), Some(" ON ")] {
+            assert!(ranged_miss(on), "{on:?} should leave ranged misses on");
+        }
+        for off in [
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("2"),
+            Some("nope"),
+        ] {
+            assert!(!ranged_miss(off), "{off:?} should turn ranged misses off");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn cache_options_part_fetch_concurrency_defaults_to_8_and_unparsable_means_one_at_a_time() {
+        let _dir = EnvGuard::set(ENV_CACHE_DIR, "/mnt/ssd-cache");
+        let _cap = EnvGuard::set(ENV_CACHE_MAX_BYTES, "1073741824");
+        let concurrency = |value: Option<&str>| {
+            let _knob = match value {
+                Some(v) => EnvGuard::set(ENV_CACHE_PART_FETCH_CONCURRENCY, v),
+                None => EnvGuard::remove(ENV_CACHE_PART_FETCH_CONCURRENCY),
+            };
+            cache_options_from_env("helion/prod")
+                .expect("cache dir set -> Some")
+                .part_fetch_concurrency
+        };
+
+        for (value, expected) in [
+            (None, 8),
+            (Some(""), 8),
+            (Some("  "), 8),
+            (Some("1"), 1),
+            (Some("0"), 0),
+            (Some(" 4 "), 4),
+            (Some("16"), 16),
+            (Some("off"), 1),
+            (Some("-3"), 1),
+        ] {
+            assert_eq!(concurrency(value), expected, "{value:?}");
         }
     }
 
@@ -5498,6 +7693,109 @@ mod tests {
         );
     }
 
+    fn segment_ns(
+        physical_name: &'static str,
+        db: crate::helix_engine::storage_core::backend::SegmentDb,
+    ) -> Namespace<'static> {
+        Namespace::Segment { physical_name, db }
+    }
+
+    #[test]
+    fn lsm_contains_many_answers_several_namespaces_in_one_round_trip() {
+        use crate::helix_engine::storage_core::backend::SegmentDb;
+        let be = LsmBackend::open_in_memory("/contains-many-test").unwrap();
+        let first = segment_ns("dense__seg_000001", SegmentDb::Vectors);
+        let second = segment_ns("dense__seg_000002", SegmentDb::Vectors);
+
+        let mut w = be.begin_write().unwrap();
+        be.put(&mut w, Namespace::Nodes, b"k1", b"node").unwrap();
+        be.put(&mut w, first, b"k1", b"vector").unwrap();
+        be.put(&mut w, second, b"k2", b"vector").unwrap();
+        be.commit(w).unwrap();
+
+        let r = be.begin_read().unwrap();
+        let keys = vec![
+            (first, b"k1".to_vec()),
+            (first, b"k2".to_vec()),
+            (second, b"k1".to_vec()),
+            (second, b"k2".to_vec()),
+            (Namespace::Nodes, b"k1".to_vec()),
+            (Namespace::Nodes, b"k2".to_vec()),
+        ];
+        let before = lsm_round_trips_for_test();
+        let present = be.contains_many_with(&r, &keys).unwrap();
+        assert_eq!(lsm_round_trips_for_test() - before, 1);
+        assert_eq!(present, vec![true, false, false, true, true, false]);
+        // Each answer is the one a single-key read of that namespace gives.
+        for ((ns, key), expected) in keys.iter().zip(&present) {
+            let single = be.get_with(&r, *ns, key, |v| v.is_some()).unwrap();
+            assert_eq!(single, *expected);
+        }
+    }
+
+    #[test]
+    fn lsm_scan_prefix_keys_many_matches_one_scan_per_prefix() {
+        use crate::helix_engine::storage_core::backend::SegmentDb;
+        let be = LsmBackend::open_in_memory("/scan-prefix-keys-many-test").unwrap();
+        let vectors = segment_ns("dense__seg_000001", SegmentDb::Vectors);
+        let out = segment_ns("dense__seg_000001", SegmentDb::HnswOut);
+        let other = segment_ns("dense__seg_000002", SegmentDb::Vectors);
+
+        let mut w = be.begin_write().unwrap();
+        be.put(&mut w, vectors, b"v:a0", b"row").unwrap();
+        be.put(&mut w, vectors, b"v:a1", b"row").unwrap();
+        be.put(&mut w, vectors, b"v:b0", b"row").unwrap();
+        be.put(&mut w, out, b"a-x", b"row").unwrap();
+        be.put(&mut w, other, b"v:a0", b"row").unwrap();
+        be.commit(w).unwrap();
+
+        let r = be.begin_read().unwrap();
+        let prefixes = vec![
+            (vectors, b"v:a".to_vec()),
+            (vectors, b"v:c".to_vec()),
+            (out, b"a".to_vec()),
+            (other, b"v:".to_vec()),
+        ];
+        let before = lsm_round_trips_for_test();
+        let rows = be
+            .scan_prefix_keys_many_with(&r, &prefixes)
+            .unwrap()
+            .expect("plain namespaces without an overlay are batched");
+        assert_eq!(lsm_round_trips_for_test() - before, 1);
+        assert_eq!(
+            rows,
+            vec![
+                vec![b"v:a0".to_vec(), b"v:a1".to_vec()],
+                Vec::new(),
+                vec![b"a-x".to_vec()],
+                vec![b"v:a0".to_vec()],
+            ]
+        );
+        // Each row set is the one a scan of that prefix alone gives.
+        for ((ns, prefix), expected) in prefixes.iter().zip(&rows) {
+            let mut keys = Vec::new();
+            be.scan(&r, *ns, KeyRange::prefix(prefix), |k, _| {
+                keys.push(k.to_vec());
+                true
+            })
+            .unwrap();
+            assert_eq!(&keys, expected);
+        }
+
+        // A write overlay or a multi-value namespace is left to the caller.
+        let mut w = be.begin_write().unwrap();
+        be.put(&mut w, vectors, b"v:a2", b"row").unwrap();
+        let overlay = be.begin_read_with_pending(w.pending().clone()).unwrap();
+        assert!(be
+            .scan_prefix_keys_many_with(&overlay, &prefixes)
+            .unwrap()
+            .is_none());
+        assert!(be
+            .scan_prefix_keys_many_with(&r, &[(Namespace::OutEdges, b"a".to_vec())])
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn lsm_pending_scan_overlays_put_update_and_delete() {
         let be = LsmBackend::open_in_memory("/pending-scan-test").unwrap();
@@ -5710,6 +8008,124 @@ mod tests {
         );
     }
 
+    /// The batched prefix scan must return what the one-prefix scan returns,
+    /// in the same order, while reading only each prefix's own rows plus one
+    /// probe per key length present in the namespace. With a row cap it
+    /// returns the first values of that order and pulls no further.
+    #[test]
+    fn lsm_dup_prefix_batch_scan_matches_the_one_prefix_scan() {
+        let be = LsmBackend::open_in_memory("/dup-prefix-batch-scan-test").unwrap();
+        let mut w = be.begin_write().unwrap();
+        for (key, value) in [
+            (b"n".as_slice(), b"short".as_slice()),
+            (b"m-long-key", b"before-long"),
+            (b"n1", b"a"),
+            (b"n1", b"b"),
+            (b"n1-suffix", b"c"),
+            (b"n1-suffix-more", b"d"),
+            (b"n2", b"other"),
+            (b"n2-long-key", b"after-long"),
+            (b"zz", b"tail"),
+        ] {
+            be.put_dup(&mut w, Namespace::OutEdges, key, value).unwrap();
+        }
+        for i in 0..200u32 {
+            be.put_dup(&mut w, Namespace::OutEdges, b"n9", &i.to_be_bytes())
+                .unwrap();
+        }
+        // A row too short to hold a key length (no dup write produces one):
+        // both scans step over it.
+        be.put(&mut w, Namespace::OutEdges, &[0, 0, 1], b"")
+            .unwrap();
+        be.commit(w).unwrap();
+
+        let r = be.begin_read().unwrap();
+        let prefixes: Vec<Vec<u8>> = [
+            b"n1".as_slice(),
+            b"n5",
+            b"n9",
+            b"n",
+            b"zz",
+            b"n1-suffix",
+            b"",
+            b"a-prefix-longer-than-any-key",
+        ]
+        .iter()
+        .map(|prefix| prefix.to_vec())
+        .collect();
+        let one_at_a_time: Vec<Vec<Vec<u8>>> = prefixes
+            .iter()
+            .map(|prefix| {
+                let mut values = Vec::new();
+                be.scan(&r, Namespace::OutEdges, KeyRange::prefix(prefix), |_, v| {
+                    values.push(v.to_vec());
+                    true
+                })
+                .unwrap();
+                values
+            })
+            .collect();
+        assert_eq!(one_at_a_time[0].len(), 4, "fixture: n1 matches 4 rows");
+        assert_eq!(one_at_a_time[6].len(), 209, "fixture: the empty prefix");
+
+        be.reset_read_count();
+        let batched = be
+            .scan_dup_prefix_values_many_with(&r, Namespace::OutEdges, &prefixes, None)
+            .unwrap()
+            .expect("a snapshot without a write overlay is served in one batch");
+        assert_eq!(batched, one_at_a_time);
+        let matched: usize = batched.iter().map(Vec::len).sum();
+        // The fixture holds keys of six lengths: one probe row for each, and
+        // the probe steps over the short row.
+        assert!(
+            be.read_count() <= matched + 7,
+            "batched prefix scans read {} rows for {matched} matches",
+            be.read_count()
+        );
+
+        // Capped, a prefix keeps the first values of its full read, across
+        // key lengths (`n1` has rows under three), and the rest of a long
+        // prefix (`n9`, the empty prefix) is never pulled. A cap of 0 reads
+        // as 1: it must not answer "no row" for a prefix that has one.
+        for (cap, kept) in [(0usize, 1usize), (1, 1), (3, 3)] {
+            be.reset_read_count();
+            let capped = be
+                .scan_dup_prefix_values_many_with(&r, Namespace::OutEdges, &prefixes, Some(cap))
+                .unwrap()
+                .expect("a capped read is served in the same batch");
+            let first: Vec<Vec<Vec<u8>>> = one_at_a_time
+                .iter()
+                .map(|values| values.iter().take(kept).cloned().collect())
+                .collect();
+            assert_eq!(capped, first, "cap {cap}");
+            assert!(
+                be.read_count() <= prefixes.len() * kept + 7,
+                "capped prefix scans read {} rows under a cap of {cap}",
+                be.read_count()
+            );
+        }
+
+        let none: Vec<Vec<u8>> = Vec::new();
+        assert_eq!(
+            be.scan_dup_prefix_values_many_with(&r, Namespace::OutEdges, &none, None)
+                .unwrap(),
+            Some(Vec::new())
+        );
+        // Plain namespaces and write overlays stay with the one-prefix scan.
+        assert!(be
+            .scan_dup_prefix_values_many_with(&r, Namespace::Nodes, &prefixes, None)
+            .unwrap()
+            .is_none());
+        let mut w = be.begin_write().unwrap();
+        be.put_dup(&mut w, Namespace::OutEdges, b"n5", b"unwritten")
+            .unwrap();
+        let overlay = be.begin_read_with_pending(w.pending().clone()).unwrap();
+        assert!(be
+            .scan_dup_prefix_values_many_with(&overlay, Namespace::OutEdges, &prefixes, Some(1))
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn lsm_exact_dup_scan_limits_reads_and_preserves_pending_changes() {
         let be = LsmBackend::open_in_memory("/exact-dup-scan-test").unwrap();
@@ -5902,6 +8318,8 @@ mod tests {
         lists: std::sync::atomic::AtomicUsize,
         appended: std::sync::atomic::AtomicBool,
         deleted: Arc<std::sync::Mutex<Vec<ObjPath>>>,
+        /// Delete requests the purge issued (one per `delete_stream` call).
+        delete_calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl std::fmt::Display for RacingReaderStore {
@@ -5958,6 +8376,8 @@ mod tests {
             &self,
             locations: stream::BoxStream<'static, object_store::Result<ObjPath>>,
         ) -> stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.delete_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.lists.load(std::sync::atomic::Ordering::SeqCst) >= self.fail_deletes_after_lists
             {
                 return stream::once(async {
@@ -6032,6 +8452,210 @@ mod tests {
         }
     }
 
+    /// Object store that keeps a WAL put waiting while `hold` is set, and with
+    /// it the flush that sent it.
+    #[derive(Debug, Default)]
+    struct HeldWalStore {
+        inner: InMemory,
+        hold: std::sync::atomic::AtomicBool,
+        /// A WAL put has arrived and waits.
+        held: std::sync::atomic::AtomicBool,
+        release: tokio::sync::Notify,
+    }
+
+    impl std::fmt::Display for HeldWalStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "HeldWalStore({})", self.inner)
+        }
+    }
+
+    impl ObjectStore for HeldWalStore {
+        fn put_opts<'a, 'b, 'c>(
+            &'a self,
+            location: &'b ObjPath,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> Boxed<'c, object_store::PutResult>
+        where
+            'a: 'c,
+            'b: 'c,
+            Self: 'c,
+        {
+            Box::pin(async move {
+                if location.as_ref().contains("/wal/")
+                    && self.hold.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.held.store(true, std::sync::atomic::Ordering::SeqCst);
+                    self.release.notified().await;
+                }
+                self.inner.put_opts(location, payload, opts).await
+            })
+        }
+
+        fn put_multipart_opts<'a, 'b, 'c>(
+            &'a self,
+            location: &'b ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> Boxed<'c, Box<dyn object_store::MultipartUpload>>
+        where
+            'a: 'c,
+            'b: 'c,
+            Self: 'c,
+        {
+            self.inner.put_multipart_opts(location, opts)
+        }
+
+        fn get_opts<'a, 'b, 'c>(
+            &'a self,
+            location: &'b ObjPath,
+            options: object_store::GetOptions,
+        ) -> Boxed<'c, object_store::GetResult>
+        where
+            'a: 'c,
+            'b: 'c,
+            Self: 'c,
+        {
+            self.inner.get_opts(location, options)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_delimiter<'a, 'b, 'c>(
+            &'a self,
+            prefix: Option<&'b ObjPath>,
+        ) -> Boxed<'c, object_store::ListResult>
+        where
+            'a: 'c,
+            'b: 'c,
+            Self: 'c,
+        {
+            self.inner.list_with_delimiter(prefix)
+        }
+
+        fn copy_opts<'a, 'b, 'c, 'd>(
+            &'a self,
+            from: &'b ObjPath,
+            to: &'c ObjPath,
+            options: object_store::CopyOptions,
+        ) -> Boxed<'d, ()>
+        where
+            'a: 'd,
+            'b: 'd,
+            'c: 'd,
+            Self: 'd,
+        {
+            self.inner.copy_opts(from, to, options)
+        }
+    }
+
+    /// A write that lands while another caller's flush is in flight is not part
+    /// of that flush: its own caller's flush makes it durable, and that flush has
+    /// to tell the readers. The first flush published before the write was on
+    /// the store.
+    #[test]
+    #[serial]
+    fn a_write_that_lands_during_a_flush_is_published_by_its_own_flush() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let store = Arc::new(HeldWalStore::default());
+        // No flush on a timer: only `flush_durable` writes the WAL here.
+        let mut settings = Settings::default();
+        settings.flush_interval = None;
+        let be = Arc::new(
+            LsmBackend::open_with_store_settings(
+                "helion/flush-overlap",
+                Arc::clone(&store) as Arc<dyn ObjectStore>,
+                Some(settings),
+            )
+            .unwrap(),
+        );
+        let feed = crate::helix_engine::storage_core::change_feed::change_feed();
+        let cursor = || feed.changes_since(u64::MAX).cursor;
+        let published_since = |cursor: u64| {
+            feed.changes_since(cursor)
+                .changes
+                .iter()
+                .any(|name| name == "flush-overlap")
+        };
+        let write_buffered = |key: &[u8]| {
+            let mut w = be.begin_write().unwrap();
+            be.put(&mut w, Namespace::Nodes, key, b"1").unwrap();
+            be.commit_buffered(w).unwrap();
+        };
+
+        write_buffered(b"first");
+        let before = cursor();
+        store.hold.store(true, SeqCst);
+        let first_flush = {
+            let be = Arc::clone(&be);
+            std::thread::spawn(move || be.flush_durable())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !store.held.load(SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the flush never reached its WAL put"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The first flush has taken what was buffered and waits for the store.
+        write_buffered(b"second");
+        store.hold.store(false, SeqCst);
+        store.release.notify_one();
+        first_flush.join().unwrap().unwrap();
+        assert!(published_since(before), "the first flush published nothing");
+
+        let after_first = cursor();
+        be.flush_durable().unwrap();
+        assert!(
+            published_since(after_first),
+            "the second write became durable and the readers were not told"
+        );
+    }
+
+    /// A flush that is refused before it is sent made nothing durable: the write
+    /// it would have published is published by the flush that does.
+    #[test]
+    #[serial]
+    fn a_refused_flush_leaves_its_publish_to_the_next_flush() {
+        let be = LsmBackend::open_in_memory("helion/flush-refused").unwrap();
+        let feed = crate::helix_engine::storage_core::change_feed::change_feed();
+        let mut w = be.begin_write().unwrap();
+        be.put(&mut w, Namespace::Nodes, b"k", b"1").unwrap();
+        be.commit_buffered(w).unwrap();
+
+        // Inside a runtime and without the blocking allowance, the flush is
+        // refused before it reaches the store.
+        let refused = Runtime::new()
+            .unwrap()
+            .block_on(async { be.flush_durable() });
+        assert!(
+            matches!(refused, Err(BackendError::Unsupported(_))),
+            "{refused:?}"
+        );
+
+        let before = feed.changes_since(u64::MAX).cursor;
+        be.flush_durable().unwrap();
+        assert!(
+            feed.changes_since(before)
+                .changes
+                .iter()
+                .any(|name| name == "flush-refused"),
+            "the write became durable and the readers were not told"
+        );
+    }
+
     fn racing_reader_purge(
         prefix: &str,
         append_after_lists: usize,
@@ -6083,6 +8707,7 @@ mod tests {
             lists: std::sync::atomic::AtomicUsize::new(0),
             appended: std::sync::atomic::AtomicBool::new(false),
             deleted: Arc::clone(&deleted),
+            delete_calls: Arc::default(),
         });
 
         let purged = purge_prefix_from_store(rt.clone(), store, prefix);
@@ -6250,6 +8875,68 @@ mod tests {
             ],
             "purge order: {deleted:?}"
         );
+    }
+
+    /// A purge deletes in multi-object requests, not one request per key: two
+    /// manifests and 2,500 other objects are 1 + 3 delete requests, and the
+    /// third pass finds nothing left to delete.
+    #[test]
+    #[serial]
+    fn purge_prefix_from_store_deletes_in_bulk_requests() {
+        let rt = shared_lsm_handle();
+        let prefix = "helion/bulk";
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        block_on_lsm(&rt, async {
+            let objects = (1..=2)
+                .map(|id| format!("manifest/{id:020}.manifest"))
+                .chain((0..2_500).map(|id| format!("wal/{id:020}.sst")));
+            for object in objects {
+                inner
+                    .put(
+                        &ObjPath::from(format!("{prefix}/{object}")),
+                        Bytes::from_static(b"x").into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            Ok::<(), String>(())
+        })
+        .unwrap();
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let delete_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store: Arc<dyn ObjectStore> = Arc::new(RacingReaderStore {
+            inner: Arc::clone(&inner),
+            zombie: ObjPath::from(format!("{prefix}/never-appended")),
+            append_after_lists: usize::MAX,
+            fail_deletes_after_lists: usize::MAX,
+            lists: std::sync::atomic::AtomicUsize::new(0),
+            appended: std::sync::atomic::AtomicBool::new(false),
+            deleted: Arc::clone(&deleted),
+            delete_calls: Arc::clone(&delete_calls),
+        });
+
+        purge_prefix_from_store(rt.clone(), store, prefix).unwrap();
+
+        assert_eq!(delete_calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let deleted = deleted.lock().unwrap();
+        assert_eq!(deleted.len(), 2_502);
+        assert!(
+            deleted[..2]
+                .iter()
+                .all(|location| manifest_id_of(location).is_some()),
+            "manifests were not deleted first: {:?}",
+            &deleted[..4]
+        );
+        let left: Vec<ObjPath> = block_on_lsm(&rt, async {
+            inner
+                .list(Some(&ObjPath::from(prefix)))
+                .map_ok(|meta| meta.location)
+                .try_collect()
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(left.is_empty(), "objects survived the purge: {left:?}");
     }
 
     #[test]
